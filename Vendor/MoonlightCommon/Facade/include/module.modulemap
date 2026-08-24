@@ -1,0 +1,4 @@
+module CMoonlightBridge {
+    header "UmbraStreamingBridge.h"
+    export *
+}

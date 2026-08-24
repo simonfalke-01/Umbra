@@ -1,0 +1,339 @@
+diff --git a/src/Connection.c b/src/Connection.c
+index cea8421..fa48396 100644
+--- a/src/Connection.c
++++ b/src/Connection.c
+@@ -267,6 +267,10 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
+     else if (StreamConfig.videoDecodeQueueCapacity > VIDEO_DECODE_QUEUE_CAPACITY_MAX) {
+         StreamConfig.videoDecodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_MAX;
+     }
++    if (StreamConfig.optimizationMode < STREAM_OPTIMIZATION_MODE_LEGACY ||
++        StreamConfig.optimizationMode > STREAM_OPTIMIZATION_MODE_QUALITY) {
++        StreamConfig.optimizationMode = STREAM_OPTIMIZATION_MODE_LEGACY;
++    }
+     RemoteAddrString = strdup(serverInfo->address);
+ 
+     // The values in RTSP SETUP will be used to populate these.
+diff --git a/src/InputStream.c b/src/InputStream.c
+index 5994836..b1cc85f 100644
+--- a/src/InputStream.c
++++ b/src/InputStream.c
+@@ -92,6 +92,35 @@ static struct {
+     bool dirty; // Update ready to send (queued packet holder in packetQueue)
+ } currentAbsoluteMouseState;
+ 
++#if defined(UMBRA_STREAM_TESTING)
++static LiTestInputPacketCallback testInputPacketCallback;
++static void* testInputCallbackContext;
++static bool testInputStreamOwned;
++#endif
++
++static inline int getInputBatchingDelayMs(int optimizationMode, uint64_t now, uint64_t lastPacketTime, int intervalMs) {
++    if (optimizationMode == STREAM_OPTIMIZATION_MODE_LATENCY) {
++        return 0;
++    }
++
++    if (now < lastPacketTime + (uint64_t)intervalMs) {
++        return (int)(lastPacketTime + (uint64_t)intervalMs - now);
++    }
++
++    return 0;
++}
++
++static void flushInputBeforeBatchingWait(void) {
++#if defined(UMBRA_STREAM_TESTING)
++    // The focused harness replaces transport sends and has no ENet host to
++    // flush. Production and live-connection test paths retain the exact flush.
++    if (testInputPacketCallback != NULL) {
++        return;
++    }
++#endif
++    flushInputOnControlStream();
++}
++
+ // Initializes the input stream
+ int initializeInputStream(void) {
+     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
+@@ -235,6 +264,19 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
+ static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
+     SOCK_RET err;
+ 
++#if defined(UMBRA_STREAM_TESTING)
++    if (testInputPacketCallback != NULL) {
++        return testInputPacketCallback(
++            (const unsigned char*)&holder->packet,
++            PACKET_SIZE(holder),
++            holder->channelId,
++            holder->enetPacketFlags,
++            moreData,
++            testInputCallbackContext
++        );
++    }
++#endif
++
+     // On GFE 3.22, the entire control stream is encrypted (and support for separate RI encrypted)
+     // has been removed. We send the plaintext packet through and the control stream code will do
+     // the encryption.
+@@ -325,6 +367,8 @@ static void inputSendThreadProc(void* context) {
+     PPACKET_HOLDER holder;
+     uint32_t multiControllerMagicLE;
+     uint32_t relMouseMagicLE;
++    const int optimizationMode = StreamConfig.optimizationMode;
++    const bool lowestLatencyMode = optimizationMode == STREAM_OPTIMIZATION_MODE_LATENCY;
+ 
+     if (AppVersionQuad[0] >= 5) {
+         multiControllerMagicLE = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
+@@ -364,13 +408,23 @@ static void inputSendThreadProc(void* context) {
+         }
+         // If it's a relative mouse move packet, we can do batching
+         else if (holder->packet.header.magic == relMouseMagicLE) {
+-            uint64_t now = PltGetMillis();
++            uint64_t now = 0;
+ 
+-            // Delay for batching if required
+-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+-                flushInputOnControlStream();
+-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
++            // Latency mode bypasses both the intentional wait and its clock
++            // reads. Legacy and quality retain the historical pacing path.
++            if (!lowestLatencyMode) {
+                 now = PltGetMillis();
++                int batchingDelayMs = getInputBatchingDelayMs(
++                    optimizationMode,
++                    now,
++                    lastMousePacketTime,
++                    MOUSE_BATCHING_INTERVAL_MS
++                );
++                if (batchingDelayMs > 0) {
++                    flushInputBeforeBatchingWait();
++                    PltSleepMs(batchingDelayMs);
++                    now = PltGetMillis();
++                }
+             }
+ 
+             PltLockMutex(&batchedInputMutex);
+@@ -426,7 +480,9 @@ static void inputSendThreadProc(void* context) {
+ 
+             PltUnlockMutex(&batchedInputMutex);
+ 
+-            lastMousePacketTime = now;
++            if (!lowestLatencyMode) {
++                lastMousePacketTime = now;
++            }
+ 
+             // We sent everything we needed in the loop above, so we can just free the
+             // holder of the original packet and wait for another input event.
+@@ -435,13 +491,21 @@ static void inputSendThreadProc(void* context) {
+         }
+         // If it's an absolute mouse move packet, we should only send the latest
+         else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
+-            uint64_t now = PltGetMillis();
++            uint64_t now = 0;
+ 
+-            // Delay for batching if required
+-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+-                flushInputOnControlStream();
+-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
++            if (!lowestLatencyMode) {
+                 now = PltGetMillis();
++                int batchingDelayMs = getInputBatchingDelayMs(
++                    optimizationMode,
++                    now,
++                    lastMousePacketTime,
++                    MOUSE_BATCHING_INTERVAL_MS
++                );
++                if (batchingDelayMs > 0) {
++                    flushInputBeforeBatchingWait();
++                    PltSleepMs(batchingDelayMs);
++                    now = PltGetMillis();
++                }
+             }
+ 
+             PltLockMutex(&batchedInputMutex);
+@@ -463,17 +527,27 @@ static void inputSendThreadProc(void* context) {
+ 
+             PltUnlockMutex(&batchedInputMutex);
+ 
+-            lastMousePacketTime = now;
++            if (!lowestLatencyMode) {
++                lastMousePacketTime = now;
++            }
+         }
+         // If it's a pen packet, we should only send the latest move or hover events
+         else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
+-            uint64_t now = PltGetMillis();
++            uint64_t now = 0;
+ 
+-            // Delay for batching if required
+-            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
+-                flushInputOnControlStream();
+-                PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
++            if (!lowestLatencyMode) {
+                 now = PltGetMillis();
++                int batchingDelayMs = getInputBatchingDelayMs(
++                    optimizationMode,
++                    now,
++                    lastPenPacketTime,
++                    PEN_BATCHING_INTERVAL_MS
++                );
++                if (batchingDelayMs > 0) {
++                    flushInputBeforeBatchingWait();
++                    PltSleepMs(batchingDelayMs);
++                    now = PltGetMillis();
++                }
+             }
+ 
+             for (;;) {
+@@ -505,7 +579,9 @@ static void inputSendThreadProc(void* context) {
+                 holder = penBatchHolder;
+             }
+ 
+-            lastPenPacketTime = now;
++            if (!lowestLatencyMode) {
++                lastPenPacketTime = now;
++            }
+         }
+         // If it's a motion packet, only send the latest for each sensor type
+         else if (holder->packet.header.magic == LE32(SS_CONTROLLER_MOTION_MAGIC)) {
+@@ -1636,3 +1712,70 @@ int LiSendControllerBatteryEvent(uint8_t controllerNumber, uint8_t batteryState,
+ 
+     return err;
+ }
++
++#if defined(UMBRA_STREAM_TESTING)
++int LiTestGetInputBatchingDelayMs(
++    int optimizationMode,
++    uint64_t now,
++    uint64_t lastPacketTime,
++    int intervalMs
++) {
++    if (intervalMs <= 0) {
++        return 0;
++    }
++    return getInputBatchingDelayMs(optimizationMode, now, lastPacketTime, intervalMs);
++}
++
++int LiTestInitializeInputStream(
++    int optimizationMode,
++    LiTestInputPacketCallback packetCallback,
++    void* context
++) {
++    if (testInputStreamOwned || packetCallback == NULL ||
++        optimizationMode < STREAM_OPTIMIZATION_MODE_LEGACY ||
++        optimizationMode > STREAM_OPTIMIZATION_MODE_QUALITY) {
++        return -1;
++    }
++
++    LiInitializeStreamConfiguration(&StreamConfig);
++    StreamConfig.optimizationMode = optimizationMode;
++    AppVersionQuad[0] = 7;
++    AppVersionQuad[1] = 1;
++    AppVersionQuad[2] = 431;
++    AppVersionQuad[3] = -1;
++    SunshineFeatureFlags = LI_FF_PEN_TOUCH_EVENTS;
++    testInputPacketCallback = packetCallback;
++    testInputCallbackContext = context;
++
++    int result = initializeInputStream();
++    if (result == 0) {
++        testInputStreamOwned = true;
++    }
++    else {
++        testInputPacketCallback = NULL;
++        testInputCallbackContext = NULL;
++    }
++    return result;
++}
++
++int LiTestStartInputStream(void) {
++    return testInputStreamOwned ? startInputStream() : -1;
++}
++
++void LiTestDestroyInputStream(void) {
++    if (!testInputStreamOwned) {
++        return;
++    }
++    if (initialized) {
++        stopInputStream();
++    }
++    destroyInputStream();
++    testInputStreamOwned = false;
++    testInputPacketCallback = NULL;
++    testInputCallbackContext = NULL;
++}
++
++int LiTestGetInputQueueCapacity(void) {
++    return MAX_QUEUED_INPUT_PACKETS;
++}
++#endif
+diff --git a/src/Limelight.h b/src/Limelight.h
+index 589e17e..7894cf6 100644
+--- a/src/Limelight.h
++++ b/src/Limelight.h
+@@ -42,6 +42,14 @@ extern "C" {
+ #define VIDEO_DECODE_QUEUE_CAPACITY_MAX     15
+ #define VIDEO_DECODE_QUEUE_CAPACITY_DEFAULT 15
+ 
++// Values for the 'optimizationMode' field below. Legacy and quality preserve
++// moonlight-common-c's historical input pacing byte-for-byte. Latency removes
++// only the deliberate mouse/stylus batching wait; packet ordering, reliability,
++// and latest-state coalescing remain unchanged.
++#define STREAM_OPTIMIZATION_MODE_LEGACY  0
++#define STREAM_OPTIMIZATION_MODE_LATENCY 1
++#define STREAM_OPTIMIZATION_MODE_QUALITY 2
++
+ // This function returns a string that you SHOULD append to the /launch and /resume
+ // query parameter string. This is used to enable certain extended functionality
+ // with Sunshine hosts. The returned string is owned by moonlight-common-c and
+@@ -111,6 +119,10 @@ typedef struct _STREAM_CONFIGURATION {
+     // Maximum compressed video frames queued for the decoder. Values outside
+     // VIDEO_DECODE_QUEUE_CAPACITY_MIN...MAX are clamped before streaming.
+     int videoDecodeQueueCapacity;
++
++    // Immutable policy snapshot for this connection. See
++    // STREAM_OPTIMIZATION_MODE_* above.
++    int optimizationMode;
+ } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
+ 
+ // Use this function to zero the stream configuration when allocated on the stack or heap
+@@ -889,6 +901,29 @@ bool LiTestOfferCompleteVideoDecodeUnit(unsigned int frameNumber);
+ bool LiTestVideoDecodeQueueWaitingForIdr(void);
+ bool LiTestVideoDecodeQueueWaitingForRfi(void);
+ void LiTestDestroyVideoDecodeQueue(void);
++
++typedef bool(*LiTestInputPacketCallback)(
++    const unsigned char* packet,
++    int packetLength,
++    unsigned char channelId,
++    unsigned int packetFlags,
++    bool moreData,
++    void* context
++);
++int LiTestGetInputBatchingDelayMs(
++    int optimizationMode,
++    uint64_t now,
++    uint64_t lastPacketTime,
++    int intervalMs
++);
++int LiTestInitializeInputStream(
++    int optimizationMode,
++    LiTestInputPacketCallback packetCallback,
++    void* context
++);
++int LiTestStartInputStream(void);
++void LiTestDestroyInputStream(void);
++int LiTestGetInputQueueCapacity(void);
+ #endif
+ 
+ // Returns the number of queued audio frames ready for delivery. Only relevant
+diff --git a/src/Misc.c b/src/Misc.c
+index a7983c6..0b800d7 100644
+--- a/src/Misc.c
++++ b/src/Misc.c
+@@ -127,6 +127,7 @@ bool isReferenceFrameInvalidationEnabled(void) {
+ void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig) {
+     memset(streamConfig, 0, sizeof(*streamConfig));
+     streamConfig->videoDecodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_DEFAULT;
++    streamConfig->optimizationMode = STREAM_OPTIMIZATION_MODE_LEGACY;
+ }
+ 
+ void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks) {

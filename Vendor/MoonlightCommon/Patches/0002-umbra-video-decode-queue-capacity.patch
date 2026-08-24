@@ -1,0 +1,358 @@
+diff --git a/src/Connection.c b/src/Connection.c
+index bac9a6e..cea8421 100644
+--- a/src/Connection.c
++++ b/src/Connection.c
+@@ -261,6 +261,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
+     memset(&LocalAddr, 0, sizeof(LocalAddr));
+     NegotiatedVideoFormat = 0;
+     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
++    if (StreamConfig.videoDecodeQueueCapacity < VIDEO_DECODE_QUEUE_CAPACITY_MIN) {
++        StreamConfig.videoDecodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_MIN;
++    }
++    else if (StreamConfig.videoDecodeQueueCapacity > VIDEO_DECODE_QUEUE_CAPACITY_MAX) {
++        StreamConfig.videoDecodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_MAX;
++    }
+     RemoteAddrString = strdup(serverInfo->address);
+ 
+     // The values in RTSP SETUP will be used to populate these.
+diff --git a/src/Limelight-internal.h b/src/Limelight-internal.h
+index e1314c5..41598c2 100644
+--- a/src/Limelight-internal.h
++++ b/src/Limelight-internal.h
+@@ -128,7 +128,7 @@ bool isControlDataInTransit(void);
+ 
+ int performRtspHandshake(PSERVER_INFORMATION serverInfo);
+ 
+-void initializeVideoDepacketizer(int pktSize);
++void initializeVideoDepacketizer(int pktSize, int decodeQueueCapacity);
+ void destroyVideoDepacketizer(void);
+ void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
+ void stopVideoDepacketizer(void);
+diff --git a/src/Limelight.h b/src/Limelight.h
+index 5e1bbcd..589e17e 100644
+--- a/src/Limelight.h
++++ b/src/Limelight.h
+@@ -35,6 +35,13 @@ extern "C" {
+ #define ENCFLG_VIDEO 0x00000002
+ #define ENCFLG_ALL   0xFFFFFFFF
+ 
++// Bounds for the compressed video decode-unit queue used when
++// CAPABILITY_DIRECT_SUBMIT is not set. The historical queue depth is retained
++// as the initialization default for clients that do not select a policy.
++#define VIDEO_DECODE_QUEUE_CAPACITY_MIN     1
++#define VIDEO_DECODE_QUEUE_CAPACITY_MAX     15
++#define VIDEO_DECODE_QUEUE_CAPACITY_DEFAULT 15
++
+ // This function returns a string that you SHOULD append to the /launch and /resume
+ // query parameter string. This is used to enable certain extended functionality
+ // with Sunshine hosts. The returned string is owned by moonlight-common-c and
+@@ -100,6 +107,10 @@ typedef struct _STREAM_CONFIGURATION {
+     // in /launch and /resume requests.
+     char remoteInputAesKey[16];
+     char remoteInputAesIv[16];
++
++    // Maximum compressed video frames queued for the decoder. Values outside
++    // VIDEO_DECODE_QUEUE_CAPACITY_MIN...MAX are clamped before streaming.
++    int videoDecodeQueueCapacity;
+ } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
+ 
+ // Use this function to zero the stream configuration when allocated on the stack or heap
+@@ -864,6 +875,22 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
+ // if CAPABILITY_DIRECT_SUBMIT is not set for the video renderer.
+ int LiGetPendingVideoFrames(void);
+ 
++// Returns the active compressed-video decode queue capacity. Only relevant
++// if CAPABILITY_DIRECT_SUBMIT is not set for the video renderer.
++int LiGetVideoDecodeQueueCapacity(void);
++
++#if defined(UMBRA_STREAM_TESTING)
++typedef void(*LiTestVideoDecodeQueueRecoveryCallback)(bool referenceFrameInvalidation);
++void LiTestInitializeVideoDecodeQueue(
++    int decodeQueueCapacity,
++    LiTestVideoDecodeQueueRecoveryCallback recoveryCallback
++);
++bool LiTestOfferCompleteVideoDecodeUnit(unsigned int frameNumber);
++bool LiTestVideoDecodeQueueWaitingForIdr(void);
++bool LiTestVideoDecodeQueueWaitingForRfi(void);
++void LiTestDestroyVideoDecodeQueue(void);
++#endif
++
+ // Returns the number of queued audio frames ready for delivery. Only relevant
+ // if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer. For most uses,
+ // LiGetPendingAudioDuration() is probably a better option than this function.
+diff --git a/src/LinkedBlockingQueue.c b/src/LinkedBlockingQueue.c
+index 5d7f9a7..880849c 100644
+--- a/src/LinkedBlockingQueue.c
++++ b/src/LinkedBlockingQueue.c
+@@ -24,6 +24,7 @@ PLINKED_BLOCKING_QUEUE_ENTRY LbqFlushQueueItems(PLINKED_BLOCKING_QUEUE queueHead
+         queueHead->head = NULL;
+         queueHead->tail = NULL;
+         queueHead->currentSize = 0;
++        atomic_store_explicit(&queueHead->currentSizeSnapshot, 0, memory_order_release);
+     }
+     else {
+         LC_ASSERT(queueHead->tail == NULL);
+@@ -40,6 +41,7 @@ int LbqInitializeLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead, int sizeB
+     int err;
+ 
+     memset(queueHead, 0, sizeof(*queueHead));
++    atomic_init(&queueHead->currentSizeSnapshot, 0);
+ 
+     err = PltCreateMutex(&queueHead->mutex);
+     if (err != 0) {
+@@ -79,7 +81,10 @@ void LbqSignalQueueUserWake(PLINKED_BLOCKING_QUEUE queueHead) {
+ }
+ 
+ int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead) {
+-    return queueHead->currentSize;
++    // Callers use this from callbacks and transport threads that may already
++    // hold unrelated queue-adjacent locks. A synchronized snapshot avoids the
++    // data race without recursively acquiring this queue's non-recursive mutex.
++    return atomic_load_explicit(&queueHead->currentSizeSnapshot, memory_order_acquire);
+ }
+ 
+ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+@@ -117,6 +122,11 @@ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOC
+     }
+ 
+     queueHead->currentSize++;
++    atomic_store_explicit(
++        &queueHead->currentSizeSnapshot,
++        queueHead->currentSize,
++        memory_order_release
++    );
+     queueHead->lifetimeSize++;
+ 
+     PltUnlockMutex(&queueHead->mutex);
+@@ -181,6 +191,11 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+     entry = queueHead->head;
+     queueHead->head = entry->flink;
+     queueHead->currentSize--;
++    atomic_store_explicit(
++        &queueHead->currentSizeSnapshot,
++        queueHead->currentSize,
++        memory_order_release
++    );
+     if (queueHead->head == NULL) {
+         LC_ASSERT(queueHead->currentSize == 0);
+         queueHead->tail = NULL;
+@@ -232,6 +247,11 @@ int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+     entry = queueHead->head;
+     queueHead->head = entry->flink;
+     queueHead->currentSize--;
++    atomic_store_explicit(
++        &queueHead->currentSizeSnapshot,
++        queueHead->currentSize,
++        memory_order_release
++    );
+     if (queueHead->head == NULL) {
+         LC_ASSERT(queueHead->currentSize == 0);
+         queueHead->tail = NULL;
+diff --git a/src/LinkedBlockingQueue.h b/src/LinkedBlockingQueue.h
+index 426f43d..c0b3eee 100644
+--- a/src/LinkedBlockingQueue.h
++++ b/src/LinkedBlockingQueue.h
+@@ -3,6 +3,8 @@
+ #include "Platform.h"
+ #include "PlatformThreads.h"
+ 
++#include <stdatomic.h>
++
+ #define LBQ_SUCCESS 0
+ #define LBQ_INTERRUPTED 1
+ #define LBQ_BOUND_EXCEEDED 2
+@@ -22,6 +24,7 @@ typedef struct _LINKED_BLOCKING_QUEUE {
+     PLINKED_BLOCKING_QUEUE_ENTRY tail;
+     int sizeBound;
+     int currentSize;
++    atomic_int currentSizeSnapshot;
+     int lifetimeSize;
+     bool shutdown;
+     bool draining;
+diff --git a/src/Misc.c b/src/Misc.c
+index e3cd6b0..a7983c6 100644
+--- a/src/Misc.c
++++ b/src/Misc.c
+@@ -126,6 +126,7 @@ bool isReferenceFrameInvalidationEnabled(void) {
+ 
+ void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig) {
+     memset(streamConfig, 0, sizeof(*streamConfig));
++    streamConfig->videoDecodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_DEFAULT;
+ }
+ 
+ void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks) {
+diff --git a/src/VideoDepacketizer.c b/src/VideoDepacketizer.c
+index 43f2df9..0261e94 100644
+--- a/src/VideoDepacketizer.c
++++ b/src/VideoDepacketizer.c
+@@ -31,6 +31,10 @@ static bool idrFrameProcessed;
+ static unsigned int consecutiveFrameDrops;
+ 
+ static LINKED_BLOCKING_QUEUE decodeUnitQueue;
++static int decodeUnitQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_DEFAULT;
++#if defined(UMBRA_STREAM_TESTING)
++static LiTestVideoDecodeQueueRecoveryCallback testDecodeQueueRecoveryCallback;
++#endif
+ 
+ typedef struct _BUFFER_DESC {
+     char* data;
+@@ -59,8 +63,15 @@ typedef struct _LENTRY_INTERNAL {
+ #define HEVC_NAL_TYPE_SEI 39
+ 
+ // Init
+-void initializeVideoDepacketizer(int pktSize) {
+-    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
++void initializeVideoDepacketizer(int pktSize, int decodeQueueCapacity) {
++    if (decodeQueueCapacity < VIDEO_DECODE_QUEUE_CAPACITY_MIN) {
++        decodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_MIN;
++    }
++    else if (decodeQueueCapacity > VIDEO_DECODE_QUEUE_CAPACITY_MAX) {
++        decodeQueueCapacity = VIDEO_DECODE_QUEUE_CAPACITY_MAX;
++    }
++    decodeUnitQueueCapacity = decodeQueueCapacity;
++    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, decodeUnitQueueCapacity);
+ 
+     nextFrameNumber = 1;
+     startFrameNumber = 0;
+@@ -465,6 +476,43 @@ static bool isIdrFrameStart(PBUFFER_DESC buffer) {
+     }
+ }
+ 
++static void requestDecodeQueueIdrRecovery(void) {
++#if defined(UMBRA_STREAM_TESTING)
++    if (testDecodeQueueRecoveryCallback != NULL) {
++        testDecodeQueueRecoveryCallback(false);
++        return;
++    }
++#endif
++    LiRequestIdrFrame();
++}
++
++static bool offerDecodeUnitToQueue(PQUEUED_DECODE_UNIT qdu) {
++    if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) != LBQ_BOUND_EXCEEDED) {
++        return true;
++    }
++
++    Limelog("Video decode unit queue overflow\n");
++
++    // RFI recovery is not supported here. The queued frames may depend on the
++    // dropped frame, so flush them and recover from a complete IDR frame.
++    waitingForIdrFrame = true;
++
++    // Clear NAL state for the frame that we failed to enqueue
++    nalChainHead = qdu->decodeUnit.bufferList;
++    nalChainDataLength = qdu->decodeUnit.fullLength;
++    dropFrameState();
++
++    // Free the DU we were going to queue
++    free(qdu);
++
++    // Free all frames in the decode unit queue
++    freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
++
++    // Request an IDR frame to recover
++    requestDecodeQueueIdrRecovery();
++    return false;
++}
++
+ // Reassemble the frame with the given frame number
+ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
+     if (nalChainHead != NULL) {
+@@ -510,25 +558,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
+             nalChainDataLength = 0;
+ 
+             if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
+-                if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
+-                    Limelog("Video decode unit queue overflow\n");
+-
+-                    // RFI recovery is not supported here
+-                    waitingForIdrFrame = true;
+-
+-                    // Clear NAL state for the frame that we failed to enqueue
+-                    nalChainHead = qdu->decodeUnit.bufferList;
+-                    nalChainDataLength = qdu->decodeUnit.fullLength;
+-                    dropFrameState();
+-
+-                    // Free the DU we were going to queue
+-                    free(qdu);
+-
+-                    // Free all frames in the decode unit queue
+-                    freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
+-
+-                    // Request an IDR frame to recover
+-                    LiRequestIdrFrame();
++                if (!offerDecodeUnitToQueue(qdu)) {
+                     return;
+                 }
+             }
+@@ -1194,3 +1224,57 @@ void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntryPtr) {
+ int LiGetPendingVideoFrames(void) {
+     return LbqGetItemCount(&decodeUnitQueue);
+ }
++
++int LiGetVideoDecodeQueueCapacity(void) {
++    return decodeUnitQueueCapacity;
++}
++
++#if defined(UMBRA_STREAM_TESTING)
++void LiTestInitializeVideoDecodeQueue(
++    int decodeQueueCapacity,
++    LiTestVideoDecodeQueueRecoveryCallback recoveryCallback
++) {
++    testDecodeQueueRecoveryCallback = recoveryCallback;
++    VideoCallbacks.capabilities &= ~CAPABILITY_DIRECT_SUBMIT;
++    NegotiatedVideoFormat = VIDEO_FORMAT_H264;
++    ReferenceFrameInvalidationSupported = false;
++    initializeVideoDepacketizer(1392, decodeQueueCapacity);
++}
++
++bool LiTestOfferCompleteVideoDecodeUnit(unsigned int frameNumber) {
++    PQUEUED_DECODE_UNIT qdu = calloc(1, sizeof(*qdu));
++    PLENTRY_INTERNAL buffer = calloc(1, sizeof(*buffer));
++    char* payload = malloc(1);
++    if (qdu == NULL || buffer == NULL || payload == NULL) {
++        free(qdu);
++        free(buffer);
++        free(payload);
++        return false;
++    }
++
++    payload[0] = 0;
++    buffer->allocPtr = payload;
++    buffer->entry.data = payload;
++    buffer->entry.length = 1;
++    buffer->entry.bufferType = BUFFER_TYPE_PICDATA;
++    qdu->decodeUnit.bufferList = &buffer->entry;
++    qdu->decodeUnit.fullLength = 1;
++    qdu->decodeUnit.frameType = FRAME_TYPE_PFRAME;
++    qdu->decodeUnit.frameNumber = (int)frameNumber;
++    return offerDecodeUnitToQueue(qdu);
++}
++
++bool LiTestVideoDecodeQueueWaitingForIdr(void) {
++    return waitingForIdrFrame;
++}
++
++bool LiTestVideoDecodeQueueWaitingForRfi(void) {
++    return waitingForRefInvalFrame;
++}
++
++void LiTestDestroyVideoDecodeQueue(void) {
++    stopVideoDepacketizer();
++    destroyVideoDepacketizer();
++    testDecodeQueueRecoveryCallback = NULL;
++}
++#endif
+diff --git a/src/VideoStream.c b/src/VideoStream.c
+index 402b056..20956f0 100644
+--- a/src/VideoStream.c
++++ b/src/VideoStream.c
+@@ -36,7 +36,7 @@ static bool receivedFullFrame;
+ 
+ // Initialize the video stream
+ void initializeVideoStream(void) {
+-    initializeVideoDepacketizer(StreamConfig.packetSize);
++    initializeVideoDepacketizer(StreamConfig.packetSize, StreamConfig.videoDecodeQueueCapacity);
+     RtpvInitializeQueue(&rtpQueue);
+     decryptionCtx = PltCreateCryptoContext();
+     receivedDataFromPeer = false;

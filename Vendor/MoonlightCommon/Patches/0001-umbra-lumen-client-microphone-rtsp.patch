@@ -1,0 +1,149 @@
+--- a/src/RtspConnection.c
++++ b/src/RtspConnection.c
+@@ -1,5 +1,6 @@
+ #include "Limelight-internal.h"
+ #include "Rtsp.h"
++#include "../../Facade/src/UmbraClientMicrophoneRTSPExtension.h"
+ 
+ #define RTSP_CONNECT_TIMEOUT_SEC 10
+ #define RTSP_RECEIVE_TIMEOUT_SEC 15
+@@ -614,6 +614,34 @@
+     return ret;
+ }
+ 
++// Umbra extension: negotiate Lumen's optional reverse microphone UDP flow
++// without changing the transport syntax used by the pinned GameStream streams.
++static bool setupClientMicrophoneStream(PRTSP_MESSAGE response, int* error) {
++    RTSP_MESSAGE request;
++    bool ret;
++    char transportValue[64];
++
++    *error = -1;
++    if (!umbra_client_microphone_rtsp_format_transport(transportValue, sizeof(transportValue))) {
++        return false;
++    }
++
++    ret = initializeRtspRequest(&request, "SETUP", umbra_client_microphone_rtsp_setup_target());
++    if (ret) {
++        if ((hasSessionId && !addOption(&request, "Session", sessionIdString)) ||
++            !addOption(&request, "Transport", transportValue) ||
++            !addOption(&request, "If-Modified-Since", "Thu, 01 Jan 1970 00:00:00 GMT")) {
++            ret = false;
++        }
++        else {
++            ret = transactRtspMessage(&request, response, false, error);
++        }
++        freeMessage(&request);
++    }
++
++    return ret;
++}
++
+ // Send RTSP PLAY request
+ static bool playStream(PRTSP_MESSAGE response, char* target, int* error) {
+     RTSP_MESSAGE request;
+@@ -658,6 +686,9 @@
+         if (request.payload == NULL) {
+             goto FreeMessage;
+         }
++        if (!umbra_client_microphone_rtsp_append_announce(&request.payload, &payloadLength)) {
++            goto FreeMessage;
++        }
+         request.flags |= FLAG_ALLOCATED_PAYLOAD;
+         request.payloadLength = payloadLength;
+ 
+@@ -1087,6 +1116,11 @@
+             goto Exit;
+         }
+ 
++        (void)umbra_client_microphone_rtsp_accept_describe(
++            response.payload,
++            (size_t)response.payloadLength
++        );
++
+         if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) && strstr(response.payload, "AV1/90000")) {
+             if ((serverInfo->serverCodecModeSupport & SCM_AV1_HIGH10_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_HIGH10_444)) {
+                 NegotiatedVideoFormat = VIDEO_FORMAT_AV1_HIGH10_444;
+@@ -1330,6 +1364,33 @@
+         freeMessage(&response);
+     }
+ 
++    if (umbra_client_microphone_rtsp_should_setup()) {
++        RTSP_MESSAGE response;
++        int error = -1;
++
++        if (!setupClientMicrophoneStream(&response, &error)) {
++            Limelog("RTSP client microphone SETUP transaction failed: %d\n", error);
++            ret = error;
++            goto Exit;
++        }
++        UmbraClientMicrophoneRTSPSetupDisposition disposition =
++            umbra_client_microphone_rtsp_evaluate_setup(&response);
++        if (disposition == UMBRA_CLIENT_MICROPHONE_RTSP_SETUP_DECLINED) {
++            Limelog("RTSP optional client microphone SETUP was declined: %d; continuing without microphone forwarding\n",
++                response.message.response.statusCode);
++            freeMessage(&response);
++        }
++        else if (disposition == UMBRA_CLIENT_MICROPHONE_RTSP_SETUP_FATAL) {
++            Limelog("RTSP successful client microphone SETUP response was malformed\n");
++            freeMessage(&response);
++            ret = -1;
++            goto Exit;
++        }
++        else {
++            freeMessage(&response);
++        }
++    }
++
+     {
+         RTSP_MESSAGE response;
+         int error = -1;
+--- a/src/RtspParser.c
++++ b/src/RtspParser.c
+@@ -280,8 +280,28 @@
+ }
+ 
+ // Adds new option opt to the struct's option list
++static bool optionNameEqualsIgnoreCase(const char* left, const char* right) {
++    while (*left != '\0' && *right != '\0') {
++        unsigned char leftCharacter = (unsigned char)*left++;
++        unsigned char rightCharacter = (unsigned char)*right++;
++        if (leftCharacter >= 'A' && leftCharacter <= 'Z') {
++            leftCharacter = (unsigned char)(leftCharacter + ('a' - 'A'));
++        }
++        if (rightCharacter >= 'A' && rightCharacter <= 'Z') {
++            rightCharacter = (unsigned char)(rightCharacter + ('a' - 'A'));
++        }
++        if (leftCharacter != rightCharacter) {
++            return false;
++        }
++    }
++    return *left == '\0' && *right == '\0';
++}
++
+ void insertOption(POPTION_ITEM* optionsHead, POPTION_ITEM opt) {
+     POPTION_ITEM current = *optionsHead;
++    bool preserveDuplicate = optionNameEqualsIgnoreCase(opt->option, "X-Lumen-Mic-Session") ||
++        optionNameEqualsIgnoreCase(opt->option, "X-Lumen-Mic-Salt") ||
++        optionNameEqualsIgnoreCase(opt->option, "Transport");
+     opt->next = NULL;
+ 
+     // Empty options list
+@@ -292,10 +312,14 @@
+ 
+     // Traverse the list and insert the new option at the end
+     while (current != NULL) {
+-        // Check for duplicate option; if so, replace the option currently there
++        // Check for duplicate option; if so, replace the option currently there.
++        // Umbra's pinned Lumen microphone extension must retain duplicate
++        // credential headers so its strict response validator can reject them.
+         if (!strcmp(current->option, opt->option)) {
+-            current->content = opt->content;
+-            return;
++            if (!preserveDuplicate) {
++                current->content = opt->content;
++                return;
++            }
+         }
+         if (current->next == NULL) {
+             current->next = opt;

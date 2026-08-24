@@ -1,0 +1,20 @@
+--- a/src/RtspConnection.c
++++ b/src/RtspConnection.c
+@@ -1,6 +1,7 @@
+ #include "Limelight-internal.h"
+ #include "Rtsp.h"
+ #include "../../Facade/src/UmbraClientMicrophoneRTSPExtension.h"
++#include "../../Facade/src/UmbraOptimizationModeRTSPExtension.h"
+ 
+ #define RTSP_CONNECT_TIMEOUT_SEC 10
+ #define RTSP_RECEIVE_TIMEOUT_SEC 15
+@@ -688,6 +689,9 @@
+             goto FreeMessage;
+         }
+         if (!umbra_client_microphone_rtsp_append_announce(&request.payload, &payloadLength)) {
++            goto FreeMessage;
++        }
++        if (!umbra_optimization_mode_rtsp_append_announce(&request.payload, &payloadLength)) {
+             goto FreeMessage;
+         }
+         request.flags |= FLAG_ALLOCATED_PAYLOAD;

@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.build/
+.build-*/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Local upstream checkout used only for porting and parity verification.
+/reference/
