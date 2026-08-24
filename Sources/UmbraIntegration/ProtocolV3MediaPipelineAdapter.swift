@@ -1037,7 +1037,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               let bitDepth = tuple[3]?.unsignedValue,
               let layout = tuple[4]?.unsignedValue,
               let primaries = tuple[5]?.unsignedValue, primaries <= UInt8.max,
-              let transfer = tuple[6]?.unsignedValue, (1...3).contains(transfer),
+              let transfer = tuple[6]?.unsignedValue, [1, 16, 18].contains(transfer),
               let matrix = tuple[7]?.unsignedValue, matrix <= UInt8.max,
               let range = tuple[8]?.unsignedValue, range <= 1,
               let flags = tuple[9]?.unsignedValue, flags & ~UInt64(0x03) == 0,

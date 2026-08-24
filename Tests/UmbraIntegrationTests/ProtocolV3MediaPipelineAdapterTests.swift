@@ -402,6 +402,73 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(videoDecoder.configuredFormats.only?.redrawRate, 60)
     }
 
+    func testHLGStartAndVideoConfigPreserveTransferWithoutStaticMetadata() throws {
+        var preferences = StreamingPreferences.default
+        preferences.optimizationMode = .quality
+        preferences.enableHDR = true
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2,
+            supportsHardwareHEVCMain10: true,
+            supportsHardwareAV1Main10: true
+        )
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 12,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let hlgCodec = try XCTUnwrap(
+            offer.fields[9]?.arrayValue?.first(where: { $0.mapValue?[6]?.unsignedValue == 18 })
+        )
+        let hlgCapability = try XCTUnwrap(
+            offer.fields[14]?.arrayValue?.first(where: { $0.mapValue?[1]?.unsignedValue == 3 })?.mapValue
+        )
+        let hlgSelection: ProtocolV3CBORValue = .map([
+            1: .unsigned(3),
+            2: hlgCapability[2]!,
+            3: hlgCapability[3]!,
+            4: hlgCapability[4]!,
+            5: hlgCapability[5]!,
+            6: .null,
+            7: .array([]),
+        ])
+        var response = successfulStartResponse(offer)
+        response[5] = hlgCodec
+        response[23] = hlgSelection
+
+        XCTAssertNoThrow(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: response,
+            offered: offer
+        ))
+
+        let videoDecoder = RationalRefreshVideoDecoder()
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: videoDecoder,
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: capabilities.supportedVideoFormatMask
+            ),
+            mode: .quality,
+            startResponseFields: response
+        )
+        XCTAssertEqual(try adapter.configureVideo(fields: videoConfigurationFields(response)), 2)
+        let hdrMode = try XCTUnwrap(videoDecoder.hdrMode)
+        XCTAssertTrue(hdrMode.enabled)
+        let metadata = try XCTUnwrap(hdrMode.metadata)
+        XCTAssertEqual(metadata.transfer, .hlg)
+        XCTAssertEqual(metadata.maximumDisplayLuminanceNits, 0)
+        XCTAssertEqual(metadata.maximumContentLightLevelNits, 0)
+        XCTAssertEqual(metadata.maximumFrameAverageLightLevelNits, 0)
+    }
+
     func testStartSelectionRejectsAnyExactTupleMutation() throws {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .quality
@@ -537,11 +604,16 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
 private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     UmbraStreaming.VideoCodecInitializationPreparing,
     UmbraStreaming.VideoDecodeOutcomeReporting,
+    UmbraStreaming.HDRMetadataReceiving,
     @unchecked Sendable {
     private let lock = NSLock()
     private var formats: [UmbraStreaming.VideoStreamFormat] = []
+    private var storedHDRMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)?
 
     var configuredFormats: [UmbraStreaming.VideoStreamFormat] { lock.withLock { formats } }
+    var hdrMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)? {
+        lock.withLock { storedHDRMode }
+    }
 
     func configure(format: UmbraStreaming.VideoStreamFormat) -> Bool {
         lock.withLock { formats.append(format) }
@@ -565,6 +637,10 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     func installDecodeOutcomeHandler(
         _ handler: @escaping @Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void
     ) {}
+
+    func setHDRMode(enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?) {
+        lock.withLock { storedHDRMode = (enabled, metadata) }
+    }
 }
 
 private final class RationalRefreshAudioDecoder: UmbraStreaming.AudioDecoding, @unchecked Sendable {
