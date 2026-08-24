@@ -1,0 +1,77 @@
+/* Two-channel audio output layout option. */
+"Stereo" = "Stereo";
+/* Audio output layout options. */
+"5.1 Surround Sound" = "5.1 Surround Sound";
+"7.1 Surround Sound" = "7.1 Surround Sound";
+
+/* Technical preference labels. */
+"Automatic" = "Automatic";
+"H.264" = "H.264";
+"HEVC (H.265)" = "HEVC (H.265)";
+"AV1" = "AV1";
+"Force Hardware Decoding" = "Force Hardware Decoding";
+"Force Software Decoding" = "Force Software Decoding";
+"Compatibility Probe" = "Compatibility Probe";
+"Vulkan" = "Vulkan";
+"Metal" = "Metal";
+"System Renderer" = "System Renderer";
+"Lowest Latency" = "Lowest Latency";
+"Best Quality" = "Best Quality";
+"Streaming mode" = "Streaming mode";
+"Choose Lowest Latency or Best Quality." = "Choose Lowest Latency or Best Quality.";
+"Umbra couldn’t load the saved streaming settings. The original data was left unchanged in case it was written by a newer version." = "Umbra couldn’t load the saved streaming settings. The original data was left unchanged in case it was written by a newer version.";
+"Fullscreen" = "Fullscreen";
+"Borderless Windowed" = "Borderless Windowed";
+"Windowed" = "Windowed";
+"Maximized" = "Maximized";
+"Off" = "Off";
+"In Fullscreen" = "In Fullscreen";
+"Always" = "Always";
+
+/* Client microphone forwarding settings. */
+"Use Mac microphone on host" = "Use Mac microphone on host";
+"Makes this Mac’s microphone available to compatible Lumen hosts. macOS asks for permission when enabled." = "Makes this Mac’s microphone available to compatible Lumen hosts. macOS asks for permission when enabled.";
+"Microphone access" = "Microphone access";
+"Not Allowed" = "Not Allowed";
+"Restricted" = "Restricted";
+"Requesting Access..." = "Requesting Access...";
+"Open Microphone Settings" = "Open Microphone Settings";
+"Opens Microphone settings in System Settings." = "Opens Microphone settings in System Settings.";
+"Allow Umbra to use the microphone in Privacy & Security settings, then return to Umbra." = "Allow Umbra to use the microphone in Privacy & Security settings, then return to Umbra.";
+"Microphone access is restricted by Screen Time or device management." = "Microphone access is restricted by Screen Time or device management.";
+
+/* Settings tab titles. */
+"General" = "General";
+"Video" = "Video";
+"Audio" = "Audio";
+"Input" = "Input";
+"Controller" = "Controller";
+"Advanced" = "Advanced";
+
+/* Application language preference. */
+"Language" = "Language";
+"System Default" = "System Default";
+"Changes take effect after you relaunch Umbra." = "Changes take effect after you relaunch Umbra.";
+
+/* Application menu commands. */
+"Add Host..." = "Add Host...";
+"Refresh" = "Refresh";
+"Host" = "Host";
+"Navigate" = "Navigate";
+"No Host Selected" = "No Host Selected";
+"Back to Hosts" = "Back to Hosts";
+"Hide Hidden Apps" = "Hide Hidden Apps";
+"Show Hidden Apps" = "Show Hidden Apps";
+"Stream" = "Stream";
+"Cancel Current Operation" = "Cancel Current Operation";
+"Export Diagnostics..." = "Export Diagnostics...";
+"Umbra Setup Guide" = "Umbra Setup Guide";
+"Troubleshooting" = "Troubleshooting";
+
+/* Diagnostics export save panel and error alert. */
+"Export Umbra Diagnostics" = "Export Umbra Diagnostics";
+"Choose where to save a privacy-safe diagnostics snapshot." = "Choose where to save a privacy-safe diagnostics snapshot.";
+"Export" = "Export";
+"Umbra Diagnostics.json" = "Umbra Diagnostics.json";
+"Diagnostics Couldn’t Be Exported" = "Diagnostics Couldn’t Be Exported";
+"OK" = "OK";

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Umbra</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.umbra.Umbra</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Umbra</string>
+    <key>CFBundleDisplayName</key>
+    <string>Umbra</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>CFBundleURLName</key>
+            <string>app.umbra.Umbra.secure-pairing</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>umbra</string>
+            </array>
+        </dict>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Umbra discovers and connects to game-streaming hosts on your local network.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>Umbra monitors keyboard input when system shortcut capture is enabled, so those shortcuts can be sent to the streaming host.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Umbra forwards microphone audio to a compatible streaming host when you enable microphone forwarding.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_nvstream._tcp</string>
+    </array>
+    <key>GCSupportsControllerUserInteraction</key>
+    <true/>
+</dict>
+</plist>

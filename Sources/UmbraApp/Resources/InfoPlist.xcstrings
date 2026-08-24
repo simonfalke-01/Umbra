@@ -1,0 +1,66 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "CFBundleDisplayName" : {
+      "comment" : "The application name shown by macOS.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Umbra"
+          }
+        }
+      }
+    },
+    "CFBundleName" : {
+      "comment" : "The short application name shown by macOS.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Umbra"
+          }
+        }
+      }
+    },
+    "NSLocalNetworkUsageDescription" : {
+      "comment" : "Explains why Umbra requests local-network access.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Umbra discovers and connects to game-streaming hosts on your local network."
+          }
+        }
+      }
+    },
+    "NSInputMonitoringUsageDescription" : {
+      "comment" : "Explains why Umbra requests Input Monitoring access.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Umbra monitors keyboard input when system shortcut capture is enabled, so those shortcuts can be sent to the streaming host."
+          }
+        }
+      }
+    },
+    "NSMicrophoneUsageDescription" : {
+      "comment" : "Explains why Umbra requests microphone access.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Umbra forwards microphone audio to a compatible streaming host when you enable microphone forwarding."
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

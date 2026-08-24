@@ -1,0 +1,12 @@
+/* Application name shown by macOS. */
+"CFBundleDisplayName" = "Umbra";
+"CFBundleName" = "Umbra";
+
+/* Local-network privacy usage description. */
+"NSLocalNetworkUsageDescription" = "Umbra discovers and connects to game-streaming hosts on your local network.";
+
+/* Input Monitoring privacy usage description. */
+"NSInputMonitoringUsageDescription" = "Umbra monitors keyboard input when system shortcut capture is enabled, so those shortcuts can be sent to the streaming host.";
+
+/* Microphone privacy usage description. */
+"NSMicrophoneUsageDescription" = "Umbra forwards microphone audio to a compatible streaming host when you enable microphone forwarding.";

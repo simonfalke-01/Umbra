@@ -10,3 +10,6 @@ xcuserdata/
 
 # Local upstream checkout used only for porting and parity verification.
 /reference/
+
+# Local Finder alias used to launch the development app.
+/Umbra

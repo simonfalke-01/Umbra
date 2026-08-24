@@ -1,0 +1,321 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "5.1 Surround Sound" : {
+      "comment" : "Audio output layout option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "5.1 Surround Sound" } } }
+    },
+    "7.1 Surround Sound" : {
+      "comment" : "Audio output layout option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "7.1 Surround Sound" } } }
+    },
+    "Add Host..." : {
+      "comment" : "Menu command that opens the add-host flow.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Add Host..." } } }
+    },
+    "Advanced" : {
+      "comment" : "Advanced settings tab title.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Advanced" } } }
+    },
+    "Always" : {
+      "comment" : "Option to capture system shortcuts in every window mode.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Always" } } }
+    },
+    "Audio" : {
+      "comment" : "Audio settings tab title.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Audio" } } }
+    },
+    "Use Mac microphone on host" : {
+      "comment" : "Toggle that enables client-to-host microphone forwarding.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Use Mac microphone on host" } } }
+    },
+    "Microphone access" : {
+      "comment" : "Label for the macOS microphone permission state.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Microphone access" } } }
+    },
+    "Not Allowed" : {
+      "comment" : "Microphone permission is denied.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Not Allowed" } } }
+    },
+    "Restricted" : {
+      "comment" : "Microphone permission is restricted by the system.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Restricted" } } }
+    },
+    "Requesting Access..." : {
+      "comment" : "Status shown while macOS microphone permission is being requested.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Requesting Access..." } } }
+    },
+    "Open Microphone Settings" : {
+      "comment" : "Button opening the macOS Microphone privacy settings.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Open Microphone Settings" } } }
+    },
+    "Opens Microphone settings in System Settings." : {
+      "comment" : "Accessibility help for the button that opens macOS Microphone privacy settings.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Opens Microphone settings in System Settings." } } }
+    },
+    "Allow Umbra to use the microphone in Privacy & Security settings, then return to Umbra." : {
+      "comment" : "Recovery instructions shown after macOS microphone permission is denied.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Allow Umbra to use the microphone in Privacy & Security settings, then return to Umbra." } } }
+    },
+    "Microphone access is restricted by Screen Time or device management." : {
+      "comment" : "Explanation shown when macOS prevents microphone permission changes.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Microphone access is restricted by Screen Time or device management." } } }
+    },
+    "Makes this Mac’s microphone available to compatible Lumen hosts. macOS asks for permission when enabled." : {
+      "comment" : "Description of client-to-host microphone forwarding.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Makes this Mac’s microphone available to compatible Lumen hosts. macOS asks for permission when enabled." } } }
+    },
+    "Automatic" : {
+      "comment" : "Preferred automatic selection for a technical setting.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Automatic" } } }
+    },
+    "AV1" : {
+      "comment" : "AV1 video codec name; do not translate the codec name.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "AV1" } } }
+    },
+    "System Renderer" : {
+      "comment" : "Renderer option that uses the system-native presentation path.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "System Renderer" } } }
+    },
+    "Back to Hosts" : {
+      "comment" : "Menu command returning to the host library.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Back to Hosts" } } }
+    },
+    "Best Quality" : {
+      "comment" : "Streaming optimization mode that prioritizes image fidelity and stable presentation.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Best Quality" } } }
+    },
+    "Borderless Windowed" : {
+      "comment" : "Streaming window mode option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Borderless Windowed" } } }
+    },
+    "Cancel Current Operation" : {
+      "comment" : "Menu command that cancels the active connection operation.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancel Current Operation" } } }
+    },
+    "Choose where to save a privacy-safe diagnostics snapshot." : {
+      "comment" : "Message in the diagnostics export save panel.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Choose where to save a privacy-safe diagnostics snapshot." } } }
+    },
+    "Changes take effect after you relaunch Umbra." : {
+      "comment" : "Explains when a newly selected application language becomes active.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Changes take effect after you relaunch Umbra." } } }
+    },
+    "Choose Lowest Latency or Best Quality." : {
+      "comment" : "Accessibility help for the streaming optimization mode control.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Choose Lowest Latency or Best Quality." } } }
+    },
+    "Compatibility Probe" : {
+      "comment" : "Renderer option that checks compatibility without selecting a production renderer.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Compatibility Probe" } } }
+    },
+    "Diagnostics Couldn’t Be Exported" : {
+      "comment" : "Title of the diagnostics export failure alert.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Diagnostics Couldn’t Be Exported" } } }
+    },
+    "Export" : {
+      "comment" : "Confirmation button in the diagnostics save panel.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Export" } } }
+    },
+    "Export Diagnostics..." : {
+      "comment" : "Menu command that saves a privacy-safe diagnostics snapshot.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Export Diagnostics..." } } }
+    },
+    "Export Umbra Diagnostics" : {
+      "comment" : "Title of the diagnostics export save panel.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Export Umbra Diagnostics" } } }
+    },
+    "Force Hardware Decoding" : {
+      "comment" : "Video decoder preference option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Force Hardware Decoding" } } }
+    },
+    "Force Software Decoding" : {
+      "comment" : "Video decoder preference option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Force Software Decoding" } } }
+    },
+    "Fullscreen" : {
+      "comment" : "Fullscreen window mode option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Fullscreen" } } }
+    },
+    "Controller" : {
+      "comment" : "Controller settings tab title.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Controller" } } }
+    },
+    "General" : {
+      "comment" : "General settings tab title.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "General" } } }
+    },
+    "H.264" : {
+      "comment" : "H.264 video codec name; do not translate the codec name.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "H.264" } } }
+    },
+    "HEVC (H.265)" : {
+      "comment" : "HEVC video codec name; do not translate codec names.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "HEVC (H.265)" } } }
+    },
+    "Host" : {
+      "comment" : "Application menu containing commands for the selected streaming host.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Host" } } }
+    },
+    "Hide Hidden Apps" : {
+      "comment" : "Menu command that hides applications marked hidden.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Hide Hidden Apps" } } }
+    },
+    "In Fullscreen" : {
+      "comment" : "Option to capture system shortcuts only while streaming fullscreen.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "In Fullscreen" } } }
+    },
+    "Language" : {
+      "comment" : "Application language setting label.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Language" } } }
+    },
+    "Lowest Latency" : {
+      "comment" : "Streaming optimization mode that prioritizes responsiveness.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Lowest Latency" } } }
+    },
+    "Input" : {
+      "comment" : "Input settings tab title.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Input" } } }
+    },
+    "Maximized" : {
+      "comment" : "Main-window display mode option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Maximized" } } }
+    },
+    "Metal" : {
+      "comment" : "Apple Metal renderer name; do not translate.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Metal" } } }
+    },
+    "Navigate" : {
+      "comment" : "Application menu containing navigation commands.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Navigate" } } }
+    },
+    "No Host Selected" : {
+      "comment" : "Disabled Host menu item shown when no host row is selected.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "No Host Selected" } } }
+    },
+    "Off" : {
+      "comment" : "Disabled option for capturing system shortcuts.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Off" } } }
+    },
+    "OK" : {
+      "comment" : "Dismisses an informational or error alert.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "OK" } } }
+    },
+    "Refresh" : {
+      "comment" : "Menu command that refreshes the current library.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Refresh" } } }
+    },
+    "Show Hidden Apps" : {
+      "comment" : "Menu command that reveals applications marked hidden.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Show Hidden Apps" } } }
+    },
+    "Stereo" : {
+      "comment" : "Two-channel audio output layout option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Stereo" } } }
+    },
+    "Stream" : {
+      "comment" : "Application menu containing streaming commands.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Stream" } } }
+    },
+    "Streaming mode" : {
+      "comment" : "Accessibility label for the streaming optimization mode control.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Streaming mode" } } }
+    },
+    "System Default" : {
+      "comment" : "Language option that follows the operating system preference.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "System Default" } } }
+    },
+    "Troubleshooting" : {
+      "comment" : "Menu item opening Moonlight troubleshooting documentation.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Troubleshooting" } } }
+    },
+    "Umbra Diagnostics.json" : {
+      "comment" : "Default filename for an exported diagnostics snapshot.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Umbra Diagnostics.json" } } }
+    },
+    "Umbra Setup Guide" : {
+      "comment" : "Menu item opening Moonlight setup documentation.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Umbra Setup Guide" } } }
+    },
+    "Umbra couldn’t load the saved streaming settings. The original data was left unchanged in case it was written by a newer version." : {
+      "comment" : "Settings recovery message shown when persisted preferences use an unsupported or corrupt format.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Umbra couldn’t load the saved streaming settings. The original data was left unchanged in case it was written by a newer version." } } }
+    },
+    "Video" : {
+      "comment" : "Video settings tab title.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Video" } } }
+    },
+    "Vulkan" : {
+      "comment" : "Vulkan renderer name; do not translate.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Vulkan" } } }
+    },
+    "Windowed" : {
+      "comment" : "Windowed display mode option.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Windowed" } } }
+    }
+  },
+  "version" : "1.0"
+}

@@ -1,0 +1,116 @@
+public enum CLIHelpTopic: String, CaseIterable, Equatable, Sendable {
+    case global
+    case list
+    case pair
+    case stream
+    case quit
+}
+
+/// Stable, dependency-free help text for the Moonlight-compatible CLI surface.
+public enum CLIHelp {
+    public static func text(for topic: CLIHelpTopic, applicationName: String = "umbra") -> String {
+        switch topic {
+        case .global:
+            """
+            Usage: \(applicationName) [options] <action>
+
+            Starts Umbra normally if no arguments are given.
+
+            Available actions:
+              list            List the available apps on a host
+              quit            Quit the currently running app
+              stream          Start streaming an app
+              pair            Pair a new host
+
+            Options:
+              -h, --help      Display this help text
+              -v, --version   Display version information
+
+            Long options may be written with one or two dashes.
+            See '\(applicationName) <action> --help' for help for a specific action.
+            """
+        case .list:
+            """
+            Usage: \(applicationName) list [options] <host>
+
+            List the available apps on the given host.
+
+            Arguments:
+              host            Host computer name, UUID, or IP address
+
+            Options:
+              -csv, --csv         Print as CSV with additional information
+              -verbose, --verbose Display connection progress
+              -h, --help          Display this help text
+              -v, --version       Display version information
+            """
+        case .pair:
+            """
+            Usage: \(applicationName) pair [options] <host>
+
+            Pair with the specified host.
+
+            Arguments:
+              host            Host computer name, UUID, or IP address
+
+            Options:
+              -pin, --pin <pin>   Use a predefined 4-digit pairing PIN
+              -h, --help          Display this help text
+              -v, --version       Display version information
+            """
+        case .stream:
+            """
+            Usage: \(applicationName) stream [options] <host> <app>
+
+            Start directly streaming a given app.
+
+            Arguments:
+              host                            Host computer name, UUID, or IP address
+              app                             App to stream
+
+            Resolution and video options:
+              -720, --720                     Use 1280x720 resolution
+              -1080, --1080                   Use 1920x1080 resolution
+              -1440, --1440                   Use 2560x1440 resolution
+              -4K, --4K                       Use 3840x2160 resolution
+              -resolution, --resolution <WxH> Use a custom resolution
+              -fps, --fps <fps>               Specify frames per second
+              -bitrate, --bitrate <kbps>      Specify bitrate in Kbps
+              -packet-size, --packet-size <n> Specify video packet size
+              -display-mode, --display-mode <fullscreen|windowed|borderless>
+              -video-codec, --video-codec <auto|H.264|HEVC|AV1>
+              -video-decoder, --video-decoder <auto|software|hardware>
+
+            Audio and input options:
+              -audio-config, --audio-config <stereo|5.1-surround|7.1-surround>
+              -capture-system-keys, --capture-system-keys <never|fullscreen|always>
+
+            Boolean options (prefix with no- to disable):
+              vsync, multi-controller, quit-after, absolute-mouse
+              mouse-buttons-swap, touchscreen-trackpad, game-optimization
+              audio-on-host, frame-pacing, mute-on-focus-loss, background-gamepad
+              reverse-scroll-direction, swap-gamepad-buttons, keep-awake
+              performance-overlay, hdr
+
+            General options:
+              -quit-running-app, --quit-running-app
+                                              Quit a different running app before launch
+              -h, --help                      Display this help text
+              -v, --version                   Display version information
+            """
+        case .quit:
+            """
+            Usage: \(applicationName) quit [options] <host>
+
+            Quit the currently running app on the given host.
+
+            Arguments:
+              host            Host computer name, UUID, or IP address
+
+            Options:
+              -h, --help      Display this help text
+              -v, --version   Display version information
+            """
+        }
+    }
+}
