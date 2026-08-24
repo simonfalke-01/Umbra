@@ -383,7 +383,14 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
 
     public var width: Int
     public var height: Int
-    public var fps: Int
+    public var fps: Int {
+        didSet {
+            frameRateNumerator = fps
+            frameRateDenominator = 1
+        }
+    }
+    public private(set) var frameRateNumerator: Int
+    public private(set) var frameRateDenominator: Int
     public var bitrateKbps: Int
     public var unlockBitrate: Bool
     public var autoAdjustBitrate: Bool
@@ -430,6 +437,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         width: Int = 1_280,
         height: Int = 720,
         fps: Int = 60,
+        frameRateNumerator: Int? = nil,
+        frameRateDenominator: Int = 1,
         bitrateKbps: Int? = nil,
         unlockBitrate: Bool = false,
         autoAdjustBitrate: Bool = true,
@@ -473,8 +482,23 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     ) {
         self.width = width
         self.height = height
-        self.fps = fps
-        self.bitrateKbps = bitrateKbps ?? Self.defaultBitrateKbps(width: width, height: height, fps: fps, yuv444: enableYUV444)
+        let exactFrameRateNumerator = frameRateNumerator ?? fps
+        self.fps = Self.roundedFramesPerSecond(
+            numerator: exactFrameRateNumerator,
+            denominator: frameRateDenominator,
+            fallback: fps
+        )
+        self.frameRateNumerator = exactFrameRateNumerator
+        self.frameRateDenominator = frameRateDenominator
+        let exactFrameRate = frameRateDenominator > 0
+            ? Double(exactFrameRateNumerator) / Double(frameRateDenominator)
+            : Double(self.fps)
+        self.bitrateKbps = bitrateKbps ?? Self.defaultBitrateKbps(
+            width: width,
+            height: height,
+            fps: exactFrameRate,
+            yuv444: enableYUV444
+        )
         self.unlockBitrate = unlockBitrate
         self.autoAdjustBitrate = autoAdjustBitrate
         self.optimizationMode = optimizationMode
@@ -520,6 +544,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case width
         case height
         case fps
+        case frameRateNumerator
+        case frameRateDenominator
         case bitrateKbps
         case unlockBitrate
         case autoAdjustBitrate
@@ -573,6 +599,14 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         let width = try container.decodeIfPresent(Int.self, forKey: .width) ?? defaults.width
         let height = try container.decodeIfPresent(Int.self, forKey: .height) ?? defaults.height
         let fps = try container.decodeIfPresent(Int.self, forKey: .fps) ?? defaults.fps
+        let frameRateNumerator = try container.decodeIfPresent(
+            Int.self,
+            forKey: .frameRateNumerator
+        )
+        let frameRateDenominator = try container.decodeIfPresent(
+            Int.self,
+            forKey: .frameRateDenominator
+        ) ?? defaults.frameRateDenominator
         let enableYUV444 = try container.decodeIfPresent(Bool.self, forKey: .enableYUV444) ?? defaults.enableYUV444
         let enableVSync = try container.decodeIfPresent(Bool.self, forKey: .enableVSync) ?? defaults.enableVSync
         let framePacing = try container.decodeIfPresent(Bool.self, forKey: .framePacing) ?? false
@@ -597,6 +631,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             width: width,
             height: height,
             fps: fps,
+            frameRateNumerator: frameRateNumerator,
+            frameRateDenominator: frameRateDenominator,
             bitrateKbps: try container.decodeIfPresent(Int.self, forKey: .bitrateKbps),
             unlockBitrate: try container.decodeIfPresent(Bool.self, forKey: .unlockBitrate) ?? defaults.unlockBitrate,
             autoAdjustBitrate: try container.decodeIfPresent(Bool.self, forKey: .autoAdjustBitrate) ?? defaults.autoAdjustBitrate,
@@ -644,10 +680,24 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     }
 
     public static func defaultBitrateKbps(width: Int, height: Int, fps: Int, yuv444: Bool) -> Int {
-        let safeFPS = max(fps, 1)
+        defaultBitrateKbps(
+            width: width,
+            height: height,
+            fps: Double(fps),
+            yuv444: yuv444
+        )
+    }
+
+    public static func defaultBitrateKbps(
+        width: Int,
+        height: Int,
+        fps: Double,
+        yuv444: Bool
+    ) -> Int {
+        let safeFPS = fps.isFinite ? max(fps, 1) : 1
         let frameRateFactor = (safeFPS <= 60
-            ? Double(safeFPS)
-            : sqrt(Double(safeFPS) / 60) * 60) / 30
+            ? safeFPS
+            : sqrt(safeFPS / 60) * 60) / 30
         let table: [(pixels: Double, factor: Double)] = [
             (Double(640 * 360), 1),
             (Double(854 * 480), 2),
@@ -675,6 +725,32 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         return Int(megabits) * 1_000
     }
 
+    public var exactFrameRate: Double {
+        guard frameRateDenominator > 0 else { return Double(fps) }
+        return Double(frameRateNumerator) / Double(frameRateDenominator)
+    }
+
+    public mutating func setFrameRate(numerator: Int, denominator: Int) {
+        fps = Self.roundedFramesPerSecond(
+            numerator: numerator,
+            denominator: denominator,
+            fallback: fps
+        )
+        frameRateNumerator = numerator
+        frameRateDenominator = denominator
+    }
+
+    private static func roundedFramesPerSecond(
+        numerator: Int,
+        denominator: Int,
+        fallback: Int
+    ) -> Int {
+        guard numerator > 0, denominator > 0 else { return fallback }
+        let rounded = (Double(numerator) / Double(denominator)).rounded()
+        guard rounded.isFinite, let value = Int(exactly: rounded) else { return fallback }
+        return value
+    }
+
     public func validate() throws {
         guard (256...8_192).contains(width) else {
             throw ModelValidationError(field: "preferences.width", reason: "must be between 256 and 8192")
@@ -685,12 +761,27 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         guard (10...9_999).contains(fps) else {
             throw ModelValidationError(field: "preferences.fps", reason: "must be between 10 and 9999")
         }
+        guard frameRateNumerator > 0,
+              frameRateDenominator > 0,
+              UInt64(exactly: frameRateNumerator) != nil,
+              UInt64(exactly: frameRateDenominator) != nil,
+              (10.0...9_999.0).contains(exactFrameRate),
+              fps == Self.roundedFramesPerSecond(
+                  numerator: frameRateNumerator,
+                  denominator: frameRateDenominator,
+                  fallback: fps
+              ) else {
+            throw ModelValidationError(
+                field: "preferences.frameRate",
+                reason: "must be an exact positive fraction between 10 and 9999 FPS"
+            )
+        }
         let hardMaximumBitrate = 500_000
         let isReferenceAutomaticBitrate = autoAdjustBitrate
             && bitrateKbps == Self.defaultBitrateKbps(
                 width: width,
                 height: height,
-                fps: fps,
+                fps: exactFrameRate,
                 yuv444: enableYUV444
             )
         let isWithinManualLimit = bitrateKbps <= (unlockBitrate ? hardMaximumBitrate : 150_000)

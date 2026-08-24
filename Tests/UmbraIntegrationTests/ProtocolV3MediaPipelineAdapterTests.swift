@@ -4,9 +4,41 @@ import UmbraCore
 import UmbraMedia
 import UmbraProtocolV3
 import UmbraQUICTransport
+import UmbraStreaming
 @testable import UmbraIntegration
 
 final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
+    func testQualityReassemblyWaitUsesExactRationalRefreshTiming() {
+        XCTAssertEqual(
+            ProtocolV3VideoReassembler.qualityWaitNanoseconds(
+                refreshNumerator: 60_000,
+                refreshDenominator: 1_001
+            ),
+            66_733_333
+        )
+        XCTAssertEqual(
+            ProtocolV3VideoReassembler.qualityWaitNanoseconds(
+                refreshNumerator: 60,
+                refreshDenominator: 1
+            ),
+            66_666_666
+        )
+        XCTAssertEqual(
+            ProtocolV3VideoReassembler.qualityWaitNanoseconds(
+                refreshNumerator: 120,
+                refreshDenominator: 1
+            ),
+            50_000_000
+        )
+        XCTAssertEqual(
+            ProtocolV3VideoReassembler.qualityWaitNanoseconds(
+                refreshNumerator: 10,
+                refreshDenominator: 1
+            ),
+            250_000_000
+        )
+    }
+
     func testReassemblyUsesOneStableAllocationAndTransfersItWithoutCopying() throws {
         let reassembler = ProtocolV3VideoReassembler(mode: .latency)
         let bytes = Data((0..<4_096).map { UInt8(truncatingIfNeeded: $0) })
@@ -289,6 +321,87 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(requirements[3]?.booleanValue, true)
     }
 
+    func testStartOfferPreservesExactRationalVDDRefreshRate() throws {
+        var preferences = StreamingPreferences.default
+        preferences.setFrameRate(numerator: 60_000, denominator: 1_001)
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 8,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+
+        XCTAssertEqual(offer.fields[6]?.unsignedValue, 60_000)
+        XCTAssertEqual(offer.fields[7]?.unsignedValue, 1_001)
+        XCTAssertNoThrow(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: successfulStartResponse(offer),
+            offered: offer
+        ))
+    }
+
+    func testVideoConfigMustMatchExactRationalStartSelection() throws {
+        var preferences = StreamingPreferences.default
+        preferences.width = 1_920
+        preferences.height = 1_080
+        preferences.setFrameRate(numerator: 60_000, denominator: 1_001)
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 10,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let selection = successfulStartResponse(offer)
+        let videoDecoder = RationalRefreshVideoDecoder()
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: videoDecoder,
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: capabilities.supportedVideoFormatMask
+            ),
+            mode: .quality,
+            startResponseFields: selection
+        )
+        let fields = videoConfigurationFields(selection)
+
+        var changedRefresh = fields
+        changedRefresh[8] = .unsigned(60)
+        changedRefresh[9] = .unsigned(1)
+        XCTAssertThrowsError(try adapter.configureVideo(fields: changedRefresh))
+
+        var changedWidth = fields
+        changedWidth[6] = .unsigned(1_918)
+        XCTAssertThrowsError(try adapter.configureVideo(fields: changedWidth))
+        XCTAssertTrue(videoDecoder.configuredFormats.isEmpty)
+
+        XCTAssertEqual(try adapter.configureVideo(fields: fields), 2)
+        XCTAssertEqual(videoDecoder.configuredFormats.only?.width, 1_920)
+        XCTAssertEqual(videoDecoder.configuredFormats.only?.height, 1_080)
+        XCTAssertEqual(videoDecoder.configuredFormats.only?.redrawRate, 60)
+    }
+
     func testStartSelectionRejectsAnyExactTupleMutation() throws {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .quality
@@ -374,6 +487,22 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         ]
     }
 
+    private func videoConfigurationFields(
+        _ selection: [UInt64: ProtocolV3CBORValue]
+    ) -> [UInt64: ProtocolV3CBORValue] {
+        [
+            1: selection[3]!,
+            2: selection[14]!,
+            3: selection[5]!,
+            4: .bytes(Data([1, 2, 3, 4])),
+            5: selection[23]!,
+            6: selection[6]!,
+            7: selection[7]!,
+            8: selection[8]!,
+            9: selection[9]!,
+        ]
+    }
+
     private func fragment(
         frameID: UInt64,
         frameSize: Int,
@@ -403,6 +532,47 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             receivedAtNanoseconds: receivedAtNanoseconds
         )
     }
+}
+
+private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
+    UmbraStreaming.VideoCodecInitializationPreparing,
+    UmbraStreaming.VideoDecodeOutcomeReporting,
+    @unchecked Sendable {
+    private let lock = NSLock()
+    private var formats: [UmbraStreaming.VideoStreamFormat] = []
+
+    var configuredFormats: [UmbraStreaming.VideoStreamFormat] { lock.withLock { formats } }
+
+    func configure(format: UmbraStreaming.VideoStreamFormat) -> Bool {
+        lock.withLock { formats.append(format) }
+        return true
+    }
+
+    func start() {}
+    func stop() {}
+    func cleanUp() {}
+    func submit(
+        frame: UmbraStreaming.CompressedVideoFrame
+    ) -> UmbraStreaming.VideoFrameDisposition { .accepted }
+
+    func prepareCodecInitialization(
+        _ data: Data,
+        payloadFormat: UmbraStreaming.EncodedVideoPayloadFormat
+    ) -> Bool {
+        !data.isEmpty
+    }
+
+    func installDecodeOutcomeHandler(
+        _ handler: @escaping @Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void
+    ) {}
+}
+
+private final class RationalRefreshAudioDecoder: UmbraStreaming.AudioDecoding, @unchecked Sendable {
+    func configure(format: UmbraStreaming.OpusStreamFormat) -> Bool { true }
+    func start() {}
+    func stop() {}
+    func cleanUp() {}
+    func submit(packet: UmbraStreaming.CompressedAudioPacket) {}
 }
 
 private extension Array {

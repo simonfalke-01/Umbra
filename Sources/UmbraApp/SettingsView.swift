@@ -380,7 +380,24 @@ private struct VideoSettingsView: View {
     }
 
     private var frameRate: FrameRatePreset {
-        FrameRatePreset(rawValue: preferences.settings.fps) ?? .custom
+        guard preferences.settings.frameRateDenominator == 1 else { return .custom }
+        return FrameRatePreset(rawValue: preferences.settings.fps) ?? .custom
+    }
+
+    private var frameRateText: String {
+        let numerator = preferences.settings.frameRateNumerator
+        let denominator = preferences.settings.frameRateDenominator
+        return denominator == 1 ? String(numerator) : "\(numerator)/\(denominator)"
+    }
+
+    private var customFrameRateLabel: String {
+        guard preferences.settings.frameRateDenominator != 1 else {
+            return "\(preferences.settings.frameRateNumerator) FPS"
+        }
+        let decimal = preferences.settings.exactFrameRate.formatted(
+            .number.precision(.fractionLength(2...3))
+        )
+        return "\(decimal) FPS (\(frameRateText))"
     }
 
     private var bitrateMbps: Binding<Double> {
@@ -465,11 +482,11 @@ private struct VideoSettingsView: View {
 
                 if frameRate == .custom {
                     SettingsRow("Custom frame rate") {
-                        Stepper(value: customFrameRateBinding, in: 10...480) {
-                            Text("\(preferences.settings.fps) FPS")
-                                .monospacedDigit()
-                                .frame(width: 80, alignment: .trailing)
-                        }
+                        Button(customFrameRateLabel, action: editCustomFrameRate)
+                            .controlSize(.small)
+                            .monospacedDigit()
+                            .accessibilityLabel("Edit custom frame rate")
+                            .accessibilityValue(customFrameRateLabel)
                     }
                 }
             }
@@ -532,8 +549,11 @@ private struct VideoSettingsView: View {
                 CustomFrameRateEditor(
                     text: $customFrameRateText,
                     onCancel: { activeEditor = nil },
-                    onApply: { fps in
-                        preferences.updateFrameRate(fps)
+                    onApply: { numerator, denominator in
+                        preferences.updateFrameRate(
+                            numerator: numerator,
+                            denominator: denominator
+                        )
                         activeEditor = nil
                     }
                 )
@@ -594,8 +614,7 @@ private struct VideoSettingsView: View {
             get: { frameRate },
             set: { preset in
                 if preset == .custom {
-                    customFrameRateText = String(preferences.settings.fps)
-                    activeEditor = .customFrameRate
+                    editCustomFrameRate()
                 } else {
                     preferences.updateFrameRate(preset.rawValue)
                 }
@@ -603,11 +622,9 @@ private struct VideoSettingsView: View {
         )
     }
 
-    private var customFrameRateBinding: Binding<Int> {
-        Binding(
-            get: { preferences.settings.fps },
-            set: { preferences.updateFrameRate($0) }
-        )
+    private func editCustomFrameRate() {
+        customFrameRateText = frameRateText
+        activeEditor = .customFrameRate
     }
 }
 
@@ -802,43 +819,64 @@ struct CustomResolutionControl: View {
     }
 }
 
+struct CustomFrameRateValue: Equatable {
+    let numerator: Int
+    let denominator: Int
+
+    init?(text: String) {
+        let components = text.split(separator: "/", omittingEmptySubsequences: false)
+        guard (1...2).contains(components.count),
+              let numerator = Int(components[0].trimmingCharacters(in: .whitespaces)),
+              let denominator = components.count == 1
+                ? 1
+                : Int(components[1].trimmingCharacters(in: .whitespaces)),
+              numerator > 0,
+              denominator > 0,
+              (10.0...480.0).contains(Double(numerator) / Double(denominator)) else {
+            return nil
+        }
+        self.numerator = numerator
+        self.denominator = denominator
+    }
+}
+
 private struct CustomFrameRateEditor: View {
     @Binding var text: String
     let onCancel: () -> Void
-    let onApply: (Int) -> Void
+    let onApply: (Int, Int) -> Void
     @FocusState private var fieldFocused: Bool
 
-    private var value: Int? {
-        guard let value = Int(text), (10...480).contains(value) else { return nil }
-        return value
-    }
+    private var value: CustomFrameRateValue? { CustomFrameRateValue(text: text) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space4) {
             Text("Custom Frame Rate")
                 .font(.headline)
-            Text("Enter a frame rate between 10 and 480 FPS.")
+            Text("Enter 10–480 FPS as a whole number or exact fraction, such as 60000/1001.")
                 .foregroundStyle(.secondary)
 
-            TextField("Frames per second", text: $text)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 180)
+            CompactTextField(
+                text: $text,
+                placeholder: "60 or 60000/1001",
+                accessibilityLabel: "Custom frame rate",
+                accessibilityHint: "Enter 10 to 480 FPS as a whole number or fraction."
+            )
+                .frame(width: 200)
                 .focused($fieldFocused)
-                .onSubmit { if let value { onApply(value) } }
 
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
                 Button("Apply") {
-                    if let value { onApply(value) }
+                    if let value { onApply(value.numerator, value.denominator) }
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(value == nil)
             }
         }
         .padding(UmbraLayout.space6)
-        .frame(width: 360)
+        .frame(width: 400)
         .onAppear { fieldFocused = true }
     }
 }

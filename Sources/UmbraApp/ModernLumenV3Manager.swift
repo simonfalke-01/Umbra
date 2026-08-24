@@ -1635,10 +1635,13 @@ final class ModernLumenV3Manager {
                   fields[20]?.bytesValue == prepared.offer.fields[13]?.bytesValue,
                   let width = fields[6]?.unsignedValue.flatMap(Int.init(exactly:)),
                   let height = fields[7]?.unsignedValue.flatMap(Int.init(exactly:)),
-                  let refreshNumerator = fields[8]?.unsignedValue,
-                  let refreshDenominator = fields[9]?.unsignedValue,
+                  let refreshNumerator = fields[8]?.unsignedValue.flatMap(Int.init(exactly:)),
+                  let refreshDenominator = fields[9]?.unsignedValue.flatMap(Int.init(exactly:)),
                   refreshDenominator > 0,
-                  let fps = Int(exactly: refreshNumerator / refreshDenominator),
+                  let fps = Int(exactly: (
+                      Double(refreshNumerator) / Double(refreshDenominator)
+                  ).rounded()),
+                  (10...9_999).contains(fps),
                   let bitrate = fields[10]?.unsignedValue.flatMap(Int.init(exactly:)),
                   let attachToken = fields[21]?.bytesValue,
                   attachToken.count == 32,
@@ -1667,7 +1670,8 @@ final class ModernLumenV3Manager {
             if prepared.offer.fields[17]?.mapValue?[6]?.booleanValue == false {
                 guard width == prepared.bootstrap.preferences.width,
                       height == prepared.bootstrap.preferences.height,
-                      fps == prepared.bootstrap.preferences.fps,
+                      refreshNumerator == prepared.bootstrap.preferences.frameRateNumerator,
+                      refreshDenominator == prepared.bootstrap.preferences.frameRateDenominator,
                       selectedFormat.isYUV444 == prepared.bootstrap.preferences.enableYUV444,
                       selectedHDR == prepared.bootstrap.preferences.enableHDR else {
                     throw ProtocolV3ClientError.invalidMessage("forbidden START adjustment")
@@ -1675,7 +1679,10 @@ final class ModernLumenV3Manager {
             }
             prepared.bootstrap.preferences.width = width
             prepared.bootstrap.preferences.height = height
-            prepared.bootstrap.preferences.fps = fps
+            prepared.bootstrap.preferences.setFrameRate(
+                numerator: refreshNumerator,
+                denominator: refreshDenominator
+            )
             prepared.bootstrap.preferences.bitrateKbps = bitrate
             prepared.bootstrap.preferences.enableYUV444 = selectedFormat.isYUV444
             prepared.bootstrap.preferences.enableHDR = selectedHDR

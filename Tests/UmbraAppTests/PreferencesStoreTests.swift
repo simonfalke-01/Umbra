@@ -202,6 +202,30 @@ final class PreferencesStoreTests: XCTestCase {
         XCTAssertEqual(preferences.settings.bitrateKbps, 5_000)
     }
 
+    func testExactRationalFrameRateUpdatePersistsWithoutChangingIntegerPresets() throws {
+        let suiteName = "UmbraAppTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let preferences = PreferencesStore(defaults: defaults)
+
+        preferences.updateConfiguredResolution(width: 1_360, height: 720)
+        XCTAssertEqual(preferences.settings.bitrateKbps, 11_000)
+        preferences.updateFrameRate(numerator: 60_000, denominator: 1_001)
+
+        XCTAssertEqual(preferences.settings.fps, 60)
+        XCTAssertEqual(preferences.settings.frameRateNumerator, 60_000)
+        XCTAssertEqual(preferences.settings.frameRateDenominator, 1_001)
+        XCTAssertEqual(preferences.settings.bitrateKbps, 10_000)
+
+        let reopened = PreferencesStore(defaults: defaults)
+        XCTAssertEqual(reopened.settings.frameRateNumerator, 60_000)
+        XCTAssertEqual(reopened.settings.frameRateDenominator, 1_001)
+
+        reopened.updateFrameRate(30)
+        XCTAssertEqual(reopened.settings.frameRateNumerator, 30)
+        XCTAssertEqual(reopened.settings.frameRateDenominator, 1)
+    }
+
     func testConfiguredResolutionUpdateRecalculatesAutomaticBitrate() throws {
         let suiteName = "UmbraAppTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

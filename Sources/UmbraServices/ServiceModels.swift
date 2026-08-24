@@ -307,7 +307,7 @@ public struct StreamPreparationResult: Sendable, Equatable {
             resolved.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: resolved.width,
                 height: resolved.height,
-                fps: resolved.fps,
+                fps: resolved.exactFrameRate,
                 yuv444: isYUV444
             )
         }

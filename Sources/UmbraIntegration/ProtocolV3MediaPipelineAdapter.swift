@@ -263,6 +263,18 @@ final class ProtocolV3VideoReassembler {
         _ fragment: ProtocolV3VideoFragment,
         framesPerSecond: Int
     ) throws -> ProtocolV3VideoReassemblyUpdate {
+        try accept(
+            fragment,
+            refreshNumerator: UInt64(max(1, framesPerSecond)),
+            refreshDenominator: 1
+        )
+    }
+
+    func accept(
+        _ fragment: ProtocolV3VideoFragment,
+        refreshNumerator: UInt64,
+        refreshDenominator: UInt64
+    ) throws -> ProtocolV3VideoReassemblyUpdate {
         guard fragment.frameID > 0,
               fragment.frameSize > 0, fragment.frameSize <= 67_108_864,
               fragment.fragmentCount > 0, fragment.fragmentCount <= Int(UInt16.max),
@@ -278,7 +290,8 @@ final class ProtocolV3VideoReassembler {
         if mode == .quality {
             expireQualityBlocker(
                 nowNanoseconds: fragment.receivedAtNanoseconds,
-                framesPerSecond: framesPerSecond,
+                refreshNumerator: refreshNumerator,
+                refreshDenominator: refreshDenominator,
                 update: &update
             )
         }
@@ -388,12 +401,16 @@ final class ProtocolV3VideoReassembler {
 
     private func expireQualityBlocker(
         nowNanoseconds: UInt64,
-        framesPerSecond: Int,
+        refreshNumerator: UInt64,
+        refreshDenominator: UInt64,
         update: inout ProtocolV3VideoReassemblyUpdate
     ) {
         guard let started = qualityGapStartedAtNanoseconds,
               nowNanoseconds >= started,
-              nowNanoseconds - started >= Self.qualityWaitNanoseconds(framesPerSecond: framesPerSecond) else {
+              nowNanoseconds - started >= Self.qualityWaitNanoseconds(
+                  refreshNumerator: refreshNumerator,
+                  refreshDenominator: refreshDenominator
+              ) else {
             return
         }
         transitionToQualityRecovery(
@@ -413,10 +430,20 @@ final class ProtocolV3VideoReassembler {
         update.requestedKeyFrameID = affectedFrameID
     }
 
-    private static func qualityWaitNanoseconds(framesPerSecond: Int) -> UInt64 {
-        let framesPerSecond = UInt64(max(1, framesPerSecond))
-        let fourFrameIntervals = 4_000_000_000 / framesPerSecond
-        return min(250_000_000, max(50_000_000, fourFrameIntervals))
+    static func qualityWaitNanoseconds(
+        refreshNumerator: UInt64,
+        refreshDenominator: UInt64
+    ) -> UInt64 {
+        guard refreshNumerator > 0, refreshDenominator > 0 else { return 250_000_000 }
+        let rate = refreshNumerator.quotientAndRemainder(dividingBy: refreshDenominator)
+        if rate.quotient >= 80 { return 50_000_000 }
+        if rate.quotient < 16 || (rate.quotient == 16 && rate.remainder == 0) {
+            return 250_000_000
+        }
+        let fourFrameIntervals = UInt64(4_000_000_000).multipliedFullWidth(
+            by: refreshDenominator
+        )
+        return refreshNumerator.dividingFullWidth(fourFrameIntervals).quotient
     }
 }
 
@@ -435,6 +462,10 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         let audioTuple: ProtocolV3CBORValue
         let microphoneTuple: ProtocolV3CBORValue
         let hdr: ProtocolV3CBORValue
+        let width: Int
+        let height: Int
+        let refreshNumerator: UInt64
+        let refreshDenominator: UInt64
         let videoGeneration: UInt32
         let audioGeneration: UInt32
         let microphoneGeneration: UInt32
@@ -448,7 +479,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         let tuple: [UInt64: ProtocolV3CBORValue]
         let width: Int
         let height: Int
-        let framesPerSecond: Int
+        let refreshNumerator: UInt64
+        let refreshDenominator: UInt64
     }
 
     private struct AudioConfigurationState: Equatable {
@@ -501,6 +533,11 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               let audioTuple = startResponseFields[12], audioTuple.mapValue != nil,
               let microphoneTuple = startResponseFields[13],
               let hdr = startResponseFields[23],
+              let width = startResponseFields[6]?.unsignedValue.flatMap(Int.init(exactly:)),
+              let height = startResponseFields[7]?.unsignedValue.flatMap(Int.init(exactly:)),
+              let refreshNumerator = startResponseFields[8]?.unsignedValue,
+              let refreshDenominator = startResponseFields[9]?.unsignedValue,
+              refreshNumerator > 0, refreshDenominator > 0,
               let videoGeneration = startResponseFields[14]?.unsignedValue.flatMap(UInt32.init(exactly:)),
               let audioGeneration = startResponseFields[15]?.unsignedValue.flatMap(UInt32.init(exactly:)),
               let microphoneGeneration = startResponseFields[16]?.unsignedValue.flatMap(UInt32.init(exactly:)),
@@ -517,6 +554,10 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             audioTuple: audioTuple,
             microphoneTuple: microphoneTuple,
             hdr: hdr,
+            width: width,
+            height: height,
+            refreshNumerator: refreshNumerator,
+            refreshDenominator: refreshDenominator,
             videoGeneration: videoGeneration,
             audioGeneration: audioGeneration,
             microphoneGeneration: microphoneGeneration
@@ -575,7 +616,11 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               (200...4_320).contains(height), height.isMultiple(of: 2),
               let refreshNumerator = fields[8]?.unsignedValue,
               let refreshDenominator = fields[9]?.unsignedValue,
-              refreshNumerator > 0, refreshDenominator > 0 else {
+              refreshNumerator > 0, refreshDenominator > 0,
+              width == expected.width,
+              height == expected.height,
+              refreshNumerator == expected.refreshNumerator,
+              refreshDenominator == expected.refreshDenominator else {
             throw ProtocolV3MediaPipelineError.invalidConfiguration("video fields")
         }
         let selected = try Self.videoFormat(tuple)
@@ -583,7 +628,10 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         guard fields[5] == expected.hdr else {
             throw ProtocolV3MediaPipelineError.invalidConfiguration("HDR selection mismatch")
         }
-        let framesPerSecond = max(1, Int(refreshNumerator / refreshDenominator))
+        let framesPerSecond = max(
+            1,
+            Int((Double(refreshNumerator) / Double(refreshDenominator)).rounded())
+        )
         let capacity = mode == .latency ? 1 : 2
         let accepted = pipeline.videoDecoder.configure(format: .init(
             codecMask: selected.rawValue,
@@ -623,7 +671,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                 tuple: tuple,
                 width: width,
                 height: height,
-                framesPerSecond: framesPerSecond
+                refreshNumerator: refreshNumerator,
+                refreshDenominator: refreshDenominator
             )
             videoReassembler.resetForConfiguration()
         }
@@ -776,7 +825,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             guard !stopped else { return }
             update = try videoReassembler.accept(
                 reassemblyFragment,
-                framesPerSecond: configuration.framesPerSecond
+                refreshNumerator: configuration.refreshNumerator,
+                refreshDenominator: configuration.refreshDenominator
             )
             if let reassembledFrameID = update.reassembledFrameID {
                 lastReassembledVideoFrameID = max(lastReassembledVideoFrameID, reassembledFrameID)

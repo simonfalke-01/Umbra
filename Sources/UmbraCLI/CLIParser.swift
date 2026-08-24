@@ -529,7 +529,7 @@ private extension UmbraCLIParser {
             preferences.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: preferences.width,
                 height: preferences.height,
-                fps: preferences.fps,
+                fps: preferences.exactFrameRate,
                 yuv444: preferences.enableYUV444
             )
         }

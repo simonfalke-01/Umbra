@@ -141,7 +141,7 @@ final class SettingsInteractionTests: XCTestCase {
         )
     }
 
-    func testSelectingCustomFrameRateOpensEditorWithoutChangingPersistedValue() throws {
+    func testCustomFrameRateEditorOffersExactFractionWithoutDuplicateSheets() throws {
         let suiteName = "UmbraAppTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -184,12 +184,34 @@ final class SettingsInteractionTests: XCTestCase {
         ))
         settle(hostingView)
 
-        _ = try XCTUnwrap(window.attachedSheet)
+        let sheet = try XCTUnwrap(window.attachedSheet)
         frameRatePicker.selectItem(withTitle: "Custom")
         XCTAssertTrue(NSApp.sendAction(action, to: frameRatePicker.target, from: frameRatePicker))
         settle(hostingView)
         XCTAssertEqual(window.sheets.count, 1)
         XCTAssertEqual(preferences.settings.fps, 60)
+
+        let sheetContentView = try XCTUnwrap(sheet.contentView)
+        let frameRateField = try XCTUnwrap(
+            descendants(of: sheetContentView, type: NSTextField.self).first {
+                $0.accessibilityLabel() == "Custom frame rate"
+            }
+        )
+        XCTAssertEqual(frameRateField.placeholderString, "60 or 60000/1001")
+        XCTAssertEqual(frameRateField.stringValue, "60")
+        XCTAssertEqual(preferences.settings.fps, 60)
+    }
+
+    func testCustomFrameRateParserAcceptsExactFractionAndRejectsInvalidValues() {
+        let exact = CustomFrameRateValue(text: "60000/1001")
+        XCTAssertEqual(exact?.numerator, 60_000)
+        XCTAssertEqual(exact?.denominator, 1_001)
+        let integer = CustomFrameRateValue(text: "120")
+        XCTAssertEqual(integer?.numerator, 120)
+        XCTAssertEqual(integer?.denominator, 1)
+        XCTAssertNil(CustomFrameRateValue(text: "60000/0"))
+        XCTAssertNil(CustomFrameRateValue(text: "9"))
+        XCTAssertNil(CustomFrameRateValue(text: "481"))
     }
 
     func testResetAllSynchronizesPacketSizeFieldText() throws {

@@ -187,7 +187,7 @@ final class PreferencesStore: ObservableObject {
                 decoded.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                     width: decoded.width,
                     height: decoded.height,
-                    fps: decoded.fps,
+                    fps: decoded.exactFrameRate,
                     yuv444: decoded.enableYUV444
                 )
             }
@@ -246,7 +246,7 @@ final class PreferencesStore: ObservableObject {
             settings.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: settings.width,
                 height: settings.height,
-                fps: settings.fps,
+                fps: settings.exactFrameRate,
                 yuv444: settings.enableYUV444
             )
             settings.autoAdjustBitrate = true
@@ -271,7 +271,7 @@ final class PreferencesStore: ObservableObject {
             let automaticBitrate = StreamingPreferences.defaultBitrateKbps(
                 width: settings.width,
                 height: settings.height,
-                fps: settings.fps,
+                fps: settings.exactFrameRate,
                 yuv444: settings.enableYUV444
             )
             if settings.autoAdjustBitrate, automaticBitrate > 150_000 {
@@ -289,7 +289,7 @@ final class PreferencesStore: ObservableObject {
                 settings.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                     width: width,
                     height: height,
-                    fps: settings.fps,
+                    fps: settings.exactFrameRate,
                     yuv444: settings.enableYUV444
                 )
             }
@@ -297,13 +297,17 @@ final class PreferencesStore: ObservableObject {
     }
 
     func updateFrameRate(_ fps: Int) {
+        updateFrameRate(numerator: fps, denominator: 1)
+    }
+
+    func updateFrameRate(numerator: Int, denominator: Int) {
         update { settings in
-            settings.fps = fps
+            settings.setFrameRate(numerator: numerator, denominator: denominator)
             if settings.autoAdjustBitrate {
                 settings.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                     width: settings.width,
                     height: settings.height,
-                    fps: settings.fps,
+                    fps: settings.exactFrameRate,
                     yuv444: settings.enableYUV444
                 )
             }

@@ -108,7 +108,7 @@ final class SettingsSnapshotTests: XCTestCase {
             $0.displayResolutionPolicy = .configured
             $0.width = 3_841
             $0.height = 2_161
-            $0.fps = 75
+            $0.setFrameRate(numerator: 60_000, denominator: 1_001)
             $0.autoAdjustBitrate = false
             $0.enableVSync = false
         }

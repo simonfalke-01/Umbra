@@ -8,6 +8,8 @@ final class PreferencesTests: XCTestCase {
         XCTAssertEqual(preferences.width, 1_280)
         XCTAssertEqual(preferences.height, 720)
         XCTAssertEqual(preferences.fps, 60)
+        XCTAssertEqual(preferences.frameRateNumerator, 60)
+        XCTAssertEqual(preferences.frameRateDenominator, 1)
         XCTAssertEqual(preferences.bitrateKbps, 10_000)
         XCTAssertEqual(preferences.windowMode, .fullscreenDesktop)
         XCTAssertEqual(preferences.uiDisplayMode, .windowed)
@@ -20,6 +22,29 @@ final class PreferencesTests: XCTestCase {
         XCTAssertTrue(preferences.keepAwake)
         XCTAssertFalse(preferences.clientMicrophoneEnabled)
         XCTAssertNoThrow(try preferences.validate())
+    }
+
+    func testExactRationalFrameRateRoundTripsAndIntegerUpdatesRemainCompatible() throws {
+        var preferences = StreamingPreferences.default
+        preferences.setFrameRate(numerator: 60_000, denominator: 1_001)
+
+        XCTAssertEqual(preferences.fps, 60)
+        XCTAssertEqual(preferences.frameRateNumerator, 60_000)
+        XCTAssertEqual(preferences.frameRateDenominator, 1_001)
+        XCTAssertEqual(preferences.exactFrameRate, 60_000.0 / 1_001.0, accuracy: 0.000_001)
+        XCTAssertNoThrow(try preferences.validate())
+
+        let data = try JSONEncoder().encode(preferences)
+        var decoded = try JSONDecoder().decode(StreamingPreferences.self, from: data)
+        XCTAssertEqual(decoded, preferences)
+
+        decoded.fps = 120
+        XCTAssertEqual(decoded.frameRateNumerator, 120)
+        XCTAssertEqual(decoded.frameRateDenominator, 1)
+        XCTAssertEqual(decoded.exactFrameRate, 120)
+
+        decoded.setFrameRate(numerator: 60_000, denominator: 0)
+        XCTAssertThrowsError(try decoded.validate())
     }
 
     func testDefaultBitrateMatchesMoonlightReferenceTable() {
@@ -37,6 +62,27 @@ final class PreferencesTests: XCTestCase {
                 yuv444: true
             ),
             150_000
+        )
+    }
+
+    func testExactRationalFrameRateCanCrossAutomaticBitrateRoundingThreshold() {
+        XCTAssertEqual(
+            StreamingPreferences.defaultBitrateKbps(
+                width: 1_360,
+                height: 720,
+                fps: 60,
+                yuv444: false
+            ),
+            11_000
+        )
+        XCTAssertEqual(
+            StreamingPreferences.defaultBitrateKbps(
+                width: 1_360,
+                height: 720,
+                fps: 60_000.0 / 1_001.0,
+                yuv444: false
+            ),
+            10_000
         )
     }
 
@@ -142,6 +188,9 @@ final class PreferencesTests: XCTestCase {
         object.removeValue(forKey: "displayResolutionPolicy")
         object.removeValue(forKey: "clientMicrophoneEnabled")
         object.removeValue(forKey: "optimizationMode")
+        object.removeValue(forKey: "frameRateNumerator")
+        object.removeValue(forKey: "frameRateDenominator")
+        object["fps"] = 75
         object["enableVSync"] = false
         object["framePacing"] = false
 
@@ -156,6 +205,8 @@ final class PreferencesTests: XCTestCase {
         XCTAssertEqual(decoded.optimizationMode, .latency)
         XCTAssertFalse(decoded.enableVSync)
         XCTAssertFalse(decoded.framePacing)
+        XCTAssertEqual(decoded.frameRateNumerator, 75)
+        XCTAssertEqual(decoded.frameRateDenominator, 1)
     }
 
     func testOptimizationModeDecodesDocumentedLegacyAliasesAndIntegers() throws {

@@ -452,7 +452,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             resolved.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: resolved.width,
                 height: resolved.height,
-                fps: resolved.fps,
+                fps: resolved.exactFrameRate,
                 yuv444: resolved.enableYUV444
             )
         }
@@ -1119,7 +1119,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         }
         let rendererConfiguration = StreamRendererConfiguration.resolve(
             policy: policy,
-            framesPerSecond: Double(preferences.fps),
+            framesPerSecond: preferences.exactFrameRate,
             displayRefreshRate: displayRefreshRate(for: screen),
             usesMetalRenderer: preferences.rendererPreference != .avSampleBufferDisplayLayer
         )
