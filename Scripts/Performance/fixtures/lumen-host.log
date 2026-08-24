@@ -1,0 +1,8 @@
+[2026-08-24 00:00:00.300]: Info: Encoder probe cache hit for adapter/output [GPU/Display] in 12 ms
+[2026-08-24 00:00:00.600]: Info: Stream startup stage timings: display enumeration=10 ms, display ready=25 ms
+[2026-08-24 00:00:00.970]: Info: New streaming session started [active sessions: 1]
+[2026-08-24 00:00:01.020]: Info: Stream startup stage timing: encoder device ready=42 ms
+[2026-08-24 00:00:01.080]: Debug: PERF trace_id=trace-fixture stage=first_capture duration_ms=18.5
+[2026-08-24 00:00:01.100]: Debug: PERF trace_id=trace-fixture stage=first_encode duration_ms=2.4
+[2026-08-24 00:00:01.110]: Debug: PERF trace_id=trace-fixture stage=first_fec duration_ms=0.3
+[2026-08-24 00:00:01.120]: Debug: PERF trace_id=trace-fixture stage=first_send duration_ms=0.2

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "description": "Conservative regression gates for instrumented startup and client-local pipeline metrics. These are not an input-to-photon or 10 ms performance claim.",
+  "checks": [
+    {"metric": "audio.rebuffers", "warn_above": 0, "fail_above": 1},
+    {"metric": "audio.dropped_packets", "warn_above": 0, "fail_above": 10},
+    {"metric": "coreaudio.client_timeouts", "warn_above": 0, "fail_above": 0},
+    {"metric": "coreaudio.hal_overloads", "warn_above": 0, "fail_above": 0}
+  ]
+}

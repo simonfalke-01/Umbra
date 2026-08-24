@@ -1,0 +1,61 @@
+# Umbra
+
+Umbra is a native Apple Silicon macOS streaming client. Its production path is
+compatible with Sunshine, Lumen, and other Moonlight/GameStream hosts through
+the pinned `moonlight-common-c` core. SwiftUI and AppKit provide the macOS UI;
+VideoToolbox, Metal, AudioQueue, Network.framework, and GameController provide
+the platform integrations.
+
+Umbra exposes two session policies:
+
+- **Latency** uses a one-frame compressed queue, two decoder submissions,
+  immediate presentation, and removes Moonlight's deliberate one-millisecond
+  mouse/stylus batching wait.
+- **Quality** uses a two-frame compressed queue, five decoder submissions, and
+  display-linked presentation while retaining Moonlight's historical input
+  pacing and reliability.
+
+Quality mode is not a lossless-stream claim. The separate
+`codec-lossless-required` fidelity request fails closed unless both peers prove
+the exact codec tuple; it preserves samples only after the encoder-input
+conversion boundary.
+
+Full builds include the production-linked Umbra/Lumen v3 stack over one QUIC
+connection. Legacy GameStream remains available for existing Moonlight hosts
+and clients. The v3 source and package gates are implemented, but the current
+release remains unqualified until the full Windows artifact and a real
+cross-machine QR-paired stream pass the installed-system gate. See
+[Architecture](Docs/ARCHITECTURE.md) and [Compatibility and validation
+status](Docs/FEATURE_PARITY.md).
+
+## Requirements
+
+- Apple Silicon Mac
+- macOS 14 or later
+- Xcode 16 or later; current development uses Xcode 26
+- Homebrew `pkg-config`, `openssl@3`, and `opus` for debug builds
+
+## Build and test
+
+```sh
+env -u CC -u CXX swift build
+env -u CC -u CXX swift test
+```
+
+Create a self-contained arm64 release bundle with pinned static OpenSSL and
+Opus builds:
+
+```sh
+Scripts/package-app.sh
+```
+
+Runtime sources are pinned under `Vendor/` with provenance and license records.
+
+The performance harness is documented in
+[`Scripts/Performance/README.md`](Scripts/Performance/README.md). Its reported
+presentation values are proxies, not physical scanout or input-to-photon
+measurements.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).

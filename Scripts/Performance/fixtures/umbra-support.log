@@ -1,0 +1,9 @@
+2026-08-24T00:00:00.100Z [INFO] [Application] Starting requested resume stream for host HOST-REDACTED, application 881448767.
+2026-08-24T00:00:00.180Z [DEBUG] [Application] The initial streaming task started.
+2026-08-24T00:00:00.250Z [INFO] [Media] Audio output started with 3 direct-pull buffers (720 frames each).
+2026-08-24T00:00:00.900Z [INFO] [Application] The requested streaming session was accepted.
+2026-08-24T00:00:00.950Z [DEBUG] [Moonlight] Starting RTSP handshake...
+2026-08-24T00:00:01.250Z [DEBUG] [Moonlight] Received first video packet after 300 ms
+2026-08-24T00:00:01.300Z [INFO] [Media] Video decoder produced frame 1.
+2026-08-24T00:00:01.550Z [DEBUG] [Moonlight] Received first audio packet after 600 ms
+2026-08-24T00:00:06.000Z [ERROR] [Media] Audio output summary: packets accepted=1000 played=998 dropped=2 rejected=0; callbacks=400 rebuffers=1; frames real=240000 silence=14400.

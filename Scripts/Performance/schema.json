@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://umbra.local/schemas/performance-run-v2.json",
+  "title": "Umbra/Lumen performance run",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "trace_id",
+    "generated_at",
+    "matrix",
+    "correlation",
+    "evidence_status",
+    "startup",
+    "timelines",
+    "audio",
+    "coreaudio",
+    "client_telemetry",
+    "telemetry_matrix",
+    "input_network_decomposition",
+    "host_stages_ms",
+    "measurement_provenance",
+    "environment_context",
+    "unavailable_metrics"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "run_id": {"type": "string", "minLength": 1},
+    "trace_id": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "matrix": {
+      "type": "object",
+      "required": ["network_kind", "optimization_mode", "client_protocol", "host"],
+      "properties": {
+        "network_kind": {"enum": ["lan", "wifi", "vpn", "cellular", "wan", "unknown"]},
+        "optimization_mode": {"enum": ["latency", "quality", "unknown"]},
+        "client_protocol": {"enum": ["vanilla-moonlight", "umbra-legacy", "umbra-v2"]},
+        "host": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "correlation": {
+      "type": "object",
+      "required": ["client", "host", "cross_clock"],
+      "properties": {
+        "client": {"type": "string"},
+        "host": {"type": "string"},
+        "cross_clock": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "evidence_status": {
+      "type": "object",
+      "required": ["status", "missing_required", "parse_errors"],
+      "properties": {
+        "status": {"enum": ["complete", "insufficient_data"]},
+        "missing_required": {"type": "array", "items": {"type": "string"}},
+        "parse_errors": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "startup": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {"type": "null"},
+          {
+            "type": "object",
+            "required": ["value_ms", "uncertainty_ms", "basis", "threshold_eligible"],
+            "properties": {
+              "value_ms": {"type": "number", "minimum": 0},
+              "uncertainty_ms": {"type": "number", "minimum": 0},
+              "basis": {"type": "string"},
+              "threshold_eligible": {"const": false}
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "timelines": {
+      "type": "object",
+      "required": ["client_monotonic", "client_wall_log", "host_explicit_trace"],
+      "properties": {
+        "client_monotonic": {"type": "array", "items": {"$ref": "#/$defs/timelineEvent"}},
+        "client_wall_log": {"type": "array", "items": {"$ref": "#/$defs/timelineEvent"}},
+        "host_explicit_trace": {"type": "array", "items": {"$ref": "#/$defs/timelineEvent"}}
+      },
+      "additionalProperties": false
+    },
+    "audio": {"$ref": "#/$defs/numericMap"},
+    "coreaudio": {"$ref": "#/$defs/numericMap"},
+    "client_telemetry": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["samples", "p50", "p95", "p99", "provenance"],
+        "properties": {
+          "samples": {"type": "integer", "minimum": 0},
+          "p50": {"type": "number", "minimum": 0},
+          "p95": {"type": "number", "minimum": 0},
+          "p99": {"type": "number", "minimum": 0},
+          "evidence": {"type": "string"},
+          "provenance": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": true
+      }
+    },
+    "telemetry_matrix": {
+      "type": "object",
+      "required": ["optimization_mode", "client_protocol"],
+      "properties": {
+        "optimization_mode": {"enum": ["latency", "quality", "unknown"]},
+        "client_protocol": {"enum": ["vanilla-moonlight", "umbra-legacy", "umbra-v2", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "input_network_decomposition": {
+      "type": "object",
+      "required": ["available", "errors", "samples", "metrics", "method"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "errors": {"type": "array", "items": {"type": "string"}},
+        "samples": {"type": "integer", "minimum": 0},
+        "mode": {"enum": ["latency", "quality"]},
+        "client_protocol": {"enum": ["vanilla-moonlight", "umbra-legacy", "umbra-v2"]},
+        "method": {"type": "string"},
+        "one_way_split_available": {"type": "boolean"},
+        "maximum_measurement_error_bound_ns": {"type": "integer", "minimum": 0},
+        "metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["samples", "p50", "p95", "p99", "evidence", "provenance"],
+            "properties": {
+              "samples": {"type": "integer", "minimum": 1},
+              "p50": {"type": "number", "minimum": 0},
+              "p95": {"type": "number", "minimum": 0},
+              "p99": {"type": "number", "minimum": 0},
+              "evidence": {"type": "string", "minLength": 1},
+              "provenance": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "host_stages_ms": {"$ref": "#/$defs/numericMap"},
+    "measurement_provenance": {"type": "object"},
+    "environment_context": {"type": "object"},
+    "unavailable_metrics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["metric", "reason"],
+        "properties": {
+          "metric": {"type": "string"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "threshold_evaluation": {
+      "type": "object",
+      "required": ["status", "checks"],
+      "properties": {
+        "status": {"enum": ["pass", "warn", "fail", "insufficient_data"]},
+        "checks": {"type": "array"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "numericMap": {
+      "type": "object",
+      "additionalProperties": {"type": ["number", "null"], "minimum": 0}
+    },
+    "timelineEvent": {
+      "type": "object",
+      "required": ["name", "source", "clock_domain", "evidence"],
+      "properties": {
+        "name": {"type": "string"},
+        "timestamp": {"type": "string", "format": "date-time"},
+        "wall_timestamp": {"type": "string", "format": "date-time"},
+        "monotonic_ns": {"type": "integer", "minimum": 0},
+        "source": {"type": "string"},
+        "clock_domain": {
+          "enum": ["client_wall_clock", "host_wall_clock", "client_monotonic"]
+        },
+        "precision": {"type": "object"},
+        "evidence": {"type": "string"},
+        "run_id": {"type": ["string", "null"]},
+        "trace_id": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
