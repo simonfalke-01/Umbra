@@ -501,7 +501,7 @@ private struct VideoSettingsView: View {
                         HStack {
                             CompactSlider(
                                 value: bitrateMbps,
-                                range: 0.5...bitrateMaximumMbps,
+                                range: 1...bitrateMaximumMbps,
                                 step: 0.5,
                                 accessibilityLabel: "Video bitrate",
                                 accessibilityValue: { "\($0.formatted(.number.precision(.fractionLength(1)))) megabits per second" }
@@ -719,8 +719,10 @@ private struct CustomResolutionEditor: View {
     private var dimensions: (width: Int, height: Int)? {
         guard let width = Int(widthText),
               let height = Int(heightText),
-              (256...8_192).contains(width),
-              (256...8_192).contains(height)
+              (StreamingPreferences.minimumStreamWidth...StreamingPreferences.maximumStreamWidth).contains(width),
+              width.isMultiple(of: 2),
+              (StreamingPreferences.minimumStreamHeight...StreamingPreferences.maximumStreamHeight).contains(height),
+              height.isMultiple(of: 2)
         else {
             return nil
         }
@@ -731,7 +733,7 @@ private struct CustomResolutionEditor: View {
         VStack(alignment: .leading, spacing: UmbraLayout.space4) {
             Text("Custom Resolution")
                 .font(.headline)
-            Text("Enter a width and height between 256 and 8,192 pixels.")
+            Text("Enter even dimensions from 320–7,680 wide and 200–4,320 high.")
                 .foregroundStyle(.secondary)
 
             HStack(spacing: UmbraLayout.space2) {
@@ -739,7 +741,7 @@ private struct CustomResolutionEditor: View {
                     text: $widthText,
                     placeholder: "Width",
                     accessibilityLabel: "Custom resolution width",
-                    accessibilityHint: "Enter 256 to 8,192 pixels."
+                    accessibilityHint: "Enter an even width from 320 to 7,680 pixels."
                 )
                     .frame(width: 120)
                     .focused($focusedField, equals: .width)
@@ -749,7 +751,7 @@ private struct CustomResolutionEditor: View {
                     text: $heightText,
                     placeholder: "Height",
                     accessibilityLabel: "Custom resolution height",
-                    accessibilityHint: "Enter 256 to 8,192 pixels."
+                    accessibilityHint: "Enter an even height from 200 to 4,320 pixels."
                 )
                     .frame(width: 120)
                     .focused($focusedField, equals: .height)
@@ -786,7 +788,7 @@ struct CustomResolutionControl: View {
                     .frame(width: 48, alignment: .trailing)
                 CompactIntegerStepper(
                     value: widthBinding,
-                    range: 256...8_192,
+                    range: StreamingPreferences.minimumStreamWidth...StreamingPreferences.maximumStreamWidth,
                     accessibilityLabel: "Custom resolution width",
                     accessibilityValue: { "\($0) pixels" }
                 )
@@ -798,7 +800,7 @@ struct CustomResolutionControl: View {
                     .frame(width: 48, alignment: .trailing)
                 CompactIntegerStepper(
                     value: heightBinding,
-                    range: 256...8_192,
+                    range: StreamingPreferences.minimumStreamHeight...StreamingPreferences.maximumStreamHeight,
                     accessibilityLabel: "Custom resolution height",
                     accessibilityValue: { "\($0) pixels" }
                 )
@@ -810,8 +812,13 @@ struct CustomResolutionControl: View {
         Binding(
             get: { preferences.settings.width },
             set: {
+                let width = normalizedEvenDimension(
+                    $0,
+                    previous: preferences.settings.width,
+                    range: StreamingPreferences.minimumStreamWidth...StreamingPreferences.maximumStreamWidth
+                )
                 preferences.updateConfiguredResolution(
-                    width: $0,
+                    width: width,
                     height: preferences.settings.height
                 )
             }
@@ -822,12 +829,26 @@ struct CustomResolutionControl: View {
         Binding(
             get: { preferences.settings.height },
             set: {
+                let height = normalizedEvenDimension(
+                    $0,
+                    previous: preferences.settings.height,
+                    range: StreamingPreferences.minimumStreamHeight...StreamingPreferences.maximumStreamHeight
+                )
                 preferences.updateConfiguredResolution(
                     width: preferences.settings.width,
-                    height: $0
+                    height: height
                 )
             }
         )
+    }
+
+    private func normalizedEvenDimension(
+        _ value: Int,
+        previous: Int,
+        range: ClosedRange<Int>
+    ) -> Int {
+        guard !value.isMultiple(of: 2) else { return value }
+        return value > previous ? min(value + 1, range.upperBound) : max(value - 1, range.lowerBound)
     }
 }
 
@@ -842,9 +863,10 @@ struct CustomFrameRateValue: Equatable {
               let denominator = components.count == 1
                 ? 1
                 : Int(components[1].trimmingCharacters(in: .whitespaces)),
-              numerator > 0,
-              denominator > 0,
-              (10.0...480.0).contains(Double(numerator) / Double(denominator)) else {
+              StreamingPreferences.isSupportedFrameRate(
+                  numerator: numerator,
+                  denominator: denominator
+              ) else {
             return nil
         }
         self.numerator = numerator

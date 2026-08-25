@@ -50,6 +50,7 @@ public enum ProtocolV3StartRequestMapper {
         try preferences.validate()
         guard applicationID > 0,
               let applicationID = UInt64(exactly: applicationID),
+              let frameRate = preferences.normalizedFrameRate,
               startIntentID.count == 16,
               startIntentID.contains(where: { $0 != 0 }),
               traceID.count == 16,
@@ -84,8 +85,8 @@ public enum ProtocolV3StartRequestMapper {
             3: .unsigned(mode == .latency ? 1 : 2),
             4: .unsigned(UInt64(preferences.width)),
             5: .unsigned(UInt64(preferences.height)),
-            6: .unsigned(UInt64(preferences.frameRateNumerator)),
-            7: .unsigned(UInt64(preferences.frameRateDenominator)),
+            6: .unsigned(UInt64(frameRate.numerator)),
+            7: .unsigned(UInt64(frameRate.denominator)),
             8: .unsigned(UInt64(preferences.bitrateKbps)),
             9: .array(codecOffers.map(ProtocolV3CBORValue.map)),
             10: .array(audioOffers.map(ProtocolV3CBORValue.map)),
@@ -327,6 +328,12 @@ public enum ProtocolV3StartRequestMapper {
         preferences: StreamingPreferences,
         capabilities: AppleStreamingCapabilities
     ) throws -> [MoonlightVideoFormat] {
+        let h264DimensionsSupported = preferences.width <= 4_096 && preferences.height <= 4_096
+        if preferences.videoCodecPreference == .h264, !h264DimensionsSupported {
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "H.264 requires dimensions at or below 4096x4096"
+            )
+        }
         let supported = MoonlightVideoFormat.allCases.filter {
             capabilities.supportedVideoFormatMask & $0.rawValue != 0
         }
@@ -345,6 +352,9 @@ public enum ProtocolV3StartRequestMapper {
         }
         var ordered = families.flatMap { family in
             family.filter(supported.contains)
+        }
+        if !h264DimensionsSupported {
+            ordered.removeAll { h264Formats.contains($0) }
         }
         if preferences.enableYUV444 {
             ordered.removeAll { !$0.isYUV444 }

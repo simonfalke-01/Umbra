@@ -386,6 +386,14 @@ public struct EffectiveStreamingPolicy: Equatable, Sendable {
 
 public struct StreamingPreferences: Codable, Hashable, Sendable {
     public static let `default` = StreamingPreferences()
+    public static let minimumStreamWidth = 320
+    public static let maximumStreamWidth = 7_680
+    public static let minimumStreamHeight = 200
+    public static let maximumStreamHeight = 4_320
+    public static let minimumFrameRate = 10
+    public static let maximumFrameRate = 480
+    public static let minimumBitrateKbps = 1_000
+    public static let maximumBitrateKbps = 500_000
 
     public var width: Int
     public var height: Int
@@ -744,6 +752,42 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         return Double(frameRateNumerator) / Double(frameRateDenominator)
     }
 
+    /// The reduced, wire-representable refresh fraction used by protocol v3.
+    public var normalizedFrameRate: (numerator: UInt32, denominator: UInt32)? {
+        guard let numerator = UInt64(exactly: frameRateNumerator),
+              let denominator = UInt64(exactly: frameRateDenominator),
+              numerator > 0,
+              denominator > 0 else {
+            return nil
+        }
+        let divisor = Self.greatestCommonDivisor(numerator, denominator)
+        guard let normalizedNumerator = UInt32(exactly: numerator / divisor),
+              let normalizedDenominator = UInt32(exactly: denominator / divisor) else {
+            return nil
+        }
+        return (normalizedNumerator, normalizedDenominator)
+    }
+
+    /// Checks the canonical 10...480 Hz contract without multiplication or floating point.
+    public static func isSupportedFrameRate(numerator: Int, denominator: Int) -> Bool {
+        guard let numerator = UInt64(exactly: numerator),
+              let denominator = UInt64(exactly: denominator),
+              numerator > 0,
+              denominator > 0 else {
+            return false
+        }
+        let quotient = numerator / denominator
+        let remainder = numerator % denominator
+        let withinLowerBound = quotient >= UInt64(minimumFrameRate)
+        let withinUpperBound = quotient < UInt64(maximumFrameRate)
+            || (quotient == UInt64(maximumFrameRate) && remainder == 0)
+        let divisor = greatestCommonDivisor(numerator, denominator)
+        return withinLowerBound
+            && withinUpperBound
+            && UInt32(exactly: numerator / divisor) != nil
+            && UInt32(exactly: denominator / divisor) != nil
+    }
+
     public mutating func setFrameRate(numerator: Int, denominator: Int) {
         fps = Self.roundedFramesPerSecond(
             numerator: numerator,
@@ -759,27 +803,50 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         denominator: Int,
         fallback: Int
     ) -> Int {
-        guard numerator > 0, denominator > 0 else { return fallback }
-        let rounded = (Double(numerator) / Double(denominator)).rounded()
-        guard rounded.isFinite, let value = Int(exactly: rounded) else { return fallback }
-        return value
+        guard let numerator = UInt64(exactly: numerator),
+              let denominator = UInt64(exactly: denominator),
+              numerator > 0,
+              denominator > 0 else {
+            return fallback
+        }
+        let quotient = numerator / denominator
+        let remainder = numerator % denominator
+        let roundsUp = remainder != 0 && remainder >= denominator - remainder
+        return Int(exactly: quotient + (roundsUp ? 1 : 0)) ?? fallback
+    }
+
+    private static func greatestCommonDivisor(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        var lhs = lhs
+        var rhs = rhs
+        while rhs != 0 {
+            (lhs, rhs) = (rhs, lhs % rhs)
+        }
+        return lhs
     }
 
     public func validate() throws {
-        guard (256...8_192).contains(width) else {
-            throw ModelValidationError(field: "preferences.width", reason: "must be between 256 and 8192")
+        guard (Self.minimumStreamWidth...Self.maximumStreamWidth).contains(width),
+              width.isMultiple(of: 2) else {
+            throw ModelValidationError(
+                field: "preferences.width",
+                reason: "must be an even value between 320 and 7680"
+            )
         }
-        guard (256...8_192).contains(height) else {
-            throw ModelValidationError(field: "preferences.height", reason: "must be between 256 and 8192")
+        guard (Self.minimumStreamHeight...Self.maximumStreamHeight).contains(height),
+              height.isMultiple(of: 2) else {
+            throw ModelValidationError(
+                field: "preferences.height",
+                reason: "must be an even value between 200 and 4320"
+            )
         }
-        guard (10...9_999).contains(fps) else {
-            throw ModelValidationError(field: "preferences.fps", reason: "must be between 10 and 9999")
+        guard (Self.minimumFrameRate...Self.maximumFrameRate).contains(fps) else {
+            throw ModelValidationError(field: "preferences.fps", reason: "must be between 10 and 480")
         }
-        guard frameRateNumerator > 0,
-              frameRateDenominator > 0,
-              UInt64(exactly: frameRateNumerator) != nil,
-              UInt64(exactly: frameRateDenominator) != nil,
-              (10.0...9_999.0).contains(exactFrameRate),
+        guard Self.isSupportedFrameRate(
+                  numerator: frameRateNumerator,
+                  denominator: frameRateDenominator
+              ),
+              normalizedFrameRate != nil,
               fps == Self.roundedFramesPerSecond(
                   numerator: frameRateNumerator,
                   denominator: frameRateDenominator,
@@ -787,10 +854,9 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
               ) else {
             throw ModelValidationError(
                 field: "preferences.frameRate",
-                reason: "must be an exact positive fraction between 10 and 9999 FPS"
+                reason: "must be an exact positive fraction between 10 and 480 FPS"
             )
         }
-        let hardMaximumBitrate = 500_000
         let isReferenceAutomaticBitrate = autoAdjustBitrate
             && bitrateKbps == Self.defaultBitrateKbps(
                 width: width,
@@ -798,13 +864,13 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
                 fps: exactFrameRate,
                 yuv444: enableYUV444
             )
-        let isWithinManualLimit = bitrateKbps <= (unlockBitrate ? hardMaximumBitrate : 150_000)
-        guard bitrateKbps >= 500,
-              bitrateKbps <= hardMaximumBitrate,
+        let isWithinManualLimit = bitrateKbps <= (unlockBitrate ? Self.maximumBitrateKbps : 150_000)
+        guard bitrateKbps >= Self.minimumBitrateKbps,
+              bitrateKbps <= Self.maximumBitrateKbps,
               isWithinManualLimit || isReferenceAutomaticBitrate else {
             throw ModelValidationError(
                 field: "preferences.bitrateKbps",
-                reason: "must be between 500 and \(unlockBitrate ? hardMaximumBitrate : 150_000), or the automatic reference bitrate"
+                reason: "must be between 1000 and \(unlockBitrate ? Self.maximumBitrateKbps : 150_000), or the automatic reference bitrate"
             )
         }
         guard packetSize == 0 || (1_024...65_507).contains(packetSize) else {
