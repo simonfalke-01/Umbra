@@ -90,6 +90,10 @@ enum StreamStatisticsPresenter {
             } else {
                 rtt = "\(milliseconds) ms"
             }
+        } else if let smoothed = protocolV3?.transport.smoothedRTTMicroseconds,
+                  let minimum = protocolV3?.transport.minimumRTTMicroseconds,
+                  let variation = protocolV3?.transport.rttVariationMicroseconds {
+            rtt = protocolV3RTT(smoothed: smoothed, minimum: minimum, variation: variation)
         } else if let protocolV3 {
             rtt = "Unavailable, QUIC cap \(protocolV3.transport.usableDatagramPayloadBytes) B, "
                 + "path changes \(protocolV3.transport.pathChangeCount)"
@@ -147,6 +151,15 @@ enum StreamStatisticsPresenter {
     private static func frameCount(_ count: Int) -> String {
         guard count >= 0 else { return "Unavailable" }
         return "\(count) \(count == 1 ? "frame" : "frames")"
+    }
+
+    static func protocolV3RTT(smoothed: UInt32, minimum: UInt32, variation: UInt32) -> String {
+        String(
+            format: "%.2f ms, variation %.2f ms, min %.2f ms",
+            Double(smoothed) / 1_000,
+            Double(variation) / 1_000,
+            Double(minimum) / 1_000
+        )
     }
 
     private static func percentiles(_ summary: LatencyPercentileSummary?) -> String {

@@ -208,6 +208,17 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         XCTAssertEqual(presentation[.audioPackets], "0")
     }
 
+    func testProtocolV3StatisticsFormatsLiveSmoothedVariationAndMinimumRTT() {
+        XCTAssertEqual(
+            StreamStatisticsPresenter.protocolV3RTT(
+                smoothed: 4_120,
+                minimum: 3_000,
+                variation: 875
+            ),
+            "4.12 ms, variation 0.88 ms, min 3.00 ms"
+        )
+    }
+
     func testStatisticsOverlayUsesNoBulletOrCenterDotSeparators() {
         let presentation = StreamStatisticsPresenter.make(
             renderer: nil,

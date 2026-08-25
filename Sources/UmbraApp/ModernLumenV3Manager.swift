@@ -283,7 +283,7 @@ final class ModernLumenV3Manager {
         let videoGeneration: UInt64
         let audioGeneration: UInt64
         let microphoneGeneration: UInt64
-        let inputGeneration: UInt64
+        let inputGeneration: UInt32
     }
 
     private struct BulkMetadata: Equatable, Sendable {
@@ -315,6 +315,14 @@ final class ModernLumenV3Manager {
         func resynchronize(_ edgeID: UInt64) {
             try? lock.withLock { sender }?.resynchronize(expectedEdgeID: edgeID)
         }
+
+        func accepts(_ feedback: ProtocolV3ControllerFeedback) -> Bool {
+            lock.withLock { sender }?.acceptsControllerFeedback(
+                inputGeneration: feedback.inputGeneration,
+                controller: feedback.controller,
+                controllerGeneration: feedback.controllerGeneration
+            ) ?? false
+        }
     }
 
     private final class RetainedSession {
@@ -330,6 +338,8 @@ final class ModernLumenV3Manager {
         var isAuthenticated = false
         var invitationRecord: ModernLumenV3HostRecord?
         var pairingInvitationID: Data?
+        let pairingEvents: AsyncStream<Result<HostDisplayModel, Error>>
+        let pairingContinuation: AsyncStream<Result<HostDisplayModel, Error>>.Continuation
         var pendingControlResponses: [UInt64: PendingControlResponse] = [:]
         var activeSessionID: Data?
         var startEvents: AsyncStream<Result<StartResult, Error>>
@@ -365,6 +375,7 @@ final class ModernLumenV3Manager {
             (activeSessionEvents, activeSessionContinuation) = AsyncStream<Data>.makeStream()
             (sessionEndedEvents, sessionEndedContinuation) = AsyncStream<Data>.makeStream()
             (startEvents, startContinuation) = AsyncStream<Result<StartResult, Error>>.makeStream()
+            (pairingEvents, pairingContinuation) = AsyncStream<Result<HostDisplayModel, Error>>.makeStream()
         }
 
         func resetAuthenticationEvents() {
@@ -404,7 +415,6 @@ final class ModernLumenV3Manager {
     private var connectionStatuses: [Data: HostConnectionStatus] = [:]
     private var catalogEventHandler: (@MainActor @Sendable ([HostDisplayModel]) -> Void)?
     private var sessionEventHandler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?
-    private var pairingEventHandler: (@MainActor @Sendable (Result<HostDisplayModel, Error>) -> Void)?
 
     init(
         trustStore: FileBackedProtocolV3TrustStore = .init(),
@@ -444,12 +454,6 @@ final class ModernLumenV3Manager {
         _ handler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?
     ) {
         sessionEventHandler = handler
-    }
-
-    func setPairingEventHandler(
-        _ handler: (@MainActor @Sendable (Result<HostDisplayModel, Error>) -> Void)?
-    ) {
-        pairingEventHandler = handler
     }
 
     func displayHosts() throws -> [HostDisplayModel] {
@@ -515,13 +519,43 @@ final class ModernLumenV3Manager {
             })
     }
 
-    func connectInvitation(_ uri: String, requestedPermissions: UInt64) throws {
+    func pairInvitation(
+        _ uri: String,
+        requestedPermissions: UInt64
+    ) async throws -> HostDisplayModel {
+        let started = try startInvitation(uri, requestedPermissions: requestedPermissions)
+        let hostID = started.hostID
+        let session = started.session
+        let pairingEvents = started.entry.pairingEvents
+        return try await withTaskCancellationHandler {
+            for await result in pairingEvents {
+                try Task.checkCancellation()
+                return try result.get()
+            }
+            try Task.checkCancellation()
+            throw ProtocolV3ClientError.invalidState
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelInvitationPairing(
+                    session: session,
+                    hostID: hostID
+                )
+            }
+        }
+    }
+
+    private func startInvitation(
+        _ uri: String,
+        requestedPermissions: UInt64
+    ) throws -> (hostID: Data, session: ProtocolV3ClientControlSession, entry: RetainedSession) {
         let invitation = try ProtocolV3PairingInvitation.decode(
             uri: uri,
             nowUnixSeconds: UInt64(Date().timeIntervalSince1970)
         )
         let abandonedPairings = sessions.filter { $0.value.pairingInvitationID != nil }
         for (hostID, entry) in abandonedPairings {
+            entry.pairingContinuation.yield(.failure(CancellationError()))
+            entry.pairingContinuation.finish()
             if let pairingInvitationID = entry.pairingInvitationID {
                 try? trustStore.cancelPairingAttempt(invitationID: pairingInvitationID)
             }
@@ -578,6 +612,11 @@ final class ModernLumenV3Manager {
             finish(session: session, hostID: invitation.hostID)
             throw error
         }
+        guard let entry = sessions[invitation.hostID], entry.session === session else {
+            session.cancel()
+            throw ProtocolV3ClientError.invalidState
+        }
+        return (invitation.hostID, session, entry)
     }
 
     func connectPaired(
@@ -1204,7 +1243,9 @@ final class ModernLumenV3Manager {
                 entry.invitationRecord = nil
                 entry.pairingInvitationID = nil
                 publishCatalog()
-                pairingEventHandler?(.success(displayHost(record, trust: trust)))
+                let pairedHost = displayHost(record, trust: trust)
+                entry.pairingContinuation.yield(.success(pairedHost))
+                entry.pairingContinuation.finish()
             } catch {
                 if let pairingInvitationID = entry.pairingInvitationID {
                     try? trustStore.cancelPairingAttempt(invitationID: pairingInvitationID)
@@ -1221,7 +1262,8 @@ final class ModernLumenV3Manager {
                     level: .error,
                     message: reported.localizedDescription
                 )
-                pairingEventHandler?(.failure(reported))
+                entry.pairingContinuation.yield(.failure(reported))
+                entry.pairingContinuation.finish()
                 session.cancel()
             }
         case .authenticated:
@@ -1287,9 +1329,11 @@ final class ModernLumenV3Manager {
                 message: "The explicit protocol-v3 connection failed: \(error). Legacy fallback was not attempted."
             )
             if entry.invitationRecord != nil {
-                pairingEventHandler?(.failure(UmbraClientServiceError.unavailable(
+                let reported = UmbraClientServiceError.unavailable(
                     "Secure pairing failed: \(error). Legacy fallback was not attempted."
-                )))
+                )
+                entry.pairingContinuation.yield(.failure(reported))
+                entry.pairingContinuation.finish()
             }
             Task { @MainActor [weak self] in
                 await self?.tearDownStream(
@@ -1317,8 +1361,24 @@ final class ModernLumenV3Manager {
         }
     }
 
+    private func cancelInvitationPairing(
+        session: ProtocolV3ClientControlSession,
+        hostID: Data
+    ) {
+        guard let entry = sessions[hostID], entry.session === session,
+              entry.invitationRecord != nil else { return }
+        entry.pairingContinuation.yield(.failure(CancellationError()))
+        entry.pairingContinuation.finish()
+        session.cancel()
+        finish(session: session, hostID: hostID)
+    }
+
     private func finish(session: ProtocolV3ClientControlSession, hostID: Data) {
         guard let entry = sessions[hostID], entry.session === session else { return }
+        if entry.invitationRecord != nil {
+            entry.pairingContinuation.yield(.failure(CancellationError()))
+        }
+        entry.pairingContinuation.finish()
         if let pairingInvitationID = entry.pairingInvitationID {
             try? trustStore.cancelPairingAttempt(invitationID: pairingInvitationID)
             entry.pairingInvitationID = nil
@@ -1391,7 +1451,7 @@ final class ModernLumenV3Manager {
                 1: .bytes(attach.sessionID),
                 2: .bytes(attach.attachToken),
                 3: .bytes(attachIntentID),
-                4: .unsigned(attach.inputGeneration),
+                4: .unsigned(UInt64(attach.inputGeneration)),
                 5: .map([
                     1: .unsigned(attach.videoGeneration),
                     2: .unsigned(attach.audioGeneration),
@@ -1425,6 +1485,7 @@ final class ModernLumenV3Manager {
                 sessionID: attach.sessionID,
                 mode: prepared.offer.mode,
                 usesAbsolutePointer: prepared.bootstrap.preferences.absoluteMouseMode,
+                inputGeneration: attach.inputGeneration,
                 failureHandler: inputFailureHandler
             )
             let resetState = try inputSender.inputResetStateBlock()
@@ -1437,9 +1498,21 @@ final class ModernLumenV3Manager {
             )
             guard Set(resetResponse.fields.keys) == Set([1, 2]),
                   resetResponse.fields[1]?.unsignedValue == 0,
-                  resetResponse.fields[2]?.unsignedValue != nil else {
+                  let resetInputGenerationRaw = resetResponse.fields[2]?.unsignedValue,
+                  let resetInputGeneration = UInt32(exactly: resetInputGenerationRaw),
+                  resetInputGeneration != 0 else {
                 throw ProtocolV3ClientError.invalidMessage("INPUT_RESET response")
             }
+            try inputSender.updateInputGeneration(resetInputGeneration)
+            entry.attachState = AttachState(
+                sessionID: attach.sessionID,
+                attachToken: attach.attachToken,
+                startIntentID: attach.startIntentID,
+                videoGeneration: attach.videoGeneration,
+                audioGeneration: attach.audioGeneration,
+                microphoneGeneration: attach.microphoneGeneration,
+                inputGeneration: resetInputGeneration
+            )
 
             try coordinator.rebind(control: replacement, sessionID: attach.sessionID)
             entry.mediaEventExecutor.installAndResume(coordinator)
@@ -1648,7 +1721,9 @@ final class ModernLumenV3Manager {
                   let videoGeneration = fields[14]?.unsignedValue,
                   let audioGeneration = fields[15]?.unsignedValue,
                   let microphoneGeneration = fields[16]?.unsignedValue,
-                  let inputGeneration = fields[17]?.unsignedValue else {
+                  let inputGenerationRaw = fields[17]?.unsignedValue,
+                  let inputGeneration = UInt32(exactly: inputGenerationRaw),
+                  inputGeneration != 0 else {
                 throw ProtocolV3ClientError.invalidMessage("START selection")
             }
             startupTelemetry.record(
@@ -1710,6 +1785,7 @@ final class ModernLumenV3Manager {
                 sessionID: sessionID,
                 mode: prepared.offer.mode,
                 usesAbsolutePointer: prepared.bootstrap.preferences.absoluteMouseMode,
+                inputGeneration: inputGeneration,
                 failureHandler: inputFailureHandler
             )
             entry.inputSenderRelay.install(inputSender)
@@ -1724,6 +1800,46 @@ final class ModernLumenV3Manager {
                 },
                 inputResyncHandler: { [inputSenderRelay = entry.inputSenderRelay] resync in
                     inputSenderRelay.resynchronize(resync.expectedEdgeID)
+                },
+                controllerFeedbackHandler: {
+                    [inputSenderRelay = entry.inputSenderRelay, output] feedback in
+                    guard inputSenderRelay.accepts(feedback) else { return }
+                    switch feedback.command {
+                    case let .rumble(lowFrequency, highFrequency):
+                        output.handle(.rumble(
+                            controller: UInt16(feedback.controller),
+                            lowFrequency: lowFrequency,
+                            highFrequency: highFrequency
+                        ))
+                    case let .triggerRumble(left, right):
+                        output.handle(.triggerRumble(
+                            controller: UInt16(feedback.controller),
+                            left: left,
+                            right: right
+                        ))
+                    case let .motionState(type, reportRateHz):
+                        output.handle(.motionState(
+                            controller: UInt16(feedback.controller),
+                            type: type,
+                            reportRateHz: reportRateHz
+                        ))
+                    case let .led(red, green, blue):
+                        output.handle(.controllerLED(
+                            controller: UInt16(feedback.controller),
+                            red: red,
+                            green: green,
+                            blue: blue
+                        ))
+                    case let .adaptiveTriggers(flags, leftType, rightType, left, right):
+                        output.handle(.adaptiveTriggers(
+                            controller: UInt16(feedback.controller),
+                            flags: flags,
+                            leftType: leftType,
+                            rightType: rightType,
+                            left: left,
+                            right: right
+                        ))
+                    }
                 },
                 failureHandler: { [weak self, hostID] error in
                     Task { @MainActor in
