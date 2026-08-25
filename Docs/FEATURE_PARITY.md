@@ -37,6 +37,8 @@ commit `d2f6990b`. The checkout is intentionally not part of the Umbra source tr
 - [x] Render with Metal and provide a native fallback path.
 - [x] Decode stereo, 5.1, and 7.1 Opus audio through native macOS audio APIs.
 - [x] Mute host audio and mute the client while inactive when configured.
+- [x] Treat client microphone forwarding as optional by default, with explicit
+      degraded startup and a fail-closed required mode.
 - [x] Show connection quality, performance statistics, stage, and failure state.
 - [x] Disconnect and optionally quit the host application after streaming.
 
@@ -44,9 +46,11 @@ commit `d2f6990b`. The checkout is intentionally not part of the Umbra source tr
 
 - [x] Forward keyboard input and normalize clipboard text entry.
 - [x] Support relative captured mouse and absolute remote-desktop pointer modes.
-- [x] Forward all mouse buttons and scrolling with swap/reverse preferences.
+- [x] Forward all mouse buttons and scrolling with swap/reverse preferences,
+      accumulating fractional wheel motion before integer wire emission.
 - [x] Support trackpad/direct-touch gestures and virtual trackpad behavior.
-- [x] Support up to 16 controllers, hot-plugging, mappings, and merged player one.
+- [x] Support up to 16 locally allocated controller slots, hot-plugging, mappings,
+      and generation-safe heterogeneous merged player one.
 - [x] Forward controller battery, touchpad, motion, rumble, trigger rumble, LEDs,
       and adaptive triggers where the macOS GameController API exposes them.
 - [x] Support controller mouse mode and gamepad navigation in the client UI.
@@ -90,3 +94,8 @@ VoiceOver and contrast traversal. Experimental protocol-v2, QUIC, lossless,
 and Lumen VDD work does not change the status of these legacy-client checks.
 Umbra must not expose a capability as proven when only parser, fixture, or
 portable test coverage exists.
+
+The fixed protocol-v3 input datagram currently fits at most 15 simultaneous
+64-byte controller state records within its 1,108-byte semantic payload. The
+16-slot local allocator is covered, but a coordinated wire-format revision is
+still required before 16 simultaneous v3 controllers can be claimed end to end.

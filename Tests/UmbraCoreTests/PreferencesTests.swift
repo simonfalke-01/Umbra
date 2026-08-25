@@ -22,6 +22,7 @@ final class PreferencesTests: XCTestCase {
         XCTAssertTrue(preferences.framePacing)
         XCTAssertTrue(preferences.keepAwake)
         XCTAssertFalse(preferences.clientMicrophoneEnabled)
+        XCTAssertFalse(preferences.clientMicrophoneRequired)
         XCTAssertNoThrow(try preferences.validate())
     }
 
@@ -186,6 +187,7 @@ final class PreferencesTests: XCTestCase {
             gameOptimizations: false,
             playAudioOnHost: true,
             clientMicrophoneEnabled: true,
+            clientMicrophoneRequired: true,
             multiController: false,
             enableMDNS: false,
             quitAppAfter: true,
@@ -231,6 +233,7 @@ final class PreferencesTests: XCTestCase {
         object.removeValue(forKey: "displaySelection")
         object.removeValue(forKey: "displayResolutionPolicy")
         object.removeValue(forKey: "clientMicrophoneEnabled")
+        object.removeValue(forKey: "clientMicrophoneRequired")
         object.removeValue(forKey: "optimizationMode")
         object.removeValue(forKey: "hdrTransferPreference")
         object.removeValue(forKey: "frameRateNumerator")
@@ -247,12 +250,23 @@ final class PreferencesTests: XCTestCase {
         XCTAssertEqual(decoded.displaySelection, .automatic)
         XCTAssertEqual(decoded.displayResolutionPolicy, .configured)
         XCTAssertFalse(decoded.clientMicrophoneEnabled)
+        XCTAssertFalse(decoded.clientMicrophoneRequired)
         XCTAssertEqual(decoded.optimizationMode, .latency)
         XCTAssertEqual(decoded.hdrTransferPreference, .automatic)
         XCTAssertFalse(decoded.enableVSync)
         XCTAssertFalse(decoded.framePacing)
         XCTAssertEqual(decoded.frameRateNumerator, 75)
         XCTAssertEqual(decoded.frameRateDenominator, 1)
+    }
+
+    func testRequiredMicrophoneCannotBeEnabledWithoutRequestingMicrophoneForwarding() {
+        var preferences = StreamingPreferences.default
+        preferences.clientMicrophoneRequired = true
+
+        XCTAssertThrowsError(try preferences.validate())
+
+        preferences.clientMicrophoneEnabled = true
+        XCTAssertNoThrow(try preferences.validate())
     }
 
     func testOptimizationModeDecodesDocumentedLegacyAliasesAndIntegers() throws {

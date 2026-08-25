@@ -1290,6 +1290,69 @@ final class IntegrationAdapterTests: XCTestCase {
         })
     }
 
+    func testRequiredClientMicrophonePreparationFailureStopsBeforeSessionCreation() async throws {
+        let factory = FakeStreamingSessionFactory(session: FakeStreamingSession())
+        let driver = NativeStreamSessionDriver(
+            mediaProvider: FakeMediaProvider(),
+            sessionFactory: factory,
+            microphonePreparer: FakeClientMicrophonePreparer(
+                result: .failure(ClientMicrophonePreparationError.permissionDenied(.denied))
+            )
+        )
+        var preferences = StreamingPreferences.default
+        preferences.clientMicrophoneEnabled = true
+        preferences.clientMicrophoneRequired = true
+        let bootstrap = try makeBootstrap(preferences: preferences)
+
+        do {
+            _ = try await driver.prepare(bootstrap)
+            XCTFail("Required microphone failure must stop before stream creation.")
+        } catch let error as UmbraIntegrationError {
+            guard case .clientMicrophoneRequiredUnavailable = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertNil(factory.configuration)
+    }
+
+    func testRequiredClientMicrophoneRuntimeFailureTerminatesTheSession() async throws {
+        let session = FakeStreamingSession(startEvents: [
+            .clientMicrophoneGeneration(StreamingClientMicrophoneGeneration(
+                sessionID: Data(repeating: 0x11, count: 16),
+                salt: Data(repeating: 0x22, count: 16),
+                serverPort: 50_012,
+                clientPort: 54_321,
+                remoteAddress: "192.0.2.42"
+            )),
+        ])
+        let microphone = FakeClientMicrophoneForwarder(clientPort: 54_321)
+        let driver = NativeStreamSessionDriver(
+            mediaProvider: FakeMediaProvider(),
+            sessionFactory: FakeStreamingSessionFactory(session: session),
+            microphonePreparer: FakeClientMicrophonePreparer(result: .success(microphone))
+        )
+        var preferences = StreamingPreferences.default
+        preferences.clientMicrophoneEnabled = true
+        preferences.clientMicrophoneRequired = true
+        let bootstrap = try makeBootstrap(preferences: preferences)
+
+        try await driver.prepare(bootstrap)
+        let run = Task { try await driver.run(bootstrap) { _ in } }
+        await session.waitUntilStarted()
+        microphone.emitWarning("Microphone capture stopped unexpectedly.")
+
+        do {
+            _ = try await run.value
+            XCTFail("Required microphone runtime failure must terminate the stream.")
+        } catch let error as UmbraIntegrationError {
+            guard case .clientMicrophoneRequiredUnavailable = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        let closeCount = await session.closeCount
+        XCTAssertGreaterThanOrEqual(closeCount, 1)
+    }
+
     @MainActor
     func testOutputAdapterRoutesControllerFeedbackAndMotionPolicy() async {
         let controllers = FakeControllerOutputService()
@@ -2131,6 +2194,7 @@ private final class FakeClientMicrophoneForwarder: ClientMicrophoneForwarding, @
     private let teardown: LockedRecorder<String>?
     private var storedGenerations: [ClientMicrophoneGenerationDescriptor] = []
     private var storedFinishCount = 0
+    private var storedWarningHandler: (@Sendable (String) -> Void)?
 
     init(clientPort: UInt16, teardown: LockedRecorder<String>? = nil) {
         self.clientPort = clientPort
@@ -2147,7 +2211,14 @@ private final class FakeClientMicrophoneForwarder: ClientMicrophoneForwarding, @
         generation: ClientMicrophoneGenerationDescriptor,
         warningHandler: @escaping @Sendable (String) -> Void
     ) throws {
-        lock.withLock { storedGenerations.append(generation) }
+        lock.withLock {
+            storedGenerations.append(generation)
+            storedWarningHandler = warningHandler
+        }
+    }
+
+    func emitWarning(_ message: String) {
+        lock.withLock { storedWarningHandler }?(message)
     }
 
     func finish() {

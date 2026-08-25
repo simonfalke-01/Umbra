@@ -205,6 +205,60 @@ final class ControllerSupportTests: XCTestCase {
         XCTAssertEqual(merged.rightStickY, -0.1)
     }
 
+    func testMergedControllerMetadataUsesUnknownFamilyAndFeedbackOwnerCapabilities() throws {
+        let merged = try XCTUnwrap(ControllerMetadataMerger.merge([
+            ControllerMetadata(
+                family: .xbox,
+                supportedButtons: [.a, .b],
+                capabilities: [.rumble]
+            ),
+            ControllerMetadata(
+                family: .playStation,
+                supportedButtons: [.x, .touchpad],
+                capabilities: [.touchpad, .adaptiveTriggers]
+            ),
+        ]))
+
+        XCTAssertEqual(merged.family, .unknown)
+        XCTAssertEqual(merged.supportedButtons, [.a, .b, .x, .touchpad])
+        XCTAssertEqual(
+            merged.capabilities,
+            [.rumble],
+            "Merged feedback is owned by the deterministic lowest-slot controller."
+        )
+        XCTAssertNil(ControllerMetadataMerger.merge([ControllerMetadata]()))
+    }
+
+    func testMergedControllerMetadataStaysStableAcrossHeterogeneousHotPlug() {
+        let first = ControllerMetadata(
+            family: .xbox,
+            supportedButtons: [.a],
+            capabilities: [.rumble]
+        )
+        let heterogeneous = ControllerMetadata(
+            family: .unknown,
+            supportedButtons: [.a, .touchpad],
+            capabilities: [.rumble]
+        )
+
+        XCTAssertEqual(
+            ControllerMetadataRebindPlanner.action(from: nil, to: first),
+            .arrival(first)
+        )
+        XCTAssertEqual(
+            ControllerMetadataRebindPlanner.action(from: first, to: first),
+            .stateOnly
+        )
+        XCTAssertEqual(
+            ControllerMetadataRebindPlanner.action(from: first, to: heterogeneous),
+            .stateOnly
+        )
+        XCTAssertEqual(
+            ControllerMetadataRebindPlanner.action(from: heterogeneous, to: nil),
+            .departure
+        )
+    }
+
     func testControllerNavigationMapsEdgesFocusModeAndAnalogRepeat() {
         var navigation = ControllerNavigationStateMachine()
         let pressed = ControllerStateSample(buttons: [.dpadUp, .a, .x, .start])

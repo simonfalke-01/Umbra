@@ -26,6 +26,8 @@ public enum PointerMode: Equatable, Sendable {
 
 public struct MouseInputMapper: Sendable {
     public var preferences: PointerPreferences
+    private var verticalWheelRemainder: Double = 0
+    private var horizontalWheelRemainder: Double = 0
 
     public init(preferences: PointerPreferences) {
         self.preferences = preferences
@@ -50,18 +52,46 @@ public struct MouseInputMapper: Sendable {
         }
     }
 
-    public func mapScroll(deltaX: Double, deltaY: Double) -> [ScrollPacket] {
+    public mutating func mapScroll(deltaX: Double, deltaY: Double) -> [ScrollPacket] {
         let direction = preferences.reverseScrollDirection ? -1.0 : 1.0
         return [
-            scrollPacket(axis: .vertical, value: deltaY * direction),
-            scrollPacket(axis: .horizontal, value: deltaX * direction),
+            Self.scrollPacket(
+                axis: .vertical,
+                value: deltaY * direction,
+                clampAcceleratedScroll: preferences.clampAcceleratedScroll,
+                remainder: &verticalWheelRemainder
+            ),
+            Self.scrollPacket(
+                axis: .horizontal,
+                value: deltaX * direction,
+                clampAcceleratedScroll: preferences.clampAcceleratedScroll,
+                remainder: &horizontalWheelRemainder
+            ),
         ].compactMap { $0 }
     }
 
-    private func scrollPacket(axis: ScrollAxis, value: Double) -> ScrollPacket? {
-        guard value != 0, value.isFinite else { return nil }
-        let clamped = preferences.clampAcceleratedScroll ? min(max(value, -1), 1) : value
-        let wheelUnits = min(max((clamped * 120).rounded(), Double(Int16.min)), Double(Int16.max))
+    public mutating func resetScrollRemainders() {
+        verticalWheelRemainder = 0
+        horizontalWheelRemainder = 0
+    }
+
+    private static func scrollPacket(
+        axis: ScrollAxis,
+        value: Double,
+        clampAcceleratedScroll: Bool,
+        remainder: inout Double
+    ) -> ScrollPacket? {
+        guard value.isFinite else {
+            remainder = 0
+            return nil
+        }
+        guard value != 0 else { return nil }
+        let clamped = clampAcceleratedScroll ? min(max(value, -1), 1) : value
+        let total = clamped * 120 + remainder
+        let whole = total.rounded(.towardZero)
+        let wheelUnits = min(max(whole, Double(Int16.min)), Double(Int16.max))
+        remainder = whole == wheelUnits ? total - wheelUnits : 0
+        guard wheelUnits != 0 else { return nil }
         return ScrollPacket(axis: axis, delta: Int16(wheelUnits))
     }
 }

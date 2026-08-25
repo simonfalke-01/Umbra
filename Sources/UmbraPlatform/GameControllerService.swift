@@ -29,11 +29,16 @@ public final class AppleGameControllerService: ControllerOutputServicing {
         didSet {
             guard oldValue !== sink else { return }
             if let oldValue { releaseAllInputs(to: oldValue) }
+            announcedMergedMetadata = nil
             guard sink != nil else { return }
             let orderedControllers = entries.values
                 .sorted { $0.slotIndex < $1.slotIndex }
                 .map(\.controller)
-            for controller in orderedControllers { announceConnection(controller) }
+            if multiControllerEnabled {
+                for controller in orderedControllers { announceConnection(controller) }
+            } else {
+                announceMergedConnection()
+            }
         }
     }
     /// Set before `start()`. Matches Moonlight's single-vs-multi-controller preference.
@@ -80,6 +85,7 @@ public final class AppleGameControllerService: ControllerOutputServicing {
     private var applicationActive = true
     private var mousePollingTimer: Timer?
     private var navigationRepeatTimer: Timer?
+    private var announcedMergedMetadata: ControllerMetadata?
     public private(set) var feedbackSessionActive = false
 
     public init() {}
@@ -108,7 +114,11 @@ public final class AppleGameControllerService: ControllerOutputServicing {
         // them so every arrival carries the complete initial active mask.
         let initialControllers = GCController.controllers()
         let registeredControllers = initialControllers.filter(register)
-        for controller in registeredControllers { announceConnection(controller) }
+        if multiControllerEnabled {
+            for controller in registeredControllers { announceConnection(controller) }
+        } else {
+            announceMergedConnection()
+        }
     }
 
     public func stop() {
@@ -128,6 +138,7 @@ public final class AppleGameControllerService: ControllerOutputServicing {
         }
         entries.removeAll()
         registry = .init()
+        announcedMergedMetadata = nil
     }
 
     /// Keeps remote controller state synchronized when GameController pauses
@@ -243,11 +254,14 @@ public final class AppleGameControllerService: ControllerOutputServicing {
     }
 
     private func announceConnection(_ controller: GCController) {
+        guard multiControllerEnabled else {
+            announceMergedConnection()
+            return
+        }
         guard let entry = entries[ObjectIdentifier(controller)] else { return }
-        let mask = multiControllerEnabled ? registry.activeMask : UInt16(1)
         sink?.platformInputDidProduce(.controllerArrival(.init(
             playerIndex: entry.playerIndex,
-            activeControllerMask: mask,
+            activeControllerMask: registry.activeMask,
             family: family(for: controller),
             supportedButtons: supportedButtons(for: controller),
             capabilities: capabilities(for: controller),
@@ -258,11 +272,54 @@ public final class AppleGameControllerService: ControllerOutputServicing {
         emitBattery(for: controller, force: true)
     }
 
+    private func announceMergedConnection() {
+        let orderedEntries = entries.values.sorted { $0.slotIndex < $1.slotIndex }
+        let metadata = ControllerMetadataMerger.merge(orderedEntries.map {
+            ControllerMetadata(
+                family: family(for: $0.controller),
+                supportedButtons: supportedButtons(for: $0.controller),
+                capabilities: capabilities(for: $0.controller)
+            )
+        })
+        switch ControllerMetadataRebindPlanner.action(from: announcedMergedMetadata, to: metadata) {
+        case .stateOnly:
+            emitMergedState()
+            return
+        case .departure:
+            emitMergedState()
+            announcedMergedMetadata = nil
+            return
+        case .arrival:
+            break
+        }
+        guard let metadata else { return }
+        sink?.platformInputDidProduce(.controllerArrival(.init(
+            playerIndex: 0,
+            activeControllerMask: 1,
+            family: metadata.family,
+            supportedButtons: metadata.supportedButtons,
+            capabilities: metadata.capabilities,
+            vendorName: nil,
+            productCategory: "Merged controllers"
+        )))
+        announcedMergedMetadata = metadata
+        emitMergedState()
+        for entry in orderedEntries { emitBattery(for: entry.controller, force: true) }
+    }
+
     private func remapConnectedControllers() {
         let orderedIDs = entries.keys.sorted {
             (entries[$0]?.slotIndex ?? .max) < (entries[$1]?.slotIndex ?? .max)
         }
         neutralizeFeedback()
+        if !orderedIDs.isEmpty {
+            sink?.platformInputDidProduce(.controller(ControllerStateMapper.packet(
+                sample: .init(),
+                playerIndex: 0,
+                activeControllerMask: 0
+            )))
+        }
+        announcedMergedMetadata = nil
         for id in orderedIDs {
             guard var entry = entries[id] else { continue }
             entry.playerIndex = ControllerPlayerAssignment.playerIndex(
@@ -271,9 +328,13 @@ public final class AppleGameControllerService: ControllerOutputServicing {
             )
             entries[id] = entry
         }
-        for id in orderedIDs {
-            guard let controller = entries[id]?.controller else { continue }
-            announceConnection(controller)
+        if multiControllerEnabled {
+            for id in orderedIDs {
+                guard let controller = entries[id]?.controller else { continue }
+                announceConnection(controller)
+            }
+        } else {
+            announceMergedConnection()
         }
     }
 
@@ -301,7 +362,7 @@ public final class AppleGameControllerService: ControllerOutputServicing {
                 rightStickY: 0
             )))
         } else {
-            emitMergedState()
+            announceMergedConnection()
         }
         synchronizeMousePollingTimer()
         synchronizeNavigationRepeatTimer()
@@ -413,7 +474,7 @@ public final class AppleGameControllerService: ControllerOutputServicing {
         (target ?? sink)?.platformInputDidProduce(.controller(ControllerStateMapper.packet(
             sample: merged,
             playerIndex: 0,
-            activeControllerMask: 1
+            activeControllerMask: entries.isEmpty ? 0 : 1
         )))
     }
 

@@ -314,25 +314,33 @@ private final class StreamEventRelay: @unchecked Sendable {
     private let output: any StreamingEventOutputHandling
     private let diagnosticHandler: @Sendable (String) -> Void
     private let microphone: (any ClientMicrophoneForwarding)?
+    private let microphoneRequired: Bool
     private let microphoneRIKey: Data
     private var storedFailure: UmbraIntegrationError?
+    private var requiredMicrophoneFailureHandler: (@Sendable () -> Void)?
 
     init(
         serviceEvents: @escaping @Sendable (StreamDriverEvent) -> Void,
         output: any StreamingEventOutputHandling,
         diagnosticHandler: @escaping @Sendable (String) -> Void,
         microphone: (any ClientMicrophoneForwarding)?,
+        microphoneRequired: Bool,
         microphoneRIKey: Data
     ) {
         self.serviceEvents = serviceEvents
         self.output = output
         self.diagnosticHandler = diagnosticHandler
         self.microphone = microphone
+        self.microphoneRequired = microphoneRequired
         self.microphoneRIKey = microphoneRIKey
     }
 
     var failure: UmbraIntegrationError? {
         lock.withLock { storedFailure }
+    }
+
+    func installRequiredMicrophoneFailureHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.withLock { requiredMicrophoneFailureHandler = handler }
     }
 
 
@@ -349,8 +357,8 @@ private final class StreamEventRelay: @unchecked Sendable {
                         remoteAddress: generation.remoteAddress,
                         rikey: microphoneRIKey
                     ),
-                    warningHandler: { [serviceEvents] message in
-                        serviceEvents(.warning(message))
+                    warningHandler: { [weak self] message in
+                        self?.handleMicrophoneWarning(message)
                     }
                 )
                 diagnosticHandler(
@@ -358,9 +366,8 @@ private final class StreamEventRelay: @unchecked Sendable {
                 )
             } catch {
                 microphone.invalidate()
-                serviceEvents(.warning(
-                    "Microphone forwarding is unavailable for this stream: \(error.localizedDescription)"
-                ))
+                let message = "Microphone forwarding is unavailable for this stream: \(error.localizedDescription)"
+                handleMicrophoneWarning(message)
             }
             return
         }
@@ -383,6 +390,20 @@ private final class StreamEventRelay: @unchecked Sendable {
         default:
             break
         }
+    }
+
+    private func handleMicrophoneWarning(_ message: String) {
+        guard microphoneRequired else {
+            serviceEvents(.warning(message))
+            return
+        }
+        let handler = lock.withLock { () -> (@Sendable () -> Void)? in
+            if storedFailure == nil {
+                storedFailure = .clientMicrophoneRequiredUnavailable(message)
+            }
+            return requiredMicrophoneFailureHandler
+        }
+        handler?()
     }
 
     static func stage(_ rawValue: Int) -> SessionStage? {
@@ -536,6 +557,7 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
             output: output,
             diagnosticHandler: diagnosticHandler,
             microphone: microphone,
+            microphoneRequired: effectiveBootstrap.preferences.clientMicrophoneRequired,
             microphoneRIKey: configuration.remoteInputAESKey
         )
         let session: any StreamingSessionControlling
@@ -569,6 +591,9 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
             if teardownInProgress { completeTeardown() }
             throw error
         }
+        relay.installRequiredMicrophoneFailureHandler {
+            Task { await session.close() }
+        }
         let sink = PlatformStreamingInputSink(
             sender: session,
             motionPolicy: motionPolicy,
@@ -582,6 +607,9 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
         activeMicrophone = microphone
         phase = .running(preparedSession.generation)
 
+        if let warning = preparedSession.microphoneWarning {
+            events(.warning(warning))
+        }
         await output.beginSession()
         try ensureCurrent(
             generation: preparedSession.generation,
@@ -593,9 +621,6 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
             defer {
                 keyFrameRecoveryTask?.cancel()
                 statisticsTask?.cancel()
-            }
-            if let warning = preparedSession.microphoneWarning {
-                events(.warning(warning))
             }
             // Install the sender before native startup can synchronously deliver and commit
             // its first frame. The stream window stays hidden until that commit, so users
@@ -737,7 +762,7 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
                 preparedSession.result = prepared.result
                 preparedSession.effectivePolicy = bootstrap.effectivePolicy
                 self.preparedSession = preparedSession
-                let microphonePreparation = await prepareClientMicrophone(
+                let microphonePreparation = try await prepareClientMicrophone(
                     for: bootstrap,
                     existing: preparedSession.microphone
                 )
@@ -831,7 +856,7 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
                 lifecycleIdentity: lifecycleIdentity,
                 lifecyclePreparationTask: lifecyclePreparationTask
             )
-            let microphonePreparation = await prepareClientMicrophone(for: bootstrap)
+            let microphonePreparation = try await prepareClientMicrophone(for: bootstrap)
             do {
                 try ensureCurrent(
                     generation: reservedGeneration,
@@ -1011,22 +1036,35 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
     private func prepareClientMicrophone(
         for bootstrap: StreamBootstrap,
         existing: (any ClientMicrophoneForwarding)? = nil
-    ) async -> (forwarder: (any ClientMicrophoneForwarding)?, warning: String?) {
+    ) async throws -> (forwarder: (any ClientMicrophoneForwarding)?, warning: String?) {
         guard bootstrap.preferences.clientMicrophoneEnabled else {
             existing?.invalidate()
             return (nil, nil)
         }
         guard let microphonePreparer else {
             existing?.invalidate()
-            return (nil, "Microphone forwarding is unavailable in this build.")
+            let reason = "Microphone forwarding is unavailable in this build."
+            if bootstrap.preferences.clientMicrophoneRequired {
+                throw UmbraIntegrationError.clientMicrophoneRequiredUnavailable(reason)
+            }
+            return (nil, reason)
         }
         if let existing { return (existing, nil) }
         guard let endpoint = bootstrap.host.activeAddress ?? bootstrap.host.uniqueAddresses.first else {
-            return (nil, "Microphone forwarding could not resolve the streaming host.")
+            let reason = "Microphone forwarding could not resolve the streaming host."
+            if bootstrap.preferences.clientMicrophoneRequired {
+                throw UmbraIntegrationError.clientMicrophoneRequiredUnavailable(reason)
+            }
+            return (nil, reason)
         }
         do {
             return (try await microphonePreparer.prepare(host: endpoint.hostname), nil)
         } catch {
+            if bootstrap.preferences.clientMicrophoneRequired {
+                throw UmbraIntegrationError.clientMicrophoneRequiredUnavailable(
+                    error.localizedDescription
+                )
+            }
             return (
                 nil,
                 "Microphone forwarding is unavailable for this stream: \(error.localizedDescription)"

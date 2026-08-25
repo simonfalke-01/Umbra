@@ -1103,6 +1103,41 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertLessThanOrEqual(nominalPacketBytes + 48, 1_108)
     }
 
+    func testOptionalMicrophoneMayDegradeToNullButRequiredMicrophoneFailsClosed() throws {
+        var preferences = StreamingPreferences.default
+        preferences.clientMicrophoneEnabled = true
+        let optional = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 11,
+            resume: false,
+            preferences: preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        var selection = successfulStartResponse(optional)
+        selection[13] = .null
+        XCTAssertNoThrow(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: selection,
+            offered: optional
+        ))
+
+        preferences.clientMicrophoneRequired = true
+        let required = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 11,
+            resume: false,
+            preferences: preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        selection = successfulStartResponse(required)
+        selection[13] = .null
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: selection,
+            offered: required
+        ))
+    }
+
     private func successfulStartResponse(
         _ offer: ProtocolV3StartOffer
     ) -> [UInt64: ProtocolV3CBORValue] {

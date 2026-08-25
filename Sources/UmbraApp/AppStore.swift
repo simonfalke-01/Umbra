@@ -24,6 +24,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var securePairingError: String?
     @Published private(set) var pendingSecureInvitation = ""
     @Published private(set) var applicationCatalogWarning: String?
+    @Published private(set) var sessionDegradation: String?
     @Published private(set) var operation: OperationPresentation?
 
     let preferences: PreferencesStore
@@ -441,6 +442,7 @@ final class AppStore: ObservableObject {
         activationInFlight = activation
         hasObservedSessionLifecycleEvent = false
         hasReachedStreamingState = false
+        sessionDegradation = nil
         preserveApplicationBrowserContext(for: hostID)
         activeTask = Task { [weak self] in
             guard let self else { return }
@@ -1040,11 +1042,14 @@ final class AppStore: ObservableObject {
             applicationCatalogWarning = message
         case .sessionPreparing:
             hasObservedSessionLifecycleEvent = true
-            updateConnectionOperation(message: "Preparing the stream...", progress: 0.05)
+            updateConnectionOperation(
+                message: sessionDegradation ?? "Preparing the stream...",
+                progress: 0.05
+            )
         case let .sessionConnecting(stage):
             hasObservedSessionLifecycleEvent = true
             updateConnectionOperation(
-                message: Self.connectionMessage(for: stage),
+                message: sessionDegradation ?? Self.connectionMessage(for: stage),
                 progress: Self.connectionProgress(for: stage)
             )
         case .sessionStreaming:
@@ -1056,6 +1061,7 @@ final class AppStore: ObservableObject {
             let wasStreaming = hasReachedStreamingState
             hasObservedSessionLifecycleEvent = false
             hasReachedStreamingState = false
+            sessionDegradation = nil
             let recovery = Self.canReconnect(after: sessionFailure, wasStreaming: wasStreaming)
                 ? streamingBrowserContext.flatMap { context in
                 context.selectedApplicationID.map {
@@ -1082,6 +1088,7 @@ final class AppStore: ObservableObject {
         case .sessionEnded:
             hasObservedSessionLifecycleEvent = false
             hasReachedStreamingState = false
+            sessionDegradation = nil
             activationInFlight = nil
             activeTask?.cancel()
             activeTask = nil
@@ -1099,6 +1106,17 @@ final class AppStore: ObservableObject {
                 )
             } else if preferences.settings.connectionWarnings, failure == nil {
                 failure = PresentedFailure(title: "Streaming Warning", message: message)
+            }
+        case let .sessionDegraded(message):
+            sessionDegradation = message
+            if operation?.kind == .connecting {
+                operation = OperationPresentation(
+                    kind: .connecting,
+                    title: operation?.title ?? "Connecting",
+                    message: message,
+                    progress: operation?.progress,
+                    isCancellable: true
+                )
             }
         case .configurationWarnings:
             break

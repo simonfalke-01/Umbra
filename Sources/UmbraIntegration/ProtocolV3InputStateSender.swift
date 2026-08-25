@@ -39,6 +39,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     private struct ControllerState {
         var type: UInt8 = 5
         var flags: UInt16 = 0
+        var advertisedFlags: UInt16 = 0
         var buttons: UInt64 = 0
         var leftTrigger: UInt16 = 0
         var rightTrigger: UInt16 = 0
@@ -253,7 +254,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
                 let normalizedButtons = supportedButtons & 0x003F_FFFF
                 if let existing = controllers[number] {
                     guard existing.type == normalizedType,
-                          existing.flags == normalizedCapabilities,
+                          existing.advertisedFlags == normalizedCapabilities,
                           existing.supportedButtons == normalizedButtons else {
                         throw ProtocolV3InputError.invalidCommand
                     }
@@ -264,6 +265,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
                 var controller = ControllerState()
                 controller.type = normalizedType
                 controller.flags = normalizedCapabilities
+                controller.advertisedFlags = normalizedCapabilities
                 controller.supportedButtons = normalizedButtons
                 controllers[number] = controller
                 try appendEdge(

@@ -10,6 +10,7 @@ public enum UmbraIntegrationError: Error, Equatable, Sendable {
     case videoRendererUnavailable
     case audioDecoderUnavailable
     case audioOutputUnavailable
+    case clientMicrophoneRequiredUnavailable(String)
     case mediaConfigurationFailed(String)
     case sessionNotPrepared(UUID)
     case preparedSessionMismatch(expected: UUID, actual: UUID)
@@ -37,6 +38,8 @@ extension UmbraIntegrationError: LocalizedError {
             "A native Opus decoder is not available in this build."
         case .audioOutputUnavailable:
             "No compatible Core Audio output is available."
+        case let .clientMicrophoneRequiredUnavailable(reason):
+            "Microphone forwarding is required but unavailable: \(reason)"
         case let .mediaConfigurationFailed(message):
             "The native media pipeline could not be configured: \(message)"
         case let .sessionNotPrepared(sessionID):
@@ -78,6 +81,10 @@ extension UmbraIntegrationError: SessionFailureProviding {
         case .audioDecoderUnavailable, .audioOutputUnavailable, .mediaConfigurationFailed:
             kind = .audioUnavailable
             stage = .audioStreamInitialization
+            errorCode = nil
+        case .clientMicrophoneRequiredUnavailable:
+            kind = .invalidConfiguration
+            stage = .platformInitialization
             errorCode = nil
         case .sessionNotPrepared, .preparedSessionMismatch:
             kind = .invalidConfiguration

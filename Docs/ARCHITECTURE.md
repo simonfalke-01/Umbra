@@ -73,6 +73,12 @@ The modern QUIC design uses one authenticated connection for Umbra-specific
 control and media. Vanilla Moonlight clients cannot use that transport and
 still require the legacy GameStream listeners on Lumen.
 
+Client microphone forwarding is optional by default. Umbra resolves paired-host
+permission, current macOS authorization, and the host's selected endpoint before
+advertising an active microphone path; unavailable optional capture is reported
+while connecting and the stream continues without it. Users can instead require
+the microphone, which makes the same preflight fail closed before streaming.
+
 ## Concurrency and ownership
 
 - UI state and presentation are `@MainActor` isolated.
@@ -83,6 +89,9 @@ still require the legacy GameStream listeners on Lumen.
 - Decode, render, audio, microphone, and input queues are bounded.
 - Session-generation checks prevent callbacks from an old stream entering a
   replacement stream.
+- Merged player-one metadata stays stable while the virtual controller is active,
+  avoiding heterogeneous hot-plug rebind races. A full disconnect/rearrival
+  advances the generation, and stale feedback is rejected.
 
 ## Trust and identity
 

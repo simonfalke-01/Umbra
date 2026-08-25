@@ -396,13 +396,32 @@ final class KeyboardAndPointerTests: XCTestCase {
     }
 
     func testScrollClampsMacAccelerationAndReverses() {
-        let mapper = MouseInputMapper(preferences: .init(
+        var mapper = MouseInputMapper(preferences: .init(
             reverseScrollDirection: true,
             clampAcceleratedScroll: true
         ))
         XCTAssertEqual(mapper.mapScroll(deltaX: -0.5, deltaY: 10), [
             .init(axis: .vertical, delta: -120),
             .init(axis: .horizontal, delta: 60),
+        ])
+    }
+
+    func testScrollAccumulatesFractionalWheelUnitsPerAxisAndResetsExplicitly() {
+        var mapper = MouseInputMapper(preferences: .init(clampAcceleratedScroll: false))
+
+        XCTAssertEqual(mapper.mapScroll(deltaX: 0.002, deltaY: 0.002), [])
+        XCTAssertEqual(mapper.mapScroll(deltaX: 0.002, deltaY: 0.002), [])
+        XCTAssertEqual(mapper.mapScroll(deltaX: 0.002, deltaY: 0.002), [])
+        XCTAssertEqual(mapper.mapScroll(deltaX: 0.002, deltaY: 0.002), [])
+        XCTAssertEqual(mapper.mapScroll(deltaX: 0.002, deltaY: 0.002), [
+            .init(axis: .vertical, delta: 1),
+            .init(axis: .horizontal, delta: 1),
+        ])
+
+        mapper.resetScrollRemainders()
+        XCTAssertEqual(mapper.mapScroll(deltaX: -0.004, deltaY: 0), [])
+        XCTAssertEqual(mapper.mapScroll(deltaX: -0.005, deltaY: 0), [
+            .init(axis: .horizontal, delta: -1),
         ])
     }
 

@@ -71,6 +71,13 @@ func protocolV3ControllerInputUsesFormatTwoAndPreservesAdvancedState() throws {
     try sender.send(.controllerMotion(number: 0, type: 2, x: 1.5, y: -0.5, z: 0.25))
     try sender.send(.controllerMotion(number: 0, type: 1, x: 1, y: 2, z: -1))
     try sender.send(.controllerBattery(number: 0, state: 3, percentage: 75))
+    try sender.send(.controllerArrival(
+        number: 0,
+        activeMask: 1,
+        type: 2,
+        supportedButtons: 0x104000,
+        capabilities: 0x0179
+    ))
     try sender.send(.controllerTouch(
         number: 0,
         eventType: 1,
@@ -196,6 +203,56 @@ func protocolV3ControllerFeedbackRequiresExactInputAndControllerGenerations() th
         inputGeneration: 8,
         controller: 1,
         controllerGeneration: 2
+    ))
+}
+
+@Test
+func protocolV3ControllerMetadataRebindIncrementsGenerationAndRejectsStaleFeedback() throws {
+    let sender = ProtocolV3InputStateSender(
+        session: RecordingProtocolV3InputSession(),
+        sessionID: Data(repeating: 0xA5, count: 16),
+        mode: .latency,
+        usesAbsolutePointer: false,
+        inputGeneration: 9,
+        failureHandler: { _ in }
+    )
+
+    try sender.send(.controllerArrival(
+        number: 0, activeMask: 1, type: 1,
+        supportedButtons: 0x0003, capabilities: 0x0001
+    ))
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 9, controller: 0, controllerGeneration: 1
+    ))
+
+    #expect(throws: ProtocolV3InputError.invalidCommand) {
+        try sender.send(.controllerArrival(
+            number: 0, activeMask: 1, type: 5,
+            supportedButtons: 0x0013, capabilities: 0x0003
+        ))
+    }
+    try sender.send(.controller(
+        number: 0, activeMask: 0, buttons: 0,
+        leftTrigger: 0, rightTrigger: 0,
+        leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0
+    ))
+    try sender.send(.controllerArrival(
+        number: 0, activeMask: 1, type: 5,
+        supportedButtons: 0x0013, capabilities: 0x0003
+    ))
+    #expect(!sender.acceptsControllerFeedback(
+        inputGeneration: 9, controller: 0, controllerGeneration: 1
+    ))
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 9, controller: 0, controllerGeneration: 2
+    ))
+
+    try sender.send(.controllerArrival(
+        number: 0, activeMask: 1, type: 5,
+        supportedButtons: 0x0013, capabilities: 0x0003
+    ))
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 9, controller: 0, controllerGeneration: 2
     ))
 }
 

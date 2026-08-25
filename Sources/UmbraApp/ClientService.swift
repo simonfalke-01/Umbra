@@ -22,6 +22,7 @@ enum UmbraClientEvent: Sendable {
     case sessionFailed(SessionFailure)
     case sessionEnded
     case sessionWarning(String)
+    case sessionDegraded(String)
     case configurationWarnings([String])
 }
 

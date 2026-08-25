@@ -355,6 +355,67 @@ public enum ControllerStateMerger {
     }
 }
 
+public struct ControllerMetadata: Equatable, Sendable {
+    public var family: ControllerFamily
+    public var supportedButtons: ControllerButtonMask
+    public var capabilities: ControllerCapabilities
+
+    public init(
+        family: ControllerFamily,
+        supportedButtons: ControllerButtonMask,
+        capabilities: ControllerCapabilities
+    ) {
+        self.family = family
+        self.supportedButtons = supportedButtons
+        self.capabilities = capabilities
+    }
+}
+
+/// Produces one stable virtual-controller description for merged player one.
+/// Conflicting physical families become unknown and supported input buttons are
+/// combined. Output capabilities stay bound to the lowest-slot controller,
+/// which is also the deterministic merged feedback owner. Once announced, the
+/// virtual metadata stays stable until every merged controller disconnects so
+/// heterogeneous hot-plug cannot create an unorderable metadata rebind.
+public enum ControllerMetadataMerger {
+    public static func merge<S: Sequence>(_ values: S) -> ControllerMetadata?
+    where S.Element == ControllerMetadata {
+        var iterator = values.makeIterator()
+        guard let first = iterator.next() else { return nil }
+        var merged = first
+        while let value = iterator.next() {
+            if value.family != merged.family { merged.family = .unknown }
+            merged.supportedButtons.formUnion(value.supportedButtons)
+        }
+        return merged
+    }
+}
+
+public enum ControllerMetadataRebindAction: Equatable, Sendable {
+    case stateOnly
+    case arrival(ControllerMetadata)
+    case departure
+}
+
+public enum ControllerMetadataRebindPlanner {
+    public static func action(
+        from previous: ControllerMetadata?,
+        to next: ControllerMetadata?
+    ) -> ControllerMetadataRebindAction {
+        if previous != nil, next != nil { return .stateOnly }
+        return switch (previous, next) {
+        case (nil, .some(let next)):
+            .arrival(next)
+        case (.some, nil):
+            .departure
+        case (.some, .some):
+            .stateOnly
+        case (nil, nil):
+            .stateOnly
+        }
+    }
+}
+
 public enum ControllerPlayerAssignment {
     public static func playerIndex(slotIndex: UInt8, multiControllerEnabled: Bool) -> UInt8 {
         multiControllerEnabled ? slotIndex : 0

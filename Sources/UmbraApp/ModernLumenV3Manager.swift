@@ -274,6 +274,7 @@ final class ModernLumenV3Manager {
         var bootstrap: StreamBootstrap
         let offer: ProtocolV3StartOffer
         let pipeline: StreamingMediaPipeline
+        let microphoneCapture: (any ClientMicrophoneCapturing)?
     }
 
     private struct AttachState {
@@ -858,14 +859,60 @@ final class ModernLumenV3Manager {
         try requirePermission(hostID: protocolHostID, permission: Permission.start, feature: "stream START")
         try requirePermission(hostID: protocolHostID, permission: Permission.input, feature: "remote input")
         try requirePermission(hostID: protocolHostID, permission: Permission.stopOwnStream, feature: "stream STOP")
-        if preferences.clientMicrophoneEnabled {
-            try requirePermission(
+        var streamPreferences = preferences
+        if streamPreferences.clientMicrophoneEnabled {
+            let hostAllowsMicrophone = try hasPermission(
                 hostID: protocolHostID,
-                permission: Permission.microphone,
-                feature: "microphone forwarding"
+                permission: Permission.microphone
             )
+            let authorization = hostAllowsMicrophone
+                ? await microphoneAuthorization.requestAuthorization()
+                : nil
+            let unavailableReason: String?
+            if !hostAllowsMicrophone {
+                unavailableReason = "the paired host did not grant microphone forwarding"
+            } else if authorization?.permitsCapture != true {
+                unavailableReason = "macOS microphone access is not authorized"
+            } else {
+                unavailableReason = nil
+            }
+            if let unavailableReason {
+                if streamPreferences.clientMicrophoneRequired {
+                    throw UmbraClientServiceError.unavailable(
+                        "Microphone forwarding is required, but \(unavailableReason)."
+                    )
+                }
+                streamPreferences.clientMicrophoneEnabled = false
+                sessionEventHandler?(.sessionDegraded(
+                    "Microphone forwarding is unavailable because \(unavailableReason). Umbra will stream without the microphone."
+                ))
+            }
         }
-        if preferences.quitAppAfter {
+        var preparedMicrophoneCapture: (any ClientMicrophoneCapturing)?
+        if streamPreferences.clientMicrophoneEnabled {
+            let capture = microphoneCaptureFactory.makeCapture()
+            do {
+                try capture.start(
+                    frameHandler: { _ in },
+                    discontinuityHandler: {},
+                    failureHandler: { _ in }
+                )
+                capture.stop()
+                preparedMicrophoneCapture = capture
+            } catch {
+                capture.stop()
+                if streamPreferences.clientMicrophoneRequired {
+                    throw UmbraClientServiceError.unavailable(
+                        "Microphone forwarding is required, but capture could not start: \(error.localizedDescription)"
+                    )
+                }
+                streamPreferences.clientMicrophoneEnabled = false
+                sessionEventHandler?(.sessionDegraded(
+                    "Microphone capture is unavailable: \(error.localizedDescription). Umbra will stream without the microphone."
+                ))
+            }
+        }
+        if streamPreferences.quitAppAfter {
             try requirePermission(
                 hostID: protocolHostID,
                 permission: Permission.quitApplication,
@@ -876,26 +923,18 @@ final class ModernLumenV3Manager {
         guard let applicationRecord = record.applications.first(where: { $0.id == id.rawValue }) else {
             throw UmbraClientServiceError.invalidInput("The selected application is unavailable.")
         }
-        let mode: QUICOptimizationMode = preferences.optimizationMode == .latency ? .latency : .quality
+        let mode: QUICOptimizationMode = streamPreferences.optimizationMode == .latency ? .latency : .quality
         let session = try await reconnect(hostID: hostID, mode: mode)
         guard let entry = sessions[protocolHostID], entry.session === session,
               entry.preparedStream == nil, entry.activeSessionID == nil else {
             throw ProtocolV3ClientError.invalidState
-        }
-        if preferences.clientMicrophoneEnabled {
-            let authorization = await microphoneAuthorization.requestAuthorization()
-            guard authorization.permitsCapture else {
-                throw UmbraClientServiceError.unavailable(
-                    "Microphone forwarding was requested, but macOS microphone access is not authorized."
-                )
-            }
         }
         let startIntentID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
         let traceID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
         let offer = try ProtocolV3StartRequestMapper.makeOffer(
             applicationID: id.rawValue,
             resume: resume,
-            preferences: preferences,
+            preferences: streamPreferences,
             capabilities: mediaCapabilities,
             startIntentID: startIntentID,
             traceID: traceID
@@ -903,7 +942,7 @@ final class ModernLumenV3Manager {
         let application = StreamApplication(
             id: applicationRecord.id,
             name: applicationRecord.name,
-            hdrSupported: preferences.enableHDR,
+            hdrSupported: streamPreferences.enableHDR,
             isHidden: applicationRecord.isHidden,
             supportsDirectLaunch: applicationRecord.isDirectLaunch
         )
@@ -915,7 +954,7 @@ final class ModernLumenV3Manager {
                 StreamApplication(
                     id: $0.id,
                     name: $0.name,
-                    hdrSupported: preferences.enableHDR,
+                    hdrSupported: streamPreferences.enableHDR,
                     isHidden: $0.isHidden,
                     supportsDirectLaunch: $0.isDirectLaunch
                 )
@@ -925,7 +964,7 @@ final class ModernLumenV3Manager {
             activeAddress: endpoint,
             currentGameID: resume ? id.rawValue : nil,
             appVersion: "protocol-v3",
-            maxLumaPixelsHEVC: preferences.width * preferences.height,
+            maxLumaPixelsHEVC: streamPreferences.width * streamPreferences.height,
             codecSupport: [
                 .h264, .hevc, .hevcMain10, .av1Main8, .av1Main10,
                 .h264High8YUV444, .hevcRext8YUV444, .hevcRext10YUV444,
@@ -937,8 +976,8 @@ final class ModernLumenV3Manager {
             sessionID: Self.uuid(from: startIntentID),
             host: host,
             application: application,
-            preferences: preferences,
-            effectivePolicy: .resolve(for: preferences),
+            preferences: streamPreferences,
+            effectivePolicy: .resolve(for: streamPreferences),
             rtspSessionURL: nil,
             remoteInputCredentials: RemoteInputCredentials(
                 key: Data(repeating: 0, count: 16),
@@ -961,7 +1000,12 @@ final class ModernLumenV3Manager {
                 for: bootstrap,
                 telemetryClient: .umbraV3
             )
-            entry.preparedStream = PreparedStream(bootstrap: bootstrap, offer: offer, pipeline: pipeline)
+            entry.preparedStream = PreparedStream(
+                bootstrap: bootstrap,
+                offer: offer,
+                pipeline: pipeline,
+                microphoneCapture: preparedMicrophoneCapture
+            )
             sessionEventHandler?(.sessionConnecting(.serverHandshake))
             startupTelemetry.record(sessionID: bootstrap.sessionID, stage: .sessionStart)
             let requestID = try session.beginStart(fields: offer.fields)
@@ -1734,6 +1778,14 @@ final class ModernLumenV3Manager {
                 responseFields: fields,
                 offered: prepared.offer
             )
+            if prepared.bootstrap.preferences.clientMicrophoneEnabled,
+               fields[13] == .null {
+                prepared.bootstrap.preferences.clientMicrophoneEnabled = false
+                prepared.bootstrap.preferences.clientMicrophoneRequired = false
+                sessionEventHandler?(.sessionDegraded(
+                    "The host microphone endpoint is unavailable. Umbra will stream without the microphone."
+                ))
+            }
             let selectedFormat = try ProtocolV3StartRequestMapper.selectedVideoFormat(
                 responseFields: fields,
                 offered: prepared.offer
@@ -1793,7 +1845,7 @@ final class ModernLumenV3Manager {
                 control: entry.session,
                 media: media,
                 microphoneCapture: prepared.bootstrap.preferences.clientMicrophoneEnabled
-                    ? microphoneCaptureFactory.makeCapture()
+                    ? prepared.microphoneCapture
                     : nil,
                 inputACKHandler: { [inputSenderRelay = entry.inputSenderRelay] acknowledgement in
                     inputSenderRelay.acknowledge(acknowledgement.appliedEdgeID)
@@ -2469,12 +2521,16 @@ final class ModernLumenV3Manager {
         permission: UInt64,
         feature: String
     ) throws {
-        guard let trust = try trustStore.trust(hostID: hostID),
-              trust.grantedPermissions & permission == permission else {
+        guard try hasPermission(hostID: hostID, permission: permission) else {
             throw UmbraClientServiceError.unavailable(
                 "The paired host did not grant \(feature). Pair again with that feature enabled; legacy fallback was not attempted."
             )
         }
+    }
+
+    private func hasPermission(hostID: Data, permission: UInt64) throws -> Bool {
+        guard let trust = try trustStore.trust(hostID: hostID) else { return false }
+        return trust.grantedPermissions & permission == permission
     }
 
     private func requireProtocolHostID(_ hostID: HostID) throws -> Data {

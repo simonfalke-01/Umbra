@@ -357,6 +357,35 @@ final class AppStoreApplicationTests: XCTestCase {
         XCTAssertNil(store.failure)
     }
 
+    func testSessionDegradationPersistsAcrossConnectionStagesUntilSessionEnds() async {
+        let host = makeHost(id: "host")
+        let application = makeApplication(id: 1, hostID: host.id, name: "Desktop")
+        let service = AppStoreClientServiceSpy(
+            hosts: [host],
+            applications: [host.id: [application]],
+            suspendsApplicationLaunch: true
+        )
+        let store = AppStore(service: service)
+        store.openApplications(for: host)
+        await waitUntil { store.applications == [application] }
+        store.launch(application)
+        await waitUntil { service.pendingApplicationLaunchCount == 1 }
+
+        let message = "Microphone forwarding is unavailable. Umbra will stream without it."
+        service.send(.sessionDegraded(message))
+        XCTAssertEqual(store.sessionDegradation, message)
+        XCTAssertEqual(store.operation?.message, message)
+
+        service.send(.sessionPreparing)
+        service.send(.sessionConnecting(.videoStreamInitialization))
+        XCTAssertEqual(store.operation?.message, message)
+
+        service.send(.sessionStreaming)
+        XCTAssertEqual(store.sessionDegradation, message)
+        service.send(.sessionEnded)
+        XCTAssertNil(store.sessionDegradation)
+    }
+
     func testConfigurationWarningWithoutActiveOperationHasNoPresentation() {
         let service = AppStoreClientServiceSpy(hosts: [], applications: [:])
         let store = AppStore(service: service)

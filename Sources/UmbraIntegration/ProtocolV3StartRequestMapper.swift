@@ -8,6 +8,19 @@ public struct ProtocolV3StartOffer: Sendable, Equatable {
     public let fields: [UInt64: ProtocolV3CBORValue]
     public let offeredVideoFormats: [MoonlightVideoFormat]
     public let mode: QUICOptimizationMode
+    public let microphoneRequired: Bool
+
+    init(
+        fields: [UInt64: ProtocolV3CBORValue],
+        offeredVideoFormats: [MoonlightVideoFormat],
+        mode: QUICOptimizationMode,
+        microphoneRequired: Bool = false
+    ) {
+        self.fields = fields
+        self.offeredVideoFormats = offeredVideoFormats
+        self.mode = mode
+        self.microphoneRequired = microphoneRequired
+    }
 }
 
 public enum ProtocolV3StartRequestMapperError: Error, Equatable, Sendable {
@@ -106,7 +119,12 @@ public enum ProtocolV3StartRequestMapper {
             ]),
             18: .boolean(preferences.playAudioOnHost),
         ]
-        return ProtocolV3StartOffer(fields: fields, offeredVideoFormats: formats, mode: mode)
+        return ProtocolV3StartOffer(
+            fields: fields,
+            offeredVideoFormats: formats,
+            mode: mode,
+            microphoneRequired: preferences.clientMicrophoneRequired
+        )
     }
 
     private static func hdrTransferOffers(
@@ -154,7 +172,7 @@ public enum ProtocolV3StartRequestMapper {
               offered.fields[9]?.arrayValue?.contains(selectedCodec) == true,
               let selectedAudio = responseFields[12],
               offered.fields[10]?.arrayValue?.contains(selectedAudio) == true,
-              responseFields[13] == offered.fields[11],
+              isValidMicrophoneSelection(responseFields[13], offered: offered),
               let selectedPresentation = responseFields[18],
               offered.fields[15]?.arrayValue?.contains(selectedPresentation) == true else {
             throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
@@ -190,6 +208,17 @@ public enum ProtocolV3StartRequestMapper {
             }
         }
         try validateAdjustments(responseFields: responseFields, offered: offered)
+    }
+
+    private static func isValidMicrophoneSelection(
+        _ selected: ProtocolV3CBORValue?,
+        offered: ProtocolV3StartOffer
+    ) -> Bool {
+        guard let selected else { return false }
+        if selected == offered.fields[11] { return true }
+        return !offered.microphoneRequired
+            && offered.fields[11]?.mapValue != nil
+            && selected == .null
     }
 
     private static func validateHDRSelection(

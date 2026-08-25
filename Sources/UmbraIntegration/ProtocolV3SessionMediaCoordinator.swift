@@ -593,6 +593,10 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         } catch {
             capture.stop()
             encoder.close()
+            lock.withLock {
+                microphoneEncoder = nil
+                microphoneConfiguration = nil
+            }
             throw error
         }
     }

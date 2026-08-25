@@ -414,6 +414,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var gameOptimizations: Bool
     public var playAudioOnHost: Bool
     public var clientMicrophoneEnabled: Bool
+    public var clientMicrophoneRequired: Bool
     public var multiController: Bool
     public var enableMDNS: Bool
     public var quitAppAfter: Bool
@@ -463,6 +464,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         gameOptimizations: Bool = true,
         playAudioOnHost: Bool = false,
         clientMicrophoneEnabled: Bool = false,
+        clientMicrophoneRequired: Bool = false,
         multiController: Bool = true,
         enableMDNS: Bool = true,
         quitAppAfter: Bool = false,
@@ -523,6 +525,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.gameOptimizations = gameOptimizations
         self.playAudioOnHost = playAudioOnHost
         self.clientMicrophoneEnabled = clientMicrophoneEnabled
+        self.clientMicrophoneRequired = clientMicrophoneRequired
         self.multiController = multiController
         self.enableMDNS = enableMDNS
         self.quitAppAfter = quitAppAfter
@@ -572,6 +575,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case gameOptimizations
         case playAudioOnHost
         case clientMicrophoneEnabled
+        case clientMicrophoneRequired
         case multiController
         case enableMDNS
         case quitAppAfter
@@ -663,6 +667,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             gameOptimizations: try container.decodeIfPresent(Bool.self, forKey: .gameOptimizations) ?? defaults.gameOptimizations,
             playAudioOnHost: try container.decodeIfPresent(Bool.self, forKey: .playAudioOnHost) ?? defaults.playAudioOnHost,
             clientMicrophoneEnabled: try container.decodeIfPresent(Bool.self, forKey: .clientMicrophoneEnabled) ?? defaults.clientMicrophoneEnabled,
+            clientMicrophoneRequired: try container.decodeIfPresent(Bool.self, forKey: .clientMicrophoneRequired) ?? defaults.clientMicrophoneRequired,
             multiController: try container.decodeIfPresent(Bool.self, forKey: .multiController) ?? defaults.multiController,
             enableMDNS: try container.decodeIfPresent(Bool.self, forKey: .enableMDNS) ?? defaults.enableMDNS,
             quitAppAfter: try container.decodeIfPresent(Bool.self, forKey: .quitAppAfter) ?? defaults.quitAppAfter,
@@ -825,6 +830,12 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
+        guard !clientMicrophoneRequired || clientMicrophoneEnabled else {
+            throw ModelValidationError(
+                field: "preferences.clientMicrophoneRequired",
+                reason: "requires client microphone forwarding to be enabled"
+            )
+        }
         guard (Self.minimumStreamWidth...Self.maximumStreamWidth).contains(width),
               width.isMultiple(of: 2) else {
             throw ModelValidationError(

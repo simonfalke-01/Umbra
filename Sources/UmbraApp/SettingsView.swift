@@ -935,12 +935,16 @@ struct AudioSettingsView: View {
         Binding(
             get: { preferences.settings.clientMicrophoneEnabled },
             set: { enabled in
+                if !enabled {
+                    preferences.update(\.clientMicrophoneRequired, to: false)
+                }
                 preferences.update(\.clientMicrophoneEnabled, to: enabled)
                 guard enabled else { return }
                 Task { @MainActor in
                     let status = await microphonePermission.requestAuthorization()
                     guard preferences.settings.clientMicrophoneEnabled else { return }
                     if !status.permitsCapture {
+                        preferences.update(\.clientMicrophoneRequired, to: false)
                         preferences.update(\.clientMicrophoneEnabled, to: false)
                     }
                 }
@@ -979,6 +983,14 @@ struct AudioSettingsView: View {
                     ),
                     binding: clientMicrophoneBinding
                 )
+                PreferenceToggle(
+                    UmbraLocalization.string("Require microphone for streaming"),
+                    message: UmbraLocalization.string(
+                        "Fails stream startup instead of continuing without microphone forwarding."
+                    ),
+                    binding: preferences.binding(for: \.clientMicrophoneRequired)
+                )
+                .disabled(!preferences.settings.clientMicrophoneEnabled)
                 microphoneAuthorizationState
             }
         }
@@ -987,10 +999,7 @@ struct AudioSettingsView: View {
                 for: NSApplication.didBecomeActiveNotification
             )
         ) { _ in
-            guard let status = microphonePermission.refreshAuthorization() else { return }
-            if !status.permitsCapture, preferences.settings.clientMicrophoneEnabled {
-                preferences.update(\.clientMicrophoneEnabled, to: false)
-            }
+            _ = microphonePermission.refreshAuthorization()
         }
     }
 

@@ -583,6 +583,16 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertEqual(authorizer.requestCount, 1)
         XCTAssertEqual(permissionModel.presentationState, .authorized)
 
+        let requiredSwitch = try XCTUnwrap(
+            descendants(of: hostingView, type: NSSwitch.self).first {
+                $0.accessibilityLabel() == "Require microphone for streaming"
+            }
+        )
+        XCTAssertTrue(requiredSwitch.isEnabled)
+        requiredSwitch.performClick(nil)
+        settle(hostingView)
+        XCTAssertTrue(preferences.settings.clientMicrophoneRequired)
+
         let authorizedSwitch = try XCTUnwrap(
             descendants(of: hostingView, type: NSSwitch.self).first {
                 $0.accessibilityLabel() == "Use Mac microphone on host"
@@ -591,6 +601,7 @@ final class SettingsInteractionTests: XCTestCase {
         authorizedSwitch.performClick(nil)
         settle(hostingView)
         XCTAssertFalse(preferences.settings.clientMicrophoneEnabled)
+        XCTAssertFalse(preferences.settings.clientMicrophoneRequired)
         XCTAssertEqual(authorizer.requestCount, 1)
 
         let disabledSwitch = try XCTUnwrap(
@@ -739,10 +750,12 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertEqual(permissionModel.presentationState, .authorized)
 
         preferences.update(\.clientMicrophoneEnabled, to: true)
+        preferences.update(\.clientMicrophoneRequired, to: true)
         authorizer.setStatus(.denied)
         notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
         settle(hostingView)
-        XCTAssertFalse(preferences.settings.clientMicrophoneEnabled)
+        XCTAssertTrue(preferences.settings.clientMicrophoneEnabled)
+        XCTAssertTrue(preferences.settings.clientMicrophoneRequired)
         XCTAssertEqual(permissionModel.presentationState, .denied)
     }
 

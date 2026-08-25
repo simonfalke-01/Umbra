@@ -594,15 +594,22 @@ public final class AppKitPointerInputAdapter {
             if oldValue !== sink {
                 releaseAllButtons(to: oldValue)
                 relativeMotion.reset()
+                mouseMapper.resetScrollRemainders()
             }
         }
     }
-    public var preferences: PointerPreferences
+    public var preferences: PointerPreferences {
+        didSet {
+            mouseMapper.preferences = preferences
+            mouseMapper.resetScrollRemainders()
+        }
+    }
     public var isCaptureActive = false {
         didSet {
             if oldValue, !isCaptureActive {
                 releaseAllButtons()
                 relativeMotion.reset()
+                mouseMapper.resetScrollRemainders()
             }
         }
     }
@@ -610,10 +617,12 @@ public final class AppKitPointerInputAdapter {
     public var onCaptureRequested: ((Bool) -> Void)?
     private var heldButtons: Set<MouseButton> = []
     private var relativeMotion = RelativeMouseDeltaAccumulator()
+    private var mouseMapper: MouseInputMapper
 
     public init(preferences: PointerPreferences = .init(), geometry: VideoGeometry) {
         self.preferences = preferences
         self.geometry = geometry
+        mouseMapper = MouseInputMapper(preferences: preferences)
     }
 
     /// Returns true when the event was consumed. A left-button release inside the
@@ -631,7 +640,6 @@ public final class AppKitPointerInputAdapter {
             return false
         }
 
-        let mapper = MouseInputMapper(preferences: preferences)
         switch event.type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if preferences.mode == .relative {
@@ -654,7 +662,7 @@ public final class AppKitPointerInputAdapter {
 
         case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
             guard preferences.mode != .absolute || videoRect.contains(point) || Self.isMouseUp(event.type),
-                  let button = mapper.mapButton(number: Self.physicalButtonNumber(for: event))
+                  let button = mouseMapper.mapButton(number: Self.physicalButtonNumber(for: event))
             else { return false }
             let action: KeyAction = Self.isMouseUp(event.type) ? .up : .down
             if action == .down {
@@ -670,7 +678,7 @@ public final class AppKitPointerInputAdapter {
 
         case .scrollWheel:
             guard preferences.mode != .absolute || videoRect.contains(point) else { return false }
-            for packet in mapper.mapScroll(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY) {
+            for packet in mouseMapper.mapScroll(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY) {
                 sink?.platformInputDidProduce(.scroll(packet))
             }
             return true
