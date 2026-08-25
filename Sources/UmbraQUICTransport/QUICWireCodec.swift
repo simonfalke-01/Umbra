@@ -139,17 +139,54 @@ enum QUICWireCodec {
         switch (channel, kind) {
         case (1, 1):
             guard payload.count >= 32 else { throw WireError.malformed }
+            guard payload.count <= QUICTransportProfile.semanticDatagramByteCount - datagramHeaderByteCount else {
+                throw WireError.oversized
+            }
             let base = payload.startIndex
             let blockLength = Int(readUInt16(payload, base + 16))
             let edgeCount = Int(readUInt16(payload, base + 18))
+            let stateFormat = readUInt16(payload, base + 20)
+            guard blockLength >= 112, payload.count >= 32 + blockLength else {
+                throw WireError.malformed
+            }
+            let stateBase = base + 32
+            let controllerCount = Int(payload[stateBase + 84])
+            let touchCount = Int(payload[stateBase + 85])
+            let marker = payload[stateBase + 87]
+            let controllerByteCount: Int
+            switch stateFormat {
+            case 2 where marker == 0:
+                controllerByteCount = 64
+            case 3 where marker == 3:
+                controllerByteCount = 56
+            default:
+                throw WireError.malformed
+            }
             guard edgeCount <= 64,
-                  readUInt16(payload, base + 20) == 2,
                   readUInt16(payload, base + 22) == 2,
                   readUInt64(payload, base + 24) == 0,
+                  blockLength == 112 + controllerCount * controllerByteCount + touchCount * 32,
                   payload.count == 32 + blockLength + edgeCount * 32,
                   objectID != 0
             else {
                 throw WireError.malformed
+            }
+            if edgeCount > 0 {
+                let edgeBase = base + 32 + blockLength
+                let firstEdgeID = readUInt64(payload, edgeBase)
+                guard firstEdgeID != 0 else { throw WireError.malformed }
+                for index in 1..<edgeCount {
+                    let expected = firstEdgeID.addingReportingOverflow(UInt64(index))
+                    guard !expected.overflow,
+                          readUInt64(payload, edgeBase + index * 32) == expected.partialValue else {
+                        throw WireError.malformed
+                    }
+                }
+                let final = firstEdgeID.addingReportingOverflow(UInt64(edgeCount - 1))
+                guard !final.overflow,
+                      readUInt64(payload, base + 8) == final.partialValue else {
+                    throw WireError.malformed
+                }
             }
         case (2, 3):
             try validateVideoFeedback(payload, objectID: objectID)

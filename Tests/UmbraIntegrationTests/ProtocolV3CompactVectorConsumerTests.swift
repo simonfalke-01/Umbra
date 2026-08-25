@@ -42,11 +42,32 @@ final class ProtocolV3CompactVectorConsumerTests: XCTestCase {
         let compactTouch = try wirePayload(fixture.artifact("input_format3_touch_after_edge_ack_1072"))
         let legacy = try wirePayload(fixture.artifact("input_format2_15_controllers_1104"))
         let legacyCompatibility = try wirePayload(fixture.artifact("input_format2_compatibility"))
+        _ = try wirePayload(fixture.artifact("input_format3_rebind_generation2"))
         assertShape(compactOnly, byteCount: 1_040, format: 3, controllers: 16, edges: 0, touches: 0)
         assertShape(compactEdges, byteCount: 1_104, format: 3, controllers: 16, edges: 2, touches: 0)
         assertShape(compactTouch, byteCount: 1_072, format: 3, controllers: 16, edges: 0, touches: 1)
         assertShape(legacy, byteCount: 1_104, format: 2, controllers: 15, edges: 0, touches: 0)
         assertShape(legacyCompatibility, byteCount: 272, format: 2, controllers: 1, edges: 1, touches: 1)
+
+        var wrapperMismatch = compactOnly
+        wrapperMismatch.write(UInt16(2), at: 20)
+        XCTAssertThrowsError(try validateInputPayload(wrapperMismatch)) {
+            XCTAssertEqual($0 as? QUICWireCodec.WireError, .malformed)
+        }
+        var markerMismatch = compactOnly
+        markerMismatch[32 + 87] = 0
+        XCTAssertThrowsError(try validateInputPayload(markerMismatch)) {
+            XCTAssertEqual($0 as? QUICWireCodec.WireError, .malformed)
+        }
+        var noncontiguous = compactEdges
+        let noncontiguousStateLength = Int(noncontiguous.read(UInt16.self, at: 16))
+        noncontiguous.write(UInt64(4), at: 32 + noncontiguousStateLength + 32)
+        XCTAssertThrowsError(try validateInputPayload(noncontiguous)) {
+            XCTAssertEqual($0 as? QUICWireCodec.WireError, .malformed)
+        }
+        XCTAssertThrowsError(try validateInputPayload(Data(repeating: 0, count: 1_109))) {
+            XCTAssertEqual($0 as? QUICWireCodec.WireError, .oversized)
+        }
 
         let compactSession = VectorRecordingInputSession()
         let compactSender = ProtocolV3InputStateSender(
@@ -176,7 +197,23 @@ final class ProtocolV3CompactVectorConsumerTests: XCTestCase {
         XCTAssertEqual(wire.prefix(4), Data("ULM3".utf8))
         let payloadLength = Int(wire.read(UInt16.self, at: 10))
         XCTAssertEqual(wire.count, 44 + payloadLength)
-        return wire.subdata(in: 44..<wire.count)
+        let payload = wire.subdata(in: 44..<wire.count)
+        try QUICWireCodec.validateOutboundPayload(
+            channel: wire[5],
+            kind: wire[6],
+            objectID: wire.read(UInt64.self, at: 36),
+            payload: payload
+        )
+        return payload
+    }
+
+    private func validateInputPayload(_ payload: Data) throws {
+        try QUICWireCodec.validateOutboundPayload(
+            channel: 1,
+            kind: 1,
+            objectID: 1,
+            payload: payload
+        )
     }
 
     private func assertShape(
@@ -301,5 +338,10 @@ private extension Data {
 
     func read<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {
         self[offset..<(offset + MemoryLayout<T>.size)].reduce(T.zero) { ($0 << 8) | T($1) }
+    }
+
+    mutating func write<T: FixedWidthInteger>(_ value: T, at offset: Int) {
+        var value = value.bigEndian
+        Swift.withUnsafeBytes(of: &value) { replaceSubrange(offset..<(offset + $0.count), with: $0) }
     }
 }
