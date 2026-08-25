@@ -1245,6 +1245,296 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
     }
 }
 
+extension ProtocolV3MediaPipelineAdapterTests {
+    func testEveryCanonicalStartModeDecisionMatchesUmbraAdmission() throws {
+        let fixture = try loadFixture()
+
+        XCTAssertEqual(fixture.schema, "umbra-lumen-start-mode/1")
+        XCTAssertEqual(fixture.vectors.count, 27)
+        XCTAssertEqual(Set(fixture.vectors.map(\.id)).count, fixture.vectors.count)
+        assertContractMatchesUmbra(fixture.contract)
+
+        for vector in fixture.vectors {
+            XCTAssertEqual(
+                decision(for: vector, contract: fixture.contract),
+                vector.expected,
+                vector.id
+            )
+            if vector.expected == "none" {
+                let offer = try makeOffer(for: vector)
+                assertAcceptedOffer(offer, matches: vector)
+            } else {
+                XCTAssertFalse(
+                    canEmitExactRejectedRequest(vector),
+                    "Umbra emitted rejected canonical request \(vector.id)"
+                )
+            }
+        }
+    }
+
+    private func loadFixture() throws -> StartModeFixture {
+        guard let lumenSourceRoot = ProcessInfo.processInfo.environment["LUMEN_SOURCE_ROOT"] else {
+            throw XCTSkip("Set LUMEN_SOURCE_ROOT to run the cross-repository Gate 1 vector check.")
+        }
+        let url = URL(fileURLWithPath: lumenSourceRoot, isDirectory: true)
+            .appendingPathComponent("docs/protocols/vectors/start_mode_vectors.json")
+        return try JSONDecoder().decode(StartModeFixture.self, from: Data(contentsOf: url))
+    }
+
+    private func assertContractMatchesUmbra(_ contract: StartModeContract) {
+        XCTAssertEqual(contract.startKeys, Array(1...18).map(UInt64.init))
+        XCTAssertEqual(contract.hostAudioKey, 18)
+        XCTAssertEqual(contract.hostAudioType, "bool")
+        XCTAssertEqual(contract.minimumWidth, UInt64(StreamingPreferences.minimumStreamWidth))
+        XCTAssertEqual(contract.maximumWidth, UInt64(StreamingPreferences.maximumStreamWidth))
+        XCTAssertEqual(contract.minimumHeight, UInt64(StreamingPreferences.minimumStreamHeight))
+        XCTAssertEqual(contract.maximumHeight, UInt64(StreamingPreferences.maximumStreamHeight))
+        XCTAssertEqual(contract.minimumRefreshHz, UInt64(StreamingPreferences.minimumFrameRate))
+        XCTAssertEqual(contract.maximumRefreshHz, UInt64(StreamingPreferences.maximumFrameRate))
+        XCTAssertEqual(contract.maximumRationalComponent, UInt64(UInt32.max))
+        XCTAssertEqual(contract.h264MaximumDimension, 4_096)
+        XCTAssertEqual(contract.codec, ["h264": 1, "hevc": 2, "av1": 3])
+        XCTAssertEqual(contract.chroma, ["yuv420": 1, "yuv444": 2])
+        XCTAssertEqual(contract.dynamicRange, ["sdr": 1, "pq": 2, "hlg": 3])
+        XCTAssertEqual(
+            contract.fidelity,
+            ["lossy": 1, "visually_lossless": 2, "codec_lossless": 3]
+        )
+        XCTAssertEqual(contract.codecLosslessProofFlag, 2)
+    }
+
+    private func decision(for vector: StartModeVector, contract: StartModeContract) -> String {
+        guard (contract.minimumWidth...contract.maximumWidth).contains(vector.width),
+            (contract.minimumHeight...contract.maximumHeight).contains(vector.height),
+            vector.width.isMultiple(of: 2),
+            vector.height.isMultiple(of: 2)
+        else {
+            return "dimensions"
+        }
+        guard (1...contract.maximumRationalComponent).contains(vector.refreshNumerator),
+            (1...contract.maximumRationalComponent).contains(vector.refreshDenominator)
+        else {
+            return "refresh_component"
+        }
+        guard greatestCommonDivisor(vector.refreshNumerator, vector.refreshDenominator) == 1 else {
+            return "refresh_unreduced"
+        }
+        guard vector.refreshNumerator >= contract.minimumRefreshHz * vector.refreshDenominator,
+            vector.refreshNumerator <= contract.maximumRefreshHz * vector.refreshDenominator
+        else {
+            return "refresh_range"
+        }
+        guard (1_000...500_000).contains(vector.bitrateKbps) else {
+            return "bitrate"
+        }
+        guard contract.codec.values.contains(vector.codec) else {
+            return "codec"
+        }
+        let validColorMode =
+            contract.chroma.values.contains(vector.chroma)
+            && ((vector.dynamicRange == contract.dynamicRange["sdr"] && vector.bitDepth == 8)
+                || ([contract.dynamicRange["pq"], contract.dynamicRange["hlg"]]
+                    .compactMap { $0 }
+                    .contains(vector.dynamicRange) && vector.bitDepth == 10))
+        guard validColorMode else {
+            return "color_mode"
+        }
+        if vector.codec == contract.codec["h264"],
+            vector.width > contract.h264MaximumDimension
+                || vector.height > contract.h264MaximumDimension
+                || vector.dynamicRange != contract.dynamicRange["sdr"]
+                || vector.bitDepth != 8
+        {
+            return "h264_limit"
+        }
+        guard (1...3).contains(vector.fidelity),
+            vector.fidelity != contract.fidelity["codec_lossless"]
+                || (vector.chroma == contract.chroma["yuv444"]
+                    && vector.codecFlags & contract.codecLosslessProofFlag != 0)
+        else {
+            return "fidelity"
+        }
+        let compatiblePresentation =
+            (vector.profile == 1 && [1, 2].contains(vector.presentation.mode))
+            || (vector.profile == 2 && vector.presentation.mode == 3)
+        guard compatiblePresentation, (1...2).contains(vector.presentation.queueDepth) else {
+            return "presentation"
+        }
+        guard ["none", "mono"].contains(vector.microphone) else {
+            return "microphone"
+        }
+        guard vector.hostAudio != nil else {
+            return "host_audio"
+        }
+        return "none"
+    }
+
+    private func makeOffer(for vector: StartModeVector) throws -> ProtocolV3StartOffer {
+        guard let codecPreference = codecPreference(vector.codec),
+            let width = Int(exactly: vector.width),
+            let height = Int(exactly: vector.height),
+            let refreshNumerator = Int(exactly: vector.refreshNumerator),
+            let refreshDenominator = Int(exactly: vector.refreshDenominator),
+            let bitrateKbps = Int(exactly: vector.bitrateKbps)
+        else {
+            throw StartModeVectorError.unrepresentable
+        }
+
+        var preferences = StreamingPreferences.default
+        preferences.width = width
+        preferences.height = height
+        preferences.setFrameRate(numerator: refreshNumerator, denominator: refreshDenominator)
+        preferences.bitrateKbps = bitrateKbps
+        preferences.unlockBitrate = bitrateKbps > 150_000
+        preferences.autoAdjustBitrate = false
+        preferences.optimizationMode = vector.profile == 1 ? .latency : .quality
+        preferences.videoCodecPreference = codecPreference
+        preferences.enableYUV444 = vector.chroma == 2
+        preferences.enableHDR = vector.dynamicRange != 1
+        preferences.hdrTransferPreference = vector.dynamicRange == 3 ? .hlg : .pq
+        preferences.fidelityPreference =
+            vector.fidelity == 3
+            ? .codecLosslessRequired
+            : .visuallyLossless
+        preferences.enableVSync = vector.presentation.mode != 1
+        preferences.clientMicrophoneEnabled = vector.microphone == "mono"
+        preferences.playAudioOnHost = vector.hostAudio ?? false
+
+        return try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 1,
+            resume: false,
+            preferences: preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+    }
+
+    private func assertAcceptedOffer(_ offer: ProtocolV3StartOffer, matches vector: StartModeVector) {
+        XCTAssertEqual(Set(offer.fields.keys), Set((1...18).map(UInt64.init)), vector.id)
+        XCTAssertEqual(offer.fields[3]?.unsignedValue, vector.profile, vector.id)
+        XCTAssertEqual(offer.fields[4]?.unsignedValue, vector.width, vector.id)
+        XCTAssertEqual(offer.fields[5]?.unsignedValue, vector.height, vector.id)
+        XCTAssertEqual(offer.fields[6]?.unsignedValue, vector.refreshNumerator, vector.id)
+        XCTAssertEqual(offer.fields[7]?.unsignedValue, vector.refreshDenominator, vector.id)
+        XCTAssertEqual(offer.fields[8]?.unsignedValue, vector.bitrateKbps, vector.id)
+        XCTAssertEqual(offer.fields[18]?.booleanValue, vector.hostAudio, vector.id)
+        XCTAssertTrue(microphoneMatches(offer.fields[11], vector.microphone), vector.id)
+        XCTAssertTrue(presentationMatches(offer.fields[15], vector.presentation), vector.id)
+
+        let tuples = offer.fields[9]?.arrayValue?.compactMap(\.mapValue) ?? []
+        let tuple = tuples.first { codecTuple($0, matches: vector, exactFidelity: vector.fidelity == 3) }
+        XCTAssertNotNil(tuple, vector.id)
+        XCTAssertEqual(tuple.map { Set($0.keys) }, Set((1...10).map(UInt64.init)), vector.id)
+
+        let hdr = offer.fields[14]?.arrayValue ?? []
+        if vector.dynamicRange == 1 {
+            XCTAssertTrue(hdr.isEmpty, vector.id)
+        } else {
+            XCTAssertTrue(
+                hdr.contains { value in
+                    value.mapValue?[1]?.unsignedValue == vector.dynamicRange
+                }, vector.id)
+        }
+    }
+
+    private func canEmitExactRejectedRequest(_ vector: StartModeVector) -> Bool {
+        guard let offer = try? makeOffer(for: vector),
+            offer.fields[3]?.unsignedValue == vector.profile,
+            offer.fields[4]?.unsignedValue == vector.width,
+            offer.fields[5]?.unsignedValue == vector.height,
+            offer.fields[6]?.unsignedValue == vector.refreshNumerator,
+            offer.fields[7]?.unsignedValue == vector.refreshDenominator,
+            offer.fields[8]?.unsignedValue == vector.bitrateKbps,
+            let hostAudio = vector.hostAudio,
+            offer.fields[18]?.booleanValue == hostAudio,
+            microphoneMatches(offer.fields[11], vector.microphone),
+            presentationMatches(offer.fields[15], vector.presentation)
+        else {
+            return false
+        }
+        return offer.fields[9]?.arrayValue?.compactMap(\.mapValue).contains {
+            codecTuple($0, matches: vector, exactFidelity: true)
+        } == true
+    }
+
+    private func codecTuple(
+        _ tuple: [UInt64: ProtocolV3CBORValue],
+        matches vector: StartModeVector,
+        exactFidelity: Bool
+    ) -> Bool {
+        let transfer: UInt64 =
+            switch vector.dynamicRange {
+            case 2: 16
+            case 3: 18
+            default: 1
+            }
+        return Set(tuple.keys) == Set((1...10).map(UInt64.init))
+            && tuple[1]?.unsignedValue == vector.codec
+            && tuple[3]?.unsignedValue == vector.bitDepth
+            && tuple[4]?.unsignedValue == vector.chroma
+            && tuple[6]?.unsignedValue == transfer
+            && tuple[9]?.unsignedValue == vector.codecFlags
+            && (!exactFidelity || tuple[10]?.unsignedValue == vector.fidelity)
+    }
+
+    private func microphoneMatches(_ value: ProtocolV3CBORValue?, _ microphone: String) -> Bool {
+        switch microphone {
+        case "none":
+            value == .null
+        case "mono":
+            value?.mapValue.map { Set($0.keys) == Set((1...9).map(UInt64.init)) } == true
+        default:
+            false
+        }
+    }
+
+    private func presentationMatches(
+        _ value: ProtocolV3CBORValue?,
+        _ presentation: StartModePresentation
+    ) -> Bool {
+        value?.arrayValue?.contains { candidate in
+            guard let tuple = candidate.mapValue else { return false }
+            return Set(tuple.keys) == Set((1...5).map(UInt64.init))
+                && tuple[1]?.unsignedValue == presentation.mode
+                && tuple[2]?.unsignedValue == presentation.queueDepth
+        } == true
+    }
+
+    private func codecPreference(_ codec: UInt64) -> VideoCodecPreference? {
+        switch codec {
+        case 1: .h264
+        case 2: .hevc
+        case 3: .av1
+        default: nil
+        }
+    }
+
+    private func greatestCommonDivisor(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        var lhs = lhs
+        var rhs = rhs
+        while rhs != 0 {
+            (lhs, rhs) = (rhs, lhs % rhs)
+        }
+        return lhs
+    }
+
+    private var fullyCapableClient: AppleStreamingCapabilities {
+        AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2,
+            supportsHardwareHEVCMain10: true,
+            supportsHardwareAV1Main10: true,
+            supportedHardwareYUV444FormatMask: VideoCodecProfile.yuv444Mask
+        )
+    }
+}
+
 private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     UmbraStreaming.VideoCodecInitializationPreparing,
     UmbraStreaming.VideoDecodeOutcomeReporting,
@@ -1372,5 +1662,103 @@ private extension Data {
             append(byte)
             index = next
         }
+    }
+}
+
+private enum StartModeVectorError: Error {
+    case unrepresentable
+}
+
+private struct StartModeFixture: Decodable {
+    let schema: String
+    let contract: StartModeContract
+    let vectors: [StartModeVector]
+}
+
+private struct StartModeContract: Decodable {
+    let startKeys: [UInt64]
+    let hostAudioKey: UInt64
+    let hostAudioType: String
+    let minimumWidth: UInt64
+    let maximumWidth: UInt64
+    let minimumHeight: UInt64
+    let maximumHeight: UInt64
+    let minimumRefreshHz: UInt64
+    let maximumRefreshHz: UInt64
+    let maximumRationalComponent: UInt64
+    let h264MaximumDimension: UInt64
+    let codec: [String: UInt64]
+    let chroma: [String: UInt64]
+    let dynamicRange: [String: UInt64]
+    let fidelity: [String: UInt64]
+    let codecLosslessProofFlag: UInt64
+
+    private enum CodingKeys: String, CodingKey {
+        case startKeys = "start_keys"
+        case hostAudioKey = "host_audio_key"
+        case hostAudioType = "host_audio_type"
+        case minimumWidth = "minimum_width"
+        case maximumWidth = "maximum_width"
+        case minimumHeight = "minimum_height"
+        case maximumHeight = "maximum_height"
+        case minimumRefreshHz = "minimum_refresh_hz"
+        case maximumRefreshHz = "maximum_refresh_hz"
+        case maximumRationalComponent = "maximum_rational_component"
+        case h264MaximumDimension = "h264_maximum_dimension"
+        case codec
+        case chroma
+        case dynamicRange = "dynamic_range"
+        case fidelity
+        case codecLosslessProofFlag = "codec_lossless_proof_flag"
+    }
+}
+
+private struct StartModeVector: Decodable {
+    let id: String
+    let width: UInt64
+    let height: UInt64
+    let refreshNumerator: UInt64
+    let refreshDenominator: UInt64
+    let codec: UInt64
+    let bitDepth: UInt64
+    let chroma: UInt64
+    let dynamicRange: UInt64
+    let codecFlags: UInt64
+    let fidelity: UInt64
+    let bitrateKbps: UInt64
+    let profile: UInt64
+    let presentation: StartModePresentation
+    let microphone: String
+    let hostAudio: Bool?
+    let expected: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case width
+        case height
+        case refreshNumerator = "refresh_numerator"
+        case refreshDenominator = "refresh_denominator"
+        case codec
+        case bitDepth = "bit_depth"
+        case chroma
+        case dynamicRange = "dynamic_range"
+        case codecFlags = "codec_flags"
+        case fidelity
+        case bitrateKbps = "bitrate_kbps"
+        case profile
+        case presentation
+        case microphone
+        case hostAudio = "host_audio"
+        case expected
+    }
+}
+
+private struct StartModePresentation: Decodable {
+    let mode: UInt64
+    let queueDepth: UInt64
+
+    private enum CodingKeys: String, CodingKey {
+        case mode
+        case queueDepth = "queue_depth"
     }
 }

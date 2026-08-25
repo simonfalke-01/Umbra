@@ -328,6 +328,13 @@ public enum ProtocolV3StartRequestMapper {
         preferences: StreamingPreferences,
         capabilities: AppleStreamingCapabilities
     ) throws -> [MoonlightVideoFormat] {
+        if preferences.fidelityPreference == .codecLosslessRequired,
+            !preferences.enableYUV444
+        {
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "codec-lossless delivery requires a proven 4:4:4 decoder tuple"
+            )
+        }
         let h264DimensionsSupported = preferences.width <= 4_096 && preferences.height <= 4_096
         if preferences.videoCodecPreference == .h264, !h264DimensionsSupported {
             throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
