@@ -62,6 +62,7 @@ struct ProtocolV3ReassembledVideoFrame {
     let videoGeneration: UInt32
     let matrix: UInt8
     let flags: UInt8
+    let firstReceivedAtNanoseconds: UInt64
     let receivedAtNanoseconds: UInt64
 }
 
@@ -202,6 +203,7 @@ private final class ProtocolV3VideoAssembly {
             videoGeneration: videoGeneration,
             matrix: matrix,
             flags: flags,
+            firstReceivedAtNanoseconds: firstReceiveTimeNanoseconds,
             receivedAtNanoseconds: completionReceiveTimeNanoseconds
         )
     }
@@ -466,6 +468,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         let height: Int
         let refreshNumerator: UInt64
         let refreshDenominator: UInt64
+        let maximumPresentAgeNanoseconds: UInt64
         let videoGeneration: UInt32
         let audioGeneration: UInt32
         let microphoneGeneration: UInt32
@@ -481,6 +484,12 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         let height: Int
         let refreshNumerator: UInt64
         let refreshDenominator: UInt64
+        let maximumPresentAgeNanoseconds: UInt64
+    }
+
+    private struct PendingPresentationDeadline {
+        let deadlineNanoseconds: UInt64
+        let videoGeneration: UInt32
     }
 
     private struct AudioConfigurationState: Equatable {
@@ -499,6 +508,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
     private let mode: QUICOptimizationMode
     private let diagnosticHandler: @Sendable (String) -> Void
     private let firstVideoSubmitHandler: @Sendable () -> Void
+    private let nowNanoseconds: @Sendable () -> UInt64
     private let expected: ExpectedSelection
     private let videoReassembler: ProtocolV3VideoReassembler
     private let lock = NSLock()
@@ -508,6 +518,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
     private var lastReassembledVideoFrameID: UInt64 = 0
     private var lastDecodedVideoFrameID: UInt64 = 0
     private var videoFeedbackHandler: (@Sendable (ProtocolV3VideoFeedback) -> Void)?
+    private var pendingPresentationDeadlines: [UInt64: PendingPresentationDeadline] = [:]
     private var pendingAudio: [UInt64: BufferedAudioPacket] = [:]
     private var nextAudioSamplePosition: UInt64 = 0
     private var videoFragmentsReceived: UInt64 = 0
@@ -527,7 +538,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         mode: QUICOptimizationMode,
         startResponseFields: [UInt64: ProtocolV3CBORValue],
         firstVideoSubmitHandler: @escaping @Sendable () -> Void = {},
-        diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in }
+        diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in },
+        nowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) throws {
         guard let videoTuple = startResponseFields[5], videoTuple.mapValue != nil,
               let audioTuple = startResponseFields[12], audioTuple.mapValue != nil,
@@ -538,6 +550,10 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               let refreshNumerator = startResponseFields[8]?.unsignedValue,
               let refreshDenominator = startResponseFields[9]?.unsignedValue,
               refreshNumerator > 0, refreshDenominator > 0,
+              let presentation = startResponseFields[18]?.mapValue,
+              Set(presentation.keys) == Set(1...5),
+              let maximumPresentAgeMicroseconds = presentation[5]?.unsignedValue,
+              (1...1_000_000).contains(maximumPresentAgeMicroseconds),
               let videoGeneration = startResponseFields[14]?.unsignedValue.flatMap(UInt32.init(exactly:)),
               let audioGeneration = startResponseFields[15]?.unsignedValue.flatMap(UInt32.init(exactly:)),
               let microphoneGeneration = startResponseFields[16]?.unsignedValue.flatMap(UInt32.init(exactly:)),
@@ -549,6 +565,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         videoReassembler = ProtocolV3VideoReassembler(mode: mode)
         self.firstVideoSubmitHandler = firstVideoSubmitHandler
         self.diagnosticHandler = diagnosticHandler
+        self.nowNanoseconds = nowNanoseconds
         expected = ExpectedSelection(
             videoTuple: videoTuple,
             audioTuple: audioTuple,
@@ -558,6 +575,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             height: height,
             refreshNumerator: refreshNumerator,
             refreshDenominator: refreshDenominator,
+            maximumPresentAgeNanoseconds: maximumPresentAgeMicroseconds * 1_000,
             videoGeneration: videoGeneration,
             audioGeneration: audioGeneration,
             microphoneGeneration: microphoneGeneration
@@ -672,9 +690,11 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                 width: width,
                 height: height,
                 refreshNumerator: refreshNumerator,
-                refreshDenominator: refreshDenominator
+                refreshDenominator: refreshDenominator,
+                maximumPresentAgeNanoseconds: expected.maximumPresentAgeNanoseconds
             )
             videoReassembler.resetForConfiguration()
+            pendingPresentationDeadlines.removeAll(keepingCapacity: true)
         }
         diagnosticHandler(
             "Protocol v3 configured VideoToolbox: format=0x"
@@ -747,6 +767,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             guard !stopped else { return false }
             stopped = true
             videoReassembler.removeAll()
+            pendingPresentationDeadlines.removeAll()
             pendingAudio.removeAll()
             return true
         }
@@ -762,6 +783,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
     public func suspendForReconnect() {
         lock.withLock {
             videoReassembler.suspendForReconnect()
+            pendingPresentationDeadlines.removeAll(keepingCapacity: true)
             pendingAudio.removeAll(keepingCapacity: true)
         }
     }
@@ -860,6 +882,17 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                 return true
             }
             if shouldReportFirstSubmit { firstVideoSubmitHandler() }
+            let deadline = Self.addingClamped(
+                frame.firstReceivedAtNanoseconds,
+                configuration.maximumPresentAgeNanoseconds
+            )
+            lock.withLock {
+                retainPresentationDeadline(
+                    frameID: frame.frameID,
+                    deadlineNanoseconds: deadline,
+                    videoGeneration: frame.videoGeneration
+                )
+            }
             let disposition = pipeline.videoDecoder.submit(frame: .init(
                 data: frame.data,
                 payloadFormat: payloadFormat,
@@ -881,6 +914,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             if disposition == .requestKeyFrame {
                 let unsentFrameIDs = frames.dropFirst(index + 1).map(\.frameID)
                 let pendingFrameIDs = lock.withLock { () -> [UInt64] in
+                    pendingPresentationDeadlines.removeValue(forKey: frame.frameID)
                     let pending = videoReassembler.requireKeyFrame()
                     videoFramesDropped += UInt64(unsentFrameIDs.count + pending.count)
                     return pending
@@ -902,26 +936,46 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         switch outcome {
         case let .decoded(frameNumber):
             guard let frameID = UInt64(exactly: frameNumber) else { return }
-            lock.withLock {
+            let deadlineMissMicroseconds = lock.withLock { () -> UInt32 in
                 lastDecodedVideoFrameID = max(lastDecodedVideoFrameID, frameID)
                 videoFramesDecoded += 1
+                return consumeDeadlineMissMicroseconds(
+                    frameID: frameID,
+                    completedAtNanoseconds: nowNanoseconds()
+                )
             }
-            emitVideoFeedback(affectedFrameID: frameID, action: 1)
+            emitVideoFeedback(
+                affectedFrameID: frameID,
+                action: 1,
+                deadlineMissMicroseconds: deadlineMissMicroseconds
+            )
         case let .failed(frameNumber):
             guard let frameID = UInt64(exactly: frameNumber) else { return }
-            let pendingFrameIDs = lock.withLock { () -> [UInt64] in
+            let failure = lock.withLock { () -> ([UInt64], UInt32) in
+                let deadlineMissMicroseconds = consumeDeadlineMissMicroseconds(
+                    frameID: frameID,
+                    completedAtNanoseconds: nowNanoseconds()
+                )
                 let pending = videoReassembler.requireKeyFrame()
                 videoFramesDropped += 1 + UInt64(pending.count)
-                return pending
+                return (pending, deadlineMissMicroseconds)
             }
-            for pendingFrameID in pendingFrameIDs {
+            for pendingFrameID in failure.0 {
                 emitVideoFeedback(affectedFrameID: pendingFrameID, action: 2)
             }
-            emitVideoFeedback(affectedFrameID: frameID, action: 4)
+            emitVideoFeedback(
+                affectedFrameID: frameID,
+                action: 3,
+                deadlineMissMicroseconds: failure.1
+            )
         }
     }
 
-    private func emitVideoFeedback(affectedFrameID: UInt64, action: UInt8) {
+    private func emitVideoFeedback(
+        affectedFrameID: UInt64,
+        action: UInt8,
+        deadlineMissMicroseconds: UInt32 = 0
+    ) {
         let feedback = lock.withLock { () -> (ProtocolV3VideoFeedback, (@Sendable (ProtocolV3VideoFeedback) -> Void)?) in
             (
                 ProtocolV3VideoFeedback(
@@ -929,7 +983,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                     lastReassembledFrameID: lastReassembledVideoFrameID,
                     lastDecodedFrameID: lastDecodedVideoFrameID,
                     action: action,
-                    deadlineMissMicroseconds: 0
+                    deadlineMissMicroseconds: deadlineMissMicroseconds
                 ),
                 videoFeedbackHandler
             )
@@ -937,6 +991,44 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         lock.withLock { videoFeedbackSent += 1 }
         feedback.1?(feedback.0)
     }
+
+    private func retainPresentationDeadline(
+        frameID: UInt64,
+        deadlineNanoseconds: UInt64,
+        videoGeneration: UInt32
+    ) {
+        if pendingPresentationDeadlines.count >= Self.maximumPendingPresentationDeadlines,
+           pendingPresentationDeadlines[frameID] == nil,
+           let oldestFrameID = pendingPresentationDeadlines.keys.min() {
+            pendingPresentationDeadlines.removeValue(forKey: oldestFrameID)
+        }
+        pendingPresentationDeadlines[frameID] = PendingPresentationDeadline(
+            deadlineNanoseconds: deadlineNanoseconds,
+            videoGeneration: videoGeneration
+        )
+    }
+
+    private func consumeDeadlineMissMicroseconds(
+        frameID: UInt64,
+        completedAtNanoseconds: UInt64
+    ) -> UInt32 {
+        guard let pending = pendingPresentationDeadlines.removeValue(forKey: frameID),
+              pending.videoGeneration == videoConfiguration?.generation,
+              completedAtNanoseconds > pending.deadlineNanoseconds else {
+            return 0
+        }
+        let missNanoseconds = completedAtNanoseconds - pending.deadlineNanoseconds
+        let roundedMicroseconds = missNanoseconds / 1_000 + (missNanoseconds % 1_000 == 0 ? 0 : 1)
+        return UInt32(min(roundedMicroseconds, UInt64(Self.maximumDeadlineMissMicroseconds)))
+    }
+
+    private static func addingClamped(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let result = lhs.addingReportingOverflow(rhs)
+        return result.overflow ? UInt64.max : result.partialValue
+    }
+
+    static let maximumDeadlineMissMicroseconds: UInt32 = 1_000_000
+    private static let maximumPendingPresentationDeadlines = 64
 
     private func receiveAudio(_ message: QUICInboundMessage) throws {
         guard let samplePosition = message.objectID,
@@ -1093,6 +1185,9 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               let dynamicMetadata = map[7]?.arrayValue,
               dynamicMetadata.isEmpty else {
             throw ProtocolV3MediaPipelineError.invalidConfiguration("HDR tuple")
+        }
+        guard transfer != 3 || map[6] == .null else {
+            throw ProtocolV3MediaPipelineError.invalidConfiguration("HLG static metadata")
         }
         var primaries = [UInt16](repeating: 0, count: 6)
         var white = [UInt16](repeating: 0, count: 2)

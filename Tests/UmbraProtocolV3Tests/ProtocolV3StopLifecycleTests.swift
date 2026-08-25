@@ -91,6 +91,17 @@ import UmbraQUICTransport
     )
     try await stopLifecycleWait { recorder.authenticatedCount == 1 }
 
+    var missingHostAudio = stopLifecycleStartFields(intent: Data(repeating: 0x5f, count: 16))
+    missingHostAudio.removeValue(forKey: 18)
+    #expect(throws: ProtocolV3ClientError.self) {
+        try session.beginStart(fields: missingHostAudio)
+    }
+    var malformedHostAudio = stopLifecycleStartFields(intent: Data(repeating: 0x60, count: 16))
+    malformedHostAudio[18] = .unsigned(0)
+    #expect(throws: ProtocolV3ClientError.self) {
+        try session.beginStart(fields: malformedHostAudio)
+    }
+
     let firstSessionID = Data(repeating: 0x61, count: 16)
     let firstIntent = Data(repeating: 0x62, count: 16)
     let firstStartID = try session.beginStart(fields: stopLifecycleStartFields(intent: firstIntent))
@@ -267,7 +278,7 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
 }
 
 private func stopLifecycleStartFields(intent: Data) -> [UInt64: ProtocolV3CBORValue] {
-    var fields = Dictionary(uniqueKeysWithValues: (1...17).map { (UInt64($0), ProtocolV3CBORValue.null) })
+    var fields = Dictionary(uniqueKeysWithValues: (1...18).map { (UInt64($0), ProtocolV3CBORValue.null) })
     fields[1] = .bytes(intent)
     fields[2] = .unsigned(0)
     fields[3] = .unsigned(1)
@@ -275,6 +286,7 @@ private func stopLifecycleStartFields(intent: Data) -> [UInt64: ProtocolV3CBORVa
     fields[5] = .unsigned(1_080)
     fields[12] = .unsigned(UInt64(QUICTransportProfile.semanticDatagramByteCount))
     fields[13] = .bytes(Data(repeating: 0x42, count: 16))
+    fields[18] = .boolean(false)
     return fields
 }
 

@@ -16,6 +16,25 @@ public enum ProtocolV3StartRequestMapperError: Error, Equatable, Sendable {
     case unsupportedAudioLayout
 }
 
+private enum ProtocolV3HDRTransfer {
+    case pq
+    case hlg
+
+    var codecValue: UInt64 {
+        switch self {
+        case .pq: 16
+        case .hlg: 18
+        }
+    }
+
+    var capabilityValue: UInt64 {
+        switch self {
+        case .pq: 2
+        case .hlg: 3
+        }
+    }
+}
+
 /// Maps resolved user preferences and probed Apple capabilities into explicit
 /// v3 START tuples. HDR and 4:4:4 are offered only when the user requested them
 /// and this Mac proved the corresponding exact decoder format.
@@ -39,21 +58,24 @@ public enum ProtocolV3StartRequestMapper {
         }
         let formats = try orderedFormats(preferences: preferences, capabilities: capabilities)
         let mode: QUICOptimizationMode = preferences.optimizationMode == .latency ? .latency : .quality
+        let hdrTransfers = preferences.enableHDR
+            ? hdrTransferOffers(for: preferences.hdrTransferPreference)
+            : []
         let codecOffers = formats.flatMap { format -> [[UInt64: ProtocolV3CBORValue]] in
-            guard preferences.enableHDR else {
+            guard !hdrTransfers.isEmpty else {
                 return [codecTuple(format, preferences: preferences, hdrTransfer: nil)]
             }
-            return [16, 18].map {
-                codecTuple(format, preferences: preferences, hdrTransfer: UInt64($0))
+            return hdrTransfers.map {
+                codecTuple(format, preferences: preferences, hdrTransfer: $0.codecValue)
             }
         }
         let audioOffers = try audioTuples(preferences: preferences, capabilities: capabilities)
         let microphone: ProtocolV3CBORValue = preferences.clientMicrophoneEnabled
             ? .map(microphoneTuple())
             : .null
-        let hdrOffers: [ProtocolV3CBORValue] = preferences.enableHDR
-            ? [.map(hdrCapabilityTuple(transfer: 2)), .map(hdrCapabilityTuple(transfer: 3))]
-            : []
+        let hdrOffers = hdrTransfers.map {
+            ProtocolV3CBORValue.map(hdrCapabilityTuple(transfer: $0.capabilityValue))
+        }
         let presentationOffers = presentationTuples(preferences: preferences)
         let strictFidelity = preferences.fidelityPreference == .codecLosslessRequired
         let fields: [UInt64: ProtocolV3CBORValue] = [
@@ -81,8 +103,19 @@ public enum ProtocolV3StartRequestMapper {
                 5: .boolean(preferences.enableHDR),
                 6: .boolean(!strictFidelity && !preferences.enableHDR && !preferences.enableYUV444),
             ]),
+            18: .boolean(preferences.playAudioOnHost),
         ]
         return ProtocolV3StartOffer(fields: fields, offeredVideoFormats: formats, mode: mode)
+    }
+
+    private static func hdrTransferOffers(
+        for preference: HDRTransferPreference
+    ) -> [ProtocolV3HDRTransfer] {
+        switch preference {
+        case .automatic: [.pq, .hlg]
+        case .pq: [.pq]
+        case .hlg: [.hlg]
+        }
     }
 
     public static func selectedVideoFormat(
@@ -108,7 +141,9 @@ public enum ProtocolV3StartRequestMapper {
         responseFields: [UInt64: ProtocolV3CBORValue],
         offered: ProtocolV3StartOffer
     ) throws {
-        guard Set(responseFields.keys) == Set(1...23),
+        guard Set(offered.fields.keys) == Set(1...18),
+              offered.fields[18]?.booleanValue != nil,
+              Set(responseFields.keys) == Set(1...23),
               responseFields[1]?.unsignedValue == 0,
               responseFields[2] == offered.fields[1],
               responseFields[4] == offered.fields[3],
@@ -204,10 +239,10 @@ public enum ProtocolV3StartRequestMapper {
                 "host selected unsupported HDR capability"
             )
         }
-        switch selectedMap[6] {
-        case .null:
+        switch (transfer, selectedMap[6]) {
+        case (_, .null):
             break
-        case let .map(mastering):
+        case (2, let .map(mastering)):
             guard supportsStatic,
                   Set(mastering.keys) == Set(1...6),
                   let primaryValues = mastering[1]?.arrayValue,
@@ -232,6 +267,10 @@ public enum ProtocolV3StartRequestMapper {
                     "host HDR mastering metadata exceeds client bounds"
                 )
             }
+        case (3, _):
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "host selected static metadata for HLG"
+            )
         default:
             throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
                 "host HDR mastering metadata is malformed"
@@ -444,7 +483,7 @@ public enum ProtocolV3StartRequestMapper {
             1: .unsigned(transfer), 2: .unsigned(9), 3: .unsigned(9),
             4: .unsigned(0), 5: .unsigned(10),
             6: .map([
-                1: .boolean(true),
+                1: .boolean(transfer == 2),
                 2: .unsigned(UInt64(UInt32.max)),
                 3: .unsigned(UInt64(UInt16.max)),
                 4: .unsigned(UInt64(UInt16.max)),

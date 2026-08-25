@@ -708,14 +708,15 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
     }
 
     private static func validateStartRequest(_ fields: [UInt64: ProtocolV3CBORValue]) throws {
-        guard Set(fields.keys) == Set(1...17),
+        guard Set(fields.keys) == Set(1...18),
               let intent = fields[1]?.bytesValue, intent.count == 16, intent.contains(where: { $0 != 0 }),
               let app = fields[2]?.unsignedValue, app <= UInt64(UInt32.max),
               [1, 2].contains(fields[3]?.unsignedValue),
               let width = fields[4]?.unsignedValue, (320...7_680).contains(width), width.isMultiple(of: 2),
               let height = fields[5]?.unsignedValue, (200...4_320).contains(height), height.isMultiple(of: 2),
               fields[12]?.unsignedValue == UInt64(QUICTransportProfile.semanticDatagramByteCount),
-              let trace = fields[13]?.bytesValue, trace.count == 16, trace.contains(where: { $0 != 0 })
+              let trace = fields[13]?.bytesValue, trace.count == 16, trace.contains(where: { $0 != 0 }),
+              fields[18]?.booleanValue != nil
         else { throw ProtocolV3ClientError.invalidMessage("START fields") }
     }
 

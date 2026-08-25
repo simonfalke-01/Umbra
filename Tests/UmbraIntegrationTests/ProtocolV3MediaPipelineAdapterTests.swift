@@ -351,6 +351,61 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         ))
     }
 
+    func testStartOfferCarriesExplicitHostAudioPreferenceAndSelectionRequiresIt() throws {
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+
+        for playAudioOnHost in [false, true] {
+            var preferences = StreamingPreferences.default
+            preferences.playAudioOnHost = playAudioOnHost
+            let offer = try ProtocolV3StartRequestMapper.makeOffer(
+                applicationID: playAudioOnHost ? 19 : 18,
+                resume: false,
+                preferences: preferences,
+                capabilities: capabilities,
+                startIntentID: Data(1...16),
+                traceID: Data(17...32)
+            )
+
+            XCTAssertEqual(offer.fields[18]?.booleanValue, playAudioOnHost)
+            XCTAssertNoThrow(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: successfulStartResponse(offer),
+                offered: offer
+            ))
+
+            var missingFields = offer.fields
+            missingFields.removeValue(forKey: 18)
+            let missing = ProtocolV3StartOffer(
+                fields: missingFields,
+                offeredVideoFormats: offer.offeredVideoFormats,
+                mode: offer.mode
+            )
+            XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: successfulStartResponse(offer),
+                offered: missing
+            ))
+
+            var malformedFields = offer.fields
+            malformedFields[18] = .unsigned(0)
+            let malformed = ProtocolV3StartOffer(
+                fields: malformedFields,
+                offeredVideoFormats: offer.offeredVideoFormats,
+                mode: offer.mode
+            )
+            XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: successfulStartResponse(offer),
+                offered: malformed
+            ))
+        }
+    }
+
     func testVideoConfigMustMatchExactRationalStartSelection() throws {
         var preferences = StreamingPreferences.default
         preferences.width = 1_920
@@ -402,10 +457,287 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(videoDecoder.configuredFormats.only?.redrawRate, 60)
     }
 
+    func testVideoFeedbackReportsExactBoundedClientLocalDeadlineMiss() throws {
+        var preferences = StreamingPreferences.default
+        preferences.optimizationMode = .quality
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 13,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let selection = successfulStartResponse(offer)
+        let decoder = RationalRefreshVideoDecoder()
+        let clock = ProtocolV3DeadlineTestClock(nanoseconds: 1_025_123_001)
+        let feedback = ProtocolV3FeedbackRecorder()
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: decoder,
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: capabilities.supportedVideoFormatMask
+            ),
+            mode: .quality,
+            startResponseFields: selection,
+            nowNanoseconds: { clock.nanoseconds }
+        )
+        adapter.installVideoFeedbackHandler { feedback.append($0) }
+        XCTAssertEqual(try adapter.configureVideo(fields: videoConfigurationFields(selection)), 2)
+
+        let codec = try XCTUnwrap(selection[5]?.mapValue)
+        try adapter.handle(videoMessage(
+            frameID: 1,
+            frameSize: 4,
+            fragmentOffset: 0,
+            fragmentIndex: 0,
+            fragmentCount: 2,
+            codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+            matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+            bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+            generation: 1,
+            bytes: Data([1, 2]),
+            receivedAtNanoseconds: 1_000_000_000
+        ))
+        try adapter.handle(videoMessage(
+            frameID: 1,
+            frameSize: 4,
+            fragmentOffset: 2,
+            fragmentIndex: 1,
+            fragmentCount: 2,
+            codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+            matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+            bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+            generation: 1,
+            bytes: Data([3, 4]),
+            receivedAtNanoseconds: 1_024_900_000
+        ))
+        decoder.emit(.decoded(frameNumber: 1))
+
+        let decoded = try XCTUnwrap(feedback.values.only)
+        XCTAssertEqual(decoded.action, 1)
+        XCTAssertEqual(decoded.affectedFrameID, 1)
+        XCTAssertEqual(decoded.deadlineMissMicroseconds, 124)
+
+        clock.nanoseconds = UInt64.max
+        try adapter.handle(videoMessage(
+            frameID: 2,
+            frameSize: 2,
+            fragmentOffset: 0,
+            fragmentIndex: 0,
+            fragmentCount: 1,
+            codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+            matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+            bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+            generation: 1,
+            bytes: Data([5, 6]),
+            receivedAtNanoseconds: 1_100_000_000
+        ))
+        decoder.emit(.decoded(frameNumber: 2))
+        XCTAssertEqual(
+            feedback.values.last?.deadlineMissMicroseconds,
+            ProtocolV3MediaPipelineAdapter.maximumDeadlineMissMicroseconds
+        )
+
+        clock.nanoseconds = 1_225_001_000
+        try adapter.handle(videoMessage(
+            frameID: 3,
+            frameSize: 2,
+            fragmentOffset: 0,
+            fragmentIndex: 0,
+            fragmentCount: 1,
+            codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+            matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+            bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+            generation: 1,
+            bytes: Data([7, 8]),
+            receivedAtNanoseconds: 1_200_000_000
+        ))
+        decoder.emit(.failed(frameNumber: 3))
+        XCTAssertEqual(feedback.values.last?.action, 3)
+        XCTAssertEqual(feedback.values.last?.deadlineMissMicroseconds, 1)
+    }
+
+    func testMediaAdapterRejectsUnboundedPresentationAge() throws {
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 14,
+            resume: false,
+            preferences: .default,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        var selection = successfulStartResponse(offer)
+        var presentation = try XCTUnwrap(selection[18]?.mapValue)
+        presentation[5] = .unsigned(1_000_001)
+        selection[18] = .map(presentation)
+
+        XCTAssertThrowsError(try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: RationalRefreshVideoDecoder(),
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: capabilities.supportedVideoFormatMask
+            ),
+            mode: .quality,
+            startResponseFields: selection
+        ))
+    }
+
+    func testSessionCoordinatorPublishesNewestValidatedRTTTelemetry() throws {
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 15,
+            resume: false,
+            preferences: .default,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let selection = successfulStartResponse(offer)
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: RationalRefreshVideoDecoder(),
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: capabilities.supportedVideoFormatMask
+            ),
+            mode: .quality,
+            startResponseFields: selection
+        )
+        let coordinator = ProtocolV3SessionMediaCoordinator(
+            control: ProtocolV3MediaControlStub(),
+            media: adapter
+        )
+        let sessionID = Data(33...48)
+        coordinator.handle(.startAccepted(sessionID: sessionID, fields: selection))
+        coordinator.handle(.transport(.inbound(rttMessage(
+            generation: 2,
+            smoothed: 4_000,
+            minimum: 3_000,
+            variation: 1_000
+        ))))
+        coordinator.handle(.transport(.inbound(rttMessage(
+            generation: 1,
+            smoothed: 9_000,
+            minimum: 8_000,
+            variation: 7_000
+        ))))
+
+        let transport = coordinator.statistics().transport
+        XCTAssertEqual(transport.smoothedRTTMicroseconds, 4_000)
+        XCTAssertEqual(transport.minimumRTTMicroseconds, 3_000)
+        XCTAssertEqual(transport.rttVariationMicroseconds, 1_000)
+    }
+
+    func testHDRTransferPreferenceControlsTheExactStartOffer() throws {
+        var preferences = StreamingPreferences.default
+        preferences.optimizationMode = .quality
+        preferences.enableHDR = true
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2,
+            supportsHardwareHEVCMain10: true,
+            supportsHardwareAV1Main10: true
+        )
+
+        let automatic = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 12,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertEqual(
+            automatic.fields[9]?.arrayValue?.prefix(2).compactMap {
+                $0.mapValue?[6]?.unsignedValue
+            },
+            [16, 18],
+            "Auto must preserve the existing PQ-first preference."
+        )
+        XCTAssertEqual(
+            automatic.fields[14]?.arrayValue?.compactMap {
+                $0.mapValue?[1]?.unsignedValue
+            },
+            [2, 3]
+        )
+
+        preferences.hdrTransferPreference = .pq
+        let pq = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 12,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertTrue(
+            pq.fields[9]?.arrayValue?.allSatisfy {
+                $0.mapValue?[6]?.unsignedValue == 16
+            } == true
+        )
+        XCTAssertEqual(
+            pq.fields[14]?.arrayValue?.compactMap {
+                $0.mapValue?[1]?.unsignedValue
+            },
+            [2]
+        )
+        let pqCapability = try XCTUnwrap(pq.fields[14]?.arrayValue?.first?.mapValue)
+        XCTAssertEqual(pqCapability[6]?.mapValue?[1]?.booleanValue, true)
+
+        preferences.enableHDR = false
+        preferences.hdrTransferPreference = .hlg
+        let sdr = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 12,
+            resume: false,
+            preferences: preferences,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertTrue(
+            sdr.fields[9]?.arrayValue?.allSatisfy {
+                $0.mapValue?[6]?.unsignedValue == 1
+            } == true
+        )
+        XCTAssertEqual(sdr.fields[14], .array([]))
+    }
+
     func testHLGStartAndVideoConfigPreserveTransferWithoutStaticMetadata() throws {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .quality
         preferences.enableHDR = true
+        preferences.hdrTransferPreference = .hlg
         let capabilities = AppleStreamingCapabilities(
             hasMetalDevice: true,
             supportsHardwareH264: true,
@@ -425,12 +757,24 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             startIntentID: Data(1...16),
             traceID: Data(17...32)
         )
+        XCTAssertTrue(
+            offer.fields[9]?.arrayValue?.allSatisfy {
+                $0.mapValue?[6]?.unsignedValue == 18
+            } == true
+        )
+        XCTAssertEqual(
+            offer.fields[14]?.arrayValue?.compactMap {
+                $0.mapValue?[1]?.unsignedValue
+            },
+            [3]
+        )
         let hlgCodec = try XCTUnwrap(
             offer.fields[9]?.arrayValue?.first(where: { $0.mapValue?[6]?.unsignedValue == 18 })
         )
         let hlgCapability = try XCTUnwrap(
             offer.fields[14]?.arrayValue?.first(where: { $0.mapValue?[1]?.unsignedValue == 3 })?.mapValue
         )
+        XCTAssertEqual(hlgCapability[6]?.mapValue?[1]?.booleanValue, false)
         let hlgSelection: ProtocolV3CBORValue = .map([
             1: .unsigned(3),
             2: hlgCapability[2]!,
@@ -449,6 +793,32 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             offered: offer
         ))
 
+        let hostileStaticMetadata: ProtocolV3CBORValue = .map([
+            1: .array(Array(repeating: .unsigned(1), count: 6)),
+            2: .array(Array(repeating: .unsigned(1), count: 2)),
+            3: .unsigned(10_000),
+            4: .unsigned(1),
+            5: .unsigned(100),
+            6: .unsigned(50),
+        ])
+        var hostileHLGSelection = try XCTUnwrap(hlgSelection.mapValue)
+        hostileHLGSelection[6] = hostileStaticMetadata
+        var hostileStartResponse = response
+        hostileStartResponse[23] = .map(hostileHLGSelection)
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: hostileStartResponse,
+            offered: offer
+        ))
+
+        var unofferedPQResponse = response
+        var unofferedPQCodec = try XCTUnwrap(hlgCodec.mapValue)
+        unofferedPQCodec[6] = .unsigned(16)
+        unofferedPQResponse[5] = .map(unofferedPQCodec)
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: unofferedPQResponse,
+            offered: offer
+        ))
+
         let videoDecoder = RationalRefreshVideoDecoder()
         let adapter = try ProtocolV3MediaPipelineAdapter(
             pipeline: StreamingMediaPipeline(
@@ -459,6 +829,12 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             mode: .quality,
             startResponseFields: response
         )
+        var hostileVideoConfiguration = videoConfigurationFields(response)
+        hostileVideoConfiguration[5] = .map(hostileHLGSelection)
+        XCTAssertThrowsError(try adapter.configureVideo(fields: hostileVideoConfiguration))
+        XCTAssertTrue(videoDecoder.configuredFormats.isEmpty)
+        XCTAssertNil(videoDecoder.hdrMode)
+
         XCTAssertEqual(try adapter.configureVideo(fields: videoConfigurationFields(response)), 2)
         let hdrMode = try XCTUnwrap(videoDecoder.hdrMode)
         XCTAssertTrue(hdrMode.enabled)
@@ -599,6 +975,83 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             receivedAtNanoseconds: receivedAtNanoseconds
         )
     }
+
+    private func videoMessage(
+        frameID: UInt64,
+        frameSize: Int,
+        fragmentOffset: Int,
+        fragmentIndex: Int,
+        fragmentCount: Int,
+        codecID: UInt8,
+        matrix: UInt8,
+        bitDepth: UInt8,
+        generation: UInt32,
+        bytes: Data,
+        receivedAtNanoseconds: UInt64
+    ) -> QUICInboundMessage {
+        var payload = Data(capacity: 64 + bytes.count)
+        appendBigEndian(UInt64(10), to: &payload)
+        appendBigEndian(UInt32(15), to: &payload)
+        appendBigEndian(UInt32(20), to: &payload)
+        appendBigEndian(UInt64(30), to: &payload)
+        appendBigEndian(UInt64(40), to: &payload)
+        appendBigEndian(UInt32(frameSize), to: &payload)
+        appendBigEndian(UInt32(fragmentOffset), to: &payload)
+        appendBigEndian(UInt16(fragmentIndex), to: &payload)
+        appendBigEndian(UInt16(fragmentCount), to: &payload)
+        payload.append(Data(repeating: 0, count: 9))
+        payload.append(codecID)
+        payload.append(matrix)
+        payload.append(bitDepth)
+        appendBigEndian(generation, to: &payload)
+        appendBigEndian(UInt32(0), to: &payload)
+        payload.append(bytes)
+        return QUICInboundMessage(
+            lane: .video,
+            payload: payload,
+            receivedAtNanoseconds: receivedAtNanoseconds,
+            semanticSequence: UInt64(fragmentIndex + 1),
+            objectID: frameID,
+            controlFlags: nil,
+            controlType: nil,
+            requestID: nil,
+            datagramChannel: 2,
+            datagramKind: 1,
+            datagramFlags: 0
+        )
+    }
+
+    private func appendBigEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var encoded = value.bigEndian
+        withUnsafeBytes(of: &encoded) { data.append(contentsOf: $0) }
+    }
+
+    private func rttMessage(
+        generation: UInt64,
+        smoothed: UInt32,
+        minimum: UInt32,
+        variation: UInt32
+    ) -> QUICInboundMessage {
+        var payload = Data()
+        appendBigEndian(generation, to: &payload)
+        appendBigEndian(smoothed, to: &payload)
+        appendBigEndian(minimum, to: &payload)
+        appendBigEndian(variation, to: &payload)
+        appendBigEndian(UInt32(0), to: &payload)
+        return QUICInboundMessage(
+            lane: .hostEvents,
+            payload: payload,
+            receivedAtNanoseconds: 1,
+            semanticSequence: generation,
+            objectID: generation,
+            controlFlags: nil,
+            controlType: nil,
+            requestID: nil,
+            datagramChannel: 5,
+            datagramKind: 1,
+            datagramFlags: 0
+        )
+    }
 }
 
 private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
@@ -609,6 +1062,7 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     private let lock = NSLock()
     private var formats: [UmbraStreaming.VideoStreamFormat] = []
     private var storedHDRMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)?
+    private var decodeOutcomeHandler: (@Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void)?
 
     var configuredFormats: [UmbraStreaming.VideoStreamFormat] { lock.withLock { formats } }
     var hdrMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)? {
@@ -636,11 +1090,70 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
 
     func installDecodeOutcomeHandler(
         _ handler: @escaping @Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void
-    ) {}
+    ) {
+        lock.withLock { decodeOutcomeHandler = handler }
+    }
+
+    func emit(_ outcome: UmbraStreaming.VideoDecodeOutcome) {
+        lock.withLock { decodeOutcomeHandler }?(outcome)
+    }
 
     func setHDRMode(enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?) {
         lock.withLock { storedHDRMode = (enabled, metadata) }
     }
+}
+
+private final class ProtocolV3DeadlineTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedNanoseconds: UInt64
+
+    init(nanoseconds: UInt64) {
+        storedNanoseconds = nanoseconds
+    }
+
+    var nanoseconds: UInt64 {
+        get { lock.withLock { storedNanoseconds } }
+        set { lock.withLock { storedNanoseconds = newValue } }
+    }
+}
+
+private final class ProtocolV3FeedbackRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [ProtocolV3VideoFeedback] = []
+
+    var values: [ProtocolV3VideoFeedback] { lock.withLock { storedValues } }
+
+    func append(_ feedback: ProtocolV3VideoFeedback) {
+        lock.withLock { storedValues.append(feedback) }
+    }
+}
+
+private final class ProtocolV3MediaControlStub: ProtocolV3SessionMediaControlling, @unchecked Sendable {
+    func sendControlRequest(
+        type: UInt16,
+        fields: [UInt64: ProtocolV3CBORValue]
+    ) throws -> UInt64 {
+        1
+    }
+
+    func sendControlResponse(
+        type: UInt16,
+        requestID: UInt64,
+        fields: [UInt64: ProtocolV3CBORValue],
+        isError: Bool
+    ) throws {}
+
+    func sendDatagram(
+        lane: QUICSemanticLane,
+        sessionID: Data,
+        channel: UInt8,
+        kind: UInt8,
+        flags: UInt8,
+        objectID: UInt64,
+        payload: Data,
+        deadlineNanoseconds: UInt64?,
+        supersessionKey: UInt64?
+    ) {}
 }
 
 private final class RationalRefreshAudioDecoder: UmbraStreaming.AudioDecoding, @unchecked Sendable {

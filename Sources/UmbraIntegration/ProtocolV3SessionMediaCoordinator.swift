@@ -23,6 +23,28 @@ public struct ProtocolV3InputResynchronization: Sendable, Equatable {
     public let reason: ProtocolV3InputResynchronizationReason
 }
 
+public enum ProtocolV3ControllerFeedbackCommand: Sendable, Equatable {
+    case rumble(lowFrequency: UInt16, highFrequency: UInt16)
+    case triggerRumble(left: UInt16, right: UInt16)
+    case motionState(type: UInt8, reportRateHz: UInt16)
+    case led(red: UInt8, green: UInt8, blue: UInt8)
+    case adaptiveTriggers(flags: UInt8, leftType: UInt8, rightType: UInt8, left: Data, right: Data)
+}
+
+public struct ProtocolV3ControllerFeedback: Sendable, Equatable {
+    public let inputGeneration: UInt32
+    public let controllerGeneration: UInt32
+    public let controller: UInt8
+    public let command: ProtocolV3ControllerFeedbackCommand
+}
+
+struct ProtocolV3RTTTelemetry: Sendable, Equatable {
+    let generation: UInt64
+    let smoothedMicroseconds: UInt32
+    let minimumMicroseconds: UInt32
+    let variationMicroseconds: UInt32
+}
+
 public enum ProtocolV3SessionMediaError: Error, Equatable, Sendable {
     case inactive
     case invalidInput
@@ -35,6 +57,9 @@ public struct ProtocolV3TransportStatistics: Equatable, Sendable {
     public let usableDatagramPayloadBytes: Int
     public let pathChangeCount: UInt64
     public let sendFailureCount: UInt64
+    public let smoothedRTTMicroseconds: UInt32?
+    public let minimumRTTMicroseconds: UInt32?
+    public let rttVariationMicroseconds: UInt32?
     public let abuseCounters: QUICAbuseCounters?
 }
 
@@ -92,6 +117,7 @@ extension ProtocolV3ClientControlSession: ProtocolV3SessionMediaControlling {}
 public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
     public typealias InputACKHandler = @Sendable (ProtocolV3InputAcknowledgement) -> Void
     public typealias InputResyncHandler = @Sendable (ProtocolV3InputResynchronization) -> Void
+    public typealias ControllerFeedbackHandler = @Sendable (ProtocolV3ControllerFeedback) -> Void
     public typealias FailureHandler = @Sendable (Error) -> Void
     public typealias StatisticsHandler = @Sendable (ProtocolV3SessionStatistics) -> Void
 
@@ -111,6 +137,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
     private let microphoneEncoderFactory: @Sendable (Int32) throws -> MonoOpusEncoder
     private let inputACKHandler: InputACKHandler
     private let inputResyncHandler: InputResyncHandler
+    private let controllerFeedbackHandler: ControllerFeedbackHandler
     private let failureHandler: FailureHandler
     private let statisticsHandler: StatisticsHandler
     private let lock = NSLock()
@@ -123,6 +150,10 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
     private var usableDatagramPayloadBytes = 0
     private var pathChangeCount: UInt64 = 0
     private var sendFailureCount: UInt64 = 0
+    private var lastRTTTelemetryGeneration: UInt64 = 0
+    private var smoothedRTTMicroseconds: UInt32?
+    private var minimumRTTMicroseconds: UInt32?
+    private var rttVariationMicroseconds: UInt32?
     private var abuseCounters: QUICAbuseCounters?
     private var terminalMediaFailures: UInt64 = 0
     private var terminalFailurePropagated = false
@@ -137,6 +168,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         },
         inputACKHandler: @escaping InputACKHandler = { _ in },
         inputResyncHandler: @escaping InputResyncHandler = { _ in },
+        controllerFeedbackHandler: @escaping ControllerFeedbackHandler = { _ in },
         failureHandler: @escaping FailureHandler = { _ in },
         statisticsHandler: @escaping StatisticsHandler = { _ in }
     ) {
@@ -146,6 +178,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         self.microphoneEncoderFactory = microphoneEncoderFactory
         self.inputACKHandler = inputACKHandler
         self.inputResyncHandler = inputResyncHandler
+        self.controllerFeedbackHandler = controllerFeedbackHandler
         self.failureHandler = failureHandler
         self.statisticsHandler = statisticsHandler
         media.installVideoFeedbackHandler { [weak self] feedback in
@@ -188,6 +221,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
             sessionID = nil
             microphoneConfiguration = nil
             microphoneEncoder = nil
+            resetRTTTelemetryLocked()
             return values
         }
         if sendMicrophoneEnd, let sessionID = resources.0, let configuration = resources.1 {
@@ -210,6 +244,9 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
                     usableDatagramPayloadBytes: usableDatagramPayloadBytes,
                     pathChangeCount: pathChangeCount,
                     sendFailureCount: sendFailureCount,
+                    smoothedRTTMicroseconds: smoothedRTTMicroseconds,
+                    minimumRTTMicroseconds: minimumRTTMicroseconds,
+                    rttVariationMicroseconds: rttVariationMicroseconds,
                     abuseCounters: abuseCounters
                 ),
                 terminalMediaFailures
@@ -227,6 +264,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
             guard !stopped else { return nil }
             stopped = true
             sessionID = nil
+            resetRTTTelemetryLocked()
             let encoder = microphoneEncoder
             microphoneEncoder = nil
             return encoder
@@ -249,6 +287,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
             self.sessionID = sessionID
             stopped = false
             terminalFailurePropagated = false
+            resetRTTTelemetryLocked()
             return microphoneConfiguration
         }
         guard let configuration, let capture = microphoneCapture else { return }
@@ -278,6 +317,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         try lock.withLock {
             guard self.sessionID == nil, !stopped else { throw ProtocolV3SessionMediaError.inactive }
             self.sessionID = sessionID
+            resetRTTTelemetryLocked()
         }
     }
 
@@ -343,11 +383,131 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
                 throw ProtocolV3SessionMediaError.invalidInput
             }
             inputResyncHandler(.init(expectedEdgeID: Self.readUInt64(message.payload, 0), reason: reason))
+        case (1?, 4?):
+            try handleControllerFeedback(message)
         case (2?, 1?), (3?, 1?):
             try media.handle(message)
+        case (5?, 1?):
+            try handleRTTTelemetry(message)
         default:
             throw ProtocolV3MediaPipelineError.invalidDatagram("interactive route")
         }
+    }
+
+    private func handleControllerFeedback(_ message: QUICInboundMessage) throws {
+        controllerFeedbackHandler(try Self.decodeControllerFeedback(message))
+    }
+
+    private func handleRTTTelemetry(_ message: QUICInboundMessage) throws {
+        let telemetry = try Self.decodeRTTTelemetry(message)
+        lock.withLock {
+            guard telemetry.generation > lastRTTTelemetryGeneration else { return }
+            lastRTTTelemetryGeneration = telemetry.generation
+            smoothedRTTMicroseconds = telemetry.smoothedMicroseconds
+            minimumRTTMicroseconds = telemetry.minimumMicroseconds
+            rttVariationMicroseconds = telemetry.variationMicroseconds
+        }
+    }
+
+    static func decodeRTTTelemetry(
+        _ message: QUICInboundMessage
+    ) throws -> ProtocolV3RTTTelemetry {
+        let payload = message.payload
+        guard message.datagramChannel == 5, message.datagramKind == 1,
+              payload.count == 24,
+              let semanticSequence = message.semanticSequence,
+              let objectID = message.objectID else {
+            throw ProtocolV3SessionMediaError.invalidInput
+        }
+        let generation = Self.readUInt64(payload, 0)
+        let smoothed = Self.readUInt32(payload, 8)
+        let minimum = Self.readUInt32(payload, 12)
+        let variation = Self.readUInt32(payload, 16)
+        guard generation != 0,
+              semanticSequence == generation,
+              objectID == generation,
+              (1...1_000_000).contains(smoothed),
+              (1...smoothed).contains(minimum),
+              variation <= 1_000_000,
+              Self.readUInt32(payload, 20) == 0 else {
+            throw ProtocolV3SessionMediaError.invalidInput
+        }
+        return ProtocolV3RTTTelemetry(
+            generation: generation,
+            smoothedMicroseconds: smoothed,
+            minimumMicroseconds: minimum,
+            variationMicroseconds: variation
+        )
+    }
+
+    private func resetRTTTelemetryLocked() {
+        lastRTTTelemetryGeneration = 0
+        smoothedRTTMicroseconds = nil
+        minimumRTTMicroseconds = nil
+        rttVariationMicroseconds = nil
+    }
+
+    static func decodeControllerFeedback(
+        _ message: QUICInboundMessage
+    ) throws -> ProtocolV3ControllerFeedback {
+        let payload = message.payload
+        guard message.datagramChannel == 1, message.datagramKind == 4,
+              payload.count == 40 else { throw ProtocolV3SessionMediaError.invalidInput }
+        let inputGeneration = Self.readUInt32(payload, 0)
+        let controllerGeneration = Self.readUInt32(payload, 4)
+        let controller = payload[8]
+        let commandID = payload[9]
+        let valueLength = Int(Self.readUInt16(payload, 10))
+        guard inputGeneration != 0,
+              message.objectID == UInt64(inputGeneration),
+              controllerGeneration != 0,
+              controller < 16,
+              payload[36..<40].allSatisfy({ $0 == 0 }) else {
+            throw ProtocolV3SessionMediaError.invalidInput
+        }
+        let command: ProtocolV3ControllerFeedbackCommand
+        switch commandID {
+        case 1, 2:
+            guard valueLength == 4, payload[16..<36].allSatisfy({ $0 == 0 }) else {
+                throw ProtocolV3SessionMediaError.invalidInput
+            }
+            let low = Self.readUInt16(payload, 12)
+            let high = Self.readUInt16(payload, 14)
+            command = commandID == 1
+                ? .rumble(lowFrequency: low, highFrequency: high)
+                : .triggerRumble(left: low, right: high)
+        case 3:
+            guard valueLength == 4, (1...2).contains(payload[12]), payload[13] == 0,
+                  Self.readUInt16(payload, 14) <= 2_000,
+                  payload[16..<36].allSatisfy({ $0 == 0 }) else {
+                throw ProtocolV3SessionMediaError.invalidInput
+            }
+            command = .motionState(type: payload[12], reportRateHz: Self.readUInt16(payload, 14))
+        case 4:
+            guard valueLength == 3, payload[15..<36].allSatisfy({ $0 == 0 }) else {
+                throw ProtocolV3SessionMediaError.invalidInput
+            }
+            command = .led(red: payload[12], green: payload[13], blue: payload[14])
+        case 5:
+            guard valueLength == 24, payload[12] & ~UInt8(0x0C) == 0, payload[15] == 0 else {
+                throw ProtocolV3SessionMediaError.invalidInput
+            }
+            command = .adaptiveTriggers(
+                flags: payload[12],
+                leftType: payload[13],
+                rightType: payload[14],
+                left: payload.subdata(in: 16..<26),
+                right: payload.subdata(in: 26..<36)
+            )
+        default:
+            throw ProtocolV3SessionMediaError.invalidInput
+        }
+        return .init(
+            inputGeneration: inputGeneration,
+            controllerGeneration: controllerGeneration,
+            controller: controller,
+            command: command
+        )
     }
 
     private func handleDisposition(_ disposition: QUICSendDisposition) {
@@ -606,6 +766,14 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
 
     private static func readUInt64(_ data: Data, _ offset: Int) -> UInt64 {
         data[offset..<(offset + 8)].reduce(0) { ($0 << 8) | UInt64($1) }
+    }
+
+    private static func readUInt32(_ data: Data, _ offset: Int) -> UInt32 {
+        data[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
+    }
+
+    private static func readUInt16(_ data: Data, _ offset: Int) -> UInt16 {
+        data[offset..<(offset + 2)].reduce(0) { ($0 << 8) | UInt16($1) }
     }
 
     private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
