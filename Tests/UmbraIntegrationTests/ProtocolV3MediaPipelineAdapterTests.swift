@@ -386,6 +386,41 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         }
     }
 
+    func testGate1ConsumesCanonicalLumenStartRequestVectorByteForByte() throws {
+        guard let lumenSourceRoot = ProcessInfo.processInfo.environment["LUMEN_SOURCE_ROOT"] else {
+            throw XCTSkip("Set LUMEN_SOURCE_ROOT to run the cross-repository Gate 1 vector check.")
+        }
+        let vectorURL = URL(fileURLWithPath: lumenSourceRoot, isDirectory: true)
+            .appendingPathComponent("docs/protocols/vectors/quic_v3_vectors.json")
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: vectorURL)) as? [String: Any]
+        )
+        let artifacts = try XCTUnwrap(document["artifacts"] as? [String: Any])
+        let startRequest = try XCTUnwrap(artifacts["start_request"] as? [String: Any])
+        let frame = try XCTUnwrap(
+            Data(gate1Hexadecimal: try XCTUnwrap(startRequest["hex"] as? String))
+        )
+
+        XCTAssertEqual(frame.prefix(8), Data([0x55, 0x4c, 0x43, 0x33, 0x03, 0x00, 0x01, 0x00]))
+        XCTAssertEqual(frame[8..<16], Data([0, 0, 0, 0, 0, 0, 0, 5]))
+        XCTAssertEqual(frame[20..<24], Data(repeating: 0, count: 4))
+        let payloadLength = frame[16..<20].reduce(UInt32(0)) {
+            ($0 << 8) | UInt32($1)
+        }
+        XCTAssertEqual(Int(payloadLength), frame.count - 24)
+
+        let payload = Data(frame.dropFirst(24))
+        let fields = try XCTUnwrap(try ProtocolV3CBORCodec().decode(payload).mapValue)
+        XCTAssertEqual(Set(fields.keys), Set(1...18))
+        XCTAssertNotNil(fields[18]?.booleanValue)
+        let numerator = try XCTUnwrap(fields[6]?.unsignedValue)
+        let denominator = try XCTUnwrap(fields[7]?.unsignedValue)
+        XCTAssertGreaterThan(denominator, 0)
+        XCTAssertGreaterThanOrEqual(Double(numerator) / Double(denominator), 10)
+        XCTAssertLessThanOrEqual(Double(numerator) / Double(denominator), 480)
+        XCTAssertEqual(try ProtocolV3CBORCodec().encode(.map(fields)), payload)
+    }
+
     func testStartOfferCarriesExplicitHostAudioPreferenceAndSelectionRequiresIt() throws {
         let capabilities = AppleStreamingCapabilities(
             hasMetalDevice: true,
@@ -1312,5 +1347,19 @@ private final class RationalRefreshAudioDecoder: UmbraStreaming.AudioDecoding, @
 private extension Array {
     var only: Element? {
         count == 1 ? first : nil
+    }
+}
+
+private extension Data {
+    init?(gate1Hexadecimal text: String) {
+        guard text.count.isMultiple(of: 2) else { return nil }
+        self.init()
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+            append(byte)
+            index = next
+        }
     }
 }
