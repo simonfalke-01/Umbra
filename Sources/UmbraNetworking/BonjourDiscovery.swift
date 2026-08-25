@@ -6,21 +6,35 @@ public struct DiscoveredHostService: Hashable, Sendable, Identifiable {
     public var type: String
     public var domain: String
     public var interfaceName: String?
+    public var txtRecord: [String: String]
+    public var changeToken: UInt64
+    var networkEndpoint: NWEndpoint?
 
     public var id: String {
         "\(name)|\(type)|\(domain)|\(interfaceName ?? "")"
     }
 
-    public init(name: String, type: String, domain: String, interfaceName: String? = nil) {
+    public init(
+        name: String,
+        type: String,
+        domain: String,
+        interfaceName: String? = nil,
+        txtRecord: [String: String] = [:],
+        changeToken: UInt64 = 0
+    ) {
         self.name = name
         self.type = type
         self.domain = domain
         self.interfaceName = interfaceName
+        self.txtRecord = txtRecord
+        self.changeToken = changeToken
+        networkEndpoint = nil
     }
 }
 
 public enum DiscoveryEvent: Equatable, Sendable {
     case added(DiscoveredHostService)
+    case updated(old: DiscoveredHostService, new: DiscoveredHostService)
     case removed(DiscoveredHostService)
     case failed(String)
 }
@@ -44,8 +58,13 @@ protocol BonjourBrowsing: AnyObject, Sendable {
     func cancel()
 }
 
+enum BonjourServiceKind: Equatable, Sendable {
+    case legacyGameStream
+    case modernLumenV3
+}
+
 protocol BonjourBrowserCreating: Sendable {
-    func makeBrowser() -> any BonjourBrowsing
+    func makeBrowser(for kind: BonjourServiceKind) -> any BonjourBrowsing
 }
 
 protocol BonjourRetryCancellable: AnyObject, Sendable {
@@ -74,21 +93,27 @@ struct BonjourRetryPolicy: Sendable {
 }
 
 private struct NWBonjourBrowserFactory: BonjourBrowserCreating {
-    func makeBrowser() -> any BonjourBrowsing {
-        NWBonjourBrowser()
+    func makeBrowser(for kind: BonjourServiceKind) -> any BonjourBrowsing {
+        NWBonjourBrowser(kind: kind)
     }
 }
 
 private final class NWBonjourBrowser: BonjourBrowsing, @unchecked Sendable {
     private let browser: NWBrowser
 
-    init() {
-        let parameters = NWParameters.tcp
+    init(kind: BonjourServiceKind) {
+        let parameters: NWParameters
+        let descriptor: NWBrowser.Descriptor
+        switch kind {
+        case .legacyGameStream:
+            parameters = .tcp
+            descriptor = .bonjour(type: "_nvstream._tcp", domain: "local.")
+        case .modernLumenV3:
+            parameters = .udp
+            descriptor = .bonjourWithTXTRecord(type: "_lumen-v3._udp", domain: "local.")
+        }
         parameters.includePeerToPeer = true
-        browser = NWBrowser(
-            for: .bonjour(type: "_nvstream._tcp", domain: "local."),
-            using: parameters
-        )
+        browser = NWBrowser(for: descriptor, using: parameters)
     }
 
     func setStateUpdateHandler(_ handler: @escaping @Sendable (BonjourBrowserState) -> Void) {
@@ -124,12 +149,22 @@ private final class NWBonjourBrowser: BonjourBrowsing, @unchecked Sendable {
 
     private static func service(from result: NWBrowser.Result) -> DiscoveredHostService? {
         guard case let .service(name, type, domain, interface) = result.endpoint else { return nil }
-        return DiscoveredHostService(
+        let txtRecord: [String: String]
+        if case let .bonjour(record) = result.metadata {
+            txtRecord = record.dictionary
+        } else {
+            txtRecord = [:]
+        }
+        var service = DiscoveredHostService(
             name: name,
             type: type,
             domain: domain,
-            interfaceName: interface?.name
+            interfaceName: interface?.name,
+            txtRecord: txtRecord,
+            changeToken: UInt64(bitPattern: Int64(result.hashValue))
         )
+        service.networkEndpoint = result.endpoint
+        return service
     }
 }
 
@@ -164,11 +199,12 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
     private let browserFactory: any BonjourBrowserCreating
     private let retryScheduler: any BonjourRetryScheduling
     private let retryPolicy: BonjourRetryPolicy
+    private let serviceKind: BonjourServiceKind
     private let lock = NSLock()
     private var browser: (any BonjourBrowsing)?
     private var retryCancellation: (any BonjourRetryCancellable)?
     private var eventHandler: (@Sendable (DiscoveryEvent) -> Void)?
-    private var knownServices: Set<DiscoveredHostService> = []
+    private var knownServices: [String: DiscoveredHostService] = [:]
     private var generation: UInt64 = 0
     private var browserToken: UInt64 = 0
     private var retryToken: UInt64 = 0
@@ -180,7 +216,21 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
             queue: queue,
             browserFactory: NWBonjourBrowserFactory(),
             retryScheduler: DispatchBonjourRetryScheduler(),
-            retryPolicy: .default
+            retryPolicy: .default,
+            serviceKind: .legacyGameStream
+        )
+    }
+
+    convenience init(
+        serviceKind: BonjourServiceKind,
+        queue: DispatchQueue = DispatchQueue(label: "app.umbra.bonjour-discovery")
+    ) {
+        self.init(
+            queue: queue,
+            browserFactory: NWBonjourBrowserFactory(),
+            retryScheduler: DispatchBonjourRetryScheduler(),
+            retryPolicy: .default,
+            serviceKind: serviceKind
         )
     }
 
@@ -188,12 +238,14 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
         queue: DispatchQueue,
         browserFactory: any BonjourBrowserCreating,
         retryScheduler: any BonjourRetryScheduling,
-        retryPolicy: BonjourRetryPolicy = .default
+        retryPolicy: BonjourRetryPolicy = .default,
+        serviceKind: BonjourServiceKind = .legacyGameStream
     ) {
         self.queue = queue
         self.browserFactory = browserFactory
         self.retryScheduler = retryScheduler
         self.retryPolicy = retryPolicy
+        self.serviceKind = serviceKind
     }
 
     public func start(eventHandler: @escaping @Sendable (DiscoveryEvent) -> Void) {
@@ -232,7 +284,7 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
     }
 
     private func launchBrowser(for generation: UInt64) {
-        let browser = browserFactory.makeBrowser()
+        let browser = browserFactory.makeBrowser(for: serviceKind)
 
         lock.lock()
         guard isRunning, self.generation == generation, self.browser == nil else {
@@ -330,14 +382,31 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
             lock.unlock()
             return
         }
-        let added = services.subtracting(knownServices)
-        let removed = knownServices.subtracting(services)
-        knownServices = services
+        var next: [String: DiscoveredHostService] = [:]
+        for service in services.sorted(by: { lhs, rhs in
+            if lhs.id != rhs.id { return lhs.id < rhs.id }
+            return lhs.changeToken < rhs.changeToken
+        }) {
+            next[service.id] = service
+        }
+        let previous = knownServices
+        let removed = previous.keys.filter { next[$0] == nil }.sorted()
+        let added = next.keys.filter { previous[$0] == nil }.sorted()
+        let updated = next.keys.filter {
+            guard let old = previous[$0], let new = next[$0] else { return false }
+            return old != new
+        }.sorted()
+        knownServices = next
         let eventHandler = eventHandler
         lock.unlock()
 
-        added.sorted(by: { $0.id < $1.id }).forEach { eventHandler?(.added($0)) }
-        removed.sorted(by: { $0.id < $1.id }).forEach { eventHandler?(.removed($0)) }
+        removed.compactMap { previous[$0] }.forEach { eventHandler?(.removed($0)) }
+        updated.forEach { id in
+            if let old = previous[id], let new = next[id] {
+                eventHandler?(.updated(old: old, new: new))
+            }
+        }
+        added.compactMap { next[$0] }.forEach { eventHandler?(.added($0)) }
     }
 
     private func isCurrentBrowser(generation: UInt64, browserToken: UInt64) -> Bool {

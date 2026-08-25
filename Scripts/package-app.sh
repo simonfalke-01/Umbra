@@ -50,6 +50,11 @@ app_identifier="$(plutil -extract CFBundleIdentifier raw "$app_root/Contents/Inf
     echo "Umbra's secure-pairing URL scheme is missing from the packaged app." >&2
     exit 1
 }
+[[ "$(plutil -extract NSBonjourServices.0 raw "$app_root/Contents/Info.plist")" == "_nvstream._tcp"
+    && "$(plutil -extract NSBonjourServices.1 raw "$app_root/Contents/Info.plist")" == "_lumen-v3._udp" ]] || {
+    echo "Umbra's legacy and secure protocol-v3 Bonjour declarations are incomplete." >&2
+    exit 1
+}
 cp "$repository_root/LICENSE" "$app_root/Contents/Resources/LICENSE"
 cp "$repository_root/NOTICE.md" "$app_root/Contents/Resources/NOTICE.md"
 cp "$repository_root/THIRD_PARTY_NOTICES.md" "$app_root/Contents/Resources/THIRD_PARTY_NOTICES.md"

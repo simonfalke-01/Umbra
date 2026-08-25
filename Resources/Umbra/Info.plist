@@ -48,6 +48,7 @@
     <key>NSBonjourServices</key>
     <array>
         <string>_nvstream._tcp</string>
+        <string>_lumen-v3._udp</string>
     </array>
     <key>GCSupportsControllerUserInteraction</key>
     <true/>

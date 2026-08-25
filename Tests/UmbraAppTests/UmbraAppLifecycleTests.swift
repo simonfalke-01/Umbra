@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import XCTest
 import UmbraCore
+import UmbraNetworking
 import UmbraProtocolV3
 @testable import UmbraApp
 
@@ -34,7 +35,7 @@ final class UmbraAppLifecycleTests: XCTestCase {
         XCTAssertEqual(replies, [true])
     }
 
-    func testPackagedInfoPlistRegistersSecurePairingURLScheme() throws {
+    func testPackagedInfoPlistRegistersSecurePairingAndBothDiscoveryProtocols() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -46,8 +47,22 @@ final class UmbraAppLifecycleTests: XCTestCase {
         )
         let urlTypes = try XCTUnwrap(plist["CFBundleURLTypes"] as? [[String: Any]])
         let schemes = try XCTUnwrap(urlTypes.first?["CFBundleURLSchemes"] as? [String])
+        let bonjourServices = try XCTUnwrap(plist["NSBonjourServices"] as? [String])
 
         XCTAssertEqual(schemes, ["umbra"])
+        XCTAssertEqual(bonjourServices, ["_nvstream._tcp", "_lumen-v3._udp"])
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+        let storage = FileBackedProtocolV3TrustStore.storageDescriptor(
+            applicationSupportDirectory: applicationSupport
+        )
+        XCTAssertTrue(storage.url.path.hasSuffix(
+            "/Application Support/app.umbra.Umbra/protocol-v3-trust-v1.json"
+        ))
+        XCTAssertFalse(storage.usesSystemKeychain)
+        XCTAssertTrue(storage.isBackupEligible)
     }
 
     func testV3PairingRequestsOnlyEnabledPrivilegedFeatures() {
@@ -111,6 +126,71 @@ final class UmbraAppLifecycleTests: XCTestCase {
         XCTAssertNil(try catalog.host(hostID: hostID))
     }
 
+    func testModernDiscoveryUpdatesOnlyPinnedCatalogAndFailureNeverDowngrades() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("UmbraV3DiscoveryTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trustStore = FileBackedProtocolV3TrustStore(url: root.appendingPathComponent("trust.json"))
+        let catalog = FileBackedModernLumenV3HostCatalog(url: root.appendingPathComponent("hosts.json"))
+        let identity = try trustStore.identity()
+        let hostPublicKey = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+        let hostID = Data(SHA256.hash(data: hostPublicKey).prefix(16))
+        let trust = try ProtocolV3TrustRecord(
+            hostID: hostID,
+            hostPublicKey: hostPublicKey,
+            tlsSPKIHash: Data(repeating: 0xA5, count: 32),
+            clientID: identity.clientID,
+            grantedPermissions: 0x17,
+            pairingGeneration: 1
+        )
+        try trustStore.commit(identity: identity, trust: trust)
+        try catalog.upsert(ModernLumenV3HostRecord(
+            hostID: hostID,
+            hostname: "old.local",
+            hostnameIsIPLiteral: false,
+            port: 47_998,
+            displayName: "Pinned Lumen",
+            applications: [],
+            applicationRevision: nil,
+            runningApplicationID: nil
+        ))
+        let discovery = FixtureModernDiscovery()
+        let manager = ModernLumenV3Manager(
+            trustStore: trustStore,
+            hostCatalog: catalog,
+            discovery: discovery,
+            log: nil
+        )
+        manager.startDiscovery()
+
+        discovery.emit(.available(try ProtocolV3DiscoveredServiceRecord(
+            service: modernService(hostID: hostID),
+            resolvedHost: "new.local",
+            resolvedPort: 47_998
+        )))
+        await eventually { (try? catalog.host(hostID: hostID)?.hostname) == "new.local" }
+        XCTAssertEqual(try catalog.host(hostID: hostID)?.hostname, "new.local")
+        XCTAssertEqual(try catalog.host(hostID: hostID)?.port, 47_998)
+
+        discovery.emit(.failed("modern browse failed"))
+        let persisted = try XCTUnwrap(manager.displayHosts().first)
+        XCTAssertTrue(persisted.id.rawValue.hasPrefix("v3:"))
+        XCTAssertTrue(persisted.details.contains("downgrade disabled"))
+        XCTAssertTrue(persisted.details.contains("new.local:47998"))
+
+        let untrustedID = Data(repeating: 0x22, count: 16)
+        discovery.emit(.available(try ProtocolV3DiscoveredServiceRecord(
+            service: modernService(hostID: untrustedID),
+            resolvedHost: "untrusted.local",
+            resolvedPort: 47_998
+        )))
+        await Task.yield()
+        XCTAssertNil(try catalog.host(hostID: untrustedID))
+        XCTAssertEqual(try manager.displayHosts().count, 1)
+        manager.stopDiscovery()
+        XCTAssertEqual(discovery.stopCount, 1)
+    }
+
     private func eventually(
         _ condition: @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,
@@ -121,6 +201,38 @@ final class UmbraAppLifecycleTests: XCTestCase {
         }
         XCTAssertTrue(condition(), file: file, line: line)
     }
+}
+
+private final class FixtureModernDiscovery: ProtocolV3Discovering, @unchecked Sendable {
+    private var handler: (@Sendable (ProtocolV3DiscoveryEvent) -> Void)?
+    private(set) var stopCount = 0
+
+    func start(eventHandler: @escaping @Sendable (ProtocolV3DiscoveryEvent) -> Void) {
+        handler = eventHandler
+    }
+
+    func stop() {
+        stopCount += 1
+        handler = nil
+    }
+
+    func emit(_ event: ProtocolV3DiscoveryEvent) {
+        handler?(event)
+    }
+}
+
+private func modernService(hostID: Data) -> DiscoveredHostService {
+    DiscoveredHostService(
+        name: "Lumen",
+        type: "_lumen-v3._udp",
+        domain: "local.",
+        txtRecord: [
+            "version": "3",
+            "id": hostID.map { String(format: "%02x", $0) }.joined(),
+            "port": "47998",
+            "capabilities": "0000000000000017",
+        ]
+    )
 }
 
 @MainActor
