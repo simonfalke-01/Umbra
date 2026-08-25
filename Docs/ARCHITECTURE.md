@@ -92,6 +92,10 @@ the microphone, which makes the same preflight fail closed before streaming.
 - Merged player-one metadata stays stable while the virtual controller is active,
   avoiding heterogeneous hot-plug rebind races. A full disconnect/rearrival
   advances the generation, and stale feedback is rejected.
+- Compact input state format 3 is enabled only by an authenticated server
+  capability. It preserves the 1,108-byte QUIC payload cap with 16 controllers;
+  format-2 hosts retain their original wire shape and degrade explicitly above
+  their 15-controller operational ceiling.
 
 ## Trust and identity
 

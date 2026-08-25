@@ -95,7 +95,7 @@ and Lumen VDD work does not change the status of these legacy-client checks.
 Umbra must not expose a capability as proven when only parser, fixture, or
 portable test coverage exists.
 
-The fixed protocol-v3 input datagram currently fits at most 15 simultaneous
-64-byte controller state records within its 1,108-byte semantic payload. The
-16-slot local allocator is covered, but a coordinated wire-format revision is
-still required before 16 simultaneous v3 controllers can be claimed end to end.
+Protocol-v3 input state format 2 fits at most 15 simultaneous 64-byte controller
+records. Authenticated hosts can advertise compact state format 3, which carries
+all 16 controller records within the same 1,108-byte payload; older hosts report
+an explicit nonterminal degradation instead of sending an oversized datagram.

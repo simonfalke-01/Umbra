@@ -324,6 +324,10 @@ final class ModernLumenV3Manager {
                 controllerGeneration: feedback.controllerGeneration
             ) ?? false
         }
+
+        func updateMaximumPayloadByteCount(_ byteCount: Int) {
+            lock.withLock { sender }?.updateMaximumPayloadByteCount(byteCount)
+        }
     }
 
     private final class RetainedSession {
@@ -337,6 +341,8 @@ final class ModernLumenV3Manager {
         var sessionEndedEvents: AsyncStream<Data>
         var sessionEndedContinuation: AsyncStream<Data>.Continuation
         var isAuthenticated = false
+        var serverCapabilities: UInt64 = 0
+        var inputDatagramPayloadByteCount = 1_108
         var invitationRecord: ModernLumenV3HostRecord?
         var pairingInvitationID: Data?
         let pairingEvents: AsyncStream<Result<HostDisplayModel, Error>>
@@ -1310,12 +1316,21 @@ final class ModernLumenV3Manager {
                 entry.pairingContinuation.finish()
                 session.cancel()
             }
-        case .authenticated:
+        case let .authenticated(_, _, serverCapabilities):
             entry.isAuthenticated = true
+            entry.serverCapabilities = serverCapabilities
             connectionStatuses[hostID] = .online
             entry.authenticationContinuation.yield(.success(()))
             entry.authenticationContinuation.finish()
             publishCatalog()
+        case let .transport(.negotiated(parameters)):
+            entry.inputDatagramPayloadByteCount = parameters.usableDatagramPayloadSize
+            entry.inputSenderRelay.updateMaximumPayloadByteCount(
+                parameters.usableDatagramPayloadSize
+            )
+        case let .transport(.datagramCapacityChanged(_, payloadByteCount)):
+            entry.inputDatagramPayloadByteCount = payloadByteCount
+            entry.inputSenderRelay.updateMaximumPayloadByteCount(payloadByteCount)
         case let .activeSessionAvailable(activeSessionID):
             entry.activeSessionContinuation.yield(activeSessionID)
             entry.activeSessionContinuation.finish()
@@ -1530,6 +1545,13 @@ final class ModernLumenV3Manager {
                 mode: prepared.offer.mode,
                 usesAbsolutePointer: prepared.bootstrap.preferences.absoluteMouseMode,
                 inputGeneration: attach.inputGeneration,
+                supportsCompactStateFormat: entry.serverCapabilities & 0x200 != 0,
+                maximumPayloadByteCount: entry.inputDatagramPayloadByteCount,
+                degradationHandler: { [weak self] message in
+                    Task { @MainActor [weak self] in
+                        self?.sessionEventHandler?(.sessionDegraded(message))
+                    }
+                },
                 failureHandler: inputFailureHandler
             )
             let resetState = try inputSender.inputResetStateBlock()
@@ -1838,6 +1860,13 @@ final class ModernLumenV3Manager {
                 mode: prepared.offer.mode,
                 usesAbsolutePointer: prepared.bootstrap.preferences.absoluteMouseMode,
                 inputGeneration: inputGeneration,
+                supportsCompactStateFormat: entry.serverCapabilities & 0x200 != 0,
+                maximumPayloadByteCount: entry.inputDatagramPayloadByteCount,
+                degradationHandler: { [weak self] message in
+                    Task { @MainActor [weak self] in
+                        self?.sessionEventHandler?(.sessionDegraded(message))
+                    }
+                },
                 failureHandler: inputFailureHandler
             )
             entry.inputSenderRelay.install(inputSender)

@@ -4,6 +4,12 @@ import Testing
 @testable import UmbraProtocolV3
 import UmbraQUICTransport
 
+@Test func serverCapabilityAdmissionPreservesOldAndCompactInputHosts() {
+    #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x17f) == 0x17f)
+    #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x37f) == 0x37f)
+    #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x400) == nil)
+}
+
 @Test func stopWaitsForSessionEndedAndReusesAuthenticatedControl() async throws {
     let codec = ProtocolV3CBORCodec()
     let identity = try ProtocolV3ClientIdentity(privateSeed: Data(0..<32))
@@ -37,13 +43,18 @@ import UmbraQUICTransport
 
     try session.start()
     let clientHello = try await transport.request(at: 0)
+    guard case let .map(clientHelloFields) = try codec.decode(clientHello.payload) else {
+        Issue.record("Expected CLIENT_HELLO map")
+        return
+    }
+    #expect(clientHelloFields[4]?.unsignedValue == 0x17f)
     let serverHelloFields: [UInt64: ProtocolV3CBORValue] = [
         1: .unsigned(3),
         2: .bytes(Data(repeating: 0x51, count: 32)),
         3: .bytes(hostID),
         4: .bytes(hostPublicKey),
         5: .bytes(spki),
-        6: .unsigned(0x17f),
+        6: .unsigned(0x37f),
         7: .unsigned(UInt64(QUICTransportProfile.semanticDatagramByteCount)),
         8: .bytes(Data(repeating: 0x41, count: 16)),
     ]
@@ -90,6 +101,7 @@ import UmbraQUICTransport
         codec: codec
     )
     try await stopLifecycleWait { recorder.authenticatedCount == 1 }
+    #expect(recorder.serverCapabilities == 0x37f)
 
     var missingHostAudio = stopLifecycleStartFields(intent: Data(repeating: 0x5f, count: 16))
     missingHostAudio.removeValue(forKey: 18)
@@ -256,6 +268,16 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
 
     var authenticatedCount: Int {
         lock.withLock { events.count { if case .authenticated = $0 { true } else { false } } }
+    }
+
+    var serverCapabilities: UInt64? {
+        lock.withLock {
+            let capabilities: [UInt64] = events.compactMap {
+                guard case let .authenticated(_, _, capabilities) = $0 else { return nil }
+                return capabilities
+            }
+            return capabilities.last
+        }
     }
 
     var endedSessionIDs: [Data] {

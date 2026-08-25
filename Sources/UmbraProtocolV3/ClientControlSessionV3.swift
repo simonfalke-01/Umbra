@@ -52,7 +52,11 @@ public enum ProtocolV3AuthenticationMode: Sendable {
 public enum ProtocolV3ClientEvent: Sendable {
     case transport(QUICTransportEvent)
     case trustEstablished(ProtocolV3TrustRecord, endpoint: QUICTransportEndpoint)
-    case authenticated(permissions: UInt64, authorityGeneration: UInt64)
+    case authenticated(
+        permissions: UInt64,
+        authorityGeneration: UInt64,
+        serverCapabilities: UInt64
+    )
     case activeSessionAvailable(Data)
     case startAccepted(sessionID: Data, fields: [UInt64: ProtocolV3CBORValue])
     case lateStartAccepted(requestID: UInt64, sessionID: Data, fields: [UInt64: ProtocolV3CBORValue])
@@ -97,6 +101,7 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
     private var expectedHostID = Data()
     private var expectedHostPublicKey = Data()
     private var permissions: UInt64 = 0
+    private var serverCapabilities: UInt64 = 0
     private var nextRequestID: UInt64 = 5
     private var pendingRequests: [UInt64: UInt16] = [:]
     private var hostRequests: [UInt64: HostRequest] = [:]
@@ -380,9 +385,12 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
               fields[3]?.bytesValue == expectedHostID,
               fields[4]?.bytesValue == expectedHostPublicKey,
               fields[5]?.bytesValue == liveSPKI,
+              let rawCapabilities = fields[6]?.unsignedValue,
+              let capabilities = Self.validatedServerCapabilities(rawCapabilities),
               fields[7]?.unsignedValue == UInt64(QUICTransportProfile.semanticDatagramByteCount),
               fields[8]?.bytesValue == attemptID
         else { throw ProtocolV3ClientError.authenticationFailed }
+        serverCapabilities = capabilities
         serverHello = complete
         transport.applicationHelloDidComplete(success: true)
         state = .authorization
@@ -477,7 +485,11 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
                 trust,
                 endpoint: .init(host: invitation.hostname, port: invitation.port)
             ))
-            eventHandler?(.authenticated(permissions: granted, authorityGeneration: generation))
+            eventHandler?(.authenticated(
+                permissions: granted,
+                authorityGeneration: generation,
+                serverCapabilities: serverCapabilities
+            ))
         case .paired:
             let activeSessionID: Data?
             if fields[5] == .null {
@@ -509,7 +521,11 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
             permissions = granted
             state = .ready
             transport.applicationAuthenticationDidComplete(success: true)
-            eventHandler?(.authenticated(permissions: granted, authorityGeneration: authority))
+            eventHandler?(.authenticated(
+                permissions: granted,
+                authorityGeneration: authority,
+                serverCapabilities: serverCapabilities
+            ))
             if let activeSessionID {
                 eventHandler?(.activeSessionAvailable(activeSessionID))
             }
@@ -718,6 +734,10 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
               let trace = fields[13]?.bytesValue, trace.count == 16, trace.contains(where: { $0 != 0 }),
               fields[18]?.booleanValue != nil
         else { throw ProtocolV3ClientError.invalidMessage("START fields") }
+    }
+
+    static func validatedServerCapabilities(_ capabilities: UInt64) -> UInt64? {
+        capabilities & ~UInt64(0x37f) == 0 ? capabilities : nil
     }
 
     private func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {

@@ -74,6 +74,10 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
             data.appendInteger(UInt64(0))
             return data
         }
+
+        func compactEncoded(id: UInt8) -> Data {
+            encoded(id: id).prefix(56)
+        }
     }
 
     private struct TouchState {
@@ -130,12 +134,17 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     private var controllers: [UInt8: ControllerState] = [:]
     private var controllerGenerations: [UInt8: UInt32] = [:]
     private var touches: [UInt32: TouchState] = [:]
+    private var dirtyTouches: Set<UInt32> = []
     private var initialBaseline = true
     private var closed = false
     private var failureReported = false
     private var retryTask: Task<Void, Never>?
     private var nextCompositionID: UInt64 = 1
     private var nextTextOperationID: UInt64 = 1
+    private let supportsCompactStateFormat: Bool
+    private var maximumPayloadByteCount: Int
+    private let degradationHandler: @Sendable (String) -> Void
+    private var degradationReported = false
 
     public init(
         session: any ProtocolV3SessionMediaControlling,
@@ -143,6 +152,9 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         mode: QUICOptimizationMode,
         usesAbsolutePointer: Bool,
         inputGeneration: UInt32 = 1,
+        supportsCompactStateFormat: Bool = false,
+        maximumPayloadByteCount: Int = 1_108,
+        degradationHandler: @escaping @Sendable (String) -> Void = { _ in },
         failureHandler: @escaping @Sendable (Error) -> Void
     ) {
         self.session = session
@@ -150,6 +162,9 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         self.mode = mode
         self.usesAbsolutePointer = usesAbsolutePointer
         self.inputGeneration = inputGeneration
+        self.supportsCompactStateFormat = supportsCompactStateFormat
+        self.maximumPayloadByteCount = min(max(0, maximumPayloadByteCount), 1_108)
+        self.degradationHandler = degradationHandler
         self.failureHandler = failureHandler
     }
 
@@ -244,9 +259,13 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
                 controller.rightX = rightX; controller.rightY = rightY
                 controllers[id] = controller
                 let mask = UInt16(bitPattern: activeMask)
-                for existing in controllers.keys where mask & (UInt16(1) << existing) == 0 {
+                let removed = Set(controllers.keys.filter {
+                    mask & (UInt16(1) << $0) == 0
+                })
+                for existing in removed {
                     controllers[existing] = nil
                 }
+                edges.removeAll { removed.contains($0.device) && ($0.kind == 3 || $0.kind == 4) }
             case let .controllerArrival(number, _, type, supportedButtons, capabilities):
                 guard number < 16 else { throw ProtocolV3InputError.invalidCommand }
                 let normalizedType = (1...5).contains(type) ? type : 5
@@ -344,6 +363,12 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         }
     }
 
+    public func updateMaximumPayloadByteCount(_ byteCount: Int) {
+        lock.withLock {
+            maximumPayloadByteCount = min(max(0, byteCount), 1_108)
+        }
+    }
+
     public func acceptsControllerFeedback(
         inputGeneration: UInt32,
         controller: UInt8,
@@ -378,6 +403,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
             controllers.removeAll()
             controllerGenerations.removeAll()
             touches.removeAll()
+            dirtyTouches.removeAll()
         }
     }
 
@@ -404,26 +430,60 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     }
 
     private func transmitSnapshot() throws {
-        let submission = try lock.withLock { () -> (Data, UInt64, Bool) in
+        let result = try lock.withLock { () -> ((Data, UInt64, Bool)?, String?) in
             guard !closed else { throw ProtocolV3InputError.closed }
             guard stateSequence < UInt64.max else { throw ProtocolV3InputError.sequenceExhausted }
-            stateSequence += 1
-            let stateBlock = stateBlock()
-            let maximumEdges = min(64, max(0, (1_108 - 32 - stateBlock.count) / 32))
+            let controllerIDs = controllers.keys.sorted()
+            let controllerByteCount = supportsCompactStateFormat ? 56 : 64
+            let minimumPayloadByteCount = 32 + 112 + controllerIDs.count * controllerByteCount
+            guard minimumPayloadByteCount <= maximumPayloadByteCount else {
+                let message = !supportsCompactStateFormat && controllerIDs.count > 15
+                    ? "This host does not support compact input state; protocol-v3 input is limited to 15 simultaneous controllers."
+                    : "Input is temporarily degraded because the QUIC path payload cap is too small for all active controllers."
+                let shouldReport = !degradationReported
+                degradationReported = true
+                return (nil, shouldReport ? message : nil)
+            }
+            let edgeBudget = (maximumPayloadByteCount - minimumPayloadByteCount) / 32
+            let maximumEdges = min(64, edgeBudget)
+            guard edges.isEmpty || maximumEdges > 0 else {
+                let message = !supportsCompactStateFormat && controllerIDs.count == 15
+                    ? "This host cannot carry input edges while 15 format-2 controllers are active; input is temporarily degraded."
+                    : "Input is temporarily degraded because the QUIC path payload cap cannot carry the pending input edge."
+                let shouldReport = !degradationReported
+                degradationReported = true
+                return (nil, shouldReport ? message : nil)
+            }
             let representedEdges = Array(edges.prefix(maximumEdges))
+            let touchBudget = (
+                maximumPayloadByteCount - minimumPayloadByteCount - representedEdges.count * 32
+            ) / 32
+            let representedTouchIDs = dirtyTouches.sorted().filter { touches[$0] != nil }.prefix(touchBudget)
+            let stateBlock = stateBlock(
+                controllerIDs: controllerIDs,
+                touchIDs: Array(representedTouchIDs)
+            )
             var payload = Data()
             payload.appendInteger(Self.monotonicMicroseconds())
             payload.appendInteger(representedEdges.last?.id ?? lastAcknowledgedEdgeID)
             payload.appendInteger(UInt16(stateBlock.count))
             payload.appendInteger(UInt16(representedEdges.count))
-            payload.appendInteger(UInt16(2))
+            payload.appendInteger(UInt16(supportsCompactStateFormat ? 3 : 2))
             payload.appendInteger(UInt16(2))
             payload.appendInteger(UInt64(0))
             payload.append(stateBlock)
             representedEdges.forEach { payload.append($0.encoded) }
+            guard payload.count <= maximumPayloadByteCount else {
+                throw ProtocolV3InputError.invalidCommand
+            }
+            stateSequence += 1
+            dirtyTouches.subtract(representedTouchIDs)
             initialBaseline = false
-            return (payload, stateSequence, !representedEdges.isEmpty)
+            degradationReported = false
+            return ((payload, stateSequence, !representedEdges.isEmpty), nil)
         }
+        if let degradation = result.1 { degradationHandler(degradation) }
+        guard let submission = result.0 else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         session.sendDatagram(
             lane: submission.2 ? .inputEdge : .inputState,
@@ -438,7 +498,10 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         )
     }
 
-    private func stateBlock() -> Data {
+    private func stateBlock(
+        controllerIDs: [UInt8]? = nil,
+        touchIDs: [UInt32]? = nil
+    ) -> Data {
         var data = Data()
         var flags: UInt32 = usesAbsolutePointer ? 1 : 2
         if initialBaseline { flags |= 4 }
@@ -451,15 +514,22 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         data.appendInteger(usesAbsolutePointer ? absoluteX : 0)
         data.appendInteger(usesAbsolutePointer ? absoluteY : 0)
         data.append(keyboard)
-        let controllerIDs = controllers.keys.sorted()
-        let touchIDs = touches.keys.sorted()
+        let controllerIDs = controllerIDs ?? controllers.keys.sorted()
+        let touchIDs = touchIDs ?? touches.keys.sorted()
         let controllerMask = controllerIDs.reduce(UInt32(0)) { $0 | (UInt32(1) << $1) }
         data.appendInteger(controllerMask)
         data.append(UInt8(controllerIDs.count))
         data.append(UInt8(touchIDs.count))
         data.append(0)
-        data.append(Data(repeating: 0, count: 25))
-        controllerIDs.forEach { data.append(controllers[$0]!.encoded(id: $0)) }
+        data.append(supportsCompactStateFormat ? 3 : 0)
+        data.append(Data(repeating: 0, count: 24))
+        controllerIDs.forEach {
+            if supportsCompactStateFormat {
+                data.append(controllers[$0]!.compactEncoded(id: $0))
+            } else {
+                data.append(controllers[$0]!.encoded(id: $0))
+            }
+        }
         touchIDs.forEach { data.append(touches[$0]!.encoded(id: $0)) }
         return data
     }
@@ -497,14 +567,18 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         switch eventType {
         case 1:
             touches[pointerID] = TouchState(phase: 2, x: x, y: y, pressure: pressure)
+            dirtyTouches.insert(pointerID)
             try appendEdge(time: time, kind: 5, device: 0, code: 2, value: 1, auxiliary: pointerID)
         case 2:
             touches[pointerID] = nil
+            dirtyTouches.remove(pointerID)
             try appendEdge(time: time, kind: 5, device: 0, code: 4, value: 0, auxiliary: pointerID)
         case 3:
             touches[pointerID] = TouchState(phase: 3, x: x, y: y, pressure: pressure)
+            dirtyTouches.insert(pointerID)
         case 4:
             touches[pointerID] = nil
+            dirtyTouches.remove(pointerID)
             try appendEdge(time: time, kind: 5, device: 0, code: 5, value: 0, auxiliary: pointerID)
         default:
             throw ProtocolV3InputError.invalidCommand
