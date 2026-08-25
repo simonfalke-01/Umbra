@@ -203,15 +203,30 @@ final class SettingsInteractionTests: XCTestCase {
     }
 
     func testCustomFrameRateParserAcceptsExactFractionAndRejectsInvalidValues() {
-        let exact = CustomFrameRateValue(text: "60000/1001")
-        XCTAssertEqual(exact?.numerator, 60_000)
-        XCTAssertEqual(exact?.denominator, 1_001)
-        let integer = CustomFrameRateValue(text: "120")
-        XCTAssertEqual(integer?.numerator, 120)
-        XCTAssertEqual(integer?.denominator, 1)
-        XCTAssertNil(CustomFrameRateValue(text: "60000/0"))
-        XCTAssertNil(CustomFrameRateValue(text: "9"))
-        XCTAssertNil(CustomFrameRateValue(text: "481"))
+        for (text, numerator, denominator) in [
+            ("10", 10, 1),
+            ("120", 120, 1),
+            ("60000/1001", 60_000, 1_001),
+            ("480", 480, 1),
+            ("480000000/1000000", 480_000_000, 1_000_000),
+        ] {
+            let value = CustomFrameRateValue(text: text)
+            XCTAssertEqual(value?.numerator, numerator, text)
+            XCTAssertEqual(value?.denominator, denominator, text)
+        }
+
+        for text in [
+            "0",
+            "1",
+            "9",
+            "481",
+            "60000/0",
+            "9223372036854775807/1",
+            "120/1/1",
+            "not-a-rate",
+        ] {
+            XCTAssertNil(CustomFrameRateValue(text: text), text)
+        }
     }
 
     func testResetAllSynchronizesPacketSizeFieldText() throws {
