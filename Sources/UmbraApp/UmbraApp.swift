@@ -72,13 +72,6 @@ struct UmbraApp: App {
                 preferences: composition.preferences
             )
             _store = StateObject(wrappedValue: store)
-            composition.protocolV3.setPairingEventHandler { [weak store] result in
-                guard case let .failure(error) = result else { return }
-                store?.failure = PresentedFailure(
-                    title: "Couldn’t Pair Securely",
-                    message: error.localizedDescription
-                )
-            }
             applicationDelegate.stopBarrier = { [weak composition] in
                 await composition?.stopForApplicationTermination()
             }
@@ -145,20 +138,7 @@ struct UmbraApp: App {
             RootView(store: store)
                 .onOpenURL { url in
                     guard url.scheme == "umbra", url.host == "pair", url.path == "/v3" else { return }
-                    do {
-                        guard let composition else { return }
-                        try composition.protocolV3.connectInvitation(
-                            url.absoluteString,
-                            requestedPermissions: ModernLumenV3Manager.requestedPermissions(
-                                for: composition.preferences.settings
-                            )
-                        )
-                    } catch {
-                        store.failure = PresentedFailure(
-                            title: "Couldn’t Pair Securely",
-                            message: error.localizedDescription
-                        )
-                    }
+                    store.showSecurePairing(invitationURI: url.absoluteString)
                 }
         }
         .defaultSize(width: 1_040, height: 720)

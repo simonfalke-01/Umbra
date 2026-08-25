@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct OperationRail: View {
     let operation: OperationPresentation
@@ -38,44 +40,225 @@ struct OperationRail: View {
 }
 
 struct AddHostSheet: View {
+    private enum PairingMethod: Hashable {
+        case invitation
+        case legacy
+    }
+
+    private enum Field: Hashable {
+        case invitation
+        case address
+    }
+
     @ObservedObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    @State private var pairingMethod: PairingMethod
+    @State private var invitation: String
     @State private var address = ""
     @State private var port = ""
-    @FocusState private var addressFocused: Bool
+    @State private var isImportingInvitation = false
+    @State private var isApplyingStoreInvitation = false
+    @State private var importError: String?
+    @StateObject private var importCoordinator: SecurePairingInvitationImportCoordinator
+    @FocusState private var focusedField: Field?
+
+    init(store: AppStore) {
+        self.store = store
+        _pairingMethod = State(initialValue: .invitation)
+        _invitation = State(initialValue: store.pendingSecureInvitation)
+        _importCoordinator = StateObject(
+            wrappedValue: SecurePairingInvitationImportCoordinator()
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space6) {
-            VStack(alignment: .leading, spacing: UmbraLayout.space2) {
-                Text("Add Host")
-                    .font(.title2.weight(.semibold))
-                Text("Enter a host name or IP address. Umbra will use the standard GameStream port unless you specify another one.")
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text("Add Host")
+                .font(.title2.weight(.semibold))
 
-            Form {
-                TextField("Host name or IP address", text: $address, prompt: Text("gaming-mac.local or 192.168.1.25"))
-                    .focused($addressFocused)
-                    .textContentType(.URL)
-                TextField("Port (optional)", text: $port, prompt: Text("Default"))
-                    .frame(maxWidth: 160)
+            Picker("Pairing method", selection: $pairingMethod) {
+                Text("Lumen Invitation").tag(PairingMethod.invitation)
+                Text("Moonlight PIN").tag(PairingMethod.legacy)
             }
-            .formStyle(.grouped)
+            .pickerStyle(.segmented)
+            .disabled(securePairingInProgress)
+
+            Group {
+                switch pairingMethod {
+                case .invitation:
+                    invitationFields
+                case .legacy:
+                    legacyFields
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(securePairingInProgress)
 
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                if pairingMethod == .invitation, store.operation?.kind == .pairing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Pairing in progress")
+                    Button("Cancel Pairing") {
+                        store.cancelCurrentOperation()
+                    }
                     .keyboardShortcut(.cancelAction)
-                Button("Add Host") { store.addHost(address: address, portText: port) }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } else {
+                    Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                    Button(primaryActionTitle, action: performPrimaryAction)
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(primaryActionDisabled)
+                }
             }
         }
         .padding(UmbraLayout.space6)
-        .frame(width: 480)
-        .onAppear { addressFocused = true }
+        .frame(width: 520)
+        .onAppear {
+            focusedField = pairingMethod == .invitation ? .invitation : .address
+        }
+        .onChange(of: pairingMethod) { _, method in
+            importCoordinator.invalidate()
+            importError = nil
+            if !isApplyingStoreInvitation {
+                store.clearSecurePairingError()
+            }
+            focusedField = method == .invitation ? .invitation : .address
+        }
+        .onChange(of: invitation) {
+            importCoordinator.invalidate()
+            importError = nil
+            if isApplyingStoreInvitation {
+                isApplyingStoreInvitation = false
+                return
+            }
+            store.clearSecurePairingError()
+        }
+        .onChange(of: store.pendingSecureInvitation) { _, replacement in
+            guard invitation != replacement else { return }
+            importCoordinator.invalidate()
+            isApplyingStoreInvitation = true
+            pairingMethod = .invitation
+            invitation = replacement
+            importError = nil
+            focusedField = .invitation
+        }
+        .onChange(of: importCoordinator.completion) { _, completion in
+            guard let completion, importCoordinator.owns(completion.token) else { return }
+            switch completion.outcome {
+            case let .success(importedInvitation):
+                invitation = importedInvitation
+                focusedField = .invitation
+            case let .failure(message):
+                importError = message
+            }
+        }
+        .onDisappear {
+            importCoordinator.invalidate()
+        }
+        .fileImporter(
+            isPresented: $isImportingInvitation,
+            allowedContentTypes: [.plainText, .image],
+            allowsMultipleSelection: false,
+            onCompletion: importInvitation
+        )
+    }
+
+    private var invitationFields: some View {
+        VStack(alignment: .leading, spacing: UmbraLayout.space2) {
+            Text("Invitation")
+                .font(.callout.weight(.medium))
+
+            HStack(alignment: .firstTextBaseline, spacing: UmbraLayout.space2) {
+                TextField(
+                    "Lumen invitation",
+                    text: $invitation,
+                    prompt: Text("umbra://pair/v3#…")
+                )
+                .focused($focusedField, equals: .invitation)
+                .textContentType(.URL)
+                .accessibilityHint("Paste the invitation generated by Lumen")
+
+                Button("Paste", action: pasteInvitation)
+                Button("Import…") { isImportingInvitation = true }
+                    .help("Import a text invitation or QR code image")
+                    .accessibilityHint("Choose a text invitation or QR code image")
+            }
+
+            if let error = importError ?? store.securePairingError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Pairing error: \(error)")
+            }
+        }
+    }
+
+    private var legacyFields: some View {
+        Form {
+            TextField(
+                "Host name or IP address",
+                text: $address,
+                prompt: Text("gaming-pc.local or 192.168.1.25")
+            )
+            .focused($focusedField, equals: .address)
+            .textContentType(.URL)
+            TextField("Port (optional)", text: $port, prompt: Text("Default"))
+                .frame(maxWidth: 160)
+        }
+        .formStyle(.grouped)
+    }
+
+    private var primaryActionTitle: String {
+        pairingMethod == .invitation ? "Pair Securely" : "Add Host"
+    }
+
+    private var securePairingInProgress: Bool {
+        pairingMethod == .invitation && store.operation?.kind == .pairing
+    }
+
+    private var primaryActionDisabled: Bool {
+        switch pairingMethod {
+        case .invitation:
+            invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .legacy:
+            address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    private func performPrimaryAction() {
+        switch pairingMethod {
+        case .invitation:
+            store.pairSecureHost(invitationURI: invitation)
+        case .legacy:
+            store.addHost(address: address, portText: port)
+        }
+    }
+
+    private func pasteInvitation() {
+        importCoordinator.invalidate()
+        guard let pasted = NSPasteboard.general.string(forType: .string),
+              !pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            importError = "The clipboard does not contain a Lumen invitation."
+            return
+        }
+        invitation = pasted
+        focusedField = .invitation
+    }
+
+    private func importInvitation(_ result: Result<[URL], Error>) {
+        do {
+            let url = try result.get().first
+            guard let url else { return }
+            importError = nil
+            importCoordinator.start(url: url)
+        } catch {
+            importCoordinator.invalidate()
+            importError = SecurePairingInvitationImportError.unreadable.localizedDescription
+        }
     }
 }
 
