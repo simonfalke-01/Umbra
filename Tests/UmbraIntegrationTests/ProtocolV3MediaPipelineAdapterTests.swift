@@ -514,7 +514,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         )
 
         var oversizedH264 = boundary
-        oversizedH264.width = 4_097
+        oversizedH264.width = 4_098
         XCTAssertThrowsError(try ProtocolV3StartRequestMapper.makeOffer(
             applicationID: 21,
             resume: false,
@@ -540,6 +540,17 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             } == true,
             "automatic negotiation must not offer an oversized H.264 tuple"
         )
+
+        var oddDimension = automatic
+        oddDimension.width = 4_097
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 27,
+            resume: false,
+            preferences: oddDimension,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        ))
     }
 
     func testGate1SDRAndHDROffersNeverProduceAnSDRTenBitTuple() throws {
