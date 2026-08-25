@@ -36,6 +36,17 @@ public enum AudioQueuePCMRendererError: Error, Sendable, Equatable, CustomString
 }
 
 struct AudioQueueOperations: @unchecked Sendable {
+    typealias CreateOutput = @Sendable (
+        AudioStreamBasicDescription,
+        AudioQueueOutputCallback,
+        UnsafeMutableRawPointer,
+        CFRunLoop?
+    ) -> (OSStatus, AudioQueueRef?)
+
+    let createOutput: CreateOutput
+    let assignCurrentDefaultOutputDevice: @Sendable (AudioQueueRef) throws -> Void
+    let applyChannelLayout: @Sendable (AudioOutputLayout, AudioQueueRef) throws -> Void
+    let allocateBuffer: @Sendable (AudioQueueRef, UInt32) -> (OSStatus, AudioQueueBufferRef?)
     let enqueueBuffer: @Sendable (AudioQueueRef, AudioQueueBufferRef) -> OSStatus
     let prime: @Sendable (AudioQueueRef, inout UInt32) -> OSStatus
     let start: @Sendable (AudioQueueRef) -> OSStatus
@@ -43,8 +54,36 @@ struct AudioQueueOperations: @unchecked Sendable {
     let reset: @Sendable (AudioQueueRef) -> OSStatus
     let stop: @Sendable (AudioQueueRef) -> OSStatus
     let dispose: @Sendable (AudioQueueRef) -> OSStatus
+    let setVolume: @Sendable (AudioQueueRef, AudioQueueParameterValue) -> OSStatus
 
     init(
+        createOutput: @escaping CreateOutput = { format, callback, userData, runLoop in
+            var format = format
+            var queue: AudioQueueRef?
+            let status = AudioQueueNewOutput(
+                &format,
+                callback,
+                userData,
+                runLoop,
+                RunLoop.Mode.default.rawValue as CFString,
+                0,
+                &queue
+            )
+            return (status, queue)
+        },
+        assignCurrentDefaultOutputDevice: @escaping @Sendable (AudioQueueRef) throws -> Void = {
+            try AudioQueuePCMRenderer.assignCurrentDefaultOutputDevice(to: $0)
+        },
+        applyChannelLayout: @escaping @Sendable (AudioOutputLayout, AudioQueueRef) throws -> Void = {
+            try AudioQueuePCMRenderer.applyChannelLayout($0, to: $1)
+        },
+        allocateBuffer: @escaping @Sendable (AudioQueueRef, UInt32) -> (OSStatus, AudioQueueBufferRef?) = {
+            queue,
+            byteCapacity in
+            var buffer: AudioQueueBufferRef?
+            let status = AudioQueueAllocateBuffer(queue, byteCapacity, &buffer)
+            return (status, buffer)
+        },
         enqueueBuffer: @escaping @Sendable (AudioQueueRef, AudioQueueBufferRef) -> OSStatus = {
             AudioQueueEnqueueBuffer($0, $1, 0, nil)
         },
@@ -72,8 +111,15 @@ struct AudioQueueOperations: @unchecked Sendable {
         },
         dispose: @escaping @Sendable (AudioQueueRef) -> OSStatus = {
             AudioQueueDispose($0, true)
+        },
+        setVolume: @escaping @Sendable (AudioQueueRef, AudioQueueParameterValue) -> OSStatus = {
+            AudioQueueSetParameter($0, kAudioQueueParam_Volume, $1)
         }
     ) {
+        self.createOutput = createOutput
+        self.assignCurrentDefaultOutputDevice = assignCurrentDefaultOutputDevice
+        self.applyChannelLayout = applyChannelLayout
+        self.allocateBuffer = allocateBuffer
         self.enqueueBuffer = enqueueBuffer
         self.prime = prime
         self.start = start
@@ -81,6 +127,7 @@ struct AudioQueueOperations: @unchecked Sendable {
         self.reset = reset
         self.stop = stop
         self.dispose = dispose
+        self.setVolume = setVolume
     }
 }
 
@@ -329,10 +376,16 @@ final class OutputSampleRing: @unchecked Sendable {
 private final class AudioQueueOutputCallbackContext: @unchecked Sendable {
     let outputRing: OutputSampleRing
     let sampleCount: Int
+    let enqueueBuffer: @Sendable (AudioQueueRef, AudioQueueBufferRef) -> OSStatus
 
-    init(outputRing: OutputSampleRing, sampleCount: Int) {
+    init(
+        outputRing: OutputSampleRing,
+        sampleCount: Int,
+        enqueueBuffer: @escaping @Sendable (AudioQueueRef, AudioQueueBufferRef) -> OSStatus
+    ) {
         self.outputRing = outputRing
         self.sampleCount = sampleCount
+        self.enqueueBuffer = enqueueBuffer
     }
 
     func callback(queue: AudioQueueRef, buffer: AudioQueueBufferRef) {
@@ -343,7 +396,7 @@ private final class AudioQueueOutputCallbackContext: @unchecked Sendable {
         let output = buffer.pointee.mAudioData.assumingMemoryBound(to: Float.self)
         outputRing.fill(output, sampleCount: sampleCount, metadata: metadata)
         buffer.pointee.mAudioDataByteSize = UInt32(sampleCount * MemoryLayout<Float>.size)
-        let status = AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
+        let status = enqueueBuffer(queue, buffer)
         if status != noErr {
             outputRing.noteCallbackEnqueueFailure(status, metadata: metadata)
         }
@@ -393,22 +446,18 @@ private final class AudioQueueCallbackRunLoop: @unchecked Sendable {
 
     func createOutput(
         format: AudioStreamBasicDescription,
-        userData: UnsafeMutableRawPointer
+        userData: UnsafeMutableRawPointer,
+        createOutput: @escaping AudioQueueOperations.CreateOutput
     ) -> (OSStatus, AudioQueueRef?) {
         let userDataAddress = UInt(bitPattern: userData)
         let thread = Thread { [self] in
             autoreleasepool {
-                var callbackFormat = format
-                var createdQueue: AudioQueueRef?
                 let callbackRunLoop = CFRunLoopGetCurrent()
-                let createStatus = AudioQueueNewOutput(
-                    &callbackFormat,
+                let (createStatus, createdQueue) = createOutput(
+                    format,
                     umbraAudioQueueOutputCallback,
-                    UnsafeMutableRawPointer(bitPattern: userDataAddress),
-                    callbackRunLoop,
-                    RunLoop.Mode.default.rawValue as CFString,
-                    0,
-                    &createdQueue
+                    UnsafeMutableRawPointer(bitPattern: userDataAddress)!,
+                    callbackRunLoop
                 )
                 lock.withLock {
                     runLoop = callbackRunLoop
@@ -590,7 +639,8 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
             let callbackContext = AudioQueueOutputCallbackContext(
                 outputRing: outputRing,
                 sampleCount: bufferingPolicy.queueBufferFrames
-                    * Int(configuration.layout.channelCount)
+                    * Int(configuration.layout.channelCount),
+                enqueueBuffer: operations.enqueueBuffer
             )
             let callbackUserData = Unmanaged.passRetained(callbackContext).toOpaque()
             let callbackRunLoop = AudioQueueCallbackRunLoop(
@@ -598,7 +648,8 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
             )
             let (createStatus, createdQueue) = callbackRunLoop.createOutput(
                 format: streamDescription,
-                userData: callbackUserData
+                userData: callbackUserData,
+                createOutput: operations.createOutput
             )
             guard createStatus == noErr, let createdQueue else {
                 callbackRunLoop.stop()
@@ -612,19 +663,14 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
 
             var buffers: [AudioQueueBufferRef] = []
             do {
-                try Self.assignCurrentDefaultOutputDevice(to: createdQueue)
-                try Self.applyChannelLayout(configuration.layout, to: createdQueue)
+                try operations.assignCurrentDefaultOutputDevice(createdQueue)
+                try operations.applyChannelLayout(configuration.layout, createdQueue)
                 let bufferByteCapacity = UInt32(bufferingPolicy.queueBufferFrames)
                     * UInt32(configuration.layout.channelCount)
                     * UInt32(MemoryLayout<Float>.size)
                 buffers.reserveCapacity(bufferingPolicy.bufferPoolCount)
                 for index in 0..<bufferingPolicy.bufferPoolCount {
-                    var buffer: AudioQueueBufferRef?
-                    let status = AudioQueueAllocateBuffer(
-                        createdQueue,
-                        bufferByteCapacity,
-                        &buffer
-                    )
+                    let (status, buffer) = operations.allocateBuffer(createdQueue, bufferByteCapacity)
                     guard status == noErr, let buffer else {
                         throw AudioQueuePCMRendererError.bufferAllocationFailed(status)
                     }
@@ -702,7 +748,7 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
             outputRing.waitUntilQuiescent()
             return .complete
         }
-        AudioQueueSetParameter(audioQueue, kAudioQueueParam_Volume, 0)
+        _ = operations.setVolume(audioQueue, 0)
         var teardownRetryCount = 0
         let stopStatus = performTeardownOperation(
             { operations.stop(audioQueue) },
@@ -809,7 +855,7 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
         )
     }
 
-    private static func applyChannelLayout(
+    fileprivate static func applyChannelLayout(
         _ outputLayout: AudioOutputLayout,
         to audioQueue: AudioQueueRef
     ) throws {
@@ -828,7 +874,7 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
         }
     }
 
-    private static func assignCurrentDefaultOutputDevice(
+    fileprivate static func assignCurrentDefaultOutputDevice(
         to audioQueue: AudioQueueRef
     ) throws {
         var defaultAddress = AudioObjectPropertyAddress(
@@ -911,11 +957,7 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
     }
 
     private func applyMuteState(to audioQueue: AudioQueueRef) {
-        AudioQueueSetParameter(
-            audioQueue,
-            kAudioQueueParam_Volume,
-            mute.isMuted ? 0 : 1
-        )
+        _ = operations.setVolume(audioQueue, mute.isMuted ? 0 : 1)
     }
 
     private func releaseCallbackContextAfterDispose() {

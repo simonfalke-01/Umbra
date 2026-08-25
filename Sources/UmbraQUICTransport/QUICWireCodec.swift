@@ -108,13 +108,13 @@ enum QUICWireCodec {
         let sequence = readUInt64(data, base + 28)
         guard sequence != 0 else { throw WireError.malformed }
         let message = MediaDatagram(
-            sessionID: data[(base + 12)..<(base + 28)],
+            sessionID: Data(data[(base + 12)..<(base + 28)]),
             channel: data[base + 5],
             kind: data[base + 6],
             flags: data[base + 7],
             semanticSequence: sequence,
             objectID: readUInt64(data, base + 36),
-            payload: data[(base + 44)..<data.endIndex]
+            payload: Data(data[(base + 44)..<data.endIndex])
         )
         try validateInboundPayload(message)
         return message
