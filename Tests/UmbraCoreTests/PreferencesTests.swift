@@ -48,6 +48,48 @@ final class PreferencesTests: XCTestCase {
         XCTAssertThrowsError(try decoded.validate())
     }
 
+    func testGate1RationalRefreshAdmissionUsesExactTenThroughFourHundredEightyHertzContract() {
+        let accepted: [(numerator: Int, denominator: Int)] = [
+            (10, 1),
+            (120, 1),
+            (60_000, 1_001),
+            (480, 1),
+            (480_000_000, 1_000_000),
+            (60_000_000_000, 1_001_000_000),
+        ]
+        for fraction in accepted {
+            var preferences = StreamingPreferences.default
+            preferences.setFrameRate(
+                numerator: fraction.numerator,
+                denominator: fraction.denominator
+            )
+            XCTAssertNoThrow(
+                try preferences.validate(),
+                "expected \(fraction.numerator)/\(fraction.denominator) to be admitted"
+            )
+        }
+
+        let rejected: [(numerator: Int, denominator: Int)] = [
+            (0, 1),
+            (1, 1),
+            (9, 1),
+            (481, 1),
+            (60_000, 0),
+            (Int.max, 1),
+        ]
+        for fraction in rejected {
+            var preferences = StreamingPreferences.default
+            preferences.setFrameRate(
+                numerator: fraction.numerator,
+                denominator: fraction.denominator
+            )
+            XCTAssertThrowsError(
+                try preferences.validate(),
+                "expected \(fraction.numerator)/\(fraction.denominator) to be rejected"
+            )
+        }
+    }
+
     func testDefaultBitrateMatchesMoonlightReferenceTable() {
         XCTAssertEqual(StreamingPreferences.defaultBitrateKbps(width: 640, height: 360, fps: 30, yuv444: false), 1_000)
         XCTAssertEqual(StreamingPreferences.defaultBitrateKbps(width: 1_920, height: 1_080, fps: 60, yuv444: false), 20_000)

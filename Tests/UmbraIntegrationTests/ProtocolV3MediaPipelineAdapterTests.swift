@@ -380,30 +380,140 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
                 offered: offer
             ))
 
-            var missingFields = offer.fields
-            missingFields.removeValue(forKey: 18)
-            let missing = ProtocolV3StartOffer(
-                fields: missingFields,
-                offeredVideoFormats: offer.offeredVideoFormats,
-                mode: offer.mode
-            )
-            XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
-                responseFields: successfulStartResponse(offer),
-                offered: missing
-            ))
+            var missingKey = offer.fields
+            missingKey.removeValue(forKey: 18)
+            var extraKey = offer.fields
+            extraKey[19] = .boolean(false)
+            var nullSubstitute = offer.fields
+            nullSubstitute[18] = .null
+            var integerSubstitute = offer.fields
+            integerSubstitute[18] = .unsigned(0)
+            var stringSubstitute = offer.fields
+            stringSubstitute[18] = .text("false")
 
-            var malformedFields = offer.fields
-            malformedFields[18] = .unsigned(0)
-            let malformed = ProtocolV3StartOffer(
-                fields: malformedFields,
-                offeredVideoFormats: offer.offeredVideoFormats,
-                mode: offer.mode
-            )
-            XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
-                responseFields: successfulStartResponse(offer),
-                offered: malformed
-            ))
+            for (name, fields) in [
+                ("missing key 18", missingKey),
+                ("extra key 19", extraKey),
+                ("null key 18", nullSubstitute),
+                ("integer key 18", integerSubstitute),
+                ("string key 18", stringSubstitute),
+            ] {
+                let hostile = ProtocolV3StartOffer(
+                    fields: fields,
+                    offeredVideoFormats: offer.offeredVideoFormats,
+                    mode: offer.mode
+                )
+                XCTAssertThrowsError(
+                    try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                        responseFields: successfulStartResponse(offer),
+                        offered: hostile
+                    ),
+                    name
+                )
+            }
         }
+    }
+
+    func testGate1H264AdmissionEnforcesThe4096By4096CeilingBeforeStart() throws {
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+
+        var boundary = StreamingPreferences.default
+        boundary.videoCodecPreference = .h264
+        boundary.width = 4_096
+        boundary.height = 4_096
+        let accepted = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 20,
+            resume: false,
+            preferences: boundary,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertTrue(
+            accepted.fields[9]?.arrayValue?.allSatisfy {
+                $0.mapValue?[1]?.unsignedValue == 1
+            } == true
+        )
+
+        var oversizedH264 = boundary
+        oversizedH264.width = 4_097
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 21,
+            resume: false,
+            preferences: oversizedH264,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        ))
+
+        var automatic = oversizedH264
+        automatic.videoCodecPreference = .automatic
+        let fallback = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 22,
+            resume: false,
+            preferences: automatic,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertFalse(
+            fallback.fields[9]?.arrayValue?.contains {
+                $0.mapValue?[1]?.unsignedValue == 1
+            } == true,
+            "automatic negotiation must not offer an oversized H.264 tuple"
+        )
+    }
+
+    func testGate1SDRAndHDROffersNeverProduceAnSDRTenBitTuple() throws {
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2,
+            supportsHardwareHEVCMain10: true,
+            supportsHardwareAV1Main10: true
+        )
+
+        var sdr = StreamingPreferences.default
+        sdr.enableHDR = false
+        let sdrOffer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 23,
+            resume: false,
+            preferences: sdr,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertTrue(
+            sdrOffer.fields[9]?.arrayValue?.allSatisfy {
+                $0.mapValue?[3]?.unsignedValue == 8
+                    && $0.mapValue?[6]?.unsignedValue == 1
+            } == true
+        )
+        XCTAssertEqual(sdrOffer.fields[14], .array([]))
+
+        var hdrH264 = sdr
+        hdrH264.videoCodecPreference = .h264
+        hdrH264.enableHDR = true
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 24,
+            resume: false,
+            preferences: hdrH264,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        ))
     }
 
     func testVideoConfigMustMatchExactRationalStartSelection() throws {
