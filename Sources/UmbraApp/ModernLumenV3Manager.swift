@@ -408,6 +408,7 @@ final class ModernLumenV3Manager {
 
     private let trustStore: FileBackedProtocolV3TrustStore
     private let hostCatalog: FileBackedModernLumenV3HostCatalog
+    nonisolated private let discovery: any ProtocolV3Discovering
     private let log: SupportLog?
     private let mediaCapabilities: AppleStreamingCapabilities?
     private let mediaProvider: (any StreamingMediaProviding)?
@@ -426,6 +427,7 @@ final class ModernLumenV3Manager {
     init(
         trustStore: FileBackedProtocolV3TrustStore = .init(),
         hostCatalog: FileBackedModernLumenV3HostCatalog = .init(),
+        discovery: any ProtocolV3Discovering = NetworkProtocolV3Discovery(),
         mediaCapabilities: AppleStreamingCapabilities? = nil,
         mediaProvider: (any StreamingMediaProviding)? = nil,
         output: (any StreamingEventOutputHandling)? = nil,
@@ -439,6 +441,7 @@ final class ModernLumenV3Manager {
     ) {
         self.trustStore = trustStore
         self.hostCatalog = hostCatalog
+        self.discovery = discovery
         self.mediaCapabilities = mediaCapabilities
         self.mediaProvider = mediaProvider
         self.output = output
@@ -455,6 +458,18 @@ final class ModernLumenV3Manager {
         _ handler: (@MainActor @Sendable ([HostDisplayModel]) -> Void)?
     ) {
         catalogEventHandler = handler
+    }
+
+    func startDiscovery() {
+        discovery.start { [weak self] event in
+            Task { @MainActor in
+                self?.handleDiscovery(event)
+            }
+        }
+    }
+
+    nonisolated func stopDiscovery() {
+        discovery.stop()
     }
 
     func setSessionEventHandler(
@@ -2481,6 +2496,49 @@ final class ModernLumenV3Manager {
                 source: "Lumen v3",
                 level: .error,
                 message: "The secure host catalog could not be published: \(error)."
+            )
+        }
+    }
+
+    private func handleDiscovery(_ event: ProtocolV3DiscoveryEvent) {
+        switch event {
+        case let .available(discovered):
+            do {
+                // Discovery is route metadata only. It can refresh a previously pinned
+                // modern host, but it can never create trust or enter the legacy path.
+                guard try trustStore.trust(hostID: discovered.hostID) != nil,
+                      var record = try hostCatalog.host(hostID: discovered.hostID) else {
+                    return
+                }
+                guard record.hostname != discovered.hostname
+                    || record.hostnameIsIPLiteral != discovered.hostnameIsIPLiteral
+                    || record.port != discovered.port else {
+                    return
+                }
+                record.hostname = discovered.hostname
+                record.hostnameIsIPLiteral = discovered.hostnameIsIPLiteral
+                record.port = discovered.port
+                try hostCatalog.upsert(record)
+                publishCatalog()
+            } catch {
+                log?.record(
+                    source: "Lumen v3 discovery",
+                    level: .error,
+                    message: "A pinned secure-host route could not be updated: \(error). Legacy fallback was not attempted."
+                )
+            }
+        case let .unavailable(hostID):
+            // mDNS withdrawal is not proof that a pinned host is offline. Preserve the
+            // catalog and trust so manual reconnect remains strict protocol v3.
+            if connectionStatuses[hostID] == .online {
+                connectionStatuses[hostID] = .unknown
+                publishCatalog()
+            }
+        case let .failed(message):
+            log?.record(
+                source: "Lumen v3 discovery",
+                level: .warning,
+                message: "\(message) Pinned secure hosts were preserved; legacy fallback was not attempted."
             )
         }
     }

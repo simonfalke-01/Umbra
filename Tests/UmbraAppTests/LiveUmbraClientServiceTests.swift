@@ -1,6 +1,7 @@
 import Foundation
 import UmbraCore
 import UmbraNetworking
+import UmbraProtocolV3
 import UmbraServices
 import XCTest
 @testable import UmbraApp
@@ -261,20 +262,42 @@ final class LiveUmbraClientServiceTests: XCTestCase {
             discoveryEnabled: preferences.settings.enableMDNS,
             pollInterval: .seconds(3_600)
         )
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("UmbraModernDiscoveryPreference-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let modernDiscovery = RecordingProtocolV3Discovery()
+        let modernManager = ModernLumenV3Manager(
+            trustStore: FileBackedProtocolV3TrustStore(
+                url: root.appendingPathComponent("trust.json")
+            ),
+            hostCatalog: FileBackedModernLumenV3HostCatalog(
+                url: root.appendingPathComponent("hosts.json")
+            ),
+            discovery: modernDiscovery,
+            log: nil
+        )
         let client = LiveUmbraClientService(
             service: applicationService,
             preferences: preferences,
-            securePorts: SecurePortRegistry()
+            securePorts: SecurePortRegistry(),
+            protocolV3: modernManager
         )
 
         _ = try await client.discoverHosts()
         XCTAssertEqual(discovery.lifecycleCounts().starts, 0)
+        XCTAssertEqual(modernDiscovery.lifecycleCounts().starts, 0)
 
         preferences.update(\.enableMDNS, to: true)
-        await eventually { discovery.lifecycleCounts().starts == 1 }
+        await eventually {
+            discovery.lifecycleCounts().starts == 1
+                && modernDiscovery.lifecycleCounts().starts == 1
+        }
 
         preferences.update(\.enableMDNS, to: false)
-        await eventually { discovery.lifecycleCounts().stops == 1 }
+        await eventually {
+            discovery.lifecycleCounts().stops == 1
+                && modernDiscovery.lifecycleCounts().stops == 1
+        }
         await applicationService.stopMonitoring()
     }
 
@@ -687,6 +710,33 @@ private final class RecordingBonjourDiscovery: BonjourDiscovering, @unchecked Se
 
     func stop() {
         lock.withLock { stops += 1 }
+    }
+
+    func lifecycleCounts() -> (starts: Int, stops: Int) {
+        lock.withLock { (starts, stops) }
+    }
+}
+
+private final class RecordingProtocolV3Discovery: ProtocolV3Discovering, @unchecked Sendable {
+    private let lock = NSLock()
+    private var starts = 0
+    private var stops = 0
+    private var running = false
+
+    func start(eventHandler: @escaping @Sendable (ProtocolV3DiscoveryEvent) -> Void) {
+        lock.withLock {
+            guard !running else { return }
+            running = true
+            starts += 1
+        }
+    }
+
+    func stop() {
+        lock.withLock {
+            guard running else { return }
+            running = false
+            stops += 1
+        }
     }
 
     func lifecycleCounts() -> (starts: Int, stops: Int) {

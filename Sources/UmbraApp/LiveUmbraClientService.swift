@@ -250,10 +250,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
         discoveryPreferenceTask = Task { @MainActor [weak self, preferences, service] in
             var lastEnabledValue: Bool?
             for await settings in preferences.$settings.values {
-                guard self != nil, !Task.isCancelled else { return }
+                guard let self, !Task.isCancelled else { return }
                 guard settings.enableMDNS != lastEnabledValue else { continue }
                 lastEnabledValue = settings.enableMDNS
                 await service.setDiscoveryEnabled(settings.enableMDNS)
+                if settings.enableMDNS {
+                    self.protocolV3?.startDiscovery()
+                } else {
+                    self.protocolV3?.stopDiscovery()
+                }
             }
         }
         protocolV3?.setCatalogEventHandler { [weak self] _ in
@@ -279,6 +284,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         serviceEventTask?.cancel()
         discoveryPreferenceTask?.cancel()
         legacyDiscoveryBootstrapTask?.cancel()
+        protocolV3?.stopDiscovery()
         for task in artworkLoadingTasks.values { task.cancel() }
     }
 
@@ -291,6 +297,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func discoverHosts() async throws -> [HostDisplayModel] {
+        if preferences.settings.enableMDNS {
+            protocolV3?.startDiscovery()
+        }
         let modernHosts = try protocolV3?.displayHosts() ?? []
         if !modernHosts.isEmpty {
             startLegacyDiscoveryBootstrap()

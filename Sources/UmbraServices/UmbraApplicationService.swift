@@ -1128,7 +1128,7 @@ public actor UmbraApplicationService: UmbraApplicationServicing {
     private func handleDiscovery(_ event: DiscoveryEvent, generation: UInt64) async {
         guard isCurrentDiscoveryGeneration(generation) else { return }
         switch event {
-        case let .added(service):
+        case let .added(service), let .updated(_, new: service):
             do {
                 let address = try await discoveryResolver.resolve(service)
                 guard isCurrentDiscoveryGeneration(generation) else { return }
