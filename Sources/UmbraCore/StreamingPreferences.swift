@@ -163,6 +163,12 @@ public enum StreamingFidelityPreference: String, Codable, CaseIterable, Hashable
     case codecLosslessRequired
 }
 
+public enum HDRTransferPreference: String, Codable, CaseIterable, Hashable, Sendable {
+    case automatic
+    case pq
+    case hlg
+}
+
 extension StreamOptimizationMode: Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -422,6 +428,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var audioConfiguration: AudioConfiguration
     public var videoCodecPreference: VideoCodecPreference
     public var enableHDR: Bool
+    public var hdrTransferPreference: HDRTransferPreference
     public var enableYUV444: Bool
     public var videoDecoderPreference: VideoDecoderPreference
     public var rendererPreference: RendererPreference
@@ -470,6 +477,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         audioConfiguration: AudioConfiguration = .stereo,
         videoCodecPreference: VideoCodecPreference = .automatic,
         enableHDR: Bool = false,
+        hdrTransferPreference: HDRTransferPreference = .automatic,
         enableYUV444: Bool = false,
         videoDecoderPreference: VideoDecoderPreference = .automatic,
         rendererPreference: RendererPreference = .automatic,
@@ -529,6 +537,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.audioConfiguration = audioConfiguration
         self.videoCodecPreference = videoCodecPreference
         self.enableHDR = enableHDR
+        self.hdrTransferPreference = hdrTransferPreference
         self.enableYUV444 = enableYUV444
         self.videoDecoderPreference = videoDecoderPreference
         self.rendererPreference = rendererPreference
@@ -577,6 +586,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case audioConfiguration
         case videoCodecPreference
         case enableHDR
+        case hdrTransferPreference
         case enableYUV444
         case videoDecoderPreference
         case rendererPreference
@@ -667,6 +677,10 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             audioConfiguration: try container.decodeIfPresent(AudioConfiguration.self, forKey: .audioConfiguration) ?? defaults.audioConfiguration,
             videoCodecPreference: try container.decodeIfPresent(VideoCodecPreference.self, forKey: .videoCodecPreference) ?? defaults.videoCodecPreference,
             enableHDR: try container.decodeIfPresent(Bool.self, forKey: .enableHDR) ?? defaults.enableHDR,
+            hdrTransferPreference: try container.decodeIfPresent(
+                HDRTransferPreference.self,
+                forKey: .hdrTransferPreference
+            ) ?? defaults.hdrTransferPreference,
             enableYUV444: enableYUV444,
             videoDecoderPreference: try container.decodeIfPresent(VideoDecoderPreference.self, forKey: .videoDecoderPreference) ?? defaults.videoDecoderPreference,
             rendererPreference: try container.decodeIfPresent(RendererPreference.self, forKey: .rendererPreference) ?? defaults.rendererPreference,

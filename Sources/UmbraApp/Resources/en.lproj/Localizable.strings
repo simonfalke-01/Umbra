@@ -6,6 +6,10 @@
 
 /* Technical preference labels. */
 "Automatic" = "Automatic";
+"Auto" = "Auto";
+"HDR transfer" = "HDR transfer";
+"PQ" = "PQ";
+"HLG" = "HLG";
 "H.264" = "H.264";
 "HEVC (H.265)" = "HEVC (H.265)";
 "AV1" = "AV1";

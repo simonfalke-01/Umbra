@@ -344,6 +344,52 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertFalse(updatedControl.isEnabled)
     }
 
+    func testHDRTransferPickerUsesNativeOptionsAndPersistsSelection() throws {
+        let suiteName = "UmbraAppTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let preferences = PreferencesStore(defaults: defaults)
+        preferences.update(\.enableHDR, to: true)
+        let hostingView = NSHostingView(rootView: UmbraSettingsView(
+            preferences: preferences,
+            initialSelection: .video,
+            hdrDisplaySupportResolver: HDRDisplaySupportResolver { _, _ in true }
+        ))
+        hostingView.frame = CGRect(
+            origin: .zero,
+            size: CGSize(
+                width: UmbraLayout.settingsWidth,
+                height: UmbraLayout.settingsMaximumHeight
+            )
+        )
+        settle(hostingView)
+
+        let picker = try XCTUnwrap(
+            descendants(of: hostingView, type: NSPopUpButton.self).first {
+                $0.accessibilityLabel() == "HDR transfer"
+            }
+        )
+        XCTAssertEqual(picker.itemTitles, ["Auto", "PQ", "HLG"])
+        XCTAssertEqual(picker.accessibilityValue() as? String, "Auto")
+        XCTAssertTrue(picker.isEnabled)
+
+        picker.selectItem(withTitle: "HLG")
+        let action = try XCTUnwrap(picker.action)
+        XCTAssertTrue(NSApp.sendAction(action, to: picker.target, from: picker))
+        settle(hostingView)
+
+        XCTAssertEqual(preferences.settings.hdrTransferPreference, .hlg)
+        XCTAssertEqual(
+            PreferencesStore(defaults: defaults).settings.hdrTransferPreference,
+            .hlg
+        )
+
+        preferences.update(\.enableHDR, to: false)
+        settle(hostingView)
+        XCTAssertFalse(picker.isEnabled)
+        XCTAssertEqual(picker.titleOfSelectedItem, "HLG")
+    }
+
     func testAdvancedSettingsPreservesStoredYUV444IntentUntilCapabilityIsProven() throws {
         let suiteName = "UmbraAppTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

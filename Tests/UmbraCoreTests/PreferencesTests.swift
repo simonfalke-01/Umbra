@@ -14,6 +14,7 @@ final class PreferencesTests: XCTestCase {
         XCTAssertEqual(preferences.windowMode, .fullscreenDesktop)
         XCTAssertEqual(preferences.uiDisplayMode, .windowed)
         XCTAssertEqual(preferences.audioConfiguration, .stereo)
+        XCTAssertEqual(preferences.hdrTransferPreference, .automatic)
         XCTAssertEqual(preferences.displaySelection, .automatic)
         XCTAssertEqual(preferences.displayResolutionPolicy, .configured)
         XCTAssertEqual(preferences.optimizationMode, .quality)
@@ -165,6 +166,7 @@ final class PreferencesTests: XCTestCase {
             audioConfiguration: .surround71,
             videoCodecPreference: .av1,
             enableHDR: true,
+            hdrTransferPreference: .hlg,
             enableYUV444: true,
             videoDecoderPreference: .hardware,
             rendererPreference: .metal,
@@ -188,6 +190,7 @@ final class PreferencesTests: XCTestCase {
         object.removeValue(forKey: "displayResolutionPolicy")
         object.removeValue(forKey: "clientMicrophoneEnabled")
         object.removeValue(forKey: "optimizationMode")
+        object.removeValue(forKey: "hdrTransferPreference")
         object.removeValue(forKey: "frameRateNumerator")
         object.removeValue(forKey: "frameRateDenominator")
         object["fps"] = 75
@@ -203,6 +206,7 @@ final class PreferencesTests: XCTestCase {
         XCTAssertEqual(decoded.displayResolutionPolicy, .configured)
         XCTAssertFalse(decoded.clientMicrophoneEnabled)
         XCTAssertEqual(decoded.optimizationMode, .latency)
+        XCTAssertEqual(decoded.hdrTransferPreference, .automatic)
         XCTAssertFalse(decoded.enableVSync)
         XCTAssertFalse(decoded.framePacing)
         XCTAssertEqual(decoded.frameRateNumerator, 75)

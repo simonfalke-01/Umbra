@@ -16,6 +16,66 @@ final class PreferencesStoreTests: XCTestCase {
         XCTAssertEqual(UIDisplayMode.mainWindowChoices, [.windowed, .maximized])
         XCTAssertEqual(StreamOptimizationMode.latency.label, "Lowest Latency")
         XCTAssertEqual(StreamOptimizationMode.quality.label, "Best Quality")
+        XCTAssertEqual(
+            HDRTransferPreference.macOSOptions,
+            [
+                HDRTransferPreferenceOption(value: .automatic, label: "Auto"),
+                HDRTransferPreferenceOption(value: .pq, label: "PQ"),
+                HDRTransferPreferenceOption(value: .hlg, label: "HLG"),
+            ]
+        )
+        XCTAssertEqual(
+            HDRTransferPreference.macOSChoices,
+            HDRTransferPreference.allCases
+        )
+    }
+
+    func testLegacyPreferencesPersistAutomaticHDRTransferMigration() throws {
+        let suiteName = "UmbraAppTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(StreamingPreferences.default)
+            ) as? [String: Any]
+        )
+        object.removeValue(forKey: "hdrTransferPreference")
+        defaults.set(
+            try JSONSerialization.data(withJSONObject: object),
+            forKey: "Umbra.streamingPreferences"
+        )
+
+        let preferences = PreferencesStore(defaults: defaults)
+
+        XCTAssertEqual(preferences.settings.hdrTransferPreference, .automatic)
+        let migratedData = try XCTUnwrap(defaults.data(forKey: "Umbra.streamingPreferences"))
+        let migratedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: migratedData) as? [String: Any]
+        )
+        XCTAssertEqual(migratedObject["hdrTransferPreference"] as? String, "automatic")
+    }
+
+    func testUnknownHDRTransferPreservesFutureSettingsForRecovery() throws {
+        let suiteName = "UmbraAppTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(StreamingPreferences.default)
+            ) as? [String: Any]
+        )
+        object["hdrTransferPreference"] = "future-transfer"
+        let originalData = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        )
+        defaults.set(originalData, forKey: "Umbra.streamingPreferences")
+
+        let preferences = PreferencesStore(defaults: defaults)
+
+        XCTAssertEqual(preferences.settings, .default)
+        XCTAssertTrue(preferences.persistenceErrorMessage?.contains("newer version") == true)
+        XCTAssertEqual(defaults.data(forKey: "Umbra.streamingPreferences"), originalData)
     }
 
     func testLegacyPreferencesInferAndPersistOptimizationMode() throws {

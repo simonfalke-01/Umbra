@@ -531,6 +531,18 @@ private struct VideoSettingsView: View {
                     preferences: preferences,
                     hdrAvailable: hdrAvailable
                 )
+
+                SettingsRow(
+                    "HDR transfer",
+                    isEnabled: preferences.settings.enableHDR
+                ) {
+                    CompactMenuPicker(
+                        title: "HDR transfer",
+                        options: HDRTransferPreference.macOSChoices,
+                        selection: preferences.binding(for: \.hdrTransferPreference),
+                        optionLabel: \.label
+                    )
+                }
             }
         }
         .sheet(item: $activeEditor) { editor in

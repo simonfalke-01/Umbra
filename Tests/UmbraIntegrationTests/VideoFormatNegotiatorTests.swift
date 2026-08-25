@@ -107,6 +107,39 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         XCTAssertTrue(av1.isHDR)
     }
 
+    func testHDRTransferPreferenceDoesNotChangeLegacyMoonlightNegotiation() throws {
+        var preferences = StreamingPreferences.default
+        preferences.enableHDR = true
+        let available = MoonlightVideoFormat.hevcMain10.rawValue
+            | MoonlightVideoFormat.av1Main10.rawValue
+        let streamHost = host(support: [.hevcMain10, .av1Main10])
+
+        preferences.hdrTransferPreference = .automatic
+        let automatic = try negotiator.select(
+            availableVideoFormats: available,
+            host: streamHost,
+            application: application,
+            preferences: preferences
+        )
+        preferences.hdrTransferPreference = .pq
+        let pq = try negotiator.select(
+            availableVideoFormats: available,
+            host: streamHost,
+            application: application,
+            preferences: preferences
+        )
+        preferences.hdrTransferPreference = .hlg
+        let hlg = try negotiator.select(
+            availableVideoFormats: available,
+            host: streamHost,
+            application: application,
+            preferences: preferences
+        )
+
+        XCTAssertEqual(pq, automatic)
+        XCTAssertEqual(hlg, automatic)
+    }
+
     func testAutomaticHDRUsesAV1Main10BeforeEightBitHEVCFallback() throws {
         var preferences = StreamingPreferences.default
         preferences.enableHDR = true

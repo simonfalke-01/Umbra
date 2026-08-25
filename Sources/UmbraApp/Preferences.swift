@@ -40,6 +40,39 @@ extension VideoCodecPreference: Identifiable {
     }
 }
 
+struct HDRTransferPreferenceOption: Hashable, Sendable {
+    let value: HDRTransferPreference
+    let label: String
+}
+
+extension HDRTransferPreference {
+    static var macOSOptions: [HDRTransferPreferenceOption] {
+        [
+            HDRTransferPreferenceOption(
+                value: .automatic,
+                label: UmbraLocalization.string("Auto")
+            ),
+            HDRTransferPreferenceOption(
+                value: .pq,
+                label: UmbraLocalization.string("PQ")
+            ),
+            HDRTransferPreferenceOption(
+                value: .hlg,
+                label: UmbraLocalization.string("HLG")
+            ),
+        ]
+    }
+
+    static var macOSChoices: [HDRTransferPreference] {
+        macOSOptions.map(\.value)
+    }
+
+    var label: String {
+        Self.macOSOptions.first(where: { $0.value == self })?.label
+            ?? UmbraLocalization.string("Auto")
+    }
+}
+
 extension VideoDecoderPreference: Identifiable {
     public var id: Int { rawValue }
 
@@ -167,6 +200,10 @@ final class PreferencesStore: ObservableObject {
             )
             let encodedObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             if encodedObject?["optimizationMode"] as? String != decoded.optimizationMode.rawValue {
+                normalizedStoredPreferences = true
+            }
+            if encodedObject?["hdrTransferPreference"] as? String
+                != decoded.hdrTransferPreference.rawValue {
                 normalizedStoredPreferences = true
             }
             let normalizedCodec = decoded.videoCodecPreference.normalizedForAppSettings

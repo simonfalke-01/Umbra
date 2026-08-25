@@ -111,6 +111,8 @@ final class SettingsSnapshotTests: XCTestCase {
             $0.setFrameRate(numerator: 60_000, denominator: 1_001)
             $0.autoAdjustBitrate = false
             $0.enableVSync = false
+            $0.enableHDR = true
+            $0.hdrTransferPreference = .hlg
         }
 
         let appearances = [

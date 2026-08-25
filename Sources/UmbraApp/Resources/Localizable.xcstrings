@@ -86,6 +86,26 @@
       "extractionState" : "manual",
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Automatic" } } }
     },
+    "Auto" : {
+      "comment" : "Automatic HDR transfer selection.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Auto" } } }
+    },
+    "HDR transfer" : {
+      "comment" : "Setting that chooses the HDR transfer function.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "HDR transfer" } } }
+    },
+    "HLG" : {
+      "comment" : "Hybrid Log-Gamma HDR transfer function; do not translate the abbreviation.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "HLG" } } }
+    },
+    "PQ" : {
+      "comment" : "Perceptual Quantizer HDR transfer function; do not translate the abbreviation.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "PQ" } } }
+    },
     "AV1" : {
       "comment" : "AV1 video codec name; do not translate the codec name.",
       "extractionState" : "manual",
