@@ -271,7 +271,8 @@ let package = Package(
                 "UmbraProtocolV3",
                 "UmbraQUICTransport",
             ],
-            path: "Tests/UmbraIntegrationTests"
+            path: "Tests/UmbraIntegrationTests",
+            resources: [.process("Fixtures")]
         ),
         .testTarget(
             name: "UmbraCLIExecutionTests",

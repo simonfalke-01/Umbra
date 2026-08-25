@@ -406,13 +406,24 @@ private final class AudioQueueOutputCallbackContext: @unchecked Sendable {
 /// Owns the callback CFRunLoop exactly like SDL's macOS CoreAudio backend.
 /// SoundSource and other HAL clients then observe a stable, dedicated audio
 /// callback thread instead of AudioQueue's implicit private-thread fallback.
-private final class AudioQueueCallbackRunLoop: @unchecked Sendable {
-    enum PromotionResult {
-        case applied
-        case failed(Int32)
-        case unavailable
-        case timedOut
-    }
+enum AudioQueueOutputThreadPromotionResult {
+    case applied
+    case failed(Int32)
+    case unavailable
+    case timedOut
+}
+
+protocol AudioQueueOutputThread: AnyObject, Sendable {
+    func createOutput(
+        format: AudioStreamBasicDescription,
+        userData: UnsafeMutableRawPointer,
+        createOutput: @escaping AudioQueueOperations.CreateOutput
+    ) -> (OSStatus, AudioQueueRef?)
+    func promoteThreadAfterSuccessfulStart() -> AudioQueueOutputThreadPromotionResult
+    func stop()
+}
+
+private final class AudioQueueCallbackRunLoop: AudioQueueOutputThread, @unchecked Sendable {
 
     private final class PromotionRequest: @unchecked Sendable {
         private let lock = NSLock()
@@ -477,7 +488,7 @@ private final class AudioQueueCallbackRunLoop: @unchecked Sendable {
         return lock.withLock { (status, audioQueue) }
     }
 
-    func promoteThreadAfterSuccessfulStart() -> PromotionResult {
+    func promoteThreadAfterSuccessfulStart() -> AudioQueueOutputThreadPromotionResult {
         guard let callbackRunLoop = lock.withLock({ runLoop }) else {
             return .unavailable
         }
@@ -527,12 +538,13 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
     private let diagnostics: AudioDiagnosticReporter
     private let operations: AudioQueueOperations
     private let threadSchedulingPolicy: AudioQueueThreadSchedulingPolicy
+    private let outputThreadFactory: @Sendable (AudioQueueThreadSchedulingPolicy) -> any AudioQueueOutputThread
     private let bufferingPolicy: AudioQueueBufferingPolicy
     private let outputRing: OutputSampleRing
 
     private var audioQueue: AudioQueueRef?
     private var callbackContext: AudioQueueOutputCallbackContext?
-    private var callbackRunLoop: AudioQueueCallbackRunLoop?
+    private var outputThread: (any AudioQueueOutputThread)?
     private var allocatedBuffers: [AudioQueueBufferRef] = []
     private var generation: UInt64 = 0
     private var startRetryToken: UInt64 = 0
@@ -563,11 +575,15 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
         configuration: PCMRendererConfiguration,
         operations: AudioQueueOperations,
         threadSchedulingPolicy: AudioQueueThreadSchedulingPolicy = AudioQueueThreadSchedulingPolicy(),
+        outputThreadFactory: @escaping @Sendable (AudioQueueThreadSchedulingPolicy) -> any AudioQueueOutputThread = {
+            AudioQueueCallbackRunLoop(schedulingPolicy: $0)
+        },
         diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.configuration = configuration
         self.operations = operations
         self.threadSchedulingPolicy = threadSchedulingPolicy
+        self.outputThreadFactory = outputThreadFactory
         diagnostics = AudioDiagnosticReporter(handler: diagnosticHandler)
         let bufferingPolicy = AudioQueueBufferingPolicy(configuration: configuration)
         self.bufferingPolicy = bufferingPolicy
@@ -643,23 +659,21 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
                 enqueueBuffer: operations.enqueueBuffer
             )
             let callbackUserData = Unmanaged.passRetained(callbackContext).toOpaque()
-            let callbackRunLoop = AudioQueueCallbackRunLoop(
-                schedulingPolicy: threadSchedulingPolicy
-            )
-            let (createStatus, createdQueue) = callbackRunLoop.createOutput(
+            let outputThread = outputThreadFactory(threadSchedulingPolicy)
+            let (createStatus, createdQueue) = outputThread.createOutput(
                 format: streamDescription,
                 userData: callbackUserData,
                 createOutput: operations.createOutput
             )
             guard createStatus == noErr, let createdQueue else {
-                callbackRunLoop.stop()
+                outputThread.stop()
                 Unmanaged<AudioQueueOutputCallbackContext>
                     .fromOpaque(callbackUserData)
                     .release()
                 throw AudioQueuePCMRendererError.createFailed(createStatus)
             }
             self.callbackContext = callbackContext
-            self.callbackRunLoop = callbackRunLoop
+            self.outputThread = outputThread
 
             var buffers: [AudioQueueBufferRef] = []
             do {
@@ -709,8 +723,8 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
                 outputRing.waitUntilQuiescent()
                 if disposeStatus == noErr {
                     releaseCallbackContextAfterDispose()
-                    self.callbackRunLoop?.stop()
-                    self.callbackRunLoop = nil
+                    self.outputThread?.stop()
+                    self.outputThread = nil
                     audioQueue = nil
                     allocatedBuffers.removeAll()
                 } else {
@@ -771,8 +785,8 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
             return .retryRequired
         }
         releaseCallbackContextAfterDispose()
-        callbackRunLoop?.stop()
-        callbackRunLoop = nil
+        outputThread?.stop()
+        outputThread = nil
         self.audioQueue = nil
         allocatedBuffers.removeAll()
         reportTeardownSummary()
@@ -803,6 +817,25 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
         }
         _ = outputRing.write(buffer)
     }
+
+#if DEBUG
+    var outputRingSnapshotForTesting: OutputSampleRingSnapshot {
+        backendQueue.sync { outputRing.snapshot }
+    }
+
+    @discardableResult
+    func invokeOutputCallbackForTesting(bufferIndex: Int = 0) -> Bool {
+        backendQueue.sync {
+            guard let audioQueue,
+                  let callbackContext,
+                  allocatedBuffers.indices.contains(bufferIndex) else {
+                return false
+            }
+            callbackContext.callback(queue: audioQueue, buffer: allocatedBuffers[bufferIndex])
+            return true
+        }
+    }
+#endif
 
     public func flush() {
         backendQueue.sync {
@@ -1008,13 +1041,13 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
     private func promoteCallbackThreadAfterSuccessfulStart(generation: UInt64) {
         guard promotedGeneration != generation else { return }
         promotedGeneration = generation
-        guard let callbackRunLoop else {
+        guard let outputThread else {
             diagnostics.report(
                 "Audio callback thread scheduling promotion was unavailable; playback continues."
             )
             return
         }
-        switch callbackRunLoop.promoteThreadAfterSuccessfulStart() {
+        switch outputThread.promoteThreadAfterSuccessfulStart() {
         case .applied:
             break
         case let .failed(status):

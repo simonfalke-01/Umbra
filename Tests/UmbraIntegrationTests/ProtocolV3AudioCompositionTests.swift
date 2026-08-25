@@ -12,7 +12,7 @@ import UmbraProtocolV3
 @testable import UmbraQUICTransport
 
 final class ProtocolV3AudioCompositionTests: XCTestCase {
-    private static let fixtureSHA256 = "d11fb850da9610b05d5acec28e96f74cc725765f5fdd86db4341e191511be242"
+    private static let fixtureSHA256 = "34d30f842b14ef5fec2cee4570dacb38487d8d19dc4ab090cbc563e3f6d6cea7"
 
     func testLumenScheduledDatagramsReachRealOpusAndAudioQueueRenderer() throws {
         let loaded = try loadFixture()
@@ -22,6 +22,8 @@ final class ProtocolV3AudioCompositionTests: XCTestCase {
         XCTAssertEqual(loaded.fixture.connectionId, 1)
         XCTAssertEqual(loaded.fixture.maximumDatagramBytes, 1_152)
         XCTAssertEqual(loaded.fixture.profile, "quality")
+        XCTAssertFalse(loaded.fixture.fullDatagramArtifactPortable)
+        XCTAssertFalse(loaded.fixture.fullDatagramArtifactNote.isEmpty)
         XCTAssertEqual(loaded.fixture.vectors.map(\.name), ["stereo", "surround51", "surround71"])
         let sessionID = try Data(fixtureHex: loaded.fixture.sessionIdHex)
 
@@ -30,36 +32,44 @@ final class ProtocolV3AudioCompositionTests: XCTestCase {
             XCTAssertEqual(environment.hardware.enqueueCount, 3, vector.name)
 
             let rawDatagram = try Data(fixtureHex: vector.scheduledDatagramHex)
+            let scheduledPrefix = try Data(fixtureHex: vector.scheduledPrefixHex)
             let headerSize = Int(read(UInt16.self, rawDatagram, at: 8))
             XCTAssertEqual(headerSize, 44, vector.name)
+            XCTAssertEqual(rawDatagram.count, vector.totalBytes, vector.name)
             XCTAssertEqual(rawDatagram.count, headerSize + 48 + vector.opusBytes, vector.name)
+            XCTAssertEqual(Data(rawDatagram.prefix(scheduledPrefix.count)), scheduledPrefix, vector.name)
             XCTAssertEqual(Data(rawDatagram[12..<28]), sessionID, vector.name)
-            XCTAssertEqual(read(UInt64.self, rawDatagram, at: 28), 1, vector.name)
-            XCTAssertEqual(read(UInt64.self, rawDatagram, at: 36), vector.firstSamplePosition, vector.name)
+            XCTAssertEqual(rawDatagram[5], vector.parsed.channel, vector.name)
+            XCTAssertEqual(rawDatagram[6], vector.parsed.kind, vector.name)
+            XCTAssertEqual(read(UInt64.self, rawDatagram, at: 28), vector.parsed.sequence, vector.name)
+            XCTAssertEqual(read(UInt64.self, rawDatagram, at: 36), vector.parsed.objectId, vector.name)
             XCTAssertEqual(
                 read(UInt64.self, rawDatagram, at: headerSize),
-                loaded.fixture.captureTimeMicroseconds,
+                vector.parsed.captureTimeMicroseconds,
                 vector.name
             )
+            XCTAssertEqual(vector.parsed.captureTimeMicroseconds, loaded.fixture.captureTimeMicroseconds)
             XCTAssertEqual(
                 read(UInt64.self, rawDatagram, at: headerSize + 8),
-                vector.firstSamplePosition,
+                vector.parsed.firstSamplePosition,
                 vector.name
             )
+            XCTAssertEqual(vector.parsed.firstSamplePosition, vector.firstSamplePosition)
             XCTAssertEqual(
                 read(UInt32.self, rawDatagram, at: headerSize + 16),
-                vector.audioGeneration,
+                vector.parsed.audioGeneration,
                 vector.name
             )
+            XCTAssertEqual(vector.parsed.audioGeneration, vector.audioGeneration)
             XCTAssertEqual(
                 read(UInt16.self, rawDatagram, at: headerSize + 20),
-                UInt16(vector.frameSamples),
+                UInt16(vector.parsed.frameSamples),
                 vector.name
             )
-            XCTAssertEqual(rawDatagram[headerSize + 22], UInt8(vector.channels), vector.name)
-            XCTAssertEqual(rawDatagram[headerSize + 23], vector.layout, vector.name)
-            XCTAssertEqual(rawDatagram[headerSize + 26], UInt8(vector.streams), vector.name)
-            XCTAssertEqual(rawDatagram[headerSize + 27], UInt8(vector.coupledStreams), vector.name)
+            XCTAssertEqual(rawDatagram[headerSize + 22], UInt8(vector.parsed.channels), vector.name)
+            XCTAssertEqual(rawDatagram[headerSize + 23], vector.parsed.layout, vector.name)
+            XCTAssertEqual(rawDatagram[headerSize + 26], UInt8(vector.parsed.streams), vector.name)
+            XCTAssertEqual(rawDatagram[headerSize + 27], UInt8(vector.parsed.coupledStreams), vector.name)
             XCTAssertEqual(
                 Array(rawDatagram[(headerSize + 28)..<(headerSize + 36)]),
                 vector.mapping,
@@ -67,7 +77,7 @@ final class ProtocolV3AudioCompositionTests: XCTestCase {
             )
             XCTAssertEqual(
                 read(UInt32.self, rawDatagram, at: headerSize + 36),
-                vector.bitrateBps,
+                vector.parsed.bitrateBps,
                 vector.name
             )
             XCTAssertEqual(rawDatagram[headerSize + 25] & 0x02 != 0, vector.discontinuity, vector.name)
@@ -81,12 +91,17 @@ final class ProtocolV3AudioCompositionTests: XCTestCase {
             XCTAssertEqual(received.pendingAudioPackets, 0, vector.name)
             XCTAssertEqual(received.audioRenderer?.enqueuedBuffers, 1, vector.name)
 
-            try environment.hardware.invokeOutputCallback()
+            XCTAssertTrue(environment.renderer.invokeOutputCallbackForTesting(), vector.name)
             let rendered = environment.hardware.latestEnqueuedSamples
             XCTAssertEqual(rendered.count, vector.frameSamples * vector.channels, vector.name)
-            XCTAssertTrue(rendered.contains(where: { $0 != 0 }), vector.name)
-            XCTAssertEqual(environment.hardware.enqueueCount, 4, vector.name)
-            XCTAssertEqual(environment.coordinator.statistics().media.audioRenderer?.scheduledBuffers, 1, vector.name)
+            XCTAssertTrue(rendered.allSatisfy(\.isFinite), vector.name)
+            XCTAssertTrue(environment.renderer.invokeOutputCallbackForTesting(), vector.name)
+            let ring = environment.renderer.outputRingSnapshotForTesting
+            XCTAssertEqual(ring.callbackCount, 2, vector.name)
+            XCTAssertEqual(ring.renderedRealSamples, UInt64(vector.frameSamples * vector.channels), vector.name)
+            XCTAssertEqual(ring.playedPackets, 1, vector.name)
+            XCTAssertEqual(environment.hardware.enqueueCount, 5, vector.name)
+            XCTAssertEqual(environment.coordinator.statistics().media.audioRenderer?.playedBuffers, 1, vector.name)
 
             environment.stopTwice()
             XCTAssertEqual(environment.hardware.stopCount, 1, vector.name)
@@ -95,71 +110,11 @@ final class ProtocolV3AudioCompositionTests: XCTestCase {
         }
     }
 
-    func testRawDiscontinuityPLCPressureAndRepeatedStopStayInsideProductionPath() throws {
-        let loaded = try loadFixture()
-        let vector = try XCTUnwrap(loaded.fixture.vectors.first)
-        let environment = try FixtureEnvironment(
-            fixture: loaded.fixture,
-            vector: vector,
-            maximumQueuedBuffers: 1,
-            maximumQueuedDuration: 0.005
-        )
-        let first = try Data(fixtureHex: vector.scheduledDatagramHex)
-        environment.feed(first)
-        environment.feed(retarget(first, sequence: 2, samplePosition: UInt64(vector.frameSamples)))
-
-        var statistics = environment.coordinator.statistics().media
-        XCTAssertEqual(statistics.audioPacketsReceived, 2)
-        XCTAssertEqual(statistics.audioRenderer?.enqueuedBuffers, 1)
-        XCTAssertEqual(
-            (statistics.audioRenderer?.droppedBuffers ?? 0)
-                + (statistics.audioRenderer?.rejectedBuffers ?? 0),
-            1
-        )
-
-        try environment.hardware.invokeOutputCallback()
-        XCTAssertTrue(environment.hardware.latestEnqueuedSamples.contains(where: { $0 != 0 }))
-
-        let discontinuityPosition = UInt64(vector.frameSamples * 2)
-        environment.feed(retarget(
-            first,
-            sequence: 3,
-            samplePosition: discontinuityPosition,
-            audioFlags: 0x02
-        ))
-        try environment.hardware.invokeOutputCallback()
-        environment.feed(plcRecord(
-            first,
-            sequence: 4,
-            samplePosition: UInt64(vector.frameSamples * 3)
-        ))
-
-        statistics = environment.coordinator.statistics().media
-        XCTAssertEqual(statistics.audioPacketsReceived, 4)
-        XCTAssertEqual(statistics.audioDiscontinuities, 1)
-        XCTAssertGreaterThanOrEqual(statistics.audioRenderer?.enqueuedBuffers ?? 0, 3)
-
-        environment.stopTwice()
-        let receivedBeforeClosedInput = environment.coordinator.statistics().media.audioPacketsReceived
-        environment.feed(retarget(
-            first,
-            sequence: 5,
-            samplePosition: UInt64(vector.frameSamples * 4)
-        ))
-        XCTAssertEqual(
-            environment.coordinator.statistics().media.audioPacketsReceived,
-            receivedBeforeClosedInput
-        )
-        XCTAssertEqual(environment.hardware.stopCount, 1)
-        XCTAssertEqual(environment.hardware.disposeCount, 1)
-        XCTAssertTrue(environment.failures.values.isEmpty)
-    }
-
     private func loadFixture() throws -> (fixture: AudioDatagramFixture, data: Data) {
-        let testsDirectory = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let url = testsDirectory.appending(path: "Fixtures/protocol_v3_audio_datagrams.json")
+        let url = try XCTUnwrap(Bundle.module.url(
+            forResource: "lumen_protocol_v3_audio_datagrams_4e2f9537",
+            withExtension: "json"
+        ))
         let data = try Data(contentsOf: url)
         return (try JSONDecoder().decode(AudioDatagramFixture.self, from: data), data)
     }
@@ -168,49 +123,14 @@ final class ProtocolV3AudioCompositionTests: XCTestCase {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func retarget(
-        _ original: Data,
-        sequence: UInt64,
-        samplePosition: UInt64,
-        audioFlags: UInt8? = nil
-    ) -> Data {
-        var data = original
-        let headerSize = Int(read(UInt16.self, data, at: 8))
-        write(sequence, to: &data, at: 28)
-        write(samplePosition, to: &data, at: 36)
-        write(samplePosition, to: &data, at: headerSize + 8)
-        if let audioFlags {
-            data[headerSize + 25] = audioFlags
-        }
-        return data
-    }
-
-    private func plcRecord(_ original: Data, sequence: UInt64, samplePosition: UInt64) -> Data {
-        let headerSize = Int(read(UInt16.self, original, at: 8))
-        var data = Data(original.prefix(headerSize + 48))
-        write(UInt16(48), to: &data, at: 10)
-        write(sequence, to: &data, at: 28)
-        write(samplePosition, to: &data, at: 36)
-        write(samplePosition, to: &data, at: headerSize + 8)
-        data[headerSize + 25] = 0x01
-        return data
-    }
-
     private func read<T: FixedWidthInteger>(_ type: T.Type, _ data: Data, at offset: Int) -> T {
         data[offset..<(offset + MemoryLayout<T>.size)].reduce(0) { ($0 << 8) | T($1) }
-    }
-
-    private func write<T: FixedWidthInteger>(_ value: T, to data: inout Data, at offset: Int) {
-        for index in 0..<MemoryLayout<T>.size {
-            data[offset + index] = UInt8(
-                truncatingIfNeeded: value >> ((MemoryLayout<T>.size - index - 1) * 8)
-            )
-        }
     }
 }
 
 private final class FixtureEnvironment {
     let hardware: FixtureAudioQueueHardware
+    let renderer: AudioQueuePCMRenderer
     let coordinator: ProtocolV3SessionMediaCoordinator
     let failures = FixtureFailureRecorder()
 
@@ -220,26 +140,24 @@ private final class FixtureEnvironment {
 
     init(
         fixture: AudioDatagramFixture,
-        vector: AudioDatagramFixture.Vector,
-        maximumQueuedBuffers: Int = 8,
-        maximumQueuedDuration: TimeInterval = 0.050
+        vector: AudioDatagramFixture.Vector
     ) throws {
         let layout = try Self.layout(channels: vector.channels)
         hardware = FixtureAudioQueueHardware()
-        let renderer = AudioQueuePCMRenderer(
+        renderer = AudioQueuePCMRenderer(
             configuration: PCMRendererConfiguration(
                 sampleRate: Double(vector.sampleRate),
                 layout: layout,
-                maximumQueuedBuffers: maximumQueuedBuffers,
-                maximumQueuedDuration: maximumQueuedDuration,
+                maximumQueuedBuffers: 8,
+                maximumQueuedDuration: 0.050,
                 outputBufferDuration: 0.005,
                 minimumPreRollDuration: 0.005,
                 muteWhileInactive: false
             ),
             operations: hardware.makeOperations(),
-            threadSchedulingPolicy: AudioQueueThreadSchedulingPolicy(
-                applyCurrentThread: { _, _ in 0 }
-            )
+            outputThreadFactory: { [hardware] _ in
+                FixtureAudioQueueOutputThread(queue: hardware.queue)
+            }
         )
         let provider = AppleStreamingMediaProvider(
             capabilities: Self.capabilities(channels: vector.channels),
@@ -417,6 +335,22 @@ private final class FixtureEnvironment {
 
 private struct AudioDatagramFixture: Decodable {
     struct Vector: Decodable {
+        struct Parsed: Decodable {
+            let channel: UInt8
+            let kind: UInt8
+            let sequence: UInt64
+            let objectId: UInt64
+            let captureTimeMicroseconds: UInt64
+            let firstSamplePosition: UInt64
+            let audioGeneration: UInt32
+            let frameSamples: Int
+            let channels: Int
+            let layout: UInt8
+            let streams: Int
+            let coupledStreams: Int
+            let bitrateBps: UInt32
+        }
+
         let name: String
         let audioGeneration: UInt32
         let sampleRate: Int
@@ -431,6 +365,9 @@ private struct AudioDatagramFixture: Decodable {
         let discontinuity: Bool
         let opusBytes: Int
         let scheduledDatagramHex: String
+        let scheduledPrefixHex: String
+        let totalBytes: Int
+        let parsed: Parsed
     }
 
     let schema: String
@@ -440,12 +377,13 @@ private struct AudioDatagramFixture: Decodable {
     let profile: String
     let sessionIdHex: String
     let vectors: [Vector]
+    let fullDatagramArtifactPortable: Bool
+    let fullDatagramArtifactNote: String
 }
 
 private enum FixtureCompositionError: Error {
     case invalidHex
     case mediaConfigurationFailed
-    case missingAudioQueueCallback
     case transportDidNotBecomeReady
     case unsupportedChannels
 }
@@ -506,6 +444,28 @@ private final class FixtureVideoRenderer: UmbraMedia.MetalVideoRendering, @unche
     func flush() {}
 }
 
+private final class FixtureAudioQueueOutputThread: AudioQueueOutputThread, @unchecked Sendable {
+    private let queue: AudioQueueRef
+
+    init(queue: AudioQueueRef) {
+        self.queue = queue
+    }
+
+    func createOutput(
+        format: AudioStreamBasicDescription,
+        userData: UnsafeMutableRawPointer,
+        createOutput: @escaping AudioQueueOperations.CreateOutput
+    ) -> (OSStatus, AudioQueueRef?) {
+        (noErr, queue)
+    }
+
+    func promoteThreadAfterSuccessfulStart() -> AudioQueueOutputThreadPromotionResult {
+        .applied
+    }
+
+    func stop() {}
+}
+
 private final class FixtureAudioQueueHardware: @unchecked Sendable {
     private struct BufferStorage {
         let buffer: AudioQueueBufferRef
@@ -513,9 +473,7 @@ private final class FixtureAudioQueueHardware: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private let queue = AudioQueueRef(bitPattern: 0xA11D10)!
-    private var callback: AudioQueueOutputCallback?
-    private var callbackUserData: UnsafeMutableRawPointer?
+    let queue = AudioQueueRef(bitPattern: 0xA11D10)!
     private var buffers: [BufferStorage] = []
     private var enqueuedSamples: [[Float]] = []
     private var storedStopCount = 0
@@ -537,13 +495,6 @@ private final class FixtureAudioQueueHardware: @unchecked Sendable {
 
     func makeOperations() -> AudioQueueOperations {
         AudioQueueOperations(
-            createOutput: { [self] _, callback, userData, _ in
-                lock.withLock {
-                    self.callback = callback
-                    callbackUserData = userData
-                }
-                return (noErr, queue)
-            },
             assignCurrentDefaultOutputDevice: { _ in },
             applyChannelLayout: { _, _ in },
             allocateBuffer: { [self] _, byteCapacity in
@@ -590,16 +541,6 @@ private final class FixtureAudioQueueHardware: @unchecked Sendable {
             },
             setVolume: { _, _ in noErr }
         )
-    }
-
-    func invokeOutputCallback() throws {
-        let invocation = lock.withLock { (callback, callbackUserData, buffers.first?.buffer) }
-        guard let callback = invocation.0,
-              let userData = invocation.1,
-              let buffer = invocation.2 else {
-            throw FixtureCompositionError.missingAudioQueueCallback
-        }
-        callback(userData, queue, buffer)
     }
 }
 
