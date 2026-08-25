@@ -351,6 +351,41 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         ))
     }
 
+    func testGate1StartOfferWireRoundTripPreservesExactSchemaAndRational() throws {
+        let capabilities = AppleStreamingCapabilities(
+            hasMetalDevice: true,
+            supportsHardwareH264: true,
+            supportsHardwareHEVC: true,
+            supportsHardwareAV1: true,
+            hasDefaultAudioOutput: true,
+            supportsNativeAudioOutput: true,
+            audioOutputChannelCount: 2
+        )
+        let codec = ProtocolV3CBORCodec()
+
+        for playAudioOnHost in [false, true] {
+            var preferences = StreamingPreferences.default
+            preferences.setFrameRate(numerator: 60_000, denominator: 1_001)
+            preferences.playAudioOnHost = playAudioOnHost
+            let offer = try ProtocolV3StartRequestMapper.makeOffer(
+                applicationID: playAudioOnHost ? 26 : 25,
+                resume: false,
+                preferences: preferences,
+                capabilities: capabilities,
+                startIntentID: Data(1...16),
+                traceID: Data(17...32)
+            )
+
+            let encoded = try codec.encode(.map(offer.fields))
+            let decoded = try XCTUnwrap(try codec.decode(encoded).mapValue)
+            XCTAssertEqual(Set(decoded.keys), Set(1...18))
+            XCTAssertEqual(decoded[6]?.unsignedValue, 60_000)
+            XCTAssertEqual(decoded[7]?.unsignedValue, 1_001)
+            XCTAssertEqual(decoded[18]?.booleanValue, playAudioOnHost)
+            XCTAssertEqual(try codec.encode(.map(decoded)), encoded)
+        }
+    }
+
     func testStartOfferCarriesExplicitHostAudioPreferenceAndSelectionRequiresIt() throws {
         let capabilities = AppleStreamingCapabilities(
             hasMetalDevice: true,
