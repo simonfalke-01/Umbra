@@ -114,6 +114,91 @@ func protocolV3ControllerInputUsesFormatTwoAndPreservesAdvancedState() throws {
     #expect(arrivalEdge.read(UInt32.self, at: 24) == 0x104000)
 }
 
+@Test
+func protocolV3ControllerFeedbackRequiresExactInputAndControllerGenerations() throws {
+    let session = RecordingProtocolV3InputSession()
+    let sender = ProtocolV3InputStateSender(
+        session: session,
+        sessionID: Data(repeating: 0xA5, count: 16),
+        mode: .latency,
+        usesAbsolutePointer: false,
+        inputGeneration: 7,
+        failureHandler: { _ in }
+    )
+
+    try sender.send(.controllerArrival(
+        number: 1,
+        activeMask: 2,
+        type: 2,
+        supportedButtons: 0,
+        capabilities: 0x007F
+    ))
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 7,
+        controller: 1,
+        controllerGeneration: 1
+    ))
+    #expect(!sender.acceptsControllerFeedback(
+        inputGeneration: 8,
+        controller: 1,
+        controllerGeneration: 1
+    ))
+    #expect(!sender.acceptsControllerFeedback(
+        inputGeneration: 7,
+        controller: 1,
+        controllerGeneration: 2
+    ))
+
+    try sender.send(.controllerArrival(
+        number: 1,
+        activeMask: 2,
+        type: 2,
+        supportedButtons: 0,
+        capabilities: 0x007F
+    ))
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 7,
+        controller: 1,
+        controllerGeneration: 1
+    ))
+
+    try sender.send(.controller(
+        number: 1,
+        activeMask: 0,
+        buttons: 0,
+        leftTrigger: 0,
+        rightTrigger: 0,
+        leftStickX: 0,
+        leftStickY: 0,
+        rightStickX: 0,
+        rightStickY: 0
+    ))
+    try sender.send(.controllerArrival(
+        number: 1,
+        activeMask: 2,
+        type: 2,
+        supportedButtons: 0,
+        capabilities: 0x007F
+    ))
+    #expect(!sender.acceptsControllerFeedback(
+        inputGeneration: 7,
+        controller: 1,
+        controllerGeneration: 1
+    ))
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 7,
+        controller: 1,
+        controllerGeneration: 2
+    ))
+
+    try sender.updateInputGeneration(8)
+    #expect(sender.acceptsControllerFeedback(
+        inputGeneration: 8,
+        controller: 1,
+        controllerGeneration: 2
+    ))
+}
+
 private extension Data {
     func read<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {
         self[offset..<(offset + MemoryLayout<T>.size)].reduce(T.zero) { ($0 << 8) | T($1) }

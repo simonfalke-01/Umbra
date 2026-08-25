@@ -122,9 +122,10 @@ enum QUICWireCodec {
 
     static func inboundLane(channel: UInt8, kind: UInt8) throws -> QUICSemanticLane {
         switch (channel, kind) {
-        case (1, 2), (1, 3): .inputState
+        case (1, 2), (1, 3), (1, 4): .inputState
         case (2, 1): .video
         case (3, 1): .audio
+        case (5, 1): .hostEvents
         default: throw WireError.unsupportedRoute
         }
     }
@@ -142,8 +143,8 @@ enum QUICWireCodec {
             let blockLength = Int(readUInt16(payload, base + 16))
             let edgeCount = Int(readUInt16(payload, base + 18))
             guard edgeCount <= 64,
-                  readUInt16(payload, base + 20) == 1,
-                  readUInt16(payload, base + 22) == 1,
+                  readUInt16(payload, base + 20) == 2,
+                  readUInt16(payload, base + 22) == 2,
                   readUInt64(payload, base + 24) == 0,
                   payload.count == 32 + blockLength + edgeCount * 32,
                   objectID != 0
@@ -177,10 +178,14 @@ enum QUICWireCodec {
             else {
                 throw WireError.malformed
             }
+        case (1, 4):
+            try validateControllerFeedback(message)
         case (2, 1):
             try validateVideoFragment(message)
         case (3, 1):
             try validateAudioPayload(message.payload, objectID: message.objectID)
+        case (5, 1):
+            try validateRTTTelemetry(message)
         default:
             throw WireError.unsupportedRoute
         }
@@ -213,15 +218,83 @@ enum QUICWireCodec {
         }
     }
 
+    private static func validateControllerFeedback(_ message: MediaDatagram) throws {
+        let payload = message.payload
+        let base = payload.startIndex
+        guard payload.count == 40 else { throw WireError.malformed }
+        let inputGeneration = readUInt32(payload, base)
+        let controllerGeneration = readUInt32(payload, base + 4)
+        let controller = payload[base + 8]
+        let command = payload[base + 9]
+        let valueLength = Int(readUInt16(payload, base + 10))
+        guard inputGeneration != 0,
+              message.objectID == UInt64(inputGeneration),
+              controllerGeneration != 0,
+              controller < 16,
+              (1...5).contains(command),
+              payload[(base + 36)..<(base + 40)].allSatisfy({ $0 == 0 })
+        else {
+            throw WireError.malformed
+        }
+        let expectedLength: Int
+        switch command {
+        case 1, 2:
+            expectedLength = 4
+        case 3:
+            expectedLength = 4
+            guard (1...2).contains(payload[base + 12]),
+                  payload[base + 13] == 0,
+                  readUInt16(payload, base + 14) <= 2_000 else {
+                throw WireError.malformed
+            }
+        case 4:
+            expectedLength = 3
+        case 5:
+            expectedLength = 24
+            guard payload[base + 12] & ~UInt8(0x0C) == 0,
+                  payload[base + 15] == 0 else {
+                throw WireError.malformed
+            }
+        default:
+            throw WireError.malformed
+        }
+        guard valueLength == expectedLength,
+              payload[(base + 12 + valueLength)..<(base + 36)].allSatisfy({ $0 == 0 }) else {
+            throw WireError.malformed
+        }
+    }
+
+    private static func validateRTTTelemetry(_ message: MediaDatagram) throws {
+        let payload = message.payload
+        let base = payload.startIndex
+        guard payload.count == 24 else { throw WireError.malformed }
+        let generation = readUInt64(payload, base)
+        let smoothedRTT = readUInt32(payload, base + 8)
+        let minimumRTT = readUInt32(payload, base + 12)
+        let variation = readUInt32(payload, base + 16)
+        guard generation != 0,
+              message.semanticSequence == generation,
+              message.objectID == generation,
+              (1...1_000_000).contains(smoothedRTT),
+              (1...smoothedRTT).contains(minimumRTT),
+              variation <= 1_000_000,
+              readUInt32(payload, base + 20) == 0 else {
+            throw WireError.malformed
+        }
+    }
+
     private static func validateVideoFeedback(_ payload: Data, objectID: UInt64) throws {
         let base = payload.startIndex
         guard payload.count >= 32 else { throw WireError.malformed }
         let action = payload[base + 16]
         let rangeCount = Int(payload[base + 17])
+        let deadlineMissMicroseconds = readUInt32(payload, base + 20)
         guard objectID != 0,
               (1...5).contains(action),
               rangeCount <= 16,
               readUInt16(payload, base + 18) == 0,
+              deadlineMissMicroseconds <= 1_000_000,
+              action == 1 || action == 3 || deadlineMissMicroseconds == 0,
               readUInt64(payload, base + 24) == 0,
               payload.count == 32 + rangeCount * 4,
               action == 2 || rangeCount == 0
@@ -272,7 +345,7 @@ enum QUICWireCodec {
 
     private static func inboundRouteAllowed(channel: UInt8, kind: UInt8) -> Bool {
         switch (channel, kind) {
-        case (1, 2), (1, 3), (2, 1), (3, 1): true
+        case (1, 2), (1, 3), (1, 4), (2, 1), (3, 1), (5, 1): true
         default: false
         }
     }

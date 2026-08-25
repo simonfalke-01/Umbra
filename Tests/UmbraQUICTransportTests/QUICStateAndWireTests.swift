@@ -128,6 +128,80 @@ struct QUICStateAndWireTests {
         #expect(try QUICWireCodec.inboundLane(channel: 2, kind: 1) == .video)
     }
 
+    @Test("ULM3 authenticates and strictly validates controller feedback")
+    func inboundControllerFeedback() throws {
+        let session = Data(repeating: 1, count: 16)
+        var payload = Data(repeating: 0, count: 40)
+        payload[3] = 7
+        payload[7] = 3
+        payload[8] = 2
+        payload[9] = 3
+        payload[11] = 4
+        payload[12] = 2
+        payload[15] = 100
+        var record = Data([0x55, 0x4C, 0x4D, 0x33, 3, 1, 4, 0, 0, 44, 0, 40])
+        record.append(session)
+        record.append(Data([0, 0, 0, 0, 0, 0, 0, 9]))
+        record.append(Data([0, 0, 0, 0, 0, 0, 0, 7]))
+        record.append(payload)
+        let decoded = try QUICWireCodec.decodeDatagram(record)
+        #expect(decoded.channel == 1)
+        #expect(decoded.kind == 4)
+        #expect(decoded.objectID == 7)
+        #expect(try QUICWireCodec.inboundLane(channel: 1, kind: 4) == .inputState)
+
+        var stale = record
+        stale[43] = 8
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.decodeDatagram(stale)
+        }
+        var reserved = record
+        reserved[60] = 1
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.decodeDatagram(reserved)
+        }
+    }
+
+    @Test("ULM3 authenticates and strictly validates RTT telemetry")
+    func inboundRTTTelemetry() throws {
+        let session = Data(repeating: 1, count: 16)
+        var record = Data([0x55, 0x4C, 0x4D, 0x33, 3, 5, 1, 0, 0, 44, 0, 24])
+        record.append(session)
+        record.append(Data([0, 0, 0, 0, 0, 0, 0, 2]))
+        record.append(Data([0, 0, 0, 0, 0, 0, 0, 2]))
+        record.append(Data([0, 0, 0, 0, 0, 0, 0, 2]))
+        record.append(Data([0, 0, 0x0F, 0xA0]))
+        record.append(Data([0, 0, 0x0B, 0xB8]))
+        record.append(Data([0, 0, 0x03, 0xE8]))
+        record.append(Data(repeating: 0, count: 4))
+
+        let decoded = try QUICWireCodec.decodeDatagram(record)
+        #expect(decoded.channel == 5)
+        #expect(decoded.kind == 1)
+        #expect(decoded.semanticSequence == 2)
+        #expect(decoded.objectID == 2)
+        #expect(try QUICWireCodec.inboundLane(channel: 5, kind: 1) == .hostEvents)
+
+        var wrongGeneration = record
+        wrongGeneration[51] = 3
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.decodeDatagram(wrongGeneration)
+        }
+        var impossibleMinimum = record
+        impossibleMinimum[56] = 0
+        impossibleMinimum[57] = 0
+        impossibleMinimum[58] = 0x13
+        impossibleMinimum[59] = 0x88
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.decodeDatagram(impossibleMinimum)
+        }
+        var reserved = record
+        reserved[67] = 1
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.decodeDatagram(reserved)
+        }
+    }
+
     @Test("ULM3 rejects wrong direction, repair, forbidden flags, and length abuse")
     func hostileDatagrams() throws {
         let session = Data(repeating: 1, count: 16)
@@ -178,6 +252,31 @@ struct QUICStateAndWireTests {
                 kind: 3,
                 objectID: 1,
                 payload: feedback
+            )
+        }
+        var unboundedDeadline = Data(repeating: 0, count: 32)
+        unboundedDeadline[16] = 1
+        unboundedDeadline[20] = 0
+        unboundedDeadline[21] = 0x0F
+        unboundedDeadline[22] = 0x42
+        unboundedDeadline[23] = 0x41
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.validateOutboundPayload(
+                channel: 2,
+                kind: 3,
+                objectID: 1,
+                payload: unboundedDeadline
+            )
+        }
+        var deadlineOnKeyFrameRequest = Data(repeating: 0, count: 32)
+        deadlineOnKeyFrameRequest[16] = 4
+        deadlineOnKeyFrameRequest[23] = 1
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.validateOutboundPayload(
+                channel: 2,
+                kind: 3,
+                objectID: 1,
+                payload: deadlineOnKeyFrameRequest
             )
         }
     }

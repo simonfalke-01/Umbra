@@ -112,6 +112,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     private let mode: QUICOptimizationMode
     private let failureHandler: @Sendable (Error) -> Void
     private let lock = NSLock()
+    private var inputGeneration: UInt32
     private var stateSequence: UInt64 = 0
     private var nextEdgeID: UInt64 = 1
     private var lastAcknowledgedEdgeID: UInt64 = 0
@@ -126,6 +127,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     private var absoluteY: UInt32 = 0
     private var usesAbsolutePointer: Bool
     private var controllers: [UInt8: ControllerState] = [:]
+    private var controllerGenerations: [UInt8: UInt32] = [:]
     private var touches: [UInt32: TouchState] = [:]
     private var initialBaseline = true
     private var closed = false
@@ -139,12 +141,14 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         sessionID: Data,
         mode: QUICOptimizationMode,
         usesAbsolutePointer: Bool,
+        inputGeneration: UInt32 = 1,
         failureHandler: @escaping @Sendable (Error) -> Void
     ) {
         self.session = session
         self.sessionID = sessionID
         self.mode = mode
         self.usesAbsolutePointer = usesAbsolutePointer
+        self.inputGeneration = inputGeneration
         self.failureHandler = failureHandler
     }
 
@@ -244,10 +248,23 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
                 }
             case let .controllerArrival(number, _, type, supportedButtons, capabilities):
                 guard number < 16 else { throw ProtocolV3InputError.invalidCommand }
-                var controller = controllers[number] ?? ControllerState()
-                controller.type = (1...5).contains(type) ? type : 5
-                controller.flags = capabilities & 0x01FF
-                controller.supportedButtons = supportedButtons & 0x003F_FFFF
+                let normalizedType = (1...5).contains(type) ? type : 5
+                let normalizedCapabilities = capabilities & 0x01FF
+                let normalizedButtons = supportedButtons & 0x003F_FFFF
+                if let existing = controllers[number] {
+                    guard existing.type == normalizedType,
+                          existing.flags == normalizedCapabilities,
+                          existing.supportedButtons == normalizedButtons else {
+                        throw ProtocolV3InputError.invalidCommand
+                    }
+                    break
+                }
+                let generation = try Self.incrementedGeneration(controllerGenerations[number] ?? 0)
+                controllerGenerations[number] = generation
+                var controller = ControllerState()
+                controller.type = normalizedType
+                controller.flags = normalizedCapabilities
+                controller.supportedButtons = normalizedButtons
                 controllers[number] = controller
                 try appendEdge(
                     time: now, kind: 4, device: number, code: controller.flags,
@@ -317,6 +334,25 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         }
     }
 
+    public func updateInputGeneration(_ generation: UInt32) throws {
+        guard generation != 0 else { throw ProtocolV3InputError.invalidCommand }
+        try lock.withLock {
+            guard !closed else { throw ProtocolV3InputError.closed }
+            inputGeneration = generation
+        }
+    }
+
+    public func acceptsControllerFeedback(
+        inputGeneration: UInt32,
+        controller: UInt8,
+        controllerGeneration: UInt32
+    ) -> Bool {
+        lock.withLock {
+            !closed && self.inputGeneration == inputGeneration && controllers[controller] != nil
+                && controllerGenerations[controller] == controllerGeneration
+        }
+    }
+
     public func inputResetStateBlock() throws -> Data {
         try lock.withLock {
             guard !closed else { throw ProtocolV3InputError.closed }
@@ -338,6 +374,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
             keyboard = Data(repeating: 0, count: 32)
             mouseButtons = 0
             controllers.removeAll()
+            controllerGenerations.removeAll()
             touches.removeAll()
         }
     }
@@ -351,6 +388,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
             keyboard = Data(repeating: 0, count: 32)
             mouseButtons = 0
             controllers.removeAll()
+            controllerGenerations.removeAll()
             touches.removeAll()
             return true
         }
@@ -503,6 +541,11 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         let result = left.addingReportingOverflow(right)
         guard !result.overflow else { throw ProtocolV3InputError.sequenceExhausted }
         return result.partialValue
+    }
+
+    private static func incrementedGeneration(_ generation: UInt32) throws -> UInt32 {
+        guard generation < UInt32.max else { throw ProtocolV3InputError.sequenceExhausted }
+        return generation + 1
     }
 
     private static func q32(_ value: Int, maximum: Int) -> UInt32 {
