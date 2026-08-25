@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import UmbraCore
+import UmbraProtocolV3
 import UmbraServices
 
 @MainActor
@@ -20,6 +21,8 @@ final class AppStore: ObservableObject {
     @Published var presentedSheet: PresentedSheet?
     @Published var confirmation: PresentedConfirmation?
     @Published var failure: PresentedFailure?
+    @Published private(set) var securePairingError: String?
+    @Published private(set) var pendingSecureInvitation = ""
     @Published private(set) var applicationCatalogWarning: String?
     @Published private(set) var operation: OperationPresentation?
 
@@ -27,6 +30,7 @@ final class AppStore: ObservableObject {
 
     private let service: UmbraClientServicing
     private var activeTask: Task<Void, Never>?
+    private var securePairingTask: Task<Void, Never>?
     private var sessionDisconnectTask: Task<Void, Never>?
     private var applicationCatalogTask: Task<Void, Never>?
     private var nextApplicationCatalogRequestToken: UInt64 = 0
@@ -37,6 +41,7 @@ final class AppStore: ObservableObject {
     private var streamingBrowserContext: ApplicationBrowserContext?
     private var nextOperationToken: UInt64 = 0
     private var currentOperationToken: UInt64?
+    private var securePairingOperationToken: UInt64?
     private var activationInFlight: ApplicationActivationReservation?
     private var hasObservedSessionLifecycleEvent = false
     private var hasReachedStreamingState = false
@@ -116,7 +121,68 @@ final class AppStore: ObservableObject {
     }
 
     func showAddHost() {
+        pendingSecureInvitation = ""
+        securePairingError = nil
         presentedSheet = .addHost
+    }
+
+    func showSecurePairing(invitationURI: String) {
+        pendingSecureInvitation = invitationURI
+        presentedSheet = .addHost
+        do {
+            _ = try SecurePairingInvitationValidator.validate(invitationURI)
+            securePairingError = nil
+        } catch {
+            securePairingError = error.localizedDescription
+            return
+        }
+        supersedePairingOperationIfNeeded()
+    }
+
+    func clearSecurePairingError() {
+        securePairingError = nil
+    }
+
+    func pairSecureHost(invitationURI: String) {
+        let validated: ValidatedSecurePairingInvitation
+        do {
+            validated = try SecurePairingInvitationValidator.validate(invitationURI)
+        } catch {
+            pendingSecureInvitation = invitationURI
+            securePairingError = error.localizedDescription
+            return
+        }
+
+        supersedePairingOperationIfNeeded()
+        guard operation == nil else {
+            securePairingError = "Finish or cancel the current operation before pairing another host."
+            return
+        }
+
+        pendingSecureInvitation = validated.uri
+        securePairingError = nil
+        let operationToken = beginOperation(OperationPresentation(
+            kind: .pairing,
+            title: "Pairing with \(validated.hostname)",
+            message: "Verifying the invitation and host identity...",
+            progress: nil,
+            isCancellable: true
+        ))
+        securePairingOperationToken = operationToken
+        securePairingTask = Task { [weak self] in
+            guard let self else { return }
+            defer { finishSecurePairingOperation(operationToken) }
+            do {
+                let host = try await service.pairSecureHost(invitationURI: validated.uri)
+                try Task.checkCancellation()
+                completeSecurePairing(host, ownedBy: operationToken)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                failSecurePairing(error, ownedBy: operationToken)
+            }
+        }
     }
 
     func addHost(address: String, portText: String) {
@@ -238,8 +304,15 @@ final class AppStore: ObservableObject {
             pairingHostID = nil
         }
         let wasActivatingApplication = activationInFlight != nil
-        activeTask?.cancel()
-        activeTask = nil
+        if let currentOperationToken,
+           securePairingOperationToken == currentOperationToken {
+            securePairingTask?.cancel()
+            securePairingTask = nil
+            securePairingOperationToken = nil
+        } else {
+            activeTask?.cancel()
+            activeTask = nil
+        }
         activationInFlight = nil
         invalidateCurrentOperation()
         if wasActivatingApplication {
@@ -861,6 +934,47 @@ final class AppStore: ObservableObject {
         operation = nil
     }
 
+    private func supersedePairingOperationIfNeeded() {
+        if let securePairingOperationToken {
+            securePairingTask?.cancel()
+            securePairingTask = nil
+            self.securePairingOperationToken = nil
+            if currentOperationToken == securePairingOperationToken {
+                invalidateCurrentOperation()
+            }
+        }
+
+        guard operation?.kind == .pairing else { return }
+        activeTask?.cancel()
+        activeTask = nil
+        invalidateCurrentOperation()
+    }
+
+    private func finishSecurePairingOperation(_ operationToken: UInt64) {
+        guard securePairingOperationToken == operationToken else { return }
+        securePairingTask = nil
+        securePairingOperationToken = nil
+        finishOperation(operationToken)
+    }
+
+    private func completeSecurePairing(
+        _ host: HostDisplayModel,
+        ownedBy operationToken: UInt64
+    ) {
+        guard currentOperationToken == operationToken,
+              securePairingOperationToken == operationToken else { return }
+        upsert(host)
+        pendingSecureInvitation = ""
+        securePairingError = nil
+        presentedSheet = nil
+    }
+
+    private func failSecurePairing(_ error: Error, ownedBy operationToken: UInt64) {
+        guard currentOperationToken == operationToken,
+              securePairingOperationToken == operationToken else { return }
+        securePairingError = Self.securePairingFailureMessage(error)
+    }
+
     private func finishActivation(_ activation: ApplicationActivationReservation) {
         guard activationInFlight == activation else { return }
         activationInFlight = nil
@@ -873,6 +987,23 @@ final class AppStore: ObservableObject {
     private func presentFailure(title: String, error: Error, ownedBy operationToken: UInt64) {
         guard currentOperationToken == operationToken else { return }
         presentFailure(title: title, error: error)
+    }
+
+    private static func securePairingFailureMessage(_ error: Error) -> String {
+        if let validation = error as? SecurePairingInvitationValidationError {
+            return validation.localizedDescription
+        }
+        if let protocolError = error as? ProtocolV3ClientError {
+            switch protocolError {
+            case .authenticationFailed, .invalidMessage:
+                return "The invitation did not match the host identity. Generate a new invitation in Lumen."
+            case .invalidState:
+                return "Pairing stopped before the host confirmed it. Generate a new invitation and try again."
+            case .startRejected:
+                return "The host rejected secure pairing. Generate a new invitation in Lumen and try again."
+            }
+        }
+        return "Umbra couldn’t complete secure pairing. Check that Lumen is running, then generate a new invitation and try again."
     }
 
     private func handle(_ event: UmbraClientEvent) {

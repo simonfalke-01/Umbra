@@ -51,6 +51,7 @@ final class DemoUmbraClientService: UmbraClientServicing {
 
     func discoverHosts() async throws -> [HostDisplayModel] { hosts }
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw UmbraClientServiceError.unavailable("Demo data does not perform network actions.") }
+    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel { throw UmbraClientServiceError.unavailable("Demo data does not perform secure pairing.") }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel { throw UmbraClientServiceError.unavailable("Demo data does not perform pairing.") }
     func cancelPairing(hostID: HostID) async {}
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel {

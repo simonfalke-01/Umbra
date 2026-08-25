@@ -760,6 +760,7 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
     private let applicationsByHost: [HostID: [ApplicationDisplayModel]]
     private var applicationRequests: [HostID] = []
     private(set) var applicationOperations: [RecordedApplicationOperation] = []
+    private(set) var securePairingInvitations: [String] = []
     private(set) var disconnectCount = 0
     private let pairingError: Error?
     private let suspendsPairing: Bool
@@ -852,6 +853,11 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
     func disconnectSession() async { disconnectCount += 1 }
 
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw unused() }
+    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel {
+        securePairingInvitations.append(invitationURI)
+        if let pairingError { throw pairingError }
+        throw unused()
+    }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
         if let pairingError { throw pairingError }
         if suspendsPairing {

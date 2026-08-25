@@ -332,6 +332,20 @@ final class LiveUmbraClientService: UmbraClientServicing {
         return displayHost(try await service.addHost(address: endpoint.address, port: port))
     }
 
+    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel {
+        guard let protocolV3 else {
+            throw UmbraClientServiceError.unavailable(
+                "Secure Lumen pairing is unavailable because Umbra's protocol-v3 services did not start."
+            )
+        }
+        return try await protocolV3.pairInvitation(
+            invitationURI,
+            requestedPermissions: ModernLumenV3Manager.requestedPermissions(
+                for: preferences.settings
+            )
+        )
+    }
+
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
         displayHost(try await service.pairHost(id: request.hostID.rawValue, pin: request.pin))
     }
