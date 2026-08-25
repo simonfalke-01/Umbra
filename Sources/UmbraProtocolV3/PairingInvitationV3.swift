@@ -68,10 +68,18 @@ public struct ProtocolV3PairingInvitation: Equatable, Sendable {
         let expiry = readUInt64(data, 152)
         guard invitationID.contains(where: { $0 != 0 }), invitationToken.contains(where: { $0 != 0 }),
               hostID.contains(where: { $0 != 0 }), spki.contains(where: { $0 != 0 }),
-              hostPublicKey.contains(where: { $0 != 0 }), issue <= nowUnixSeconds,
-              expiry >= nowUnixSeconds, expiry >= issue, expiry - issue <= 300,
+              hostPublicKey.contains(where: { $0 != 0 }),
               Data(SHA256.hash(data: Data(hostPublicKey)).prefix(16)) == hostID
-        else { throw ProtocolV3WireError.invalidField("v3 invitation identity or lifetime") }
+        else { throw ProtocolV3WireError.invalidField("v3 invitation identity") }
+        guard issue <= nowUnixSeconds else {
+            throw ProtocolV3WireError.invalidField("v3 invitation not active")
+        }
+        guard expiry >= nowUnixSeconds else {
+            throw ProtocolV3WireError.invalidField("v3 invitation expired")
+        }
+        guard expiry >= issue, expiry - issue <= 300 else {
+            throw ProtocolV3WireError.invalidField("v3 invitation lifetime")
+        }
         return Self(
             rawBytes: data,
             invitationID: Data(invitationID),
