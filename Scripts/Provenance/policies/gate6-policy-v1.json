@@ -1,0 +1,55 @@
+{
+  "schema": "umbra-lumen/gate6-policy/1",
+  "source_freeze": {
+    "required_repositories": ["Umbra", "Lumen"],
+    "required_vector_ids": [
+      "quic-v3",
+      "start-mode",
+      "vdd-gate5",
+      "audio-datagrams",
+      "discovery-composition"
+    ],
+    "required_toolchain_ids": [
+      "macos-swift",
+      "macos-clang",
+      "macos-codesign",
+      "windows-msbuild-wdk",
+      "windows-mingw",
+      "windows-cmake-ninja",
+      "windows-wix"
+    ],
+    "required_signing_purposes": [
+      "umbra-app",
+      "lumen-application",
+      "lumen-virtual-hid",
+      "lumen-virtual-microphone",
+      "lumen-virtual-display"
+    ],
+    "require_clean": true,
+    "require_pushed": true,
+    "require_initialized_clean_reachable_submodules": true,
+    "forbid_placeholders": true
+  },
+  "artifact": {
+    "required_artifact_kinds": [
+      "umbra-app-tree",
+      "umbra-app-archive",
+      "lumen-msi",
+      "lumen-zip",
+      "lumen-executable",
+      "msquic-runtime",
+      "msquic-shim",
+      "vdd-driver",
+      "vhid-driver",
+      "vmic-driver",
+      "vdd-shader",
+      "protocol-vector",
+      "test-log"
+    ],
+    "required_run_ids": [],
+    "require_complete_streams": true,
+    "require_zero_exit_for_mandatory_runs": true,
+    "require_empty_inventory_differences": true,
+    "require_verified_signatures": true
+  }
+}

@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://umbra.invalid/schemas/source-freeze-manifest-v1.schema.json",
+  "title": "Umbra/Lumen Gate 6 Source Freeze Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "kind",
+    "release_id",
+    "created_at_utc",
+    "digest_algorithm",
+    "repositories",
+    "protocol_vectors",
+    "source_inputs",
+    "toolchains",
+    "signing_identities",
+    "build_plans",
+    "inventory_policies"
+  ],
+  "properties": {
+    "schema": {"const": "umbra-lumen/source-freeze-manifest/1"},
+    "kind": {"const": "source_freeze"},
+    "release_id": {"type": "string", "minLength": 1},
+    "created_at_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "digest_algorithm": {"const": "sha256"},
+    "repositories": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/repository"}
+    },
+    "protocol_vectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/vector"}
+    },
+    "source_inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "object"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "object": {"$ref": "#/$defs/objectRef"}
+        }
+      }
+    },
+    "toolchains": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "host", "os", "architecture", "executable", "version_argv", "version_stdout", "version"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "host": {"type": "string", "minLength": 1},
+          "os": {"type": "string", "minLength": 1},
+          "architecture": {"type": "string", "minLength": 1},
+          "executable": {"$ref": "#/$defs/objectRef"},
+          "version_argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "version_stdout": {"$ref": "#/$defs/objectRef"},
+          "version": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "signing_identities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["purpose", "certificate_sha256", "subject", "issuer", "serial", "not_before_utc", "not_after_utc", "policy"],
+        "properties": {
+          "purpose": {"type": "string", "minLength": 1},
+          "certificate_sha256": {"$ref": "#/$defs/sha256"},
+          "subject": {"type": "string", "minLength": 1},
+          "issuer": {"type": "string", "minLength": 1},
+          "serial": {"type": "string", "minLength": 1},
+          "not_before_utc": {"type": "string", "format": "date-time"},
+          "not_after_utc": {"type": "string", "format": "date-time"},
+          "policy": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "build_plans": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["run_id", "repository", "target", "configuration", "architecture", "argv", "cwd", "environment", "input_ids"],
+        "properties": {
+          "run_id": {"type": "string", "minLength": 1},
+          "repository": {"type": "string", "minLength": 1},
+          "target": {"type": "string", "minLength": 1},
+          "configuration": {"type": "string", "minLength": 1},
+          "architecture": {"type": "string", "minLength": 1},
+          "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "cwd": {"type": "string", "minLength": 1},
+          "environment": {"type": "object", "additionalProperties": {"type": "string"}},
+          "input_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+        }
+      }
+    },
+    "inventory_policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "source_path", "object"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "source_path": {"type": "string", "minLength": 1},
+          "object": {"$ref": "#/$defs/objectRef"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitOid": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "objectRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256", "bytes", "media_type"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "minLength": 1}
+      }
+    },
+    "archiveRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256", "bytes", "media_type", "format", "prefix"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "minLength": 1},
+        "format": {"const": "git-archive-tar"},
+        "prefix": {"type": "string", "pattern": "/$"}
+      }
+    },
+    "submodule": {
+      "type": "object",
+      "required": ["path", "url", "gitlink_commit", "checked_out_commit", "clean", "remote_reachable", "archive", "tree_manifest"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "minLength": 1},
+        "gitlink_commit": {"$ref": "#/$defs/gitOid"},
+        "checked_out_commit": {"$ref": "#/$defs/gitOid"},
+        "clean": {"const": true},
+        "remote_reachable": {"const": true},
+        "archive": {"$ref": "#/$defs/archiveRef"},
+        "tree_manifest": {"$ref": "#/$defs/objectRef"}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "required": ["name", "remote_url", "commit", "tree", "branch", "upstream_ref", "upstream_commit", "fetched_at_utc", "clean", "pushed", "status_evidence", "archive", "tree_manifest", "submodules"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "remote_url": {"type": "string", "minLength": 1},
+        "commit": {"$ref": "#/$defs/gitOid"},
+        "tree": {"$ref": "#/$defs/gitOid"},
+        "branch": {"type": "string", "minLength": 1},
+        "upstream_ref": {"type": "string", "minLength": 1},
+        "upstream_commit": {"$ref": "#/$defs/gitOid"},
+        "fetched_at_utc": {"type": "string", "format": "date-time"},
+        "clean": {"const": true},
+        "pushed": {"const": true},
+        "status_evidence": {"$ref": "#/$defs/objectRef"},
+        "archive": {"$ref": "#/$defs/archiveRef"},
+        "tree_manifest": {"$ref": "#/$defs/objectRef"},
+        "submodules": {"type": "array", "items": {"$ref": "#/$defs/submodule"}}
+      }
+    },
+    "vectorEndpoint": {
+      "type": "object",
+      "required": ["repository", "commit", "path", "sha256"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "commit": {"$ref": "#/$defs/gitOid"},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "vector": {
+      "type": "object",
+      "required": ["id", "schema", "byte_identical", "producer", "consumers", "generator"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "schema": {"type": "string", "minLength": 1},
+        "byte_identical": {"type": "boolean"},
+        "producer": {"$ref": "#/$defs/vectorEndpoint"},
+        "consumers": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/vectorEndpoint"}},
+        "generator": {
+          "type": "object",
+          "required": ["argv", "source_sha256"],
+          "properties": {
+            "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            "source_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    }
+  }
+}

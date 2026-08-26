@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://umbra.invalid/schemas/run-evidence-v1.schema.json",
+  "title": "Umbra/Lumen binary-safe run evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "classification", "argv", "cwd", "environment", "toolchain_ids", "started_at_utc", "ended_at_utc", "monotonic_duration_ns", "exit_code", "stdout", "stderr", "result"],
+  "properties": {
+    "schema": {"const": "umbra-lumen/run-evidence/1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "classification": {"enum": ["mandatory", "capability_conditional"]},
+    "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "cwd": {"type": "string", "minLength": 1},
+    "environment": {"type": "object", "additionalProperties": {"type": "string"}},
+    "toolchain_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "started_at_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "ended_at_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "monotonic_duration_ns": {"type": "integer", "minimum": 0},
+    "exit_code": {"type": "integer"},
+    "stdout": {"$ref": "#/$defs/stream"},
+    "stderr": {"$ref": "#/$defs/stream"},
+    "result": {"enum": ["pass", "fail"]}
+  },
+  "$defs": {
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256", "bytes", "media_type", "complete"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "minLength": 1},
+        "complete": {"const": true}
+      }
+    }
+  }
+}

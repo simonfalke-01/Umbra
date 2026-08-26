@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://umbra.invalid/schemas/artifact-manifest-v1.schema.json",
+  "title": "Umbra/Lumen Gate 6 Artifact Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "kind", "release_id", "created_at_utc", "source_freeze", "runs", "artifacts", "inventories", "test_summaries", "signatures"],
+  "properties": {
+    "schema": {"const": "umbra-lumen/artifact-manifest/1"},
+    "kind": {"const": "artifact"},
+    "release_id": {"type": "string", "minLength": 1},
+    "created_at_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "source_freeze": {"$ref": "#/$defs/objectRef"},
+    "runs": {"type": "array", "minItems": 1, "items": {"$ref": "run-evidence-v1.schema.json"}},
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["artifact_id", "kind", "path", "object", "producer_run_id", "architecture", "format", "signature_ids", "source_refs"],
+        "properties": {
+          "artifact_id": {"type": "string", "minLength": 1},
+          "kind": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "object": {"$ref": "#/$defs/objectRef"},
+          "producer_run_id": {"type": "string", "minLength": 1},
+          "architecture": {"type": "string", "minLength": 1},
+          "format": {"type": "string", "minLength": 1},
+          "signature_ids": {"type": "array", "items": {"type": "string"}},
+          "source_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+        }
+      }
+    },
+    "inventories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["inventory_id", "artifact_id", "policy", "actual", "validator_run_id", "missing", "unexpected", "mismatched"],
+        "properties": {
+          "inventory_id": {"type": "string", "minLength": 1},
+          "artifact_id": {"type": "string", "minLength": 1},
+          "policy": {"$ref": "#/$defs/objectRef"},
+          "actual": {"$ref": "#/$defs/objectRef"},
+          "validator_run_id": {"type": "string", "minLength": 1},
+          "missing": {"type": "array", "maxItems": 0},
+          "unexpected": {"type": "array", "maxItems": 0},
+          "mismatched": {"type": "array", "maxItems": 0}
+        }
+      }
+    },
+    "test_summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["run_id", "passed", "failed", "skipped"],
+        "properties": {
+          "run_id": {"type": "string", "minLength": 1},
+          "passed": {"type": "integer", "minimum": 0},
+          "failed": {"type": "integer", "minimum": 0},
+          "skipped": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "signatures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["signature_id", "artifact_id", "verified", "identity_sha256", "evidence"],
+        "properties": {
+          "signature_id": {"type": "string", "minLength": 1},
+          "artifact_id": {"type": "string", "minLength": 1},
+          "verified": {"const": true},
+          "identity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "evidence": {"$ref": "#/$defs/objectRef"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "objectRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256", "bytes", "media_type"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
