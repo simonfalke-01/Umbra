@@ -23,6 +23,14 @@ public struct ProtocolV3StartOffer: Sendable, Equatable {
     }
 }
 
+public struct ProtocolV3SelectedMode: Sendable, Equatable {
+    public let width: Int
+    public let height: Int
+    public let refreshNumerator: UInt32
+    public let refreshDenominator: UInt32
+    public let bitrateKbps: Int
+}
+
 public enum ProtocolV3StartRequestMapperError: Error, Equatable, Sendable {
     case noSupportedVideoTuple
     case unsupportedRequestedTuple(String)
@@ -179,12 +187,14 @@ public enum ProtocolV3StartRequestMapper {
                 "START selected an unoffered exact tuple"
             )
         }
+        _ = try selectedModeScalars(responseFields)
         let selectedHDR = responseFields[23]
         try validateHDRSelection(
             selectedHDR,
             selectedCodec: selectedCodec,
             offeredHDR: offered.fields[14]?.arrayValue ?? []
         )
+        try validateSelectedColorMode(selectedCodec, selectedHDR: selectedHDR)
         guard let requirements = offered.fields[17]?.mapValue,
               let selectedCodecMap = selectedCodec.mapValue,
               let fidelity = selectedCodecMap[10]?.unsignedValue,
@@ -208,6 +218,82 @@ public enum ProtocolV3StartRequestMapper {
             }
         }
         try validateAdjustments(responseFields: responseFields, offered: offered)
+    }
+
+    public static func selectedMode(
+        responseFields: [UInt64: ProtocolV3CBORValue],
+        offered: ProtocolV3StartOffer
+    ) throws -> ProtocolV3SelectedMode {
+        try validateSelectedTuples(responseFields: responseFields, offered: offered)
+        return try selectedModeScalars(responseFields)
+    }
+
+    private static func selectedModeScalars(
+        _ responseFields: [UInt64: ProtocolV3CBORValue]
+    ) throws -> ProtocolV3SelectedMode {
+        guard let width = responseFields[6]?.unsignedValue.flatMap(Int.init(exactly:)),
+              let height = responseFields[7]?.unsignedValue.flatMap(Int.init(exactly:)),
+              (StreamingPreferences.minimumStreamWidth...StreamingPreferences.maximumStreamWidth)
+                  .contains(width),
+              (StreamingPreferences.minimumStreamHeight...StreamingPreferences.maximumStreamHeight)
+                  .contains(height),
+              width.isMultiple(of: 2),
+              height.isMultiple(of: 2),
+              let refreshNumerator = responseFields[8]?.unsignedValue.flatMap(UInt32.init(exactly:)),
+              let refreshDenominator = responseFields[9]?.unsignedValue.flatMap(UInt32.init(exactly:)),
+              refreshNumerator > 0,
+              refreshDenominator > 0,
+              greatestCommonDivisor(refreshNumerator, refreshDenominator) == 1,
+              StreamingPreferences.isSupportedFrameRate(
+                  numerator: Int(refreshNumerator),
+                  denominator: Int(refreshDenominator)
+              ),
+              let bitrateKbps = responseFields[10]?.unsignedValue.flatMap(Int.init(exactly:)),
+              (StreamingPreferences.minimumBitrateKbps...StreamingPreferences.maximumBitrateKbps)
+                  .contains(bitrateKbps) else {
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "START selected scalar outside the canonical mode contract"
+            )
+        }
+        return ProtocolV3SelectedMode(
+            width: width,
+            height: height,
+            refreshNumerator: refreshNumerator,
+            refreshDenominator: refreshDenominator,
+            bitrateKbps: bitrateKbps
+        )
+    }
+
+    private static func validateSelectedColorMode(
+        _ selectedCodec: ProtocolV3CBORValue,
+        selectedHDR: ProtocolV3CBORValue?
+    ) throws {
+        guard let codec = selectedCodec.mapValue,
+              let depth = codec[3]?.unsignedValue,
+              let transfer = codec[6]?.unsignedValue else {
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "START selected color mode"
+            )
+        }
+        let valid = if selectedHDR == .null {
+            depth == 8 && transfer == 1
+        } else {
+            depth == 10 && (transfer == 16 || transfer == 18)
+        }
+        guard valid else {
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "START selected SDR/HDR depth mismatch"
+            )
+        }
+    }
+
+    private static func greatestCommonDivisor(_ lhs: UInt32, _ rhs: UInt32) -> UInt32 {
+        var lhs = lhs
+        var rhs = rhs
+        while rhs != 0 {
+            (lhs, rhs) = (rhs, lhs % rhs)
+        }
+        return lhs
     }
 
     private static func isValidMicrophoneSelection(
