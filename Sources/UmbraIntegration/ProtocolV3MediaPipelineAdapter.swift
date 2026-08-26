@@ -10,6 +10,38 @@ public enum ProtocolV3MediaPipelineError: Error, Equatable, Sendable {
     case decoderRejectedConfiguration
 }
 
+/// Stable values from Lumen's authenticated `/api/vdd/status` `captureState` field.
+/// Umbra must not infer this state from connection health or decoder activity.
+public enum LumenVDDCaptureState: String, Codable, CaseIterable, Sendable {
+    case inactive
+    case direct
+    case fallback
+    case quarantined
+    case unavailable
+
+    public var isDegraded: Bool {
+        self == .quarantined || self == .unavailable
+    }
+
+    public static func authenticatedStatusField(_ value: String) throws -> Self {
+        guard let state = Self(rawValue: value) else {
+            throw ProtocolV3MediaPipelineError.invalidConfiguration("VDD capture state")
+        }
+        return state
+    }
+}
+
+public struct ProtocolV3SelectedVideoTelemetry: Equatable, Sendable {
+    public let width: Int
+    public let height: Int
+    public let refreshNumerator: UInt32
+    public let refreshDenominator: UInt32
+    public let videoGeneration: UInt32
+    public let format: MoonlightVideoFormat
+    public let isHDR: Bool
+    public let vddCaptureState: LumenVDDCaptureState?
+}
+
 public struct ProtocolV3VideoFeedback: Equatable, Sendable {
     public let affectedFrameID: UInt64
     public let lastReassembledFrameID: UInt64
@@ -21,6 +53,7 @@ public struct ProtocolV3VideoFeedback: Equatable, Sendable {
 public struct ProtocolV3MediaStatistics: Equatable, Sendable {
     public let videoPipeline: MediaPipelineStatistics?
     public let audioRenderer: AudioRendererStatistics?
+    public let selectedVideo: ProtocolV3SelectedVideoTelemetry?
     public let videoFragmentsReceived: UInt64
     public let videoFramesReassembled: UInt64
     public let videoFramesSubmitted: UInt64
@@ -509,6 +542,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
     private let diagnosticHandler: @Sendable (String) -> Void
     private let firstVideoSubmitHandler: @Sendable () -> Void
     private let nowNanoseconds: @Sendable () -> UInt64
+    private let authenticatedVDDCaptureState: LumenVDDCaptureState?
     private let expected: ExpectedSelection
     private let videoReassembler: ProtocolV3VideoReassembler
     private let lock = NSLock()
@@ -537,6 +571,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         pipeline: StreamingMediaPipeline,
         mode: QUICOptimizationMode,
         startResponseFields: [UInt64: ProtocolV3CBORValue],
+        authenticatedVDDCaptureState: LumenVDDCaptureState? = nil,
         firstVideoSubmitHandler: @escaping @Sendable () -> Void = {},
         diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in },
         nowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
@@ -566,6 +601,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         self.firstVideoSubmitHandler = firstVideoSubmitHandler
         self.diagnosticHandler = diagnosticHandler
         self.nowNanoseconds = nowNanoseconds
+        self.authenticatedVDDCaptureState = authenticatedVDDCaptureState
         expected = ExpectedSelection(
             videoTuple: videoTuple,
             audioTuple: audioTuple,
@@ -599,6 +635,18 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             ProtocolV3MediaStatistics(
                 videoPipeline: pipeline.videoStatistics(),
                 audioRenderer: pipeline.audioStatistics(),
+                selectedVideo: videoConfiguration.map {
+                    ProtocolV3SelectedVideoTelemetry(
+                        width: $0.width,
+                        height: $0.height,
+                        refreshNumerator: UInt32($0.refreshNumerator),
+                        refreshDenominator: UInt32($0.refreshDenominator),
+                        videoGeneration: $0.generation,
+                        format: $0.format,
+                        isHDR: $0.isHDR,
+                        vddCaptureState: authenticatedVDDCaptureState
+                    )
+                },
                 videoFragmentsReceived: videoFragmentsReceived,
                 videoFramesReassembled: videoFramesReassembled,
                 videoFramesSubmitted: videoFramesSubmitted,
