@@ -286,6 +286,7 @@ class Gate6BuildReleaseTests(unittest.TestCase):
         ]
         for plan in plans:
             plan |= {
+                "classification": "mandatory",
                 "repository": "Umbra",
                 "architecture": "arm64",
                 "cwd": "Umbra",
@@ -396,6 +397,18 @@ class Gate6BuildReleaseTests(unittest.TestCase):
         )
 
     def test_builds_from_frozen_plans_and_writes_unsealed_am_fragment(self) -> None:
+        classified = self.store.read_json(self.sfm_ref.id)
+        self.assertEqual(
+            {plan["classification"] for plan in classified["build_plans"]},
+            {"mandatory"},
+        )
+        missing_classification = json.loads(json.dumps(classified))
+        del missing_classification["build_plans"][0]["classification"]
+        with self.assertRaisesRegex(
+            gate6.ValidationError, "build_plans\\[0\\]\\.classification is invalid"
+        ):
+            gate6.validate_source_freeze_manifest(missing_classification)
+
         completed = self.run_driver()
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
