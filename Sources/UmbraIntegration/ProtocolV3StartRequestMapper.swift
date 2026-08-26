@@ -187,14 +187,18 @@ public enum ProtocolV3StartRequestMapper {
                 "START selected an unoffered exact tuple"
             )
         }
-        _ = try selectedModeScalars(responseFields)
+        let selectedMode = try selectedModeScalars(responseFields)
         let selectedHDR = responseFields[23]
         try validateHDRSelection(
             selectedHDR,
             selectedCodec: selectedCodec,
             offeredHDR: offered.fields[14]?.arrayValue ?? []
         )
-        try validateSelectedColorMode(selectedCodec, selectedHDR: selectedHDR)
+        try validateSelectedColorMode(
+            selectedCodec,
+            selectedHDR: selectedHDR,
+            selectedMode: selectedMode
+        )
         guard let requirements = offered.fields[17]?.mapValue,
               let selectedCodecMap = selectedCodec.mapValue,
               let fidelity = selectedCodecMap[10]?.unsignedValue,
@@ -266,9 +270,11 @@ public enum ProtocolV3StartRequestMapper {
 
     private static func validateSelectedColorMode(
         _ selectedCodec: ProtocolV3CBORValue,
-        selectedHDR: ProtocolV3CBORValue?
+        selectedHDR: ProtocolV3CBORValue?,
+        selectedMode: ProtocolV3SelectedMode
     ) throws {
         guard let codec = selectedCodec.mapValue,
+              let codecFamily = codec[1]?.unsignedValue,
               let depth = codec[3]?.unsignedValue,
               let transfer = codec[6]?.unsignedValue else {
             throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
@@ -283,6 +289,12 @@ public enum ProtocolV3StartRequestMapper {
         guard valid else {
             throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
                 "START selected SDR/HDR depth mismatch"
+            )
+        }
+        guard codecFamily != 1
+                || (selectedMode.width <= 4_096 && selectedMode.height <= 4_096) else {
+            throw ProtocolV3StartRequestMapperError.unsupportedRequestedTuple(
+                "H.264 requires dimensions at or below 4096x4096"
             )
         }
     }

@@ -351,6 +351,99 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         ))
     }
 
+    func testHostAdjustedStartScalarsAreReadmittedAgainstCanonicalBounds() throws {
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 28,
+            resume: false,
+            preferences: .default,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+
+        for dimensions: (UInt64, UInt64) in [(1_920, 1_080), (320, 200)] {
+            let response = adjustedStartResponse(offer, dimensions: dimensions)
+            XCTAssertNoThrow(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: response,
+                offered: offer
+            ))
+        }
+        for refresh: (UInt64, UInt64) in [(120, 1), (60_000, 1_001)] {
+            let response = adjustedStartResponse(offer, refresh: refresh)
+            XCTAssertNoThrow(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: response,
+                offered: offer
+            ))
+        }
+
+        let invalidDimensions: [(UInt64, UInt64)] = [
+            (318, 1_080),
+            (7_682, 4_320),
+            (1_921, 1_080),
+        ]
+        for dimensions in invalidDimensions {
+            XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: adjustedStartResponse(offer, dimensions: dimensions),
+                offered: offer
+            ), "\(dimensions)")
+        }
+
+        let oversizedComponent = UInt64(UInt32.max) + 1
+        let invalidRefresh: [(UInt64, UInt64)] = [
+            (0, 1),
+            (9, 1),
+            (481, 1),
+            (120, 2),
+            (oversizedComponent, 1),
+            (60_000, oversizedComponent),
+        ]
+        for refresh in invalidRefresh {
+            XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+                responseFields: adjustedStartResponse(offer, refresh: refresh),
+                offered: offer
+            ), "\(refresh)")
+        }
+
+        var h264Preferences = StreamingPreferences.default
+        h264Preferences.videoCodecPreference = .h264
+        let h264Offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 30,
+            resume: false,
+            preferences: h264Preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertThrowsError(try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            responseFields: adjustedStartResponse(h264Offer, dimensions: (4_098, 4_096)),
+            offered: h264Offer
+        ))
+    }
+
+    func testStrictSelectionUsesNormalizedOfferedRefreshInsteadOfRawPreferenceFraction() throws {
+        var preferences = StreamingPreferences.default
+        preferences.setFrameRate(numerator: 120, denominator: 2)
+        preferences.enableYUV444 = true
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 29,
+            resume: false,
+            preferences: preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        XCTAssertEqual(offer.fields[6]?.unsignedValue, 60)
+        XCTAssertEqual(offer.fields[7]?.unsignedValue, 1)
+        XCTAssertEqual(offer.fields[17]?.mapValue?[6]?.booleanValue, false)
+
+        let selected = try ProtocolV3StartRequestMapper.selectedMode(
+            responseFields: successfulStartResponse(offer),
+            offered: offer
+        )
+        XCTAssertEqual(selected.refreshNumerator, 60)
+        XCTAssertEqual(selected.refreshDenominator, 1)
+    }
+
     func testGate1StartOfferWireRoundTripPreservesExactSchemaAndRational() throws {
         let capabilities = AppleStreamingCapabilities(
             hasMetalDevice: true,
@@ -628,9 +721,11 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
                 availableVideoFormats: capabilities.supportedVideoFormatMask
             ),
             mode: .quality,
-            startResponseFields: selection
+            startResponseFields: selection,
+            authenticatedVDDCaptureState: .unavailable
         )
         let fields = videoConfigurationFields(selection)
+        XCTAssertNil(adapter.statistics().selectedVideo)
 
         var changedRefresh = fields
         changedRefresh[8] = .unsigned(60)
@@ -646,6 +741,22 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(videoDecoder.configuredFormats.only?.width, 1_920)
         XCTAssertEqual(videoDecoder.configuredFormats.only?.height, 1_080)
         XCTAssertEqual(videoDecoder.configuredFormats.only?.redrawRate, 60)
+        let telemetry = try XCTUnwrap(adapter.statistics().selectedVideo)
+        XCTAssertEqual(telemetry.width, 1_920)
+        XCTAssertEqual(telemetry.height, 1_080)
+        XCTAssertEqual(telemetry.refreshNumerator, 60_000)
+        XCTAssertEqual(telemetry.refreshDenominator, 1_001)
+        XCTAssertEqual(telemetry.videoGeneration, 1)
+        XCTAssertEqual(
+            telemetry.format,
+            try ProtocolV3StartRequestMapper.selectedVideoFormat(
+                responseFields: selection,
+                offered: offer
+            )
+        )
+        XCTAssertFalse(telemetry.isHDR)
+        XCTAssertEqual(telemetry.vddCaptureState, .unavailable)
+        XCTAssertTrue(telemetry.vddCaptureState?.isDegraded == true)
     }
 
     func testVideoFeedbackReportsExactBoundedClientLocalDeadlineMiss() throws {
@@ -1154,6 +1265,47 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             18: presentation, 19: .array([]), 20: offer.fields[13]!,
             21: .bytes(Data(49...80)), 22: .unsigned(1), 23: hdr,
         ]
+    }
+
+    private func adjustedStartResponse(
+        _ offer: ProtocolV3StartOffer,
+        dimensions: (UInt64, UInt64)? = nil,
+        refresh: (UInt64, UInt64)? = nil
+    ) -> [UInt64: ProtocolV3CBORValue] {
+        var response = successfulStartResponse(offer)
+        var adjustments: [ProtocolV3CBORValue] = []
+        if let dimensions {
+            let requested: ProtocolV3CBORValue = .array([offer.fields[4]!, offer.fields[5]!])
+            let selected: ProtocolV3CBORValue = .array([
+                .unsigned(dimensions.0),
+                .unsigned(dimensions.1),
+            ])
+            response[6] = .unsigned(dimensions.0)
+            response[7] = .unsigned(dimensions.1)
+            adjustments.append(.map([
+                1: .unsigned(1),
+                2: requested,
+                3: selected,
+                4: .unsigned(1),
+            ]))
+        }
+        if let refresh {
+            let requested: ProtocolV3CBORValue = .array([offer.fields[6]!, offer.fields[7]!])
+            let selected: ProtocolV3CBORValue = .array([
+                .unsigned(refresh.0),
+                .unsigned(refresh.1),
+            ])
+            response[8] = .unsigned(refresh.0)
+            response[9] = .unsigned(refresh.1)
+            adjustments.append(.map([
+                1: .unsigned(2),
+                2: requested,
+                3: selected,
+                4: .unsigned(1),
+            ]))
+        }
+        response[19] = .array(adjustments)
+        return response
     }
 
     private func videoConfigurationFields(

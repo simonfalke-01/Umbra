@@ -1,4 +1,5 @@
 import Foundation
+import UmbraCore
 import UmbraMedia
 import UmbraProtocolV3
 import UmbraQUICTransport
@@ -499,8 +500,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         let hdr: ProtocolV3CBORValue
         let width: Int
         let height: Int
-        let refreshNumerator: UInt64
-        let refreshDenominator: UInt64
+        let refreshNumerator: UInt32
+        let refreshDenominator: UInt32
         let maximumPresentAgeNanoseconds: UInt64
         let videoGeneration: UInt32
         let audioGeneration: UInt32
@@ -515,8 +516,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         let tuple: [UInt64: ProtocolV3CBORValue]
         let width: Int
         let height: Int
-        let refreshNumerator: UInt64
-        let refreshDenominator: UInt64
+        let refreshNumerator: UInt32
+        let refreshDenominator: UInt32
         let maximumPresentAgeNanoseconds: UInt64
     }
 
@@ -582,9 +583,12 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               let hdr = startResponseFields[23],
               let width = startResponseFields[6]?.unsignedValue.flatMap(Int.init(exactly:)),
               let height = startResponseFields[7]?.unsignedValue.flatMap(Int.init(exactly:)),
-              let refreshNumerator = startResponseFields[8]?.unsignedValue,
-              let refreshDenominator = startResponseFields[9]?.unsignedValue,
-              refreshNumerator > 0, refreshDenominator > 0,
+              let refreshNumerator = startResponseFields[8]?.unsignedValue.flatMap(UInt32.init(exactly:)),
+              let refreshDenominator = startResponseFields[9]?.unsignedValue.flatMap(UInt32.init(exactly:)),
+              Self.isCanonicalRefresh(
+                  numerator: refreshNumerator,
+                  denominator: refreshDenominator
+              ),
               let presentation = startResponseFields[18]?.mapValue,
               Set(presentation.keys) == Set(1...5),
               let maximumPresentAgeMicroseconds = presentation[5]?.unsignedValue,
@@ -639,8 +643,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                     ProtocolV3SelectedVideoTelemetry(
                         width: $0.width,
                         height: $0.height,
-                        refreshNumerator: UInt32($0.refreshNumerator),
-                        refreshDenominator: UInt32($0.refreshDenominator),
+                        refreshNumerator: $0.refreshNumerator,
+                        refreshDenominator: $0.refreshDenominator,
                         videoGeneration: $0.generation,
                         format: $0.format,
                         isHDR: $0.isHDR,
@@ -680,9 +684,12 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
               let height = Int(exactly: heightRaw),
               (320...7_680).contains(width), width.isMultiple(of: 2),
               (200...4_320).contains(height), height.isMultiple(of: 2),
-              let refreshNumerator = fields[8]?.unsignedValue,
-              let refreshDenominator = fields[9]?.unsignedValue,
-              refreshNumerator > 0, refreshDenominator > 0,
+              let refreshNumerator = fields[8]?.unsignedValue.flatMap(UInt32.init(exactly:)),
+              let refreshDenominator = fields[9]?.unsignedValue.flatMap(UInt32.init(exactly:)),
+              Self.isCanonicalRefresh(
+                  numerator: refreshNumerator,
+                  denominator: refreshDenominator
+              ),
               width == expected.width,
               height == expected.height,
               refreshNumerator == expected.refreshNumerator,
@@ -694,9 +701,10 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         guard fields[5] == expected.hdr else {
             throw ProtocolV3MediaPipelineError.invalidConfiguration("HDR selection mismatch")
         }
-        let framesPerSecond = max(
-            1,
-            Int((Double(refreshNumerator) / Double(refreshDenominator)).rounded())
+        let quotient = refreshNumerator / refreshDenominator
+        let remainder = refreshNumerator % refreshDenominator
+        let framesPerSecond = Int(
+            quotient + (remainder != 0 && remainder >= refreshDenominator - remainder ? 1 : 0)
         )
         let capacity = mode == .latency ? 1 : 2
         let accepted = pipeline.videoDecoder.configure(format: .init(
@@ -895,8 +903,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             guard !stopped else { return }
             update = try videoReassembler.accept(
                 reassemblyFragment,
-                refreshNumerator: configuration.refreshNumerator,
-                refreshDenominator: configuration.refreshDenominator
+                refreshNumerator: UInt64(configuration.refreshNumerator),
+                refreshDenominator: UInt64(configuration.refreshDenominator)
             )
             if let reassembledFrameID = update.reassembledFrameID {
                 lastReassembledVideoFrameID = max(lastReassembledVideoFrameID, reassembledFrameID)
@@ -1166,6 +1174,23 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                 pipeline.audioDecoder.stop()
             }
         }
+    }
+
+    private static func isCanonicalRefresh(numerator: UInt32, denominator: UInt32) -> Bool {
+        guard numerator > 0,
+              denominator > 0,
+              StreamingPreferences.isSupportedFrameRate(
+                  numerator: Int(numerator),
+                  denominator: Int(denominator)
+              ) else {
+            return false
+        }
+        var lhs = numerator
+        var rhs = denominator
+        while rhs != 0 {
+            (lhs, rhs) = (rhs, lhs % rhs)
+        }
+        return lhs == 1
     }
 
     private static func videoFormat(
