@@ -1787,16 +1787,6 @@ final class ModernLumenV3Manager {
                   fields[4]?.unsignedValue == prepared.offer.fields[3]?.unsignedValue,
                   fields[11]?.unsignedValue == UInt64(QUICTransportProfile.semanticDatagramByteCount),
                   fields[20]?.bytesValue == prepared.offer.fields[13]?.bytesValue,
-                  let width = fields[6]?.unsignedValue.flatMap(Int.init(exactly:)),
-                  let height = fields[7]?.unsignedValue.flatMap(Int.init(exactly:)),
-                  let refreshNumerator = fields[8]?.unsignedValue.flatMap(Int.init(exactly:)),
-                  let refreshDenominator = fields[9]?.unsignedValue.flatMap(Int.init(exactly:)),
-                  refreshDenominator > 0,
-                  let fps = Int(exactly: (
-                      Double(refreshNumerator) / Double(refreshDenominator)
-                  ).rounded()),
-                  (10...9_999).contains(fps),
-                  let bitrate = fields[10]?.unsignedValue.flatMap(Int.init(exactly:)),
                   let attachToken = fields[21]?.bytesValue,
                   attachToken.count == 32,
                   let videoGeneration = fields[14]?.unsignedValue,
@@ -1811,7 +1801,7 @@ final class ModernLumenV3Manager {
                 sessionID: prepared.bootstrap.sessionID,
                 stage: .hostLaunch
             )
-            try ProtocolV3StartRequestMapper.validateSelectedTuples(
+            let selectedMode = try ProtocolV3StartRequestMapper.selectedMode(
                 responseFields: fields,
                 offered: prepared.offer
             )
@@ -1832,22 +1822,22 @@ final class ModernLumenV3Manager {
                 throw ProtocolV3ClientError.invalidMessage("unoffered HDR selection")
             }
             if prepared.offer.fields[17]?.mapValue?[6]?.booleanValue == false {
-                guard width == prepared.bootstrap.preferences.width,
-                      height == prepared.bootstrap.preferences.height,
-                      refreshNumerator == prepared.bootstrap.preferences.frameRateNumerator,
-                      refreshDenominator == prepared.bootstrap.preferences.frameRateDenominator,
+                guard fields[6] == prepared.offer.fields[4],
+                      fields[7] == prepared.offer.fields[5],
+                      fields[8] == prepared.offer.fields[6],
+                      fields[9] == prepared.offer.fields[7],
                       selectedFormat.isYUV444 == prepared.bootstrap.preferences.enableYUV444,
                       selectedHDR == prepared.bootstrap.preferences.enableHDR else {
                     throw ProtocolV3ClientError.invalidMessage("forbidden START adjustment")
                 }
             }
-            prepared.bootstrap.preferences.width = width
-            prepared.bootstrap.preferences.height = height
+            prepared.bootstrap.preferences.width = selectedMode.width
+            prepared.bootstrap.preferences.height = selectedMode.height
             prepared.bootstrap.preferences.setFrameRate(
-                numerator: refreshNumerator,
-                denominator: refreshDenominator
+                numerator: Int(selectedMode.refreshNumerator),
+                denominator: Int(selectedMode.refreshDenominator)
             )
-            prepared.bootstrap.preferences.bitrateKbps = bitrate
+            prepared.bootstrap.preferences.bitrateKbps = selectedMode.bitrateKbps
             prepared.bootstrap.preferences.enableYUV444 = selectedFormat.isYUV444
             prepared.bootstrap.preferences.enableHDR = selectedHDR
             try await lifecycle.updatePreparation(for: prepared.bootstrap)
