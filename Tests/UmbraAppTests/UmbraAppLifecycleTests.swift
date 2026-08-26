@@ -227,10 +227,10 @@ private func modernService(hostID: Data) -> DiscoveredHostService {
         type: "_lumen-v3._udp",
         domain: "local.",
         txtRecord: [
-            "version": "3",
+            "v": "3",
             "id": hostID.map { String(format: "%02x", $0) }.joined(),
             "port": "47998",
-            "capabilities": "0000000000000017",
+            "caps": "0000000000000017",
         ]
     )
 }

@@ -58,7 +58,7 @@ protocol BonjourBrowsing: AnyObject, Sendable {
     func cancel()
 }
 
-enum BonjourServiceKind: Equatable, Sendable {
+enum BonjourServiceKind: Hashable, Sendable {
     case legacyGameStream
     case modernLumenV3
 }
