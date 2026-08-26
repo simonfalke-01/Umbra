@@ -12,6 +12,14 @@ Source Freeze Manifest (SFM) is sealed before any qualifying build. A later
 Artifact Manifest (AM) may reference that SFM only after all mandatory runs,
 inventories, hashes, and signature checks pass.
 
+Every frozen `build_plans[].run_id` must appear exactly once in the AM, no
+additional run is admitted, and each run's mandatory or capability-conditional
+classification must match the SFM. AM validation therefore always requires the
+object store that contains the sealed SFM; structural validation without the
+frozen plan set is intentionally rejected.
+Capability-conditional plans still require a passing evidence run: that run
+proves either the supported path or the explicit unsupported/degraded path.
+
 Objects live at `objects/sha256/<prefix>/<digest>`. No object is overwritten.
 `events.jsonl` is append-only; each line references a separately
 content-addressed event object that chains to its predecessor.

@@ -781,6 +781,20 @@ def validate_policy(policy: Any) -> dict[str, Any]:
     for section in ("source_freeze", "artifact"):
         if not isinstance(policy.get(section), dict):
             raise ValidationError(f"policy.{section} must be an object")
+    artifact_policy = policy["artifact"]
+    if "required_run_ids" in artifact_policy:
+        raise ValidationError(
+            "policy.artifact.required_run_ids is ambiguous; run coverage must derive from the frozen SFM"
+        )
+    expected_coverage = {
+        "mode": "exact_sfm_build_plans",
+        "require_classification_match": True,
+        "covered_classifications": ["mandatory", "capability_conditional"],
+    }
+    if artifact_policy.get("run_coverage") != expected_coverage:
+        raise ValidationError(
+            "policy.artifact.run_coverage must require exact frozen plans and classification matching"
+        )
     return policy
 
 
@@ -993,6 +1007,13 @@ def validate_source_freeze_manifest(
                 if not isinstance(row.get("argv"), list) or not row["argv"]:
                     raise ValidationError(
                         f"{collection}[{index}].argv must be nonempty"
+                    )
+                if row.get("classification") not in {
+                    "mandatory",
+                    "capability_conditional",
+                }:
+                    raise ValidationError(
+                        f"{collection}[{index}].classification is invalid"
                     )
                 for field in (
                     "repository",
@@ -1259,6 +1280,10 @@ def validate_artifact_manifest(
     release_id = _require_nonempty(manifest.get("release_id"), "release_id")
     _validate_utc(manifest.get("created_at_utc"), "created_at_utc")
     sfm_ref = validate_object_ref(manifest.get("source_freeze"), "source_freeze")
+    if store is None:
+        raise ValidationError(
+            "AM validation requires the object store to resolve complete frozen-run coverage"
+        )
 
     runs = _require_list(manifest.get("runs"), "runs")
     if not all(isinstance(run, dict) for run in runs):
@@ -1266,8 +1291,11 @@ def validate_artifact_manifest(
     _unique_values(runs, "run_id", "runs")
     for index, run in enumerate(runs):
         validate_run_record(run, f"runs[{index}]")
-        if run["classification"] == "mandatory" and run["result"] != "pass":
-            raise ValidationError(f"mandatory run failed: {run['run_id']}")
+        if run["result"] != "pass":
+            raise ValidationError(
+                "every frozen run must pass its execution or explicit capability-path check: "
+                f"{run['run_id']}"
+            )
     run_ids = {run["run_id"] for run in runs}
 
     artifacts = _require_list(manifest.get("artifacts"), "artifacts")
@@ -1350,12 +1378,22 @@ def validate_artifact_manifest(
             for event in events
         ):
             raise ValidationError("referenced SFM was not sealed before the AM")
+        plans_by_id = {plan["run_id"]: plan for plan in sfm["build_plans"]}
+        runs_by_id = {run["run_id"]: run for run in runs}
+        missing_runs = sorted(set(plans_by_id) - set(runs_by_id))
+        extra_runs = sorted(set(runs_by_id) - set(plans_by_id))
+        if missing_runs or extra_runs:
+            raise ValidationError(
+                "AM run coverage differs from frozen SFM build plans; "
+                f"missing={missing_runs}, extra={extra_runs}"
+            )
+        frozen_toolchains = {toolchain["id"] for toolchain in sfm["toolchains"]}
         for run in runs:
-            planned_runs = {plan["run_id"] for plan in sfm["build_plans"]}
-            frozen_toolchains = {toolchain["id"] for toolchain in sfm["toolchains"]}
-            if run["run_id"] not in planned_runs:
+            plan = plans_by_id[run["run_id"]]
+            if run["classification"] != plan["classification"]:
                 raise ValidationError(
-                    f"run was not declared in the SFM: {run['run_id']}"
+                    "run classification differs from frozen SFM build plan: "
+                    f"{run['run_id']}"
                 )
             if any(
                 toolchain_id not in frozen_toolchains
@@ -1405,9 +1443,6 @@ def validate_artifact_manifest(
             "kind",
             artifact_policy.get("required_artifact_kinds", []),
             "artifact kind",
-        )
-        _require_policy_values(
-            runs, "run_id", artifact_policy.get("required_run_ids", []), "run"
         )
     return manifest
 
@@ -1548,7 +1583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     validate_am_parser = subparsers.add_parser("validate-am")
     validate_am_parser.add_argument("manifest")
-    validate_am_parser.add_argument("--store")
+    validate_am_parser.add_argument("--store", required=True)
     validate_am_parser.add_argument("--policy")
 
     seal_sfm_parser = subparsers.add_parser("seal-sfm")
@@ -1579,10 +1614,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 load_json_file(arguments.manifest), _load_policy(arguments.policy)
             )
         elif arguments.command == "validate-am":
-            store = ObjectStore(arguments.store) if arguments.store else None
             validate_artifact_manifest(
                 load_json_file(arguments.manifest),
-                store=store,
+                store=ObjectStore(arguments.store),
                 policy=_load_policy(arguments.policy),
             )
         elif arguments.command == "seal-sfm":

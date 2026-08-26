@@ -102,7 +102,14 @@ def minimal_policy() -> dict:
         },
         "artifact": {
             "required_artifact_kinds": ["umbra-app-tree"],
-            "required_run_ids": ["test-run"],
+            "run_coverage": {
+                "mode": "exact_sfm_build_plans",
+                "require_classification_match": True,
+                "covered_classifications": [
+                    "mandatory",
+                    "capability_conditional",
+                ],
+            },
         },
     }
 
@@ -209,6 +216,7 @@ def minimal_sfm(store: gate6.ObjectStore, release_id: str = "release-test") -> d
         "build_plans": [
             {
                 "run_id": "test-run",
+                "classification": "mandatory",
                 "repository": "Umbra",
                 "target": "tests",
                 "configuration": "release",
@@ -246,6 +254,30 @@ def passing_run(store: gate6.ObjectStore) -> dict:
         "stderr": object_ref(store, b"") | {"complete": True},
         "result": "pass",
     }
+
+
+def am_for_plans(
+    store: gate6.ObjectStore,
+    sfm_ref: gate6.ObjectRef,
+    plans: list[dict],
+    release_id: str = "release-test",
+) -> dict:
+    am = minimal_am(store, sfm_ref, release_id)
+    runs = []
+    for plan in plans:
+        run_record = passing_run(store)
+        run_record["run_id"] = plan["run_id"]
+        run_record["classification"] = plan["classification"]
+        runs.append(run_record)
+    am["runs"] = runs
+    producer_run_id = runs[0]["run_id"]
+    am["artifacts"][0]["producer_run_id"] = producer_run_id
+    am["inventories"][0]["validator_run_id"] = producer_run_id
+    am["test_summaries"] = [
+        {"run_id": run["run_id"], "passed": 1, "failed": 0, "skipped": 0}
+        for run in runs
+    ]
+    return am
 
 
 def minimal_am(
@@ -521,6 +553,108 @@ class ManifestTests(unittest.TestCase):
                     minimal_am(store, sealed, "other-release"), store=store
                 )
 
+    def test_am_validation_requires_store_and_unambiguous_policy_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = gate6.ObjectStore(temporary)
+            unsealed = store.put_json(minimal_sfm(store))
+            with self.assertRaisesRegex(
+                gate6.ValidationError, "requires the object store"
+            ):
+                gate6.validate_artifact_manifest(
+                    minimal_am(store, unsealed), policy=minimal_policy()
+                )
+
+            legacy_policy = minimal_policy()
+            legacy_policy["artifact"]["required_run_ids"] = []
+            with self.assertRaisesRegex(gate6.ValidationError, "ambiguous"):
+                gate6.validate_policy(legacy_policy)
+
+    def test_am_requires_every_frozen_plan_exactly_once_with_matching_classification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = gate6.ObjectStore(temporary)
+            policy = minimal_policy()
+            sfm = minimal_sfm(store)
+            second = copy.deepcopy(sfm["build_plans"][0])
+            second |= {"run_id": "umbra-package", "target": "package"}
+            conditional = copy.deepcopy(sfm["build_plans"][0])
+            conditional |= {
+                "run_id": "hdr-capability",
+                "target": "hdr-capability",
+                "classification": "capability_conditional",
+            }
+            sfm["build_plans"].extend([second, conditional])
+            sfm_ref = gate6.seal_source_freeze(store, sfm, policy)
+            plans = sfm["build_plans"]
+
+            for omitted in [plan["run_id"] for plan in plans]:
+                with self.subTest(omitted=omitted):
+                    incomplete = am_for_plans(
+                        store,
+                        sfm_ref,
+                        [plan for plan in plans if plan["run_id"] != omitted],
+                    )
+                    with self.assertRaisesRegex(
+                        gate6.ValidationError, f"missing=\\['{omitted}'\\]"
+                    ):
+                        gate6.validate_artifact_manifest(
+                            incomplete, store=store, policy=policy
+                        )
+                    with self.assertRaisesRegex(gate6.ValidationError, "missing="):
+                        gate6.seal_artifact_manifest(store, incomplete, policy)
+
+            arbitrary_single_run = am_for_plans(store, sfm_ref, [plans[1]])
+            with self.assertRaisesRegex(gate6.ValidationError, "missing="):
+                gate6.validate_artifact_manifest(
+                    arbitrary_single_run, store=store, policy=policy
+                )
+
+            extra = am_for_plans(store, sfm_ref, plans)
+            extra_run = passing_run(store)
+            extra_run["run_id"] = "not-frozen"
+            extra["runs"].append(extra_run)
+            extra["test_summaries"].append(
+                {"run_id": "not-frozen", "passed": 1, "failed": 0, "skipped": 0}
+            )
+            with self.assertRaisesRegex(
+                gate6.ValidationError, "extra=\\['not-frozen'\\]"
+            ):
+                gate6.validate_artifact_manifest(extra, store=store, policy=policy)
+
+            duplicate = am_for_plans(store, sfm_ref, plans)
+            duplicate["runs"].append(copy.deepcopy(duplicate["runs"][0]))
+            with self.assertRaisesRegex(gate6.ValidationError, "duplicate run_id"):
+                gate6.validate_artifact_manifest(duplicate, store=store, policy=policy)
+
+            ambiguous = am_for_plans(store, sfm_ref, plans)
+            next(run for run in ambiguous["runs"] if run["run_id"] == "hdr-capability")[
+                "classification"
+            ] = "mandatory"
+            with self.assertRaisesRegex(
+                gate6.ValidationError, "classification differs"
+            ):
+                gate6.validate_artifact_manifest(ambiguous, store=store, policy=policy)
+
+            conditional_failure = am_for_plans(store, sfm_ref, plans)
+            failed_conditional = next(
+                run
+                for run in conditional_failure["runs"]
+                if run["run_id"] == "hdr-capability"
+            )
+            failed_conditional["exit_code"] = 1
+            failed_conditional["result"] = "fail"
+            with self.assertRaisesRegex(
+                gate6.ValidationError, "every frozen run must pass"
+            ):
+                gate6.validate_artifact_manifest(
+                    conditional_failure, store=store, policy=policy
+                )
+
+            complete = am_for_plans(store, sfm_ref, plans)
+            gate6.validate_artifact_manifest(complete, store=store, policy=policy)
+            gate6.seal_artifact_manifest(store, complete, policy)
+
     def test_sfm_rejects_submodule_vector_tool_and_policy_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = gate6.ObjectStore(temporary)
@@ -647,7 +781,9 @@ class ManifestTests(unittest.TestCase):
             failed = copy.deepcopy(am)
             failed["runs"][0]["exit_code"] = 1
             failed["runs"][0]["result"] = "fail"
-            with self.assertRaisesRegex(gate6.ValidationError, "mandatory run failed"):
+            with self.assertRaisesRegex(
+                gate6.ValidationError, "every frozen run must pass"
+            ):
                 gate6.validate_artifact_manifest(failed, store=store)
 
             inventory = copy.deepcopy(am)
@@ -697,6 +833,15 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(path=path):
                 parsed = json.loads(path.read_text(encoding="utf-8"))
                 self.assertIsInstance(parsed, dict)
+        bundled_policy = gate6.load_json_file(
+            PROVENANCE_ROOT / "policies" / "gate6-policy-v1.json"
+        )
+        gate6.validate_policy(bundled_policy)
+        self.assertNotIn("required_run_ids", bundled_policy["artifact"])
+        self.assertEqual(
+            bundled_policy["artifact"]["run_coverage"]["mode"],
+            "exact_sfm_build_plans",
+        )
 
 
 if __name__ == "__main__":

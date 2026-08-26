@@ -46,7 +46,11 @@
       "protocol-vector",
       "test-log"
     ],
-    "required_run_ids": [],
+    "run_coverage": {
+      "mode": "exact_sfm_build_plans",
+      "require_classification_match": true,
+      "covered_classifications": ["mandatory", "capability_conditional"]
+    },
     "require_complete_streams": true,
     "require_zero_exit_for_mandatory_runs": true,
     "require_empty_inventory_differences": true,
