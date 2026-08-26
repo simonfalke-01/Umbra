@@ -287,7 +287,8 @@ let package = Package(
         .testTarget(
             name: "UmbraAppTests",
             dependencies: ["UmbraApp", "UmbraCore", "UmbraMedia", "UmbraProtocolV3"],
-            path: "Tests/UmbraAppTests"
+            path: "Tests/UmbraAppTests",
+            resources: [.process("Fixtures")]
         ),
     ]
 )

@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "producer": {
+    "repository": "Lumen",
+    "commit": "75aaf7e3",
+    "serviceAssembly": "src/main.cpp:440-505",
+    "modernFormatter": "src/protocol_v3/runtime.cpp:385-405",
+    "publisherValidator": "src/platform/common.h:1300-1338"
+  },
+  "instanceName": "Lumen",
+  "domain": "local.",
+  "resolvedHost": "lumen-composition.local",
+  "hostPublicKey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "services": [
+    {
+      "role": "legacy",
+      "type": "_nvstream._tcp",
+      "port": 47989,
+      "txt": []
+    },
+    {
+      "role": "modern",
+      "type": "_lumen-v3._udp",
+      "port": 48030,
+      "txt": [
+        ["v", "3"],
+        ["id", "56475aa75463474c0285df5dbf2bcab7"],
+        ["port", "48030"],
+        ["caps", "000000000000037f"]
+      ]
+    }
+  ]
+}

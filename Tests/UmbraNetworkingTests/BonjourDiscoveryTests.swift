@@ -136,20 +136,20 @@ final class BonjourDiscoveryTests: XCTestCase {
         ).hostnameIsIPLiteral)
 
         var invalidCases: [[String: String]] = [
-            ["version": "2", "id": String(repeating: "11", count: 16), "port": "47998", "capabilities": "0000000000000017"],
-            ["version": "03", "id": String(repeating: "11", count: 16), "port": "47998", "capabilities": "0000000000000017"],
-            ["version": "3", "id": String(repeating: "11", count: 15), "port": "47998", "capabilities": "0000000000000017"],
-            ["version": "3", "id": String(repeating: "AA", count: 16), "port": "47998", "capabilities": "0000000000000017"],
-            ["version": "3", "id": String(repeating: "00", count: 16), "port": "47998", "capabilities": "0000000000000017"],
-            ["version": "3", "id": String(repeating: "11", count: 16), "port": "047998", "capabilities": "0000000000000017"],
-            ["version": "3", "id": String(repeating: "11", count: 16), "port": "47998", "capabilities": "17"],
-            ["version": "3", "id": String(repeating: "11", count: 16), "port": "47998", "capabilities": "0000000000000017", "extra": "x"],
+            ["v": "2", "id": String(repeating: "11", count: 16), "port": "47998", "caps": "0000000000000017"],
+            ["v": "03", "id": String(repeating: "11", count: 16), "port": "47998", "caps": "0000000000000017"],
+            ["v": "3", "id": String(repeating: "11", count: 15), "port": "47998", "caps": "0000000000000017"],
+            ["v": "3", "id": String(repeating: "AA", count: 16), "port": "47998", "caps": "0000000000000017"],
+            ["v": "3", "id": String(repeating: "00", count: 16), "port": "47998", "caps": "0000000000000017"],
+            ["v": "3", "id": String(repeating: "11", count: 16), "port": "047998", "caps": "0000000000000017"],
+            ["v": "3", "id": String(repeating: "11", count: 16), "port": "47998", "caps": "17"],
+            ["v": "3", "id": String(repeating: "11", count: 16), "port": "47998", "caps": "0000000000000017", "extra": "x"],
         ]
         invalidCases.append([
-            "version": "3",
+            "v": "3",
             "id": String(repeating: "11", count: 16),
             "port": "47999",
-            "capabilities": "0000000000000017",
+            "caps": "0000000000000017",
         ])
         for txtRecord in invalidCases {
             let service = DiscoveredHostService(
@@ -411,10 +411,10 @@ private func modernService(
         domain: "local.",
         interfaceName: interfaceName,
         txtRecord: [
-            "version": "3",
+            "v": "3",
             "id": String(repeating: "11", count: 16),
             "port": "47998",
-            "capabilities": "0000000000000017",
+            "caps": "0000000000000017",
         ],
         changeToken: changeToken
     )
