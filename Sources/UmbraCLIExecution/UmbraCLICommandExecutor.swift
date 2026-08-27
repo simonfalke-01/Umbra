@@ -46,6 +46,10 @@ public struct UmbraCLICommandExecutor: Sendable {
         switch command {
         case .launchApplication:
             return .launchApplication
+        case .recoverStorage:
+            return .terminate(
+                .failure("Storage recovery must be executed before Umbra opens its services.\n")
+            )
         case let .list(command):
             return await executeList(command, transcript: transcript)
         case let .pair(command):

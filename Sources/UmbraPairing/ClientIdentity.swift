@@ -1,7 +1,7 @@
-import Darwin
 import CommonCrypto
 import Foundation
 import Security
+import UmbraCore
 
 public struct ClientIdentity: @unchecked Sendable {
     public let privateKey: SecKey
@@ -70,8 +70,6 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
     }
 
     private let storageURL: URL
-    private let lockURL: URL
-    private let fileManager: FileManager
     private let randomSource: any PairingRandomSource
     private let legacyClientIDProvider: @Sendable () -> String?
     private let lock = NSLock()
@@ -84,8 +82,6 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
 
     public init(storageURL: URL) {
         self.storageURL = storageURL
-        self.lockURL = storageURL.appendingPathExtension("lock")
-        self.fileManager = .default
         self.randomSource = SecurePairingRandomSource()
         self.legacyClientIDProvider = Self.loadLegacyClientID
     }
@@ -93,12 +89,9 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
     init(
         storageURL: URL,
         randomSource: any PairingRandomSource,
-        fileManager: FileManager = .default,
         legacyClientIDProvider: @escaping @Sendable () -> String? = { nil }
     ) {
         self.storageURL = storageURL
-        self.lockURL = storageURL.appendingPathExtension("lock")
-        self.fileManager = fileManager
         self.randomSource = randomSource
         self.legacyClientIDProvider = legacyClientIDProvider
     }
@@ -120,11 +113,11 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
         if let cachedIdentity { return cachedIdentity }
         Self.processFileLock.lock()
         defer { Self.processFileLock.unlock() }
-        let identity = try withExclusiveFileLock {
-            if fileManager.fileExists(atPath: storageURL.path) {
-                return try loadIdentity()
+        let identity = try withExclusiveFileLock { access in
+            if try access.fileExists() {
+                return try loadIdentity(access: access)
             }
-            return try createAndPersistIdentity()
+            return try createAndPersistIdentity(access: access)
         }
         cachedIdentity = identity
         return identity
@@ -137,24 +130,24 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
         if let cachedClientID { return cachedClientID }
         Self.processFileLock.lock()
         defer { Self.processFileLock.unlock() }
-        let clientID = try withExclusiveFileLock {
-            if !fileManager.fileExists(atPath: storageURL.path) {
-                cachedIdentity = try createAndPersistIdentity()
+        let clientID = try withExclusiveFileLock { access in
+            if try !access.fileExists() {
+                cachedIdentity = try createAndPersistIdentity(access: access)
             }
-            var stored = try loadStoredIdentity()
-            if let existing = stored.clientID, Self.isValidClientID(existing) {
+            var stored = try loadStoredIdentity(access: access)
+            if let existing = stored.clientID {
                 return existing
             }
             let resolvedID = legacyClientIDProvider().flatMap(Self.validClientID) ?? Self.makeClientID()
             stored.clientID = resolvedID
-            try persist(stored)
+            try persist(stored, access: access)
             return resolvedID
         }
         cachedClientID = clientID
         return clientID
     }
 
-    private func createAndPersistIdentity() throws -> ClientIdentity {
+    private func createAndPersistIdentity(access: SecureAtomicFileWriter.Access) throws -> ClientIdentity {
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeySizeInBits as String: 2_048,
@@ -187,15 +180,14 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
             certificateDER: certificate,
             clientID: legacyClientIDProvider().flatMap(Self.validClientID) ?? Self.makeClientID()
         )
-        try persist(stored)
+        try persist(stored, access: access)
         cachedClientID = stored.clientID
         return identity
     }
 
-    private func loadIdentity() throws -> ClientIdentity {
+    private func loadIdentity(access: SecureAtomicFileWriter.Access) throws -> ClientIdentity {
         do {
-            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storageURL.path)
-            let stored = try loadStoredIdentity()
+            let stored = try loadStoredIdentity(access: access)
             let attributes: [String: Any] = [
                 kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
                 kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
@@ -221,20 +213,24 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
         }
     }
 
-    private func loadStoredIdentity() throws -> StoredIdentity {
-        let stored = try JSONDecoder().decode(StoredIdentity.self, from: Data(contentsOf: storageURL))
+    private func loadStoredIdentity(access: SecureAtomicFileWriter.Access) throws -> StoredIdentity {
+        let stored = try JSONDecoder().decode(StoredIdentity.self, from: access.read())
         guard stored.version == StoredIdentity.currentVersion else {
             throw PairingError.identityUnavailable("The stored client identity version is unsupported")
+        }
+        if let clientID = stored.clientID, !Self.isValidClientID(clientID) {
+            throw PairingError.identityUnavailable(
+                "The stored client identifier is invalid and was not replaced"
+            )
         }
         return stored
     }
 
-    private func persist(_ stored: StoredIdentity) throws {
+    private func persist(_ stored: StoredIdentity, access: SecureAtomicFileWriter.Access) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(stored)
-        try data.write(to: storageURL, options: [.atomic, .completeFileProtectionUnlessOpen])
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storageURL.path)
+        try access.atomicWrite(data)
     }
 
     private static func makeClientID() -> String {
@@ -261,29 +257,18 @@ public final class FileBackedClientIdentityProvider: ClientIdentityProviding, @u
         }
     }
 
-    private func withExclusiveFileLock<T>(_ operation: () throws -> T) throws -> T {
-        let directory = storageURL.deletingLastPathComponent()
-        try fileManager.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-
-        let descriptor = Darwin.open(
-            lockURL.path,
-            O_CREAT | O_RDWR | O_CLOEXEC,
-            mode_t(S_IRUSR | S_IWUSR)
-        )
-        guard descriptor >= 0 else {
-            throw PairingError.identityUnavailable("The client identity lock could not be opened (errno \(errno))")
+    private func withExclusiveFileLock<T>(
+        _ operation: (SecureAtomicFileWriter.Access) throws -> T
+    ) throws -> T {
+        do {
+            return try SecureAtomicFileWriter.withExclusiveAccess(to: storageURL, operation)
+        } catch let error as PairingError {
+            throw error
+        } catch {
+            throw PairingError.identityUnavailable(
+                "The client identity persistence path is unavailable: \(error.localizedDescription)"
+            )
         }
-        defer { Darwin.close(descriptor) }
-        guard Darwin.lockf(descriptor, F_LOCK, 0) == 0 else {
-            throw PairingError.identityUnavailable("The client identity lock could not be acquired (errno \(errno))")
-        }
-        defer { _ = Darwin.lockf(descriptor, F_ULOCK, 0) }
-        return try operation()
     }
 }
 

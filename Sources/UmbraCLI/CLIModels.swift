@@ -4,6 +4,7 @@ import UmbraCore
 public enum UmbraCommand: Equatable, Sendable {
     /// Launch Umbra's normal graphical interface.
     case launchApplication
+    case recoverStorage
     case list(ListAppsCommand)
     case pair(PairHostCommand)
     case stream(StreamAppCommand)

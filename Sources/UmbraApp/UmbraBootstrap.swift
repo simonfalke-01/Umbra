@@ -32,6 +32,11 @@ enum UmbraBootstrap {
             writeStandardError(result.standardError)
             exit(result.exitCode)
         }
+        if let recoveryResult = storageRecoveryResult(for: parseResult) {
+            writeStandardOutput(recoveryResult.standardOutput)
+            writeStandardError(recoveryResult.standardError)
+            exit(recoveryResult.exitCode)
+        }
 
         do {
             let service = try makeHeadlessService()
@@ -53,6 +58,27 @@ enum UmbraBootstrap {
         } catch {
             writeStandardError("\(error.localizedDescription)\n")
             exit(CLIExitCode.failure.rawValue)
+        }
+    }
+
+    static func storageRecoveryResult(
+        for parseResult: CLIParseResult,
+        recover: () throws -> UmbraStorageRecoveryResult = {
+            try UmbraStorageRecovery.recoverDefaultStorage()
+        }
+    ) -> CLIExecutionResult? {
+        guard case .ready(command: .recoverStorage, warnings: []) = parseResult else {
+            return nil
+        }
+        do {
+            let result = try recover()
+            return .success(
+                "Umbra storage was moved to this recoverable backup:\n"
+                    + "\(result.backupURL.path)\n"
+                    + "No fresh identity was created. Start Umbra normally to create fresh storage.\n"
+            )
+        } catch {
+            return .failure("Storage recovery failed: \(error.localizedDescription)\n")
         }
     }
 

@@ -58,7 +58,7 @@ let package = Package(
         ),
         .target(
             name: "UmbraPairing",
-            dependencies: ["UmbraNetworking"],
+            dependencies: ["UmbraCore", "UmbraNetworking"],
             path: "Sources/UmbraPairing"
         ),
         .target(

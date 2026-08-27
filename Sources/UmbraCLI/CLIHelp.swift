@@ -1,5 +1,6 @@
 public enum CLIHelpTopic: String, CaseIterable, Equatable, Sendable {
     case global
+    case recoverStorage = "recover-storage"
     case list
     case pair
     case stream
@@ -21,6 +22,7 @@ public enum CLIHelp {
               quit            Quit the currently running app
               stream          Start streaming an app
               pair            Pair a new host
+              recover-storage Preserve unreadable storage and reset Umbra on next launch
 
             Options:
               -h, --help      Display this help text
@@ -28,6 +30,22 @@ public enum CLIHelp {
 
             Long options may be written with one or two dashes.
             See '\(applicationName) <action> --help' for help for a specific action.
+            """
+        case .recoverStorage:
+            """
+            Usage: \(applicationName) recover-storage [options]
+
+            Recover from Umbra storage that macOS no longer permits the app to read.
+
+            This moves the entire Umbra Application Support directory to a uniquely named sibling
+            backup without reading or deleting its contents. Saved hosts, pairing identities,
+            protocol trust, preferences, and cached state will be absent on the next normal launch,
+            which creates fresh storage and requires hosts to be paired again. The command prints
+            the exact backup path so the previous storage remains recoverable.
+
+            Options:
+              -h, --help      Display this help text
+              -v, --version   Display version information
             """
         case .list:
             """

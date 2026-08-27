@@ -73,6 +73,28 @@ final class CLIParserTests: XCTestCase {
         )
     }
 
+    func testRecoverStorageParsesWithoutOperandsAndDocumentsConsequences() throws {
+        XCTAssertEqual(
+            parser.parse(arguments: ["recover-storage"]),
+            .ready(command: .recoverStorage, warnings: [])
+        )
+        assertUsageError(
+            parser.parse(arguments: ["recover-storage", "unexpected"]),
+            message: "Unexpected argument: unexpected",
+            topic: .recoverStorage
+        )
+        assertUsageError(
+            parser.parse(arguments: ["recover-storage", "--verbose"]),
+            message: "Unknown options: verbose",
+            topic: .recoverStorage
+        )
+
+        let help = CLIHelp.text(for: .recoverStorage, applicationName: "umbra")
+        XCTAssertTrue(help.contains("entire Umbra Application Support directory"))
+        XCTAssertTrue(help.contains("requires hosts to be paired again"))
+        XCTAssertTrue(help.contains("exact backup path"))
+    }
+
     func testStreamParsesCompleteMoonlightOptionSurface() throws {
         let parsed = parser.parse(arguments: [
             "stream",
@@ -338,6 +360,7 @@ final class CLIParserTests: XCTestCase {
           quit            Quit the currently running app
           stream          Start streaming an app
           pair            Pair a new host
+          recover-storage Preserve unreadable storage and reset Umbra on next launch
 
         Options:
           -h, --help      Display this help text

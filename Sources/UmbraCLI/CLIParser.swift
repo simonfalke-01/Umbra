@@ -66,6 +66,8 @@ public struct UmbraCLIParser: Sendable {
         switch commandTopic {
         case .global:
             return usageError("Invalid action: \(action)", topic: .global)
+        case .recoverStorage:
+            return parseRecoverStorage(operands: operands)
         case .list:
             return parseList(operands: operands, tokenized: tokenized)
         case .pair:
@@ -257,6 +259,8 @@ private extension UmbraCLIParser {
         switch topic {
         case .global:
             return common
+        case .recoverStorage:
+            return common
         case .list:
             return common.union(["csv", "verbose"])
         case .pair:
@@ -280,12 +284,20 @@ private extension UmbraCLIParser {
     func helpTopic(for action: String?) -> CLIHelpTopic? {
         guard let action else { return nil }
         switch action.lowercased() {
+        case "recover-storage": return .recoverStorage
         case "list": return .list
         case "pair": return .pair
         case "stream": return .stream
         case "quit": return .quit
         default: return nil
         }
+    }
+
+    func parseRecoverStorage(operands: [String]) -> CLIParseResult {
+        guard operands.isEmpty else {
+            return usageError("Unexpected argument: \(operands[0])", topic: .recoverStorage)
+        }
+        return .ready(command: .recoverStorage, warnings: [])
     }
 
     func parseList(operands: [String], tokenized: TokenizedArguments) -> CLIParseResult {

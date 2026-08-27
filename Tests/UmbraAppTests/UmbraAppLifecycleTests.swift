@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import XCTest
+import UmbraCLI
 import UmbraCore
 import UmbraNetworking
 import UmbraProtocolV3
@@ -8,6 +9,48 @@ import UmbraProtocolV3
 
 @MainActor
 final class UmbraAppLifecycleTests: XCTestCase {
+    func testStorageRecoveryBootstrapReturnsExactBackupBeforeServiceExecution() throws {
+        let backupURL = URL(fileURLWithPath: "/tmp/app.umbra.Umbra.recovery-fixture")
+        var recoveryCallCount = 0
+
+        let result = UmbraBootstrap.storageRecoveryResult(
+            for: .ready(command: .recoverStorage, warnings: [])
+        ) {
+            recoveryCallCount += 1
+            return UmbraStorageRecoveryResult(backupURL: backupURL)
+        }
+
+        XCTAssertEqual(recoveryCallCount, 1)
+        XCTAssertEqual(
+            result,
+            .success(
+                "Umbra storage was moved to this recoverable backup:\n"
+                    + "/tmp/app.umbra.Umbra.recovery-fixture\n"
+                    + "No fresh identity was created. Start Umbra normally to create fresh storage.\n"
+            )
+        )
+    }
+
+    func testStorageRecoveryBootstrapDoesNotRunForNormalLaunchAndSurfacesFailures() throws {
+        var recoveryCallCount = 0
+        let normalResult = UmbraBootstrap.storageRecoveryResult(
+            for: .ready(command: .launchApplication, warnings: [])
+        ) {
+            recoveryCallCount += 1
+            return UmbraStorageRecoveryResult(backupURL: URL(fileURLWithPath: "/unused"))
+        }
+        XCTAssertNil(normalResult)
+        XCTAssertEqual(recoveryCallCount, 0)
+
+        let failure = UmbraBootstrap.storageRecoveryResult(
+            for: .ready(command: .recoverStorage, warnings: [])
+        ) {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        XCTAssertEqual(failure?.exitCode, CLIExitCode.failure.rawValue)
+        XCTAssertTrue(failure?.standardError.contains("Storage recovery failed:") == true)
+    }
+
     func testRepeatedQuitSharesOneOrderedStopBarrierAndOneReply() async throws {
         let gate = TerminationBarrierGate()
         let delegate = UmbraApplicationDelegate()

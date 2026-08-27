@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 private let jsonFileStoreProcessLock = NSLock()
@@ -50,13 +49,11 @@ public struct UmbraSnapshot: ValidatedPersistenceModel, Hashable, Sendable {
 public actor JSONFileStore<Value: ValidatedPersistenceModel> {
     public let fileURL: URL
 
-    private let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
     public init(fileURL: URL) {
         self.fileURL = fileURL
-        self.fileManager = .default
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
         self.encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -65,18 +62,18 @@ public actor JSONFileStore<Value: ValidatedPersistenceModel> {
     }
 
     public func load() throws -> Value {
-        try withExclusiveFileLock { try loadUnlocked() }
+        try withExclusiveFileLock { access in try loadUnlocked(access: access) }
     }
 
     public func save(_ value: Value) throws {
-        try withExclusiveFileLock { try saveUnlocked(value) }
+        try withExclusiveFileLock { access in try saveUnlocked(value, access: access) }
     }
 
     @discardableResult
     public func update(_ transform: @Sendable (Value) throws -> Value) throws -> Value {
-        try withExclusiveFileLock {
-            let updated = try transform(loadUnlocked())
-            try saveUnlocked(updated)
+        try withExclusiveFileLock { access in
+            let updated = try transform(loadUnlocked(access: access))
+            try saveUnlocked(updated, access: access)
             return updated
         }
     }
@@ -85,44 +82,27 @@ public actor JSONFileStore<Value: ValidatedPersistenceModel> {
         try save(Value.defaultValue)
     }
 
-    private func loadUnlocked() throws -> Value {
-        guard fileManager.fileExists(atPath: fileURL.path) else {
+    private func loadUnlocked(access: SecureAtomicFileWriter.Access) throws -> Value {
+        guard let data = try access.readIfPresentHardeningLegacyOwnerReadablePermissions() else {
             return Value.defaultValue
         }
-        let data = try Data(contentsOf: fileURL)
         let value = try decoder.decode(Value.self, from: data)
         try value.validate()
         return value
     }
 
-    private func saveUnlocked(_ value: Value) throws {
+    private func saveUnlocked(_ value: Value, access: SecureAtomicFileWriter.Access) throws {
         try value.validate()
-        let parentDirectory = fileURL.deletingLastPathComponent()
-        try fileManager.createDirectory(at: parentDirectory, withIntermediateDirectories: true)
         let data = try encoder.encode(value)
-        try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUnlessOpen])
+        try access.atomicWrite(data)
     }
 
-    private func withExclusiveFileLock<T>(_ operation: () throws -> T) throws -> T {
+    private func withExclusiveFileLock<T>(
+        _ operation: (SecureAtomicFileWriter.Access) throws -> T
+    ) throws -> T {
         jsonFileStoreProcessLock.lock()
         defer { jsonFileStoreProcessLock.unlock() }
-        let parentDirectory = fileURL.deletingLastPathComponent()
-        try fileManager.createDirectory(at: parentDirectory, withIntermediateDirectories: true)
-        let lockURL = fileURL.appendingPathExtension("lock")
-        let descriptor = Darwin.open(
-            lockURL.path,
-            O_CREAT | O_RDWR | O_CLOEXEC,
-            mode_t(S_IRUSR | S_IWUSR)
-        )
-        guard descriptor >= 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        defer { Darwin.close(descriptor) }
-        guard Darwin.lockf(descriptor, F_LOCK, 0) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        defer { _ = Darwin.lockf(descriptor, F_ULOCK, 0) }
-        return try operation()
+        return try SecureAtomicFileWriter.withExclusiveAccess(to: fileURL, operation)
     }
 }
 
