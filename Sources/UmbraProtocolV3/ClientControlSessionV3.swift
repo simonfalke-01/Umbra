@@ -2,11 +2,46 @@ import CryptoKit
 import Foundation
 import UmbraQUICTransport
 
-public enum ProtocolV3ClientError: Error, Equatable, Sendable {
+public enum ProtocolV3ClientError: LocalizedError, Equatable, Sendable {
     case invalidState
     case invalidMessage(String)
     case authenticationFailed
     case startRejected(UInt8)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidState:
+            "The secure protocol-v3 session is not ready for this operation."
+        case let .invalidMessage(context):
+            "Lumen sent an invalid protocol-v3 message (\(context))."
+        case .authenticationFailed:
+            "Secure protocol-v3 authentication failed. "
+                + "Pair the host again if its identity or authorization changed."
+        case let .startRejected(status):
+            Self.startRejectionDescription(status)
+        }
+    }
+
+    private static func startRejectionDescription(_ status: UInt8) -> String {
+        let reason = switch status {
+        case 1: "the START request was malformed"
+        case 2: "the client is not authenticated"
+        case 3: "the paired client is not authorized to start streams"
+        case 4: "the START authorization expired"
+        case 5: "the START intent was already consumed"
+        case 6: "the client and host protocol versions do not match"
+        case 7: "the requested capabilities are not available"
+        case 8:
+            "Lumen is busy with another stream or lifecycle transition; "
+                + "stop the active stream or wait for it to finish, then try again"
+        case 9: "the selected application no longer exists; refresh the application list and try again"
+        case 10: "the requested video, audio, HDR, or fidelity mode is unsupported by the host"
+        case 11: "Lumen could not activate a required display, encoder, audio, or application resource"
+        case 12: "Lumen encountered an internal stream-start failure"
+        default: "Lumen returned an unknown START failure"
+        }
+        return "Secure stream START was rejected because \(reason) (status \(status))."
+    }
 }
 
 public struct ProtocolV3ClientIdentity: @unchecked Sendable {

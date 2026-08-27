@@ -10,6 +10,17 @@ import UmbraQUICTransport
     #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x400) == nil)
 }
 
+@Test func startRejectionDescriptionsPreserveTheHostStatusAndRecoveryAction() {
+    let busy = ProtocolV3ClientError.startRejected(8).localizedDescription
+    #expect(busy.contains("busy with another stream or lifecycle transition"))
+    #expect(busy.contains("status 8"))
+    #expect(busy.contains("stop the active stream or wait"))
+
+    let unsupported = ProtocolV3ClientError.startRejected(10).localizedDescription
+    #expect(unsupported.contains("video, audio, HDR, or fidelity mode"))
+    #expect(unsupported.contains("status 10"))
+}
+
 @Test func stopWaitsForSessionEndedAndReusesAuthenticatedControl() async throws {
     let codec = ProtocolV3CBORCodec()
     let identity = try ProtocolV3ClientIdentity(privateSeed: Data(0..<32))

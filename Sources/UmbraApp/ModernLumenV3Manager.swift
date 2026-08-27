@@ -12,6 +12,7 @@ import UmbraServices
 
 private enum ModernLumenV3ManagerError: LocalizedError {
     case startTimedOut
+    case configurationTimedOut([UInt16])
     case lateStartCompensationFailed(String)
     case bulkTransferFailed(String)
 
@@ -19,11 +20,24 @@ private enum ModernLumenV3ManagerError: LocalizedError {
         switch self {
         case .startTimedOut:
             "Secure stream START timed out after 10 seconds and was cancelled."
+        case let .configurationTimedOut(types):
+            "Secure stream configuration timed out before Lumen acknowledged \(Self.configurationNames(types))."
         case let .lateStartCompensationFailed(message):
             "A late START succeeded but compensating STOP failed: \(message)"
         case let .bulkTransferFailed(message):
             "Secure application artwork transfer failed: \(message)"
         }
+    }
+
+    private static func configurationNames(_ types: [UInt16]) -> String {
+        types.map {
+            switch $0 {
+            case 0x0140: "VIDEO_CONFIG"
+            case 0x0142: "AUDIO_CONFIG"
+            case 0x0144: "MICROPHONE_CONFIG"
+            default: String(format: "configuration 0x%04x", $0)
+            }
+        }.joined(separator: ", ")
     }
 }
 
@@ -245,6 +259,29 @@ final class ProtocolV3MediaEventExecutor: @unchecked Sendable {
 
 @MainActor
 final class ModernLumenV3Manager {
+    typealias PairedSessionFactory = @MainActor (
+        _ trust: ProtocolV3TrustRecord,
+        _ identity: ProtocolV3ClientIdentity,
+        _ host: String,
+        _ port: UInt16,
+        _ hostnameIsIPLiteral: Bool,
+        _ mode: QUICOptimizationMode
+    ) throws -> ProtocolV3ClientControlSession
+
+    struct RecoveryPhaseTimeouts: Sendable {
+        let authentication: Duration
+        let activeSessionAnnouncement: Duration
+        let attachResponse: Duration
+        let inputResetResponse: Duration
+
+        static let wireContract = Self(
+            authentication: .seconds(5),
+            activeSessionAnnouncement: .seconds(2),
+            attachResponse: .seconds(3),
+            inputResetResponse: .seconds(2)
+        )
+    }
+
     private enum Permission {
         static let browse: UInt64 = 1 << 0
         static let start: UInt64 = 1 << 1
@@ -258,6 +295,11 @@ final class ModernLumenV3Manager {
         let type: UInt16
         let requestID: UInt64
         let fields: [UInt64: ProtocolV3CBORValue]
+    }
+
+    private struct ManagerEventEnvelope: Sendable {
+        let event: ProtocolV3ClientEvent
+        let session: ProtocolV3ClientControlSession
     }
 
     private struct PendingControlResponse {
@@ -281,9 +323,9 @@ final class ModernLumenV3Manager {
         let sessionID: Data
         let attachToken: Data
         let startIntentID: Data
-        let videoGeneration: UInt64
-        let audioGeneration: UInt64
-        let microphoneGeneration: UInt64
+        let videoGeneration: UInt32
+        let audioGeneration: UInt32
+        let microphoneGeneration: UInt32
         let inputGeneration: UInt32
     }
 
@@ -299,6 +341,34 @@ final class ModernLumenV3Manager {
     private struct PendingBulkObject {
         let metadata: BulkMetadata
         let continuation: AsyncStream<Result<Data, ModernLumenV3ManagerError>>.Continuation
+    }
+
+    private struct ConfigurationBinding: Equatable, Sendable {
+        let sessionID: Data
+        let generation: UInt32
+    }
+
+    private final class ConfigurationBarrierState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: [UInt16: ConfigurationBinding]
+
+        init(required: [UInt16: ConfigurationBinding]) {
+            pending = required
+        }
+
+        func acknowledge(_ acknowledgement: ProtocolV3ConfigurationAcknowledgement) -> Bool {
+            lock.withLock {
+                let binding = ConfigurationBinding(
+                    sessionID: acknowledgement.sessionID,
+                    generation: acknowledgement.generation
+                )
+                guard pending[acknowledgement.type] == binding else { return false }
+                pending[acknowledgement.type] = nil
+                return pending.isEmpty
+            }
+        }
+
+        var remaining: Set<UInt16> { lock.withLock { Set(pending.keys) } }
     }
 
     private final class InputSenderRelay: @unchecked Sendable {
@@ -330,6 +400,19 @@ final class ModernLumenV3Manager {
         }
     }
 
+    private final class ActivationTaskRelay: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: Task<Void, Never>?
+
+        func install(_ task: Task<Void, Never>?) {
+            lock.withLock { self.task = task }
+        }
+
+        func cancel() {
+            lock.withLock { task }?.cancel()
+        }
+    }
+
     private final class RetainedSession {
         var session: ProtocolV3ClientControlSession
         let terminalEvents: AsyncStream<Void>
@@ -342,7 +425,7 @@ final class ModernLumenV3Manager {
         var sessionEndedContinuation: AsyncStream<Data>.Continuation
         var isAuthenticated = false
         var serverCapabilities: UInt64 = 0
-        var inputDatagramPayloadByteCount = 1_108
+        var inputDatagramPayloadByteCount = 0
         var invitationRecord: ModernLumenV3HostRecord?
         var pairingInvitationID: Data?
         let pairingEvents: AsyncStream<Result<HostDisplayModel, Error>>
@@ -360,12 +443,20 @@ final class ModernLumenV3Manager {
         var cancelledStartOffers: [UInt64: ProtocolV3StartOffer] = [:]
         var attachState: AttachState?
         var isRecovering = false
+        var teardownTask: Task<Void, Never>?
         let inputSenderRelay = InputSenderRelay()
+        let activationTaskRelay = ActivationTaskRelay()
         var bulkHeaders: [UInt64: QUICInboundBulkHeader] = [:]
         var pendingBulkObjects: [UInt64: PendingBulkObject] = [:]
         var rejectedBulkRequestIDs = Set<UInt64>()
         var statisticsTask: Task<Void, Never>?
         let mediaEventExecutor = ProtocolV3MediaEventExecutor()
+        let configurationAcknowledgements: AsyncStream<ProtocolV3ConfigurationOutcome>
+        let configurationAcknowledgementContinuation:
+            AsyncStream<ProtocolV3ConfigurationOutcome>.Continuation
+        let managerEvents: AsyncStream<ManagerEventEnvelope>
+        let managerEventContinuation: AsyncStream<ManagerEventEnvelope>.Continuation
+        var managerEventTask: Task<Void, Never>?
 
         init(
             session: ProtocolV3ClientControlSession,
@@ -383,6 +474,9 @@ final class ModernLumenV3Manager {
             (sessionEndedEvents, sessionEndedContinuation) = AsyncStream<Data>.makeStream()
             (startEvents, startContinuation) = AsyncStream<Result<StartResult, Error>>.makeStream()
             (pairingEvents, pairingContinuation) = AsyncStream<Result<HostDisplayModel, Error>>.makeStream()
+            (configurationAcknowledgements, configurationAcknowledgementContinuation) =
+                AsyncStream<ProtocolV3ConfigurationOutcome>.makeStream()
+            (managerEvents, managerEventContinuation) = AsyncStream<ManagerEventEnvelope>.makeStream()
         }
 
         func resetAuthenticationEvents() {
@@ -419,6 +513,9 @@ final class ModernLumenV3Manager {
     private let microphoneAuthorization: any ClientMicrophoneAuthorizing
     private let microphoneCaptureFactory: any ClientMicrophoneCaptureCreating
     private let startupTelemetry: SessionStartupTelemetryRecorder
+    private let pairedSessionFactory: PairedSessionFactory
+    private let configurationBarrierTimeout: Duration
+    private let recoveryPhaseTimeouts: RecoveryPhaseTimeouts
     private var sessions: [Data: RetainedSession] = [:]
     private var connectionStatuses: [Data: HostConnectionStatus] = [:]
     private var catalogEventHandler: (@MainActor @Sendable ([HostDisplayModel]) -> Void)?
@@ -437,6 +534,9 @@ final class ModernLumenV3Manager {
         microphoneAuthorization: any ClientMicrophoneAuthorizing = SystemClientMicrophoneAuthorization(),
         microphoneCaptureFactory: any ClientMicrophoneCaptureCreating = AudioQueueMicrophoneCaptureFactory(),
         startupTelemetry: SessionStartupTelemetryRecorder = SessionStartupTelemetryRecorder(),
+        pairedSessionFactory: PairedSessionFactory? = nil,
+        configurationBarrierTimeout: Duration = .seconds(3),
+        recoveryPhaseTimeouts: RecoveryPhaseTimeouts = .wireContract,
         log: SupportLog?
     ) {
         self.trustStore = trustStore
@@ -451,6 +551,9 @@ final class ModernLumenV3Manager {
         self.microphoneAuthorization = microphoneAuthorization
         self.microphoneCaptureFactory = microphoneCaptureFactory
         self.startupTelemetry = startupTelemetry
+        self.pairedSessionFactory = pairedSessionFactory ?? Self.makePairedSession
+        self.configurationBarrierTimeout = configurationBarrierTimeout
+        self.recoveryPhaseTimeouts = recoveryPhaseTimeouts
         self.log = log
     }
 
@@ -655,16 +758,13 @@ final class ModernLumenV3Manager {
         guard trust.clientID == identity.clientID else {
             throw ProtocolV3ClientError.authenticationFailed
         }
-        let transport = try NetworkQUICTransport(configuration: .init(
-            endpoint: .init(host: host, port: port),
-            expectedLeafSPKISHA256: trust.tlsSPKIHash,
-            serverName: hostnameIsIPLiteral ? nil : host,
-            mode: mode
-        ))
-        let session = ProtocolV3ClientControlSession(
-            transport: transport,
-            identity: identity,
-            mode: .paired(trust, replaceExisting: true)
+        let session = try pairedSessionFactory(
+            trust,
+            identity,
+            host,
+            port,
+            hostnameIsIPLiteral,
+            mode
         )
         retain(session, hostID: hostID)
         do {
@@ -731,7 +831,11 @@ final class ModernLumenV3Manager {
                 guard cursor == 0,
                       record.applicationRevision == page.revision,
                       page.applications.isEmpty,
-                      page.nextCursor == nil else {
+                      page.nextCursor == nil,
+                      record.applications.filter(\.isRunning).count <= 1,
+                      zip(record.applications, record.applications.dropFirst()).allSatisfy({
+                          $0.id < $1.id
+                      }) else {
                     throw ProtocolV3ClientError.invalidMessage("application-list revalidation")
                 }
                 return try applications(hostID: hostID)
@@ -750,6 +854,9 @@ final class ModernLumenV3Manager {
                 throw ProtocolV3ClientError.invalidMessage("application-list pagination")
             }
             applicationRecords.append(contentsOf: page.applications)
+            guard applicationRecords.filter(\.isRunning).count <= 1 else {
+                throw ProtocolV3ClientError.invalidMessage("application-list running state")
+            }
             if let nextCursor = page.nextCursor {
                 guard nextCursor == cursor + UInt64(page.applications.count) else {
                     throw ProtocolV3ClientError.invalidMessage("application-list cursor")
@@ -881,6 +988,28 @@ final class ModernLumenV3Manager {
         try requirePermission(hostID: protocolHostID, permission: Permission.input, feature: "remote input")
         try requirePermission(hostID: protocolHostID, permission: Permission.stopOwnStream, feature: "stream STOP")
         var streamPreferences = preferences
+        if streamPreferences.quitAppAfter {
+            try requirePermission(
+                hostID: protocolHostID,
+                permission: Permission.quitApplication,
+                feature: "remote application quit"
+            )
+        }
+        var record = try requireHostRecord(protocolHostID)
+        guard let applicationRecord = record.applications.first(where: { $0.id == id.rawValue }) else {
+            throw UmbraClientServiceError.invalidInput("The selected application is unavailable.")
+        }
+        let mode: QUICOptimizationMode = streamPreferences.optimizationMode == .latency ? .latency : .quality
+        let session = try await reconnect(hostID: hostID, mode: mode)
+        guard let entry = sessions[protocolHostID], entry.session === session,
+              entry.preparedStream == nil, entry.activeSessionID == nil else {
+            throw ProtocolV3ClientError.invalidState
+        }
+        try requireStreamingDatagramCapacity(
+            entry: entry,
+            hostID: protocolHostID,
+            session: session
+        )
         if streamPreferences.clientMicrophoneEnabled {
             let hostAllowsMicrophone = try hasPermission(
                 hostID: protocolHostID,
@@ -932,23 +1061,6 @@ final class ModernLumenV3Manager {
                     "Microphone capture is unavailable: \(error.localizedDescription). Umbra will stream without the microphone."
                 ))
             }
-        }
-        if streamPreferences.quitAppAfter {
-            try requirePermission(
-                hostID: protocolHostID,
-                permission: Permission.quitApplication,
-                feature: "remote application quit"
-            )
-        }
-        var record = try requireHostRecord(protocolHostID)
-        guard let applicationRecord = record.applications.first(where: { $0.id == id.rawValue }) else {
-            throw UmbraClientServiceError.invalidInput("The selected application is unavailable.")
-        }
-        let mode: QUICOptimizationMode = streamPreferences.optimizationMode == .latency ? .latency : .quality
-        let session = try await reconnect(hostID: hostID, mode: mode)
-        guard let entry = sessions[protocolHostID], entry.session === session,
-              entry.preparedStream == nil, entry.activeSessionID == nil else {
-            throw ProtocolV3ClientError.invalidState
         }
         let startIntentID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
         let traceID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
@@ -1011,6 +1123,11 @@ final class ModernLumenV3Manager {
         )
         entry.resetStartEvents()
         entry.resetSessionEndedEvents()
+        try requireStreamingDatagramCapacity(
+            entry: entry,
+            hostID: protocolHostID,
+            session: session
+        )
         sessionEventHandler?(.sessionPreparing)
         do {
             // Claim lifecycle teardown ownership before any fallible window,
@@ -1026,6 +1143,11 @@ final class ModernLumenV3Manager {
                 offer: offer,
                 pipeline: pipeline,
                 microphoneCapture: preparedMicrophoneCapture
+            )
+            try requireStreamingDatagramCapacity(
+                entry: entry,
+                hostID: protocolHostID,
+                session: session
             )
             sessionEventHandler?(.sessionConnecting(.serverHandshake))
             startupTelemetry.record(sessionID: bootstrap.sessionID, stage: .sessionStart)
@@ -1190,6 +1312,8 @@ final class ModernLumenV3Manager {
         sessions[hostID]?.session.cancel()
         sessions[hostID]?.terminalContinuation.finish()
         sessions[hostID]?.authenticationContinuation.finish()
+        sessions[hostID]?.managerEventContinuation.finish()
+        sessions[hostID]?.managerEventTask?.cancel()
         sessions[hostID] = RetainedSession(
             session: session,
             invitationRecord: invitationRecord,
@@ -1204,18 +1328,29 @@ final class ModernLumenV3Manager {
     ) {
         guard let entry = sessions[hostID] else { return }
         let mediaExecutor = entry.mediaEventExecutor
+        let managerEventContinuation = entry.managerEventContinuation
+        if entry.managerEventTask == nil {
+            let managerEvents = entry.managerEvents
+            entry.managerEventTask = Task<Void, Never> { @MainActor [weak self] in
+                for await envelope in managerEvents {
+                    guard let self else { return }
+                    self.handle(
+                        envelope.event,
+                        hostID: hostID,
+                        session: envelope.session
+                    )
+                }
+            }
+        }
         session.setEventHandler { [weak self] (event: ProtocolV3ClientEvent) in
             if let terminalBarrier = Self.mediaExecutorTerminalBarrier(for: event) {
                 let terminalCompletion: (@Sendable () -> Void)?
                 if terminalBarrier {
-                    terminalCompletion = { [weak self] in
-                        Task { @MainActor in
-                            self?.handle(
-                                event,
-                                hostID: hostID,
-                                session: session
-                            )
-                        }
+                    terminalCompletion = {
+                        managerEventContinuation.yield(.init(
+                            event: event,
+                            session: session
+                        ))
                     }
                 } else {
                     terminalCompletion = nil
@@ -1239,9 +1374,7 @@ final class ModernLumenV3Manager {
                 )
                 return
             }
-            Task { @MainActor in
-                self?.handle(event, hostID: hostID, session: session)
-            }
+            managerEventContinuation.yield(.init(event: event, session: session))
         }
     }
 
@@ -1269,14 +1402,16 @@ final class ModernLumenV3Manager {
         }
         if case let .startAccepted(sessionID, fields) = event {
             entry.activeStartRequestID = nil
-            Task { @MainActor [weak self] in
-                await self?.activateStream(
+            let task = Task<Void, Never> { @MainActor [weak self] in
+                guard let self else { return }
+                await self.activateStream(
                     entry: entry,
                     hostID: hostID,
                     sessionID: sessionID,
                     fields: fields
                 )
             }
+            entry.activationTaskRelay.install(task)
             return
         }
         if case let .lateStartAccepted(requestID, sessionID, fields) = event {
@@ -1343,9 +1478,11 @@ final class ModernLumenV3Manager {
             entry.inputSenderRelay.updateMaximumPayloadByteCount(
                 parameters.usableDatagramPayloadSize
             )
+            entry.mediaCoordinator?.handle(event)
         case let .transport(.datagramCapacityChanged(_, payloadByteCount)):
             entry.inputDatagramPayloadByteCount = payloadByteCount
             entry.inputSenderRelay.updateMaximumPayloadByteCount(payloadByteCount)
+            entry.mediaCoordinator?.handle(event)
         case let .activeSessionAvailable(activeSessionID):
             entry.activeSessionContinuation.yield(activeSessionID)
             entry.activeSessionContinuation.finish()
@@ -1355,6 +1492,7 @@ final class ModernLumenV3Manager {
                     entry.sessionEndedContinuation.yield(sessionID)
                     entry.sessionEndedContinuation.finish()
                 }
+                if entry.stopTask != nil { return }
                 Task { @MainActor [weak self] in
                     await self?.tearDownStream(
                         entry: entry,
@@ -1463,6 +1601,10 @@ final class ModernLumenV3Manager {
         entry.activeSessionContinuation.finish()
         entry.sessionEndedContinuation.finish()
         entry.startContinuation.finish()
+        entry.configurationAcknowledgementContinuation.finish()
+        entry.activationTaskRelay.cancel()
+        entry.managerEventContinuation.finish()
+        entry.managerEventTask?.cancel()
         entry.terminalContinuation.yield(())
         entry.terminalContinuation.finish()
     }
@@ -1482,7 +1624,6 @@ final class ModernLumenV3Manager {
             )
             return
         }
-        let deadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
         do {
             let record = try requireHostRecord(hostID)
             let trust = try requireTrust(hostID)
@@ -1490,16 +1631,13 @@ final class ModernLumenV3Manager {
             guard trust.clientID == identity.clientID else {
                 throw ProtocolV3ClientError.authenticationFailed
             }
-            let transport = try NetworkQUICTransport(configuration: .init(
-                endpoint: .init(host: record.hostname, port: record.port),
-                expectedLeafSPKISHA256: trust.tlsSPKIHash,
-                serverName: record.hostnameIsIPLiteral == true ? nil : record.hostname,
-                mode: prepared.offer.mode
-            ))
-            let replacement = ProtocolV3ClientControlSession(
-                transport: transport,
-                identity: identity,
-                mode: .paired(trust, replaceExisting: true)
+            let replacement = try pairedSessionFactory(
+                trust,
+                identity,
+                record.hostname,
+                record.port,
+                record.hostnameIsIPLiteral == true,
+                prepared.offer.mode
             )
             entry.resetAuthenticationEvents()
             let oldSession = entry.session
@@ -1510,11 +1648,11 @@ final class ModernLumenV3Manager {
             try await waitForAuthentication(
                 hostID: hostID,
                 session: replacement,
-                timeout: try remainingDuration(until: deadline)
+                timeout: recoveryPhaseTimeouts.authentication
             )
             let ownedSessionID = try await waitForActiveSession(
                 entry: entry,
-                timeout: try remainingDuration(until: deadline)
+                timeout: recoveryPhaseTimeouts.activeSessionAnnouncement
             )
             guard ownedSessionID == attach.sessionID else {
                 throw ProtocolV3ClientError.authenticationFailed
@@ -1527,15 +1665,15 @@ final class ModernLumenV3Manager {
                 3: .bytes(attachIntentID),
                 4: .unsigned(UInt64(attach.inputGeneration)),
                 5: .map([
-                    1: .unsigned(attach.videoGeneration),
-                    2: .unsigned(attach.audioGeneration),
-                    3: .unsigned(attach.microphoneGeneration),
+                    1: .unsigned(UInt64(attach.videoGeneration)),
+                    2: .unsigned(UInt64(attach.audioGeneration)),
+                    3: .unsigned(UInt64(attach.microphoneGeneration)),
                 ]),
             ]
             let attachResponse = try await requestAttachWithStableIntent(
                 entry: entry,
                 fields: attachFields,
-                deadline: deadline
+                timeout: recoveryPhaseTimeouts.attachResponse
             )
             guard Set(attachResponse.fields.keys) == Set(1...6),
                   attachResponse.fields[1]?.unsignedValue == 0,
@@ -1547,9 +1685,9 @@ final class ModernLumenV3Manager {
                   attachResponse.fields[5]?.booleanValue != nil,
                   let currentGenerations = attachResponse.fields[6]?.mapValue,
                   Set(currentGenerations.keys) == Set(1...3),
-                  currentGenerations[1]?.unsignedValue == attach.videoGeneration,
-                  currentGenerations[2]?.unsignedValue == attach.audioGeneration,
-                  currentGenerations[3]?.unsignedValue == attach.microphoneGeneration else {
+                  currentGenerations[1]?.unsignedValue == UInt64(attach.videoGeneration),
+                  currentGenerations[2]?.unsignedValue == UInt64(attach.audioGeneration),
+                  currentGenerations[3]?.unsignedValue == UInt64(attach.microphoneGeneration) else {
                 throw ProtocolV3ClientError.invalidMessage("ATTACH response")
             }
 
@@ -1575,7 +1713,7 @@ final class ModernLumenV3Manager {
                 requestType: 0x0120,
                 responseType: 0x0121,
                 fields: [1: .bytes(attach.sessionID), 2: .bytes(resetState)],
-                timeout: try remainingDuration(until: deadline)
+                timeout: recoveryPhaseTimeouts.inputResetResponse
             )
             guard Set(resetResponse.fields.keys) == Set([1, 2]),
                   resetResponse.fields[1]?.unsignedValue == 0,
@@ -1618,20 +1756,20 @@ final class ModernLumenV3Manager {
     private func requestAttachWithStableIntent(
         entry: RetainedSession,
         fields: [UInt64: ProtocolV3CBORValue],
-        deadline: UInt64
+        timeout: Duration
     ) async throws -> ControlResponse {
         var lastError: Error = ProtocolV3ClientError.invalidState
-        for attempt in 0..<2 {
-            let remaining = try remainingNanoseconds(until: deadline)
-            let attemptBudget = attempt == 0 ? max(1, remaining / 2) : remaining
+        for _ in 0..<2 {
             do {
                 return try await requestControl(
                     entry: entry,
                     requestType: 0x0102,
                     responseType: 0x0103,
                     fields: fields,
-                    timeout: .nanoseconds(Int64(clamping: attemptBudget))
+                    timeout: timeout
                 )
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 lastError = error
             }
@@ -1644,21 +1782,24 @@ final class ModernLumenV3Manager {
         timeout: Duration
     ) async throws -> Data {
         let events = entry.activeSessionEvents
-        let value = await withTaskGroup(of: Data?.self) { group in
+        return try await withThrowingTaskGroup(of: Data.self) { group in
             group.addTask {
                 var iterator = events.makeAsyncIterator()
-                return await iterator.next()
+                guard let value = await iterator.next() else {
+                    throw ProtocolV3ClientError.authenticationFailed
+                }
+                return value
             }
             group.addTask {
-                try? await Task.sleep(for: timeout)
-                return nil
+                try await Task.sleep(for: timeout)
+                throw ProtocolV3ClientError.authenticationFailed
             }
-            let value = await group.next() ?? nil
-            group.cancelAll()
+            defer { group.cancelAll() }
+            guard let value = try await group.next() else {
+                throw ProtocolV3ClientError.authenticationFailed
+            }
             return value
         }
-        guard let value else { throw ProtocolV3ClientError.authenticationFailed }
-        return value
     }
 
     private func failAttachedRecovery(
@@ -1762,16 +1903,6 @@ final class ModernLumenV3Manager {
         )))
     }
 
-    private func remainingDuration(until deadline: UInt64) throws -> Duration {
-        .nanoseconds(Int64(clamping: try remainingNanoseconds(until: deadline)))
-    }
-
-    private func remainingNanoseconds(until deadline: UInt64) throws -> UInt64 {
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard now < deadline else { throw ProtocolV3ClientError.invalidState }
-        return deadline - now
-    }
-
     private func activateStream(
         entry: RetainedSession,
         hostID: Data,
@@ -1789,9 +1920,14 @@ final class ModernLumenV3Manager {
                   fields[20]?.bytesValue == prepared.offer.fields[13]?.bytesValue,
                   let attachToken = fields[21]?.bytesValue,
                   attachToken.count == 32,
-                  let videoGeneration = fields[14]?.unsignedValue,
-                  let audioGeneration = fields[15]?.unsignedValue,
-                  let microphoneGeneration = fields[16]?.unsignedValue,
+                  let videoGenerationRaw = fields[14]?.unsignedValue,
+                  let videoGeneration = UInt32(exactly: videoGenerationRaw),
+                  videoGeneration != 0,
+                  let audioGenerationRaw = fields[15]?.unsignedValue,
+                  let audioGeneration = UInt32(exactly: audioGenerationRaw),
+                  audioGeneration != 0,
+                  let microphoneGenerationRaw = fields[16]?.unsignedValue,
+                  let microphoneGeneration = UInt32(exactly: microphoneGenerationRaw),
                   let inputGenerationRaw = fields[17]?.unsignedValue,
                   let inputGeneration = UInt32(exactly: inputGenerationRaw),
                   inputGeneration != 0 else {
@@ -1942,6 +2078,19 @@ final class ModernLumenV3Manager {
                     if let video = statistics.media.videoPipeline {
                         output.handleVideoStatistics(video)
                     }
+                },
+                configurationAcknowledgementHandler: {
+                    [
+                        configurationAcknowledgementContinuation = entry.configurationAcknowledgementContinuation,
+                        startContinuation = entry.startContinuation
+                    ] outcome in
+                    configurationAcknowledgementContinuation.yield(outcome)
+                    if case .rejected = outcome {
+                        startContinuation.yield(.failure(
+                            ProtocolV3SessionMediaError.invalidConfiguration
+                        ))
+                        startContinuation.finish()
+                    }
                 }
             )
             entry.activeSessionID = sessionID
@@ -1971,6 +2120,23 @@ final class ModernLumenV3Manager {
             }
             mediaCoordinator.handle(.startAccepted(sessionID: sessionID, fields: fields))
             entry.mediaEventExecutor.installAndResume(mediaCoordinator)
+            // Lumen pipelines configuration requests behind START. Do not expose
+            // input or publish streaming until every required success ACK is sent.
+            var requiredConfigurations: [UInt16: ConfigurationBinding] = [
+                0x0140: .init(sessionID: sessionID, generation: videoGeneration),
+                0x0142: .init(sessionID: sessionID, generation: audioGeneration),
+            ]
+            if fields[13] != .null {
+                requiredConfigurations[0x0144] = .init(
+                    sessionID: sessionID,
+                    generation: microphoneGeneration
+                )
+            }
+            try await Self.waitForConfigurationAcknowledgements(
+                entry.configurationAcknowledgements,
+                required: requiredConfigurations,
+                timeout: configurationBarrierTimeout
+            )
             try inputSender.start()
             inputInstaller.installInputSink(ProtocolV3PlatformInputSink(
                 sender: inputSender,
@@ -1984,17 +2150,22 @@ final class ModernLumenV3Manager {
         } catch {
             entry.startContinuation.yield(.failure(error))
             entry.startContinuation.finish()
-            sessionEventHandler?(.sessionFailed(SessionFailure(
-                kind: .connectionFailed,
-                message: error.localizedDescription,
-                stage: .connection
-            )))
+            if !(error is CancellationError) {
+                sessionEventHandler?(.sessionFailed(SessionFailure(
+                    kind: .connectionFailed,
+                    message: error.localizedDescription,
+                    stage: .connection
+                )))
+            }
             await tearDownStream(
                 entry: entry,
                 hostID: hostID,
                 publishEnded: false,
                 sendMicrophoneEnd: true
             )
+            entry.session.cancel()
+            connectionStatuses[hostID] = .offline
+            publishCatalog()
         }
     }
 
@@ -2004,21 +2175,32 @@ final class ModernLumenV3Manager {
         offer: ProtocolV3StartOffer
     ) async throws -> StartResult {
         let events = entry.startEvents
-        let result = await withTaskGroup(of: Result<StartResult, Error>.self) { group in
-            group.addTask {
-                var iterator = events.makeAsyncIterator()
-                return await iterator.next() ?? .failure(ProtocolV3ClientError.invalidState)
+        do {
+            return try await withThrowingTaskGroup(of: StartResult.self) { group in
+                group.addTask {
+                    var iterator = events.makeAsyncIterator()
+                    let result = await iterator.next()
+                    try Task.checkCancellation()
+                    guard let result else {
+                        throw ProtocolV3ClientError.invalidState
+                    }
+                    return try result.get()
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(10))
+                    throw ModernLumenV3ManagerError.startTimedOut
+                }
+                defer { group.cancelAll() }
+                guard let first = try await group.next() else {
+                    throw ProtocolV3ClientError.invalidState
+                }
+                return first
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(10))
-                return .failure(ModernLumenV3ManagerError.startTimedOut)
-            }
-            let first = await group.next() ?? .failure(ProtocolV3ClientError.invalidState)
-            group.cancelAll()
-            return first
-        }
-        if case let .failure(error) = result,
-           case .startTimedOut = error as? ModernLumenV3ManagerError {
+        } catch is CancellationError {
+            entry.activationTaskRelay.cancel()
+            throw CancellationError()
+        } catch let error as ModernLumenV3ManagerError {
+            guard case .startTimedOut = error else { throw error }
             if entry.activeStartRequestID == requestID {
                 do {
                     try entry.session.cancelStart(requestID: requestID)
@@ -2035,8 +2217,9 @@ final class ModernLumenV3Manager {
                 }
             }
             return try await awaitStartEvent(events)
+        } catch {
+            throw error
         }
-        return try result.get()
     }
 
     private func awaitStartEvent(
@@ -2069,6 +2252,40 @@ final class ModernLumenV3Manager {
         }
         guard endedSessionID == sessionID else {
             throw ProtocolV3ClientError.invalidMessage("SESSION_ENDED timeout or session mismatch")
+        }
+    }
+
+    private nonisolated static func waitForConfigurationAcknowledgements(
+        _ events: AsyncStream<ProtocolV3ConfigurationOutcome>,
+        required: [UInt16: ConfigurationBinding],
+        timeout: Duration
+    ) async throws {
+        let state = ConfigurationBarrierState(required: required)
+        let remaining = try await withThrowingTaskGroup(of: Set<UInt16>.self) { group in
+            group.addTask {
+                for await outcome in events {
+                    try Task.checkCancellation()
+                    switch outcome {
+                    case let .acknowledged(acknowledgement):
+                        if state.acknowledge(acknowledgement) { return [] }
+                    case .rejected:
+                        throw ProtocolV3SessionMediaError.invalidConfiguration
+                    }
+                }
+                try Task.checkCancellation()
+                return state.remaining
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return state.remaining
+            }
+            defer { group.cancelAll() }
+            let first = try await group.next() ?? state.remaining
+            group.cancelAll()
+            return first
+        }
+        guard remaining.isEmpty else {
+            throw ModernLumenV3ManagerError.configurationTimedOut(remaining.sorted())
         }
     }
 
@@ -2152,13 +2369,38 @@ final class ModernLumenV3Manager {
         publishEnded: Bool,
         sendMicrophoneEnd: Bool
     ) async {
+        if let teardownTask = entry.teardownTask {
+            await teardownTask.value
+            return
+        }
+        let teardownTask = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performTearDownStream(
+                entry: entry,
+                hostID: hostID,
+                publishEnded: publishEnded,
+                sendMicrophoneEnd: sendMicrophoneEnd
+            )
+        }
+        entry.teardownTask = teardownTask
+        await teardownTask.value
+        entry.teardownTask = nil
+    }
+
+    private func performTearDownStream(
+        entry: RetainedSession,
+        hostID: Data,
+        publishEnded: Bool,
+        sendMicrophoneEnd: Bool
+    ) async {
+        guard entry.lifecyclePrepared || entry.preparedStream != nil
+                || entry.mediaCoordinator != nil || entry.inputSender != nil
+                || entry.activeSessionID != nil else {
+            return
+        }
         let prepared = entry.preparedStream
         let coordinator = entry.mediaCoordinator
         let inputSender = entry.inputSender
-        guard entry.lifecyclePrepared || prepared != nil || coordinator != nil
-                || inputSender != nil || entry.activeSessionID != nil else {
-            return
-        }
         await entry.mediaEventExecutor.clearAndWait()
         entry.preparedStream = nil
         entry.statisticsTask?.cancel()
@@ -2355,18 +2597,29 @@ final class ModernLumenV3Manager {
             expectedType: responseType,
             continuation: continuation
         )
-        let result = await withTaskGroup(of: Result<ControlResponse, ProtocolV3ClientError>.self) { group in
-            group.addTask {
-                var iterator = responses.makeAsyncIterator()
-                return await iterator.next() ?? .failure(.invalidState)
+        let result: Result<ControlResponse, Error>
+        do {
+            let response = try await withThrowingTaskGroup(of: ControlResponse.self) { group in
+                group.addTask {
+                    var iterator = responses.makeAsyncIterator()
+                    guard let result = await iterator.next() else {
+                        throw ProtocolV3ClientError.invalidState
+                    }
+                    return try result.get()
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw ProtocolV3ClientError.invalidState
+                }
+                defer { group.cancelAll() }
+                guard let first = try await group.next() else {
+                    throw ProtocolV3ClientError.invalidState
+                }
+                return first
             }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return .failure(.invalidState)
-            }
-            let first = await group.next() ?? .failure(.invalidState)
-            group.cancelAll()
-            return first
+            result = .success(response)
+        } catch {
+            result = .failure(error)
         }
         if entry.pendingControlResponses.removeValue(forKey: requestID) != nil {
             continuation.finish()
@@ -2462,20 +2715,23 @@ final class ModernLumenV3Manager {
         }
         if entry.isAuthenticated { return }
         let authenticationEvents = entry.authenticationEvents
-        let result = await withTaskGroup(of: Result<Void, ProtocolV3ClientError>.self) { group in
+        try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 var iterator = authenticationEvents.makeAsyncIterator()
-                return await iterator.next() ?? .failure(.invalidState)
+                guard let result = await iterator.next() else {
+                    throw ProtocolV3ClientError.invalidState
+                }
+                return try result.get()
             }
             group.addTask {
-                try? await Task.sleep(for: timeout)
-                return .failure(.authenticationFailed)
+                try await Task.sleep(for: timeout)
+                throw ProtocolV3ClientError.authenticationFailed
             }
-            let first = await group.next() ?? .failure(.invalidState)
-            group.cancelAll()
-            return first
+            defer { group.cancelAll() }
+            guard try await group.next() != nil else {
+                throw ProtocolV3ClientError.invalidState
+            }
         }
-        try result.get()
     }
 
     private func publishCatalog() {
@@ -2610,6 +2866,24 @@ final class ModernLumenV3Manager {
         return trust.grantedPermissions & permission == permission
     }
 
+    private func requireStreamingDatagramCapacity(
+        entry: RetainedSession,
+        hostID: Data,
+        session: ProtocolV3ClientControlSession
+    ) throws {
+        guard sessions[hostID] === entry,
+              entry.session === session,
+              !entry.isRecovering else {
+            throw ProtocolV3ClientError.invalidState
+        }
+        guard entry.inputDatagramPayloadByteCount > 0 else {
+            throw UmbraClientServiceError.unavailable(
+                "Secure streaming requires QUIC DATAGRAM support, but this connection negotiated control streams only. "
+                    + "Pairing and application browsing remain available; no stream was started."
+            )
+        }
+    }
+
     private func requireProtocolHostID(_ hostID: HostID) throws -> Data {
         guard let value = Self.protocolHostID(from: hostID) else {
             throw UmbraClientServiceError.invalidInput("The selected host is not a protocol-v3 host.")
@@ -2648,6 +2922,27 @@ final class ModernLumenV3Manager {
         return UUID(uuidString: value)!
     }
 
+    private static func makePairedSession(
+        trust: ProtocolV3TrustRecord,
+        identity: ProtocolV3ClientIdentity,
+        host: String,
+        port: UInt16,
+        hostnameIsIPLiteral: Bool,
+        mode: QUICOptimizationMode
+    ) throws -> ProtocolV3ClientControlSession {
+        let transport = try NetworkQUICTransport(configuration: .init(
+            endpoint: .init(host: host, port: port),
+            expectedLeafSPKISHA256: trust.tlsSPKIHash,
+            serverName: hostnameIsIPLiteral ? nil : host,
+            mode: mode
+        ))
+        return ProtocolV3ClientControlSession(
+            transport: transport,
+            identity: identity,
+            mode: .paired(trust, replaceExisting: true)
+        )
+    }
+
     private static func isRecoverableConnectionLoss(_ event: ProtocolV3ClientEvent) -> Bool {
         switch event {
         case .failed,
@@ -2669,8 +2964,6 @@ final class ModernLumenV3Manager {
         case let .transport(.inbound(message)) where message.lane != .control:
             false
         case .transport(.sendDisposition),
-             .transport(.negotiated),
-             .transport(.datagramCapacityChanged),
              .transport(.pathChanged),
              .transport(.laneWaiting),
              .transport(.datagramFlowWaiting),

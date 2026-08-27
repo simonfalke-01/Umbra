@@ -69,6 +69,23 @@ public struct ProtocolV3SessionStatistics: Equatable, Sendable {
     public let terminalMediaFailures: UInt64
 }
 
+public struct ProtocolV3ConfigurationAcknowledgement: Equatable, Sendable {
+    public let type: UInt16
+    public let sessionID: Data
+    public let generation: UInt32
+
+    public init(type: UInt16, sessionID: Data, generation: UInt32) {
+        self.type = type
+        self.sessionID = sessionID
+        self.generation = generation
+    }
+}
+
+public enum ProtocolV3ConfigurationOutcome: Equatable, Sendable {
+    case acknowledged(ProtocolV3ConfigurationAcknowledgement)
+    case rejected(type: UInt16, sessionID: Data?, generation: UInt32?)
+}
+
 public protocol ProtocolV3SessionMediaControlling: AnyObject, Sendable {
     @discardableResult
     func sendControlRequest(
@@ -120,6 +137,9 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
     public typealias ControllerFeedbackHandler = @Sendable (ProtocolV3ControllerFeedback) -> Void
     public typealias FailureHandler = @Sendable (Error) -> Void
     public typealias StatisticsHandler = @Sendable (ProtocolV3SessionStatistics) -> Void
+    public typealias ConfigurationAcknowledgementHandler = @Sendable (
+        ProtocolV3ConfigurationOutcome
+    ) -> Void
 
     private struct MicrophoneConfiguration {
         let generation: UInt32
@@ -140,6 +160,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
     private let controllerFeedbackHandler: ControllerFeedbackHandler
     private let failureHandler: FailureHandler
     private let statisticsHandler: StatisticsHandler
+    private let configurationAcknowledgementHandler: ConfigurationAcknowledgementHandler
     private let lock = NSLock()
     private var sessionID: Data?
     private var microphoneConfiguration: MicrophoneConfiguration?
@@ -170,7 +191,8 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         inputResyncHandler: @escaping InputResyncHandler = { _ in },
         controllerFeedbackHandler: @escaping ControllerFeedbackHandler = { _ in },
         failureHandler: @escaping FailureHandler = { _ in },
-        statisticsHandler: @escaping StatisticsHandler = { _ in }
+        statisticsHandler: @escaping StatisticsHandler = { _ in },
+        configurationAcknowledgementHandler: @escaping ConfigurationAcknowledgementHandler = { _ in }
     ) {
         self.control = control
         self.media = media
@@ -181,6 +203,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         self.controllerFeedbackHandler = controllerFeedbackHandler
         self.failureHandler = failureHandler
         self.statisticsHandler = statisticsHandler
+        self.configurationAcknowledgementHandler = configurationAcknowledgementHandler
         media.installVideoFeedbackHandler { [weak self] feedback in
             self?.sendVideoFeedback(feedback)
         }
@@ -326,6 +349,13 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
         requestID: UInt64,
         fields: [UInt64: ProtocolV3CBORValue]
     ) throws {
+        if [0x0140, 0x0142, 0x0144].contains(type) {
+            try validateConfigurationSession(
+                type: type,
+                requestID: requestID,
+                fields: fields
+            )
+        }
         switch type {
         case 0x0140:
             do {
@@ -333,11 +363,13 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
                 try control.sendControlResponse(type: 0x0141, requestID: requestID, fields: [
                     1: .unsigned(0), 2: fields[1]!, 3: fields[2]!, 4: .unsigned(UInt64(capacity)),
                 ], isError: false)
+                try reportConfigurationAcknowledgement(type: type, fields: fields)
             } catch {
                 try? control.sendControlResponse(type: 0x0141, requestID: requestID, fields: [
                     1: .unsigned(1), 2: fields[1] ?? .null, 3: fields[2] ?? .unsigned(0),
                     4: .unsigned(1),
                 ], isError: true)
+                reportConfigurationRejection(type: type, fields: fields)
                 throw error
             }
         case 0x0142:
@@ -346,19 +378,87 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
                 try control.sendControlResponse(type: 0x0143, requestID: requestID, fields: [
                     1: .unsigned(0), 2: fields[1]!, 3: fields[2]!,
                 ], isError: false)
+                try reportConfigurationAcknowledgement(type: type, fields: fields)
             } catch {
                 try? control.sendControlResponse(type: 0x0143, requestID: requestID, fields: [
                     1: .unsigned(1), 2: fields[1] ?? .null, 3: fields[2] ?? .unsigned(0),
                 ], isError: true)
+                reportConfigurationRejection(type: type, fields: fields)
                 throw error
             }
         case 0x0144:
-            try configureMicrophone(requestID: requestID, fields: fields)
+            do {
+                try configureMicrophone(requestID: requestID, fields: fields)
+                try reportConfigurationAcknowledgement(type: type, fields: fields)
+            } catch {
+                reportConfigurationRejection(type: type, fields: fields)
+                throw error
+            }
         case 0x0133:
             stopAndCleanUp(sendMicrophoneEnd: false)
         default:
             break
         }
+    }
+
+    private func validateConfigurationSession(
+        type: UInt16,
+        requestID: UInt64,
+        fields: [UInt64: ProtocolV3CBORValue]
+    ) throws {
+        let activeSessionID = lock.withLock { sessionID }
+        guard let activeSessionID,
+              fields[1]?.bytesValue == activeSessionID else {
+            let responseFields: [UInt64: ProtocolV3CBORValue]
+            if type == 0x0140 {
+                responseFields = [
+                    1: .unsigned(1), 2: fields[1] ?? .null,
+                    3: fields[2] ?? .unsigned(0), 4: .unsigned(1),
+                ]
+            } else {
+                responseFields = [
+                    1: .unsigned(1), 2: fields[1] ?? .null,
+                    3: fields[2] ?? .unsigned(0),
+                ]
+            }
+            try? control.sendControlResponse(
+                type: type + 1,
+                requestID: requestID,
+                fields: responseFields,
+                isError: true
+            )
+            reportConfigurationRejection(type: type, fields: fields)
+            throw ProtocolV3SessionMediaError.invalidConfiguration
+        }
+    }
+
+    private func reportConfigurationAcknowledgement(
+        type: UInt16,
+        fields: [UInt64: ProtocolV3CBORValue]
+    ) throws {
+        guard let sessionID = fields[1]?.bytesValue,
+              sessionID.count == 16,
+              let generationRaw = fields[2]?.unsignedValue,
+              let generation = UInt32(exactly: generationRaw),
+              generation != 0 else {
+            throw ProtocolV3SessionMediaError.invalidConfiguration
+        }
+        configurationAcknowledgementHandler(.acknowledged(.init(
+            type: type,
+            sessionID: sessionID,
+            generation: generation
+        )))
+    }
+
+    private func reportConfigurationRejection(
+        type: UInt16,
+        fields: [UInt64: ProtocolV3CBORValue]
+    ) {
+        configurationAcknowledgementHandler(.rejected(
+            type: type,
+            sessionID: fields[1]?.bytesValue,
+            generation: fields[2]?.unsignedValue.flatMap(UInt32.init(exactly:))
+        ))
     }
 
     private func handleDatagram(_ message: QUICInboundMessage) throws {
