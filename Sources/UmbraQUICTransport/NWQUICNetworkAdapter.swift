@@ -5,7 +5,7 @@ import Security
 
 @available(macOS 13.0, *)
 final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
-    private enum WaitSource: Hashable { case group, control, datagram }
+    private enum WaitSource: Hashable { case group, control }
     private final class ImmutableDataOwner: @unchecked Sendable {
         let data: NSData
         init(_ data: Data) { self.data = data as NSData }
@@ -34,6 +34,8 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
     private var group: NWConnectionGroup?
     private var control: NWConnection?
     private var datagram: NWConnection?
+    private var datagramChildOptions: NWProtocolQUIC.Options?
+    private var datagramOpenAttempted = false
     private var controlReady = false
     private var datagramReady = false
     private var readyEmitted = false
@@ -158,6 +160,7 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
         )
         let parameters = NWParameters(quic: options)
         parameters.serviceClass = configuration.profile.mode == .latency ? .responsiveData : .interactiveVideo
+        datagramChildOptions = Self.makeDatagramChildOptions(from: parameters)
         let connectionGroup = NWConnectionGroup(with: NWMultiplexGroup(to: endpoint), using: parameters)
         group = connectionGroup
         connectionGroup.stateUpdateHandler = { [weak self] state in
@@ -194,9 +197,7 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
 
     private func openFlows(generation: UInt64) {
         guard let group else { return }
-        let streamOptions = NWProtocolQUIC.Options()
-        streamOptions.direction = .bidirectional
-        guard let control = NWConnection(from: group, using: streamOptions) else {
+        guard let control = NWConnection(from: group) else {
             emit(.failed("unable to open control stream 0"))
             return
         }
@@ -205,12 +206,23 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
             guard let self, let control, self.generation == generation, !cancelled else { return }
             handleControlState(state, connection: control, generation: generation)
         }
+        control.pathUpdateHandler = { [weak self] path in
+            self?.observe(path: path, generation: generation)
+        }
         control.start(queue: queue)
+    }
 
-        let datagramOptions = NWProtocolQUIC.Options()
-        datagramOptions.isDatagram = true
-        guard let datagram = NWConnection(from: group, using: datagramOptions) else {
-            emit(.failed("unable to open RFC 9221 flow"))
+    private func openDatagramFlow(generation: UInt64) {
+        guard self.generation == generation, !cancelled, controlReady else { return }
+        guard !datagramOpenAttempted, datagram == nil else { return }
+        datagramOpenAttempted = true
+        guard let group, let datagramChildOptions else {
+            updateDatagramCapacity(0)
+            return
+        }
+        self.datagramChildOptions = nil
+        guard let datagram = NWConnection(from: group, using: datagramChildOptions) else {
+            updateDatagramCapacity(0)
             return
         }
         self.datagram = datagram
@@ -234,9 +246,9 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
             leaveWaiting(.control)
             guard let metadata = connection.metadata(definition: NWProtocolQUIC.definition)
                     as? NWProtocolQUIC.Metadata,
-                  metadata.streamIdentifier == 0
+                  metadata.streamIdentifier == 0 || metadata.streamIdentifier == 4
             else {
-                emit(.failed("control stream is not QUIC stream 0"))
+                emit(.failed("control stream is not an admitted client bidirectional stream"))
                 return
             }
             negotiatedALPN = metadata.negotiatedALPN
@@ -246,6 +258,7 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
                 receiveControl(connection, generation: generation)
             }
             emitReadyIfComplete()
+            openDatagramFlow(generation: generation)
         case .waiting(let error):
             enterWaiting(.control, reason: error.debugDescription)
         case .failed(let error): emit(.failed(error.debugDescription))
@@ -262,34 +275,50 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
     ) {
         switch state {
         case .ready:
-            leaveWaiting(.datagram)
             guard let metadata = connection.metadata(definition: NWProtocolQUIC.definition)
                     as? NWProtocolQUIC.Metadata
             else {
-                emit(.failed("missing QUIC DATAGRAM metadata"))
+                datagramReady = false
+                datagramReceiveStarted = false
+                updateDatagramCapacity(0)
+                connection.cancel()
                 return
             }
-            negotiatedALPN = metadata.negotiatedALPN
-            usableDatagramByteCount = metadata.usableDatagramFrameSize
             datagramReady = true
             if !datagramReceiveStarted {
                 datagramReceiveStarted = true
                 receiveDatagram(connection, generation: generation)
             }
-            emitReadyIfComplete()
-        case .waiting(let error):
-            enterWaiting(.datagram, reason: error.debugDescription)
-        case .failed(let error): emit(.failed(error.debugDescription))
-        case .cancelled: break
+            updateDatagramCapacity(metadata.usableDatagramFrameSize)
+        case .waiting:
+            datagramReady = false
+            updateDatagramCapacity(0)
+        case .failed, .cancelled:
+            datagramReady = false
+            datagramReceiveStarted = false
+            updateDatagramCapacity(0)
         case .setup, .preparing: break
-        @unknown default: emit(.failed("unknown DATAGRAM state"))
+        @unknown default:
+            datagramReady = false
+            updateDatagramCapacity(0)
         }
     }
 
     private func emitReadyIfComplete() {
-        guard controlReady, datagramReady, !readyEmitted, let negotiatedALPN else { return }
+        guard Self.canEmitReady(
+            controlReady: controlReady,
+            readyEmitted: readyEmitted,
+            hasWaitingSources: !waitingSources.isEmpty,
+            negotiatedALPN: negotiatedALPN
+        ), let negotiatedALPN else { return }
         readyEmitted = true
         emit(.ready(alpn: negotiatedALPN, usableDatagramByteCount: usableDatagramByteCount))
+    }
+
+    private func updateDatagramCapacity(_ byteCount: Int) {
+        guard byteCount != usableDatagramByteCount else { return }
+        usableDatagramByteCount = byteCount
+        if readyEmitted { emit(.datagramCapacityChanged(byteCount)) }
     }
 
     private func enterWaiting(_ source: WaitSource, reason: String) {
@@ -301,6 +330,7 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
     private func leaveWaiting(_ source: WaitSource) {
         guard waitingSources.remove(source) != nil, waitingSources.isEmpty else { return }
         emit(.recovered)
+        emitReadyIfComplete()
     }
 
     private func submitControl(
@@ -328,7 +358,10 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
         _ submission: QUICNetworkSubmission,
         completion: @escaping @Sendable (String?) -> Void
     ) {
-        guard let datagram else { completion("DATAGRAM flow unavailable"); return }
+        guard datagramReady, let datagram else {
+            completion("DATAGRAM flow unavailable")
+            return
+        }
         var content = dispatchDataRetaining(submission.header)
         content.append(dispatchDataRetaining(submission.payload))
         let current = DispatchTime.now().uptimeNanoseconds
@@ -362,8 +395,13 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
         connection.receiveMessage { [weak self] data, _, _, error in
             guard let self, self.generation == generation, !cancelled else { return }
             if let data { emit(.datagram(data)) }
-            if let error { emit(.failed(error.debugDescription)) }
-            else { receiveDatagram(connection, generation: generation) }
+            if error != nil {
+                datagramReady = false
+                datagramReceiveStarted = false
+                updateDatagramCapacity(0)
+            } else {
+                receiveDatagram(connection, generation: generation)
+            }
         }
     }
 
@@ -589,12 +627,12 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
         if let observation = migrationTracker.observe(snapshot) {
             emit(.pathChanged(observation))
         }
-        if let datagram,
+        if datagramReady,
+           let datagram,
            let metadata = datagram.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata,
            metadata.usableDatagramFrameSize != usableDatagramByteCount
         {
-            usableDatagramByteCount = metadata.usableDatagramFrameSize
-            emit(.datagramCapacityChanged(usableDatagramByteCount))
+            updateDatagramCapacity(metadata.usableDatagramFrameSize)
         }
     }
 
@@ -615,6 +653,25 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
         group = nil
         control = nil
         datagram = nil
+        datagramChildOptions = nil
+    }
+
+    static func makeDatagramChildOptions(from parentParameters: NWParameters) -> NWProtocolQUIC.Options? {
+        guard let options = parentParameters.copy().defaultProtocolStack.transportProtocol
+                as? NWProtocolQUIC.Options else {
+            return nil
+        }
+        options.isDatagram = true
+        return options
+    }
+
+    static func canEmitReady(
+        controlReady: Bool,
+        readyEmitted: Bool,
+        hasWaitingSources: Bool,
+        negotiatedALPN: String?
+    ) -> Bool {
+        controlReady && !readyEmitted && !hasWaitingSources && negotiatedALPN != nil
     }
 
     private func emit(_ event: QUICNetworkAdapterEvent) {

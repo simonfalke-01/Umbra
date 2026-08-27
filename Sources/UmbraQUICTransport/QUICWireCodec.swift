@@ -37,7 +37,9 @@ enum QUICWireCodec {
         guard type != 0,
               flags & ~UInt8(0x07) == 0,
               flags & 0x02 == 0 || flags & 0x01 != 0,
-              requestID == 0 ? (flags & 0x03 == 0 && isEventType(type)) : !isEventType(type)
+              requestID == 0
+                ? (flags & 0x03 == 0 && isEventType(type, requestID: requestID))
+                : !isEventType(type, requestID: requestID)
         else {
             throw WireError.malformed
         }
@@ -393,8 +395,8 @@ enum QUICWireCodec {
         return flags & ~allowedVideoFlags == 0
     }
 
-    static func isEventType(_ type: UInt16) -> Bool {
-        type == 0x0132 || type == 0x0133 || type == 0x0200
+    static func isEventType(_ type: UInt16, requestID: UInt64) -> Bool {
+        type == 0x0132 || type == 0x0133 || (type == 0x0200 && requestID == 0)
     }
 
     private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
@@ -448,8 +450,9 @@ final class QUICControlFrameDecoder: @unchecked Sendable {
                 .reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
             guard type != 0,
                   requestID == 0
-                    ? (header[header.startIndex + 5] & 0x03 == 0 && QUICWireCodec.isEventType(type))
-                    : !QUICWireCodec.isEventType(type),
+                    ? (header[header.startIndex + 5] & 0x03 == 0 &&
+                        QUICWireCodec.isEventType(type, requestID: requestID))
+                    : !QUICWireCodec.isEventType(type, requestID: requestID),
                   payloadLength > 0,
                   payloadLength <= QUICWireCodec.maximumControlPayloadByteCount
             else {

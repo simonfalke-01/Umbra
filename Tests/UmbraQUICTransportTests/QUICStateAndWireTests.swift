@@ -61,13 +61,21 @@ struct QUICStateAndWireTests {
     @Test("ULC3 permits request-zero events but rejects reserved and oversized frames")
     func controlHostile() throws {
         let payload = Data([0xA0])
+        for type: UInt16 in [0x0132, 0x0133] {
+            let event = try QUICWireCodec.controlHeader(
+                flags: 0,
+                type: type,
+                requestID: 0,
+                payloadByteCount: 1
+            ) + payload
+            #expect(try QUICControlFrameDecoder().append(event).first?.type == type)
+        }
         let event = try QUICWireCodec.controlHeader(
             flags: 0,
-            type: 0x0200,
+            type: 0x0132,
             requestID: 0,
             payloadByteCount: 1
         ) + payload
-        #expect(try QUICControlFrameDecoder().append(event).first?.requestID == 0)
         let response = try QUICWireCodec.controlHeader(
             flags: 0x03,
             type: 0x0004,
@@ -92,6 +100,84 @@ struct QUICStateAndWireTests {
                 requestID: 1,
                 payloadByteCount: QUICWireCodec.maximumControlPayloadByteCount + 1
             )
+        }
+    }
+
+    @Test("ULC3 disambiguates application-list and telemetry-batch type 0x0200 by request ID")
+    func dualUseApplicationListAndTelemetryType() throws {
+        let payload = Data([0xA0])
+        let applicationList = try QUICWireCodec.controlHeader(
+            flags: 0,
+            type: 0x0200,
+            requestID: 1,
+            payloadByteCount: payload.count
+        ) + payload
+        let telemetryBatch = try QUICWireCodec.controlHeader(
+            flags: 0,
+            type: 0x0200,
+            requestID: 0,
+            payloadByteCount: payload.count
+        ) + payload
+        let applicationListResponse = try QUICWireCodec.controlHeader(
+            flags: 0x01,
+            type: 0x0200,
+            requestID: 1,
+            payloadByteCount: payload.count
+        ) + payload
+
+        let applicationFrame = try #require(QUICControlFrameDecoder().append(applicationList).only)
+        #expect(applicationFrame.type == 0x0200)
+        #expect(applicationFrame.requestID == 1)
+        let applicationResponse = try #require(
+            QUICControlFrameDecoder().append(applicationListResponse).only
+        )
+        #expect(applicationResponse.flags == 0x01)
+        #expect(applicationResponse.requestID == 1)
+        let telemetryFrame = try #require(QUICControlFrameDecoder().append(telemetryBatch).only)
+        #expect(telemetryFrame.type == 0x0200)
+        #expect(telemetryFrame.requestID == 0)
+
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.controlHeader(
+                flags: 0x01,
+                type: 0x0200,
+                requestID: 0,
+                payloadByteCount: payload.count
+            )
+        }
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.controlHeader(
+                flags: 0,
+                type: 0x0004,
+                requestID: 0,
+                payloadByteCount: payload.count
+            )
+        }
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICWireCodec.controlHeader(
+                flags: 0,
+                type: 0x0132,
+                requestID: 1,
+                payloadByteCount: payload.count
+            )
+        }
+
+        var responseFlagOnTelemetry = telemetryBatch
+        responseFlagOnTelemetry[5] = 0x01
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICControlFrameDecoder().append(responseFlagOnTelemetry)
+        }
+        var requestZeroNonEvent = telemetryBatch
+        requestZeroNonEvent[6] = 0x00
+        requestZeroNonEvent[7] = 0x04
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICControlFrameDecoder().append(requestZeroNonEvent)
+        }
+        var requestIDOnSessionEvent = applicationList
+        requestIDOnSessionEvent[6] = 0x01
+        requestIDOnSessionEvent[7] = 0x32
+        #expect(throws: QUICWireCodec.WireError.malformed) {
+            try QUICControlFrameDecoder().append(requestIDOnSessionEvent)
         }
     }
 
