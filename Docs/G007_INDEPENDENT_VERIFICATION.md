@@ -5,6 +5,22 @@ Gate 6 (Ultragoal G007). It is intentionally read-only. The verifier does not
 access the Windows host, rebuild artifacts, install packages, mutate services
 or devices, or advance Gate 7.
 
+## Current verdict
+
+**NOT APPROVED.** Host execution, certificate cleanup, installed-state checks,
+and further Windows CI were explicitly stopped or deferred before the required
+evidence was returned. Therefore G007 currently has no terminal full-profile
+result, MSI/ZIP bundle, Lumen Artifact Manifest, assembly fragment, final
+shared Artifact Manifest, certificate/private-key cleanup proof, or canonical
+unchanged-state proof that can satisfy this checklist.
+
+The local checks recorded for this review prove the frozen SFM and validation
+tooling only. They do not prove the missing Windows artifacts. No pass may be
+inferred from the preserved host state, retained prerequisite count, or the
+stopped CI run. This verdict can change only after a separately authorized
+lane returns the complete read-only evidence listed below; this review does
+not authorize or begin that lane.
+
 ## Frozen identity
 
 All returned evidence must resolve to the following immutable source freeze:
