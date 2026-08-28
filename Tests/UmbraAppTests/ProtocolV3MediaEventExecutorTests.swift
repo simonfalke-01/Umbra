@@ -148,6 +148,37 @@ final class ProtocolV3MediaEventExecutorTests: XCTestCase {
         XCTAssertEqual(received.snapshot, [9])
     }
 
+    func testDefaultCapacityAdmitsFragmentedVideoBurstBeyondLegacyLimit() {
+        let executor = ProtocolV3MediaEventExecutor()
+        let burstCount = 1_024
+        let received = LockedMediaEventValues<Int>()
+        let overflows = LockedMediaEventValues<Int>()
+
+        for index in 0..<burstCount {
+            executor.submit(
+                Self.event(producer: 0, index: index),
+                terminalBarrier: false,
+                overflowHandler: { overflows.append(1) }
+            )
+        }
+        executor.installAndResume { event in
+            if let value = Self.value(from: event) {
+                received.append(value)
+            }
+        }
+
+        let drained = expectation(description: "fragment burst drained")
+        executor.submit(
+            .failed(.invalidState),
+            terminalBarrier: true,
+            completion: { drained.fulfill() }
+        )
+        wait(for: [drained], timeout: 5)
+
+        XCTAssertTrue(overflows.snapshot.isEmpty)
+        XCTAssertEqual(received.snapshot.count, burstCount)
+    }
+
     func testSubmissionRetainsEncodedPayloadStorage() {
         let executor = ProtocolV3MediaEventExecutor()
         let payload = Data(repeating: 0xA5, count: 4_096)

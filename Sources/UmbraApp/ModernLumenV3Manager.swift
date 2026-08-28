@@ -44,6 +44,11 @@ private enum ModernLumenV3ManagerError: LocalizedError {
 final class ProtocolV3MediaEventExecutor: @unchecked Sendable {
     typealias EventHandler = @Sendable (ProtocolV3ClientEvent) -> Void
 
+    /// Bounds a burst to roughly one multi-megabyte fragmented key frame while
+    /// leaving the downstream latency-mode reassembler responsible for dropping
+    /// stale frames. The former 64-event cap could not admit one 4K frame.
+    static let defaultMaximumPendingEventCount = 4_096
+
     private struct Submission {
         let event: ProtocolV3ClientEvent
         let terminalBarrier: Bool
@@ -76,7 +81,7 @@ final class ProtocolV3MediaEventExecutor: @unchecked Sendable {
     private var paused = true
     private var failedClosed = false
 
-    init(maximumPendingEventCount: Int = 64) {
+    init(maximumPendingEventCount: Int = defaultMaximumPendingEventCount) {
         precondition(maximumPendingEventCount > 0)
         self.maximumPendingEventCount = maximumPendingEventCount
     }
