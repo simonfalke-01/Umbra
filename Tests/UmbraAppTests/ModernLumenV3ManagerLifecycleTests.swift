@@ -312,7 +312,7 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
                 1: .unsigned(0),
                 2: selection[3]!,
                 3: stopFields[4]!,
-                4: .boolean(true),
+                4: .boolean(false),
             ],
             codec: fixture.codec
         )
@@ -320,7 +320,10 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
             type: 0x0133,
             requestID: 0,
             flags: 0,
-            fields: sessionEndedFields(sessionID: selection[3]!.bytesValue!),
+            fields: sessionEndedFields(
+                sessionID: selection[3]!.bytesValue!,
+                applicationRunning: true
+            ),
             codec: fixture.codec
         )
         transport.emit(.mediaSessionEnded("concurrent terminal notification"))
@@ -330,6 +333,43 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
         XCTAssertEqual(Array(stoppedEvents.suffix(2)), [.finishPresentation, .finish])
         XCTAssertEqual(output.endCount, 1)
         XCTAssertEqual(try fixture.catalog.host(hostID: fixture.hostID)?.runningApplicationID, 1)
+        await fixture.manager.stopAll()
+    }
+
+    func testSessionEndedClearsRunningApplicationWhenHostReportsStopped() async throws {
+        let fixture = try makeFixture(applications: [ModernLumenV3ApplicationRecord(
+            id: 1,
+            name: "Desktop",
+            isRunning: true,
+            artworkSHA256: nil,
+            isHidden: false,
+            isDirectLaunch: false
+        )])
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let sessionID = Data(repeating: 0x45, count: 16)
+
+        let reconnect = Task { @MainActor in
+            try await fixture.manager.reconnect(hostID: fixture.displayHostID, mode: .quality)
+        }
+        let transport = try await fixture.factory.waitForTransport()
+        try await authenticate(fixture, transport: transport, activeSessionID: sessionID)
+        _ = try await reconnect.value
+        XCTAssertEqual(try fixture.catalog.host(hostID: fixture.hostID)?.runningApplicationID, 1)
+
+        transport.receive(
+            type: 0x0133,
+            requestID: 0,
+            flags: 0,
+            fields: sessionEndedFields(sessionID: sessionID, applicationRunning: false),
+            codec: fixture.codec
+        )
+
+        await eventually {
+            guard let record = try? fixture.catalog.host(hostID: fixture.hostID) else {
+                return false
+            }
+            return record.runningApplicationID == nil
+        }
         await fixture.manager.stopAll()
     }
 
@@ -1634,9 +1674,13 @@ private func microphoneConfigurationFields(
     [1: selection[3]!, 2: selection[16]!, 3: selection[13]!, 4: .unsigned(0)]
 }
 
-private func sessionEndedFields(sessionID: Data) -> [UInt64: ProtocolV3CBORValue] {
+private func sessionEndedFields(
+    sessionID: Data,
+    applicationRunning: Bool = false
+) -> [UInt64: ProtocolV3CBORValue] {
     [
-        1: .bytes(sessionID), 2: .unsigned(1), 3: .unsigned(1), 4: .boolean(false),
+        1: .bytes(sessionID), 2: .unsigned(1), 3: .unsigned(1),
+        4: .boolean(applicationRunning),
         5: .unsigned(0), 6: .unsigned(0), 7: .unsigned(0), 8: .unsigned(0),
     ]
 }
