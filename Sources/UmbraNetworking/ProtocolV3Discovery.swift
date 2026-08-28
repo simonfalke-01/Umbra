@@ -26,6 +26,7 @@ public struct ProtocolV3DiscoveredServiceRecord: Equatable, Sendable {
         resolvedHost: String,
         resolvedPort: UInt16
     ) throws {
+        let endpointHost = Self.normalizedResolvedHost(resolvedHost)
         let normalizedType = service.type.hasSuffix(".")
             ? String(service.type.dropLast())
             : service.type
@@ -49,16 +50,16 @@ public struct ProtocolV3DiscoveredServiceRecord: Equatable, Sendable {
               capabilityText.count == 16,
               capabilityText.allSatisfy({ $0.isNumber || ("a" ... "f").contains($0) }),
               let capabilities = UInt64(capabilityText, radix: 16),
-              !resolvedHost.isEmpty,
-              resolvedHost.utf8.count <= 253,
-              resolvedHost.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7f }) else {
+              !endpointHost.isEmpty,
+              endpointHost.utf8.count <= 253,
+              endpointHost.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7f }) else {
             throw ProtocolV3DiscoveryError.invalidAdvertisement
         }
         serviceID = service.id
         displayName = service.name
         self.hostID = hostID
-        hostname = resolvedHost
-        hostnameIsIPLiteral = Self.isIPLiteral(resolvedHost)
+        hostname = endpointHost
+        hostnameIsIPLiteral = Self.isIPLiteral(endpointHost)
         port = advertisedPort
         self.capabilities = capabilities
     }
@@ -100,6 +101,15 @@ public struct ProtocolV3DiscoveredServiceRecord: Equatable, Sendable {
         if address.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 { return true }
         var ipv6 = in6_addr()
         return address.withCString { inet_pton(AF_INET6, $0, &ipv6) } == 1
+    }
+
+    private static func normalizedResolvedHost(_ hostname: String) -> String {
+        guard let zone = hostname.firstIndex(of: "%") else { return hostname }
+        let unscoped = String(hostname[..<zone])
+        var ipv4 = in_addr()
+        return unscoped.withCString { inet_pton(AF_INET, $0, &ipv4) } == 1
+            ? unscoped
+            : hostname
     }
 }
 

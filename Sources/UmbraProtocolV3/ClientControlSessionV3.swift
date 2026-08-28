@@ -163,6 +163,10 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         queue.sync { eventHandler = handler }
     }
 
+    public var canBeginStart: Bool {
+        queue.sync { state == .ready }
+    }
+
     public func start() throws {
         try queue.sync {
             guard state == .idle else { throw ProtocolV3ClientError.invalidState }

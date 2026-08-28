@@ -1000,7 +1000,11 @@ final class ModernLumenV3Manager {
             throw UmbraClientServiceError.invalidInput("The selected application is unavailable.")
         }
         let mode: QUICOptimizationMode = streamPreferences.optimizationMode == .latency ? .latency : .quality
-        let session = try await reconnect(hostID: hostID, mode: mode)
+        var session = try await reconnect(hostID: hostID, mode: mode)
+        if !session.canBeginStart {
+            finish(session: session, hostID: protocolHostID)
+            session = try await reconnect(hostID: hostID, mode: mode)
+        }
         guard let entry = sessions[protocolHostID], entry.session === session,
               entry.preparedStream == nil, entry.activeSessionID == nil else {
             throw ProtocolV3ClientError.invalidState
@@ -2187,7 +2191,7 @@ final class ModernLumenV3Manager {
                     return try result.get()
                 }
                 group.addTask {
-                    try await Task.sleep(for: .seconds(10))
+                    try await Task.sleep(for: .seconds(30))
                     throw ModernLumenV3ManagerError.startTimedOut
                 }
                 defer { group.cancelAll() }
@@ -2746,6 +2750,22 @@ final class ModernLumenV3Manager {
         }
     }
 
+    private static func isScopedLinkLocalIPv6(_ hostname: String) -> Bool {
+        var address = hostname.lowercased()
+        if address.hasPrefix("["), address.hasSuffix("]") {
+            address.removeFirst()
+            address.removeLast()
+        }
+        if let zone = address.firstIndex(of: "%") {
+            address = String(address[..<zone])
+        }
+        guard let firstHextet = address.split(separator: ":", maxSplits: 1).first,
+              let value = UInt16(firstHextet, radix: 16) else {
+            return false
+        }
+        return value & 0xffc0 == 0xfe80
+    }
+
     private func handleDiscovery(_ event: ProtocolV3DiscoveryEvent) {
         switch event {
         case let .available(discovered):
@@ -2754,6 +2774,10 @@ final class ModernLumenV3Manager {
                 // modern host, but it can never create trust or enter the legacy path.
                 guard try trustStore.trust(hostID: discovered.hostID) != nil,
                       var record = try hostCatalog.host(hostID: discovered.hostID) else {
+                    return
+                }
+                if Self.isScopedLinkLocalIPv6(discovered.hostname),
+                   !Self.isScopedLinkLocalIPv6(record.hostname) {
                     return
                 }
                 guard record.hostname != discovered.hostname
