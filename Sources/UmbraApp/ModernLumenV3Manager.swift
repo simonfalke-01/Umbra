@@ -1076,6 +1076,25 @@ final class ModernLumenV3Manager {
             startIntentID: startIntentID,
             traceID: traceID
         )
+        log?.record(
+            source: "Lumen v3",
+            level: .info,
+            message: "START offer app=\(offer.fields[2]?.unsignedValue ?? 0) "
+                + "profile=\(offer.fields[3]?.unsignedValue ?? 0) "
+                + "mode=\(offer.fields[4]?.unsignedValue ?? 0)x\(offer.fields[5]?.unsignedValue ?? 0)"
+                + "@\(offer.fields[6]?.unsignedValue ?? 0)/\(offer.fields[7]?.unsignedValue ?? 0) "
+                + "bitrate_kbps=\(offer.fields[8]?.unsignedValue ?? 0) "
+                + "codecs=\(offer.fields[9]?.arrayValue?.count ?? 0) "
+                + "audio=\(offer.fields[10]?.arrayValue?.count ?? 0) "
+                + "microphone=\(offer.fields[11]?.mapValue == nil ? 0 : 1) "
+                + "semantic_datagram=\(offer.fields[12]?.unsignedValue ?? 0) "
+                + "negotiated_payload=\(entry.inputDatagramPayloadByteCount) "
+                + "hdr=\(offer.fields[14]?.arrayValue?.count ?? 0) "
+                + "presentation=\(offer.fields[15]?.arrayValue?.count ?? 0) "
+                + "resume=\(offer.fields[16]?.booleanValue == true ? 1 : 0) "
+                + "constraints=\(offer.fields[17]?.mapValue?.count ?? 0) "
+                + "host_audio=\(offer.fields[18]?.booleanValue == true ? 1 : 0)."
+        )
         let application = StreamApplication(
             id: applicationRecord.id,
             name: applicationRecord.name,
