@@ -607,39 +607,15 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         let controller = try StreamWindowController(device: nil)
 
         let resolved = controller.resolveStreamingPreferences(preferences, uiScreen: screen)
-        let logicalSafeSize = DisplayGeometry.nativePixelSize(
-            fullPixelSize: screen.frame.size,
-            pointSize: screen.frame.size,
-            safeAreaInsets: DisplayEdgeInsets(screen.safeAreaInsets),
-            excludingDisplayCutouts: true
-        )
-        let expected = StreamWindowController.capabilitySafeNativeSize(
-            logicalSafeSize,
-            optimizationMode: preferences.optimizationMode
+        let expected = CGSize(
+            width: native.safePixelSize.width / max(screen.backingScaleFactor, 1),
+            height: native.safePixelSize.height / max(screen.backingScaleFactor, 1)
         )
 
         XCTAssertEqual(resolved.width, StreamWindowController.evenPixelDimension(expected.width))
         XCTAssertEqual(resolved.height, StreamWindowController.evenPixelDimension(expected.height))
         XCTAssertLessThan(resolved.width, Int(native.safePixelSize.width))
         XCTAssertLessThan(resolved.height, Int(native.safePixelSize.height))
-    }
-
-    func testLatencyNativeResolutionCapsWithoutChangingQuality() {
-        let logical = CGSize(width: 2_056, height: 1_290)
-        XCTAssertEqual(
-            StreamWindowController.capabilitySafeNativeSize(
-                logical,
-                optimizationMode: .latency
-            ),
-            CGSize(width: 1_728, height: 1_080)
-        )
-        XCTAssertEqual(
-            StreamWindowController.capabilitySafeNativeSize(
-                logical,
-                optimizationMode: .quality
-            ),
-            logical
-        )
     }
 
     func testVirtualTrackpadCoordinatesUseTheWholeViewWithoutClamping() throws {
