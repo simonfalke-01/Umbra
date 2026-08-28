@@ -613,11 +613,33 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             safeAreaInsets: DisplayEdgeInsets(screen.safeAreaInsets),
             excludingDisplayCutouts: true
         )
+        let expected = StreamWindowController.capabilitySafeNativeSize(
+            logicalSafeSize,
+            optimizationMode: preferences.optimizationMode
+        )
 
-        XCTAssertEqual(resolved.width, StreamWindowController.evenPixelDimension(logicalSafeSize.width))
-        XCTAssertEqual(resolved.height, StreamWindowController.evenPixelDimension(logicalSafeSize.height))
+        XCTAssertEqual(resolved.width, StreamWindowController.evenPixelDimension(expected.width))
+        XCTAssertEqual(resolved.height, StreamWindowController.evenPixelDimension(expected.height))
         XCTAssertLessThan(resolved.width, Int(native.safePixelSize.width))
         XCTAssertLessThan(resolved.height, Int(native.safePixelSize.height))
+    }
+
+    func testLatencyNativeResolutionCapsWithoutChangingQuality() {
+        let logical = CGSize(width: 2_056, height: 1_290)
+        XCTAssertEqual(
+            StreamWindowController.capabilitySafeNativeSize(
+                logical,
+                optimizationMode: .latency
+            ),
+            CGSize(width: 1_728, height: 1_080)
+        )
+        XCTAssertEqual(
+            StreamWindowController.capabilitySafeNativeSize(
+                logical,
+                optimizationMode: .quality
+            ),
+            logical
+        )
     }
 
     func testVirtualTrackpadCoordinatesUseTheWholeViewWithoutClamping() throws {

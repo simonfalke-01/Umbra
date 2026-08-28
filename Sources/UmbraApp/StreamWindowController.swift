@@ -453,10 +453,14 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             safeAreaInsets: DisplayEdgeInsets(screen.safeAreaInsets),
             excludingDisplayCutouts: preferences.displayResolutionPolicy == .nativeExcludingNotch
         )
+        let runtimeSize = Self.capabilitySafeNativeSize(
+            logicalSize,
+            optimizationMode: preferences.optimizationMode
+        )
 
         var resolved = preferences
-        resolved.width = Self.evenPixelDimension(logicalSize.width)
-        resolved.height = Self.evenPixelDimension(logicalSize.height)
+        resolved.width = Self.evenPixelDimension(runtimeSize.width)
+        resolved.height = Self.evenPixelDimension(runtimeSize.height)
         if resolved.autoAdjustBitrate {
             resolved.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: resolved.width,
@@ -471,6 +475,17 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     static func evenPixelDimension(_ value: CGFloat) -> Int {
         let clamped = max(256, Int(value.rounded()))
         return clamped.isMultiple(of: 2) ? clamped : clamped - 1
+    }
+
+    static func capabilitySafeNativeSize(
+        _ logicalSize: CGSize,
+        optimizationMode: StreamOptimizationMode
+    ) -> CGSize {
+        guard optimizationMode == .latency else { return logicalSize }
+        return CGSize(
+            width: min(logicalSize.width, 1_728),
+            height: min(logicalSize.height, 1_080)
+        )
     }
 
     func installInputSink(_ sink: (any PlatformInputPacketSink)?) {
