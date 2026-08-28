@@ -204,6 +204,52 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             framesPerSecond: 120
         )
         XCTAssertEqual(recovered.readyFrames.map(\.frameID), [5])
+        XCTAssertTrue(reassembler.requiresKeyFrame)
+        XCTAssertTrue(reassembler.confirmDecodedRecoveryKeyFrame(frameID: 5))
+        XCTAssertFalse(reassembler.requiresKeyFrame)
+    }
+
+    func testQualityRecoveryRejectsDependentsUntilRecoveryKeyFrameDecodes() throws {
+        let reassembler = ProtocolV3VideoReassembler(mode: .quality)
+        _ = reassembler.requireKeyFrame()
+
+        let recovery = try reassembler.accept(
+            fragment(
+                frameID: 10,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([1, 2]),
+                receivedAtNanoseconds: 1
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(recovery.readyFrames.map(\.frameID), [10])
+        XCTAssertTrue(reassembler.requiresKeyFrame)
+
+        let rejected = try reassembler.accept(
+            fragment(
+                frameID: 11,
+                frameSize: 2,
+                bytes: Data([3, 4]),
+                receivedAtNanoseconds: 2
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertTrue(rejected.readyFrames.isEmpty)
+        XCTAssertTrue(reassembler.pendingFrameIDs.isEmpty)
+        XCTAssertFalse(reassembler.confirmDecodedRecoveryKeyFrame(frameID: 9))
+        XCTAssertTrue(reassembler.confirmDecodedRecoveryKeyFrame(frameID: 10))
+
+        let recovered = try reassembler.accept(
+            fragment(
+                frameID: 12,
+                frameSize: 2,
+                bytes: Data([5, 6]),
+                receivedAtNanoseconds: 3
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(recovered.readyFrames.map(\.frameID), [12])
         XCTAssertFalse(reassembler.requiresKeyFrame)
     }
 
@@ -303,6 +349,8 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             framesPerSecond: 120
         )
         XCTAssertEqual(recovered.readyFrames.map(\.frameID), [4])
+        XCTAssertTrue(reassembler.requiresKeyFrame)
+        XCTAssertTrue(reassembler.confirmDecodedRecoveryKeyFrame(frameID: 4))
         XCTAssertFalse(reassembler.requiresKeyFrame)
     }
 
@@ -897,6 +945,64 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(feedback.values.last?.deadlineMissMicroseconds, 1)
     }
 
+    func testDecoderOverflowHoldsDependentsUntilRecoveryIDRDecodes() throws {
+        var preferences = StreamingPreferences.default
+        preferences.optimizationMode = .quality
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 131,
+            resume: false,
+            preferences: preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let selection = successfulStartResponse(offer)
+        let decoder = RationalRefreshVideoDecoder()
+        decoder.setDisposition(.requestKeyFrame, for: 2)
+        let feedback = ProtocolV3FeedbackRecorder()
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: decoder,
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: fullyCapableClient.supportedVideoFormatMask
+            ),
+            mode: .quality,
+            startResponseFields: selection
+        )
+        adapter.installVideoFeedbackHandler { feedback.append($0) }
+        XCTAssertEqual(try adapter.configureVideo(fields: videoConfigurationFields(selection)), 2)
+        let codec = try XCTUnwrap(selection[5]?.mapValue)
+
+        func send(frameID: UInt64, flags: UInt8 = 0) throws {
+            try adapter.handle(videoMessage(
+                frameID: frameID,
+                frameSize: 2,
+                fragmentOffset: 0,
+                fragmentIndex: 0,
+                fragmentCount: 1,
+                codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+                matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+                bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+                generation: 1,
+                flags: flags,
+                bytes: Data([UInt8(truncatingIfNeeded: frameID), 0x7f]),
+                receivedAtNanoseconds: frameID
+            ))
+        }
+
+        try send(frameID: 1, flags: 0x01)
+        decoder.emit(.decoded(frameNumber: 1))
+        try send(frameID: 2)
+        try send(frameID: 3, flags: 0x01)
+        try send(frameID: 4)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3])
+        XCTAssertEqual(feedback.values.filter { $0.action == 4 }.count, 1)
+
+        decoder.emit(.decoded(frameNumber: 3))
+        try send(frameID: 5)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 5])
+    }
+
     func testInputToDecodeProxyUsesTheFrameCausalWatermark() throws {
         let capabilities = fullyCapableClient
         let offer = try ProtocolV3StartRequestMapper.makeOffer(
@@ -1446,6 +1552,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         matrix: UInt8,
         bitDepth: UInt8,
         generation: UInt32,
+        flags: UInt8 = 0,
         bytes: Data,
         receivedAtNanoseconds: UInt64
     ) -> QUICInboundMessage {
@@ -1477,7 +1584,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             requestID: nil,
             datagramChannel: 2,
             datagramKind: 1,
-            datagramFlags: 0
+            datagramFlags: flags
         )
     }
 
@@ -1813,10 +1920,20 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     private var formats: [UmbraStreaming.VideoStreamFormat] = []
     private var storedHDRMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)?
     private var decodeOutcomeHandler: (@Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void)?
+    private var storedSubmittedFrameNumbers: [Int] = []
+    private var dispositions: [Int: UmbraStreaming.VideoFrameDisposition] = [:]
 
     var configuredFormats: [UmbraStreaming.VideoStreamFormat] { lock.withLock { formats } }
     var hdrMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)? {
         lock.withLock { storedHDRMode }
+    }
+    var submittedFrameNumbers: [Int] { lock.withLock { storedSubmittedFrameNumbers } }
+
+    func setDisposition(
+        _ disposition: UmbraStreaming.VideoFrameDisposition,
+        for frameNumber: Int
+    ) {
+        lock.withLock { dispositions[frameNumber] = disposition }
     }
 
     func configure(format: UmbraStreaming.VideoStreamFormat) -> Bool {
@@ -1829,7 +1946,12 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     func cleanUp() {}
     func submit(
         frame: UmbraStreaming.CompressedVideoFrame
-    ) -> UmbraStreaming.VideoFrameDisposition { .accepted }
+    ) -> UmbraStreaming.VideoFrameDisposition {
+        lock.withLock {
+            storedSubmittedFrameNumbers.append(frame.frameNumber)
+            return dispositions[frame.frameNumber] ?? .accepted
+        }
+    }
 
     func prepareCodecInitialization(
         _ data: Data,
