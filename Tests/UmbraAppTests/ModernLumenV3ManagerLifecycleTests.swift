@@ -92,6 +92,64 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
         await fixture.manager.stopAll()
     }
 
+    func testApplicationListRestartsOnceWhenHostSnapshotChangesDuringPagination() async throws {
+        let fixture = try makeFixture(applications: [])
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let refresh = Task { @MainActor in
+            try await fixture.manager.refreshApplications(hostID: fixture.displayHostID, mode: .quality)
+        }
+        let transport = try await fixture.factory.waitForTransport()
+        try await authenticate(fixture, transport: transport)
+
+        let first = try await transport.controlRequest(type: 0x0200)
+        transport.receive(
+            type: 0x0201,
+            requestID: first.requestID,
+            flags: 1,
+            fields: applicationPageFields(
+                revision: 9,
+                applications: (1...128).map {
+                    applicationEntry(id: UInt64($0), name: "Application \($0)", state: 0)
+                },
+                nextCursor: 128
+            ),
+            codec: fixture.codec
+        )
+        let stalePage = try await transport.controlRequest(type: 0x0200, ordinal: 1)
+        transport.receive(
+            type: 0x0201,
+            requestID: stalePage.requestID,
+            flags: 1,
+            fields: applicationPageFields(
+                revision: 10,
+                applications: [],
+                nextCursor: nil,
+                status: 8
+            ),
+            codec: fixture.codec
+        )
+
+        let restarted = try await transport.controlRequest(type: 0x0200, ordinal: 2)
+        let restartedFields = try decodeFields(restarted.request.payload, codec: fixture.codec)
+        XCTAssertEqual(restartedFields[1]?.unsignedValue, 0)
+        transport.receive(
+            type: 0x0201,
+            requestID: restarted.requestID,
+            flags: 1,
+            fields: applicationPageFields(
+                revision: 10,
+                applications: [applicationEntry(id: 200, name: "Fresh Snapshot", state: 0)],
+                nextCursor: nil
+            ),
+            codec: fixture.codec
+        )
+
+        let applications = try await refresh.value
+        XCTAssertEqual(applications.map(\.name), ["Fresh Snapshot"])
+        XCTAssertEqual(try fixture.catalog.host(hostID: fixture.hostID)?.applicationRevision, 10)
+        await fixture.manager.stopAll()
+    }
+
     func testNotModifiedApplicationListPreservesOneValidatedRunningApplication() async throws {
         let cached = [ModernLumenV3ApplicationRecord(
             id: 1,
@@ -598,17 +656,19 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
                 activationUptime: 1
             )
         }
-        let transport = try await fixture.factory.waitForTransport()
-        try await authenticate(fixture, transport: transport)
-        let start = try await transport.controlRequest(type: 0x0100)
-        let offer = try decodeFields(start.request.payload, codec: fixture.codec)
-        transport.receive(
-            type: 0x0101,
-            requestID: start.requestID,
-            flags: 1,
-            fields: failedStartResponse(status: 8, intent: offer[1]!),
-            codec: fixture.codec
-        )
+        for attempt in 0..<3 {
+            let transport = try await fixture.factory.waitForTransport(ordinal: attempt)
+            try await authenticate(fixture, transport: transport)
+            let start = try await transport.controlRequest(type: 0x0100)
+            let offer = try decodeFields(start.request.payload, codec: fixture.codec)
+            transport.receive(
+                type: 0x0101,
+                requestID: start.requestID,
+                flags: 1,
+                fields: failedStartResponse(status: 8, intent: offer[1]!),
+                codec: fixture.codec
+            )
+        }
 
         do {
             try await launch.value
@@ -712,6 +772,35 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
         XCTAssertTrue(transport.activeSessionMutations.isEmpty)
         let values = await lifecycle.snapshot()
         XCTAssertTrue(values.isEmpty)
+        await fixture.manager.stopAll()
+    }
+
+    func testSubPhaseOneDatagramCapacityRejectsWithoutSTART() async throws {
+        let fixture = try makeFixture(
+            applications: [ModernLumenV3ApplicationRecord(
+                id: 1, name: "Desktop", isRunning: false, artworkSHA256: nil,
+                isHidden: false, isDirectLaunch: false
+            )],
+            initialDatagramPayloadByteCount:
+                QUICTransportProfile.semanticDatagramPayloadByteCount - 1
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let launch = Task { @MainActor in
+            try await fixture.manager.launchApplication(
+                id: ApplicationID(1), hostID: fixture.displayHostID, resume: false,
+                preferences: .default, activationUptime: 1
+            )
+        }
+        let transport = try await fixture.factory.waitForTransport()
+        try await authenticate(fixture, transport: transport)
+        do {
+            try await launch.value
+            XCTFail("Expected sub-phase-one DATAGRAM capacity to reject streaming.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("complete 1108-byte phase-one payload"))
+        }
+        XCTAssertEqual(transport.controlRequestCount(type: 0x0100), 0)
+        XCTAssertTrue(transport.activeSessionMutations.isEmpty)
         await fixture.manager.stopAll()
     }
 
@@ -1376,10 +1465,11 @@ private func applicationPageFields(
     revision: UInt64,
     applications: [ProtocolV3CBORValue],
     nextCursor: UInt64?,
-    notModified: Bool = false
+    notModified: Bool = false,
+    status: UInt64 = 0
 ) -> [UInt64: ProtocolV3CBORValue] {
     [
-        1: .unsigned(0),
+        1: .unsigned(status),
         2: .unsigned(revision),
         3: .array(applications),
         4: nextCursor.map(ProtocolV3CBORValue.unsigned) ?? .null,

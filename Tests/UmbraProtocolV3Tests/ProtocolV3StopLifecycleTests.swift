@@ -7,6 +7,8 @@ import UmbraQUICTransport
 @Test func serverCapabilityAdmissionPreservesOldAndCompactInputHosts() {
     #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x17f) == 0x17f)
     #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x37f) == 0x37f)
+    #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0) == nil)
+    #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x200) == nil)
     #expect(ProtocolV3ClientControlSession.validatedServerCapabilities(0x400) == nil)
 }
 
@@ -139,6 +141,24 @@ import UmbraQUICTransport
     )
     try await stopLifecycleWait { transport.currentActiveSessionID == firstSessionID }
 
+    transport.receive(
+        type: 0x0200,
+        requestID: 0,
+        flags: 0,
+        fields: [
+            1: .unsigned(2), 2: .bytes(firstSessionID),
+            3: .bytes(Data(repeating: 0x6f, count: 16)),
+            4: .unsigned(1), 5: .unsigned(1), 6: .negative(0),
+            7: .unsigned(1),
+            8: .array([.map([
+                1: .unsigned(1), 2: .unsigned(1), 3: .unsigned(1),
+                4: .negative(0), 5: .unsigned(0),
+            ])]),
+        ],
+        codec: codec
+    )
+    try await stopLifecycleWait { recorder.telemetryBatchCount == 1 }
+
     let firstStopIntent = Data(repeating: 0x63, count: 16)
     let firstStopID = try session.stop(fields: stopLifecycleStopFields(
         sessionID: firstSessionID,
@@ -158,6 +178,14 @@ import UmbraQUICTransport
         try session.beginStart(fields: stopLifecycleStartFields(intent: Data(repeating: 0x70, count: 16)))
     }
 
+    transport.receive(
+        type: 0x0132,
+        requestID: 0,
+        flags: 0,
+        fields: [1: .bytes(firstSessionID), 2: .unsigned(1)],
+        codec: codec
+    )
+    try await stopLifecycleWait { recorder.stoppingSessionIDs == [firstSessionID] }
     transport.receive(
         type: 0x0133,
         requestID: 0,
@@ -204,8 +232,37 @@ import UmbraQUICTransport
     try await stopLifecycleWait {
         recorder.endedSessionIDs == [firstSessionID, secondSessionID]
     }
+
+    let cancelledIntent = Data(repeating: 0x75, count: 16)
+    let cancelledStartID = try session.beginStart(
+        fields: stopLifecycleStartFields(intent: cancelledIntent)
+    )
+    try session.cancelStart(requestID: cancelledStartID)
+    transport.receive(
+        type: 0x0101,
+        requestID: cancelledStartID,
+        flags: 1,
+        fields: stopLifecycleFailedStartResponse(intent: cancelledIntent, status: 8),
+        codec: codec
+    )
+    try await stopLifecycleWait { recorder.lateRejectedStartIDs == [cancelledStartID] }
+    #expect(session.canBeginStart)
     #expect(transport.cancelCount == 0)
     #expect(recorder.failureCount == 0)
+
+    let pingID = try session.sendControlRequest(
+        type: 0x0005,
+        fields: [1: .unsigned(1), 2: .unsigned(1)]
+    )
+    transport.receive(
+        type: 0x0201,
+        requestID: pingID,
+        flags: 1,
+        fields: [:],
+        codec: codec
+    )
+    try await stopLifecycleWait { recorder.failureCount == 1 }
+    #expect(transport.cancelCount == 1)
 }
 
 private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Sendable {
@@ -301,6 +358,36 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
         }
     }
 
+    var stoppingSessionIDs: [Data] {
+        lock.withLock {
+            events.compactMap {
+                guard case let .controlMessage(type, requestID, fields) = $0,
+                      type == 0x0132, requestID == 0 else { return nil }
+                return fields[1]?.bytesValue
+            }
+        }
+    }
+
+    var telemetryBatchCount: Int {
+        lock.withLock {
+            events.count {
+                guard case let .controlMessage(type, requestID, _) = $0 else { return false }
+                return type == 0x0200 && requestID == 0
+            }
+        }
+    }
+
+    var lateRejectedStartIDs: [UInt64] {
+        lock.withLock {
+            events.compactMap {
+                guard case let .controlMessage(type, requestID, fields) = $0,
+                      type == 0x0101,
+                      fields[1]?.unsignedValue != 0 else { return nil }
+                return requestID
+            }
+        }
+    }
+
     var failureCount: Int {
         lock.withLock { events.count { if case .failed = $0 { true } else { false } } }
     }
@@ -332,6 +419,19 @@ private func stopLifecycleStartResponse(
     fields[2] = .bytes(intent)
     fields[3] = .bytes(sessionID)
     fields[11] = .unsigned(UInt64(QUICTransportProfile.semanticDatagramByteCount))
+    return fields
+}
+
+private func stopLifecycleFailedStartResponse(
+    intent: Data,
+    status: UInt8
+) -> [UInt64: ProtocolV3CBORValue] {
+    var fields = Dictionary(uniqueKeysWithValues: (1...23).map {
+        (UInt64($0), ProtocolV3CBORValue.null)
+    })
+    fields[1] = .unsigned(UInt64(status))
+    fields[2] = .bytes(intent)
+    fields[19] = .array([])
     return fields
 }
 

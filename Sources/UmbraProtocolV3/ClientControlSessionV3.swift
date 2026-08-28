@@ -610,10 +610,16 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
     ) throws {
         guard type == 0x0101, flags == 1, cancelledStartRequests.remove(requestID) != nil,
               pendingRequests.removeValue(forKey: requestID) == 0x0100,
+              Set(fields.keys) == Set(1...23),
               let status = fields[1]?.unsignedValue, status <= UInt64(UInt8.max) else {
             throw ProtocolV3ClientError.invalidMessage("late START response")
         }
         guard status == 0 else {
+            guard fields[19]?.arrayValue?.isEmpty == true,
+                  (3...18).allSatisfy({ fields[UInt64($0)] == .null }),
+                  (20...23).allSatisfy({ fields[UInt64($0)] == .null }) else {
+                throw ProtocolV3ClientError.invalidMessage("late START failure")
+            }
             eventHandler?(.controlMessage(type: type, requestID: requestID, fields: fields))
             return
         }
@@ -635,7 +641,23 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         fields: [UInt64: ProtocolV3CBORValue]
     ) throws {
         if requestID == 0 {
-            guard flags == 0 else { throw ProtocolV3ClientError.invalidMessage("v3 event flags") }
+            guard flags == 0, state == .streaming || state == .stopping else {
+                throw ProtocolV3ClientError.invalidMessage("v3 event authority")
+            }
+            if type == 0x0132 {
+                guard Set(fields.keys) == Set(1...2),
+                      fields[1]?.bytesValue == activeSessionID,
+                      let reason = fields[2]?.unsignedValue,
+                      (1...7).contains(reason) else {
+                    throw ProtocolV3ClientError.invalidMessage("SESSION_STOPPING")
+                }
+            } else if type == 0x0200 {
+                guard Self.isValidTelemetryBatch(fields, activeSessionID: activeSessionID) else {
+                    throw ProtocolV3ClientError.invalidMessage("TELEMETRY_BATCH")
+                }
+            } else if type != 0x0133 {
+                throw ProtocolV3ClientError.invalidMessage("unsupported v3 event")
+            }
         } else if requestID.isMultiple(of: 2) {
             guard state == .streaming, flags == 0, [0x0140, 0x0142, 0x0144].contains(type),
                   type != 0x0144 || permissions & (1 << 3) != 0 else {
@@ -662,6 +684,9 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
             guard flags & 1 != 0, let requestType = pendingRequests.removeValue(forKey: requestID) else {
                 throw ProtocolV3ClientError.invalidMessage("v3 response authority")
             }
+            guard requestType < UInt16.max, type == requestType + 1 else {
+                throw ProtocolV3ClientError.invalidMessage("v3 response type")
+            }
             if requestType == 0x0130, type == 0x0131, fields[1]?.unsignedValue == 0 {
                 try transport.setActiveSessionID(nil)
                 hostRequests.removeAll(keepingCapacity: false)
@@ -686,7 +711,15 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         if type == 0x0133 {
             guard requestID == 0, Set(fields.keys) == Set(1...8),
                   let endedSessionID = fields[1]?.bytesValue,
-                  endedSessionID == activeSessionID else {
+                  endedSessionID == activeSessionID,
+                  let reason = fields[2]?.unsignedValue,
+                  (1...7).contains(reason),
+                  fields[3]?.unsignedValue != nil,
+                  fields[4]?.booleanValue != nil,
+                  fields[5]?.unsignedValue != nil,
+                  fields[6]?.unsignedValue != nil,
+                  fields[7]?.unsignedValue != nil,
+                  fields[8]?.unsignedValue != nil else {
                 throw ProtocolV3ClientError.invalidMessage("SESSION_ENDED")
             }
             try transport.setActiveSessionID(nil)
@@ -782,7 +815,50 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
     }
 
     static func validatedServerCapabilities(_ capabilities: UInt64) -> UInt64? {
-        capabilities & ~UInt64(0x37f) == 0 ? capabilities : nil
+        capabilities & UInt64(0x17f) == UInt64(0x17f)
+            && capabilities & ~UInt64(0x37f) == 0
+            ? capabilities
+            : nil
+    }
+
+    private static func isValidTelemetryBatch(
+        _ fields: [UInt64: ProtocolV3CBORValue],
+        activeSessionID: Data?
+    ) -> Bool {
+        guard Set(fields.keys) == Set(1...8),
+              fields[1]?.unsignedValue == 2,
+              fields[2]?.bytesValue == activeSessionID,
+              let traceID = fields[3]?.bytesValue,
+              traceID.count == 16,
+              traceID.contains(where: { $0 != 0 }),
+              let source = fields[4]?.unsignedValue,
+              source == 1 || source == 2,
+              fields[5]?.unsignedValue == 1,
+              isSignedInteger(fields[6]),
+              fields[7]?.unsignedValue != nil,
+              let samples = fields[8]?.arrayValue,
+              samples.count <= 256 else {
+            return false
+        }
+        return samples.allSatisfy { value in
+            guard let sample = value.mapValue,
+                  Set(sample.keys) == Set(1...5),
+                  sample[1]?.unsignedValue != nil,
+                  sample[2]?.unsignedValue != nil,
+                  sample[3]?.unsignedValue != nil,
+                  isSignedInteger(sample[4]),
+                  sample[5]?.unsignedValue != nil else {
+                return false
+            }
+            return true
+        }
+    }
+
+    private static func isSignedInteger(_ value: ProtocolV3CBORValue?) -> Bool {
+        switch value {
+        case .unsigned, .negative: true
+        default: false
+        }
     }
 
     private func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {

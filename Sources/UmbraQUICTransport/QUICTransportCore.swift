@@ -263,10 +263,9 @@ final class QUICTransportCore: QUICTransportProtocol, @unchecked Sendable {
                 return
             }
             if networkReady { return }
-            let payloadCap = usableDatagramByteCount > QUICWireCodec.datagramHeaderByteCount
-                ? min(QUICTransportProfile.semanticDatagramByteCount, usableDatagramByteCount) -
-                    QUICWireCodec.datagramHeaderByteCount
-                : nil
+            let payloadCap = Self.admittedDatagramPayloadByteCount(
+                wireByteCount: usableDatagramByteCount
+            )
             currentDatagramPayloadCap = payloadCap
             scheduler.updateUsableDatagramPayloadSize(
                 payloadCap ?? 0
@@ -289,18 +288,21 @@ final class QUICTransportCore: QUICTransportProtocol, @unchecked Sendable {
                 recordPremature(terminal: false)
                 return
             }
-            guard wireByteCount > QUICWireCodec.datagramHeaderByteCount else {
+            guard let payloadCount = Self.admittedDatagramPayloadByteCount(
+                wireByteCount: wireByteCount
+            ) else {
                 currentDatagramPayloadCap = nil
                 scheduler.updateUsableDatagramPayloadSize(0)
-                endMediaSession("QUIC path cannot carry ULM3")
+                endMediaSession("QUIC path cannot carry the complete phase-one ULM3 record")
                 emit(.datagramCapacityChanged(wireByteCount: wireByteCount, payloadByteCount: 0))
                 return
             }
-            let boundedWireCount = min(QUICTransportProfile.semanticDatagramByteCount, wireByteCount)
-            let payloadCount = boundedWireCount - QUICWireCodec.datagramHeaderByteCount
             currentDatagramPayloadCap = payloadCount
             scheduler.updateUsableDatagramPayloadSize(payloadCount)
-            emit(.datagramCapacityChanged(wireByteCount: boundedWireCount, payloadByteCount: payloadCount))
+            emit(.datagramCapacityChanged(
+                wireByteCount: QUICTransportProfile.semanticDatagramByteCount,
+                payloadByteCount: payloadCount
+            ))
             pump()
         case .waiting(let reason):
             if case .waiting = stateMachine.state { return }
@@ -743,6 +745,11 @@ final class QUICTransportCore: QUICTransportProtocol, @unchecked Sendable {
         let discarded = scheduler.discardQueued(lanes: datagramLanes)
         discarded.forEach { emit(.sendDisposition($0)) }
         emit(.mediaSessionEnded(reason))
+    }
+
+    static func admittedDatagramPayloadByteCount(wireByteCount: Int) -> Int? {
+        guard wireByteCount >= QUICTransportProfile.semanticDatagramByteCount else { return nil }
+        return QUICTransportProfile.semanticDatagramPayloadByteCount
     }
 
     private func emit(_ event: QUICTransportEvent) {
