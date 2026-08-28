@@ -976,23 +976,42 @@ final class ModernLumenV3Manager {
         preferences: StreamingPreferences,
         activationUptime: TimeInterval
     ) async throws {
-        do {
-            try await launchApplicationAttempt(
-                id: id,
-                hostID: hostID,
-                resume: resume,
-                preferences: preferences,
-                activationUptime: activationUptime
-            )
-        } catch ProtocolV3ClientError.invalidState {
-            try await launchApplicationAttempt(
-                id: id,
-                hostID: hostID,
-                resume: resume,
-                preferences: preferences,
-                activationUptime: activationUptime
-            )
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        let backoffMilliseconds = [500, 1_500]
+        for attempt in 0...backoffMilliseconds.count {
+            do {
+                try await launchApplicationAttempt(
+                    id: id,
+                    hostID: hostID,
+                    resume: resume,
+                    preferences: preferences,
+                    activationUptime: activationUptime
+                )
+                return
+            } catch {
+                guard Self.isTransientStartConflict(error), attempt < backoffMilliseconds.count else {
+                    throw error
+                }
+                let delayMilliseconds = backoffMilliseconds[attempt]
+                let backoff = Duration.milliseconds(delayMilliseconds)
+                guard ContinuousClock.now.advanced(by: backoff) <= deadline else {
+                    throw error
+                }
+                log?.record(
+                    source: "Lumen v3",
+                    level: .warning,
+                    message: "START hit a transient lifecycle conflict; retrying in "
+                        + "\(delayMilliseconds) ms "
+                        + "(attempt \(attempt + 2) of \(backoffMilliseconds.count + 1))."
+                )
+                try await Task.sleep(for: backoff)
+            }
         }
+    }
+
+    private static func isTransientStartConflict(_ error: Error) -> Bool {
+        guard let error = error as? ProtocolV3ClientError else { return false }
+        return error == .invalidState || error == .startRejected(8)
     }
 
     private func launchApplicationAttempt(
@@ -1213,7 +1232,7 @@ final class ModernLumenV3Manager {
                 publishEnded: false,
                 sendMicrophoneEnd: false
             )
-            if error as? ProtocolV3ClientError == .invalidState {
+            if Self.isTransientStartConflict(error) {
                 await retireForFreshStart(session: session, hostID: protocolHostID)
             }
             throw error
