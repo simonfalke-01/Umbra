@@ -775,6 +775,57 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
         await fixture.manager.stopAll()
     }
 
+    func testLaunchWaitsForSlightlyLateDatagramCapacityBeforeSTART() async throws {
+        let lifecycle = RecordingManagerLifecycle()
+        let fixture = try makeFixture(
+            applications: [ModernLumenV3ApplicationRecord(
+                id: 1, name: "Desktop", isRunning: false, artworkSHA256: nil,
+                isHidden: false, isDirectLaunch: false
+            )],
+            lifecycle: lifecycle,
+            initialDatagramPayloadByteCount: nil
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let launch = Task { @MainActor in
+            try await fixture.manager.launchApplication(
+                id: ApplicationID(1), hostID: fixture.displayHostID, resume: false,
+                preferences: .default, activationUptime: 1
+            )
+        }
+        let transport = try await fixture.factory.waitForTransport()
+        try await authenticate(fixture, transport: transport)
+
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(transport.controlRequestCount(type: 0x0100), 0)
+        let preCapacityEvents = await lifecycle.snapshot()
+        XCTAssertTrue(preCapacityEvents.isEmpty)
+
+        transport.emit(.datagramCapacityChanged(
+            wireByteCount: QUICTransportProfile.semanticDatagramByteCount,
+            payloadByteCount: QUICTransportProfile.semanticDatagramPayloadByteCount
+        ))
+        let start = try await transport.controlRequest(type: 0x0100)
+        let preparedEvents = await lifecycle.snapshot()
+        XCTAssertEqual(preparedEvents, [.prepare])
+        let offer = try decodeFields(start.request.payload, codec: fixture.codec)
+        transport.receive(
+            type: 0x0101,
+            requestID: start.requestID,
+            flags: 1,
+            fields: failedStartResponse(status: 10, intent: offer[1]!),
+            codec: fixture.codec
+        )
+        do {
+            try await launch.value
+            XCTFail("Expected the injected START rejection.")
+        } catch {
+            XCTAssertEqual(error as? ProtocolV3ClientError, .startRejected(10))
+        }
+        let completedEvents = await lifecycle.snapshot()
+        XCTAssertEqual(Array(completedEvents.suffix(2)), [.finishPresentation, .finish])
+        await fixture.manager.stopAll()
+    }
+
     func testSubPhaseOneDatagramCapacityRejectsWithoutSTART() async throws {
         let fixture = try makeFixture(
             applications: [ModernLumenV3ApplicationRecord(

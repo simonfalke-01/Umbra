@@ -1067,7 +1067,7 @@ final class ModernLumenV3Manager {
         entry.launchAttemptActive = true
         defer { entry.launchAttemptActive = false }
         do {
-            try requireStreamingDatagramCapacity(
+            try await awaitInitialStreamingDatagramCapacity(
                 entry: entry,
                 hostID: protocolHostID,
                 session: session
@@ -3048,6 +3048,31 @@ final class ModernLumenV3Manager {
                     + "Pairing and application browsing remain available; no stream was started."
             )
         }
+    }
+
+    /// Network.framework makes the admitted control stream ready before its
+    /// DATAGRAM child flow finishes opening. Give that initial zero-capacity
+    /// state a short grace period, while continuing to reject a negotiated
+    /// nonzero-but-insufficient capacity and any later capacity loss immediately.
+    private func awaitInitialStreamingDatagramCapacity(
+        entry: RetainedSession,
+        hostID: Data,
+        session: ProtocolV3ClientControlSession
+    ) async throws {
+        let requiredPayloadByteCount = QUICTransportProfile.semanticDatagramPayloadByteCount
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
+        while true {
+            guard sessions[hostID] === entry,
+                  entry.session === session,
+                  !entry.isRecovering else {
+                throw ProtocolV3ClientError.invalidState
+            }
+            let availablePayloadByteCount = entry.inputDatagramPayloadByteCount
+            if availablePayloadByteCount >= requiredPayloadByteCount { return }
+            if availablePayloadByteCount > 0 || ContinuousClock.now >= deadline { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try requireStreamingDatagramCapacity(entry: entry, hostID: hostID, session: session)
     }
 
     private func requireProtocolHostID(_ hostID: HostID) throws -> Data {
