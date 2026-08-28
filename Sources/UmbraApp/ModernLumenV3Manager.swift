@@ -19,7 +19,7 @@ private enum ModernLumenV3ManagerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .startTimedOut:
-            "Secure stream START timed out after 10 seconds and was cancelled."
+            "Secure stream START timed out after 30 seconds and was cancelled."
         case let .configurationTimedOut(types):
             "Secure stream configuration timed out before Lumen acknowledged \(Self.configurationNames(types))."
         case let .lateStartCompensationFailed(message):
@@ -1002,7 +1002,7 @@ final class ModernLumenV3Manager {
         let mode: QUICOptimizationMode = streamPreferences.optimizationMode == .latency ? .latency : .quality
         var session = try await reconnect(hostID: hostID, mode: mode)
         if !session.canBeginStart {
-            finish(session: session, hostID: protocolHostID)
+            await retireForFreshStart(session: session, hostID: protocolHostID)
             session = try await reconnect(hostID: hostID, mode: mode)
         }
         guard let entry = sessions[protocolHostID], entry.session === session,
@@ -1611,6 +1611,17 @@ final class ModernLumenV3Manager {
         entry.managerEventTask?.cancel()
         entry.terminalContinuation.yield(())
         entry.terminalContinuation.finish()
+    }
+
+    private func retireForFreshStart(
+        session: ProtocolV3ClientControlSession,
+        hostID: Data
+    ) async {
+        guard let entry = sessions[hostID], entry.session === session else { return }
+        let terminalEvents = entry.terminalEvents
+        session.cancel()
+        await Self.waitForTerminalEvent(terminalEvents)
+        finish(session: session, hostID: hostID)
     }
 
     private func recoverAttachedSession(
@@ -2336,7 +2347,7 @@ final class ModernLumenV3Manager {
             log?.record(
                 source: "Lumen v3",
                 level: .warning,
-                message: "A START accepted after its 10-second client deadline was immediately stopped."
+                message: "A START accepted after its 30-second client deadline was immediately stopped."
             )
         } catch {
             entry.cancelledStartOffers[requestID] = nil
