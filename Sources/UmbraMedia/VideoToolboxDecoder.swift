@@ -1343,6 +1343,26 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
     }
 }
 
+private func copyParameterSets(
+    from data: Data,
+    ranges: [Range<Int>?]
+) throws -> [Data] {
+    try data.withUnsafeBytes { bytes in
+        try ranges.compactMap { range in
+            guard let range else { return nil }
+            guard range.lowerBound >= 0,
+                  range.upperBound <= bytes.count,
+                  let baseAddress = bytes.baseAddress else {
+                throw VideoDecoderError.invalidAccessUnit
+            }
+            return Data(
+                bytes: baseAddress.advanced(by: range.lowerBound),
+                count: range.count
+            )
+        }
+    }
+}
+
 struct LengthPrefixedAccessUnit {
     private struct ParameterSetRanges {
         var first: Range<Int>?
@@ -1369,11 +1389,11 @@ struct LengthPrefixedAccessUnit {
             }
         }
 
-        func copiedData(from data: Data, codec: VideoCodec) -> [Data] {
+        func copiedData(from data: Data, codec: VideoCodec) throws -> [Data] {
             let ranges: [Range<Int>?] = codec == .h264
                 ? [first, second]
                 : codec == .hevc ? [first, second, third] : []
-            return ranges.compactMap { $0.map { Data(data[$0]) } }
+            return try copyParameterSets(from: data, ranges: ranges)
         }
     }
 
@@ -1411,7 +1431,7 @@ struct LengthPrefixedAccessUnit {
             throw VideoDecoderError.invalidAccessUnit
         }
         unitCount = count
-        parameterSets = ranges.copiedData(from: data, codec: codec)
+        parameterSets = try ranges.copiedData(from: data, codec: codec)
         payload = try EncodedVideoPayload(retaining: data)
     }
 }
@@ -1442,21 +1462,11 @@ struct AnnexBAccessUnit {
             }
         }
 
-        func copiedData(from data: Data, codec: VideoCodec) -> [Data] {
-            var result: [Data] = []
-            result.reserveCapacity(codec == .h264 ? 2 : codec == .hevc ? 3 : 0)
-            switch codec {
-            case .h264:
-                if let first { result.append(Data(data[first])) }
-                if let second { result.append(Data(data[second])) }
-            case .hevc:
-                if let first { result.append(Data(data[first])) }
-                if let second { result.append(Data(data[second])) }
-                if let third { result.append(Data(data[third])) }
-            case .av1:
-                break
-            }
-            return result
+        func copiedData(from data: Data, codec: VideoCodec) throws -> [Data] {
+            let ranges: [Range<Int>?] = codec == .h264
+                ? [first, second]
+                : codec == .hevc ? [first, second, third] : []
+            return try copyParameterSets(from: data, ranges: ranges)
         }
     }
 
@@ -1485,7 +1495,7 @@ struct AnnexBAccessUnit {
             try Self.scan(bytes, codec: codec)
         }
         unitCount = scan.unitCount
-        parameterSets = scan.parameterSetRanges.copiedData(from: data, codec: codec)
+        parameterSets = try scan.parameterSetRanges.copiedData(from: data, codec: codec)
 
         let payload = try EncodedVideoPayload(
             allocating: scan.payloadByteCount,

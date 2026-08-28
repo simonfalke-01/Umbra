@@ -402,6 +402,43 @@ final class MediaFormatTests: XCTestCase {
         ]))
     }
 
+    func testParameterSetExtractionUsesSliceRelativeByteOffsets() throws {
+        let annexBBytes = Data([
+            0, 0, 1, 0x40, 0x01, 0xAA,
+            0, 0, 1, 0x42, 0x01, 0xBB,
+            0, 0, 1, 0x44, 0x01, 0xCC,
+            0, 0, 1, 0x26, 0x01, 0xDD,
+        ])
+        let annexBStorage = Data([0xFE, 0xED]) + annexBBytes + Data([0xEF])
+        let annexBSlice = annexBStorage.dropFirst(2).dropLast()
+        XCTAssertNotEqual(annexBSlice.startIndex, 0)
+
+        let annexB = try AnnexBAccessUnit(data: annexBSlice, codec: .hevc)
+        XCTAssertEqual(annexB.parameterSets, [
+            Data([0x40, 0x01, 0xAA]),
+            Data([0x42, 0x01, 0xBB]),
+            Data([0x44, 0x01, 0xCC]),
+        ])
+
+        let lengthPrefixedBytes = Data([
+            0, 0, 0, 3, 0x67, 0x64, 0x1F,
+            0, 0, 0, 2, 0x68, 0xEE,
+            0, 0, 0, 2, 0x65, 0xAA,
+        ])
+        let lengthPrefixedStorage = Data([0xFA]) + lengthPrefixedBytes + Data([0xFB])
+        let lengthPrefixedSlice = lengthPrefixedStorage.dropFirst().dropLast()
+        XCTAssertNotEqual(lengthPrefixedSlice.startIndex, 0)
+
+        let lengthPrefixed = try LengthPrefixedAccessUnit(
+            data: lengthPrefixedSlice,
+            codec: .h264
+        )
+        XCTAssertEqual(lengthPrefixed.parameterSets, [
+            Data([0x67, 0x64, 0x1F]),
+            Data([0x68, 0xEE]),
+        ])
+    }
+
     func testAV1LowOverheadOBUBytesRemainByteIdenticalInCoreMediaStorage() throws {
         let accessUnit = Data([
             0x12, 0x00,
