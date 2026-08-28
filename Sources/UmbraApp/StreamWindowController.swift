@@ -442,30 +442,21 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         uiScreen: NSScreen? = nil
     ) -> StreamingPreferences {
         guard preferences.displayResolutionPolicy != .configured,
-              let screen = resolvedScreen(for: preferences, currentScreen: nil, uiScreen: uiScreen),
-              let displayID = AppKitDisplaySelection.displayID(for: screen)
+              let screen = resolvedScreen(for: preferences, currentScreen: nil, uiScreen: uiScreen)
         else {
             return preferences
         }
 
-        let fallbackPixelSize = DisplayGeometry.nativePixelSize(
-            fullPixelSize: CGSize(
-                width: CGDisplayPixelsWide(displayID),
-                height: CGDisplayPixelsHigh(displayID)
-            ),
+        let logicalSize = DisplayGeometry.nativePixelSize(
+            fullPixelSize: screen.frame.size,
             pointSize: screen.frame.size,
             safeAreaInsets: DisplayEdgeInsets(screen.safeAreaInsets),
             excludingDisplayCutouts: preferences.displayResolutionPolicy == .nativeExcludingNotch
         )
-        let pixelSize = StreamDisplayGeometryPolicy.resolvedPixelSize(
-            policy: preferences.displayResolutionPolicy,
-            nativeGeometry: DisplayGeometry.nativeGeometry(for: displayID),
-            fallback: fallbackPixelSize
-        )
 
         var resolved = preferences
-        resolved.width = Self.evenPixelDimension(pixelSize.width)
-        resolved.height = Self.evenPixelDimension(pixelSize.height)
+        resolved.width = Self.evenPixelDimension(logicalSize.width)
+        resolved.height = Self.evenPixelDimension(logicalSize.height)
         if resolved.autoAdjustBitrate {
             resolved.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: resolved.width,

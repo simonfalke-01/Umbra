@@ -595,7 +595,7 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         )
     }
 
-    func testCurrentBuiltInDisplayResolvesPhysicalNativeSafeResolution() throws {
+    func testCurrentBuiltInDisplayResolvesLogicalSafeResolution() throws {
         let screen = try XCTUnwrap(NSScreen.main)
         let displayID = try XCTUnwrap(AppKitDisplaySelection.displayID(for: screen))
         let native = try XCTUnwrap(DisplayGeometry.nativeGeometry(for: displayID))
@@ -607,9 +607,17 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         let controller = try StreamWindowController(device: nil)
 
         let resolved = controller.resolveStreamingPreferences(preferences, uiScreen: screen)
+        let logicalSafeSize = DisplayGeometry.nativePixelSize(
+            fullPixelSize: screen.frame.size,
+            pointSize: screen.frame.size,
+            safeAreaInsets: DisplayEdgeInsets(screen.safeAreaInsets),
+            excludingDisplayCutouts: true
+        )
 
-        XCTAssertEqual(resolved.width, Int(native.safePixelSize.width))
-        XCTAssertEqual(resolved.height, Int(native.safePixelSize.height))
+        XCTAssertEqual(resolved.width, StreamWindowController.evenPixelDimension(logicalSafeSize.width))
+        XCTAssertEqual(resolved.height, StreamWindowController.evenPixelDimension(logicalSafeSize.height))
+        XCTAssertLessThan(resolved.width, Int(native.safePixelSize.width))
+        XCTAssertLessThan(resolved.height, Int(native.safePixelSize.height))
     }
 
     func testVirtualTrackpadCoordinatesUseTheWholeViewWithoutClamping() throws {

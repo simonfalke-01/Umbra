@@ -130,9 +130,9 @@ extension DisplaySelection: Codable {
 public enum DisplayResolutionPolicy: String, Codable, CaseIterable, Sendable {
     /// Use the explicitly configured width and height.
     case configured
-    /// Use the selected display's native pixel dimensions, including the camera housing area.
+    /// Use the selected display's logical dimensions, including the camera housing area.
     case native
-    /// Use the selected display's native pixel dimensions below any camera housing.
+    /// Use the selected display's logical dimensions below any camera housing.
     case nativeExcludingNotch
 }
 
