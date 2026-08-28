@@ -167,7 +167,7 @@ final class MediaHardwareTests: XCTestCase {
         decoder.stop()
     }
 
-    func testLatencyCapacityOverflowRecordsRecoveryAndRequestsKeyframe() throws {
+    func testLatencyCapacityOverflowRecordsDropAndRequestsKeyframe() throws {
         let decoder = VideoToolboxDecoder(
             policy: .softwareOnly,
             capacityPolicy: .dropNewestWhenFull
@@ -202,6 +202,56 @@ final class MediaHardwareTests: XCTestCase {
         ))
         XCTAssertEqual(dependentFrameDisposition, .requestKeyFrame)
         XCTAssertEqual(decoder.lastError, .missingParameterSets(.h264))
+        decoder.stop()
+    }
+
+    func testLatencyCapacityOverflowDoesNotRecreateHealthyVideoToolboxSession() throws {
+        let annexBFrame = try makeRealH264AnnexBKeyFrame(width: 64, height: 64)
+        let encodedFrame = try AnnexBAccessUnit(
+            data: annexBFrame,
+            codec: .h264
+        ).lengthPrefixedData
+        let renderer = RealDecodeRecordingRenderer()
+        let decoder = VideoToolboxDecoder(
+            renderer: renderer,
+            policy: .automatic,
+            maximumOutstandingFrames: 2,
+            capacityPolicy: .dropNewestWhenFull
+        )
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0001,
+            width: 64,
+            height: 64,
+            redrawRate: 120
+        )))
+        decoder.start()
+
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 1,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 0
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        let establishedSessionGeneration = decoder.currentSessionGeneration
+        XCTAssertGreaterThan(establishedSessionGeneration, 0)
+
+        XCTAssertEqual(decoder.recordCapacityOverflow(
+            depth: 2,
+            generation: decoder.currentDecodeGeneration,
+            at: 1
+        ), .requestKeyFrame)
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 2,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 8_333
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(decoder.currentSessionGeneration, establishedSessionGeneration)
+        XCTAssertNil(decoder.lastError)
         decoder.stop()
     }
 
