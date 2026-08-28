@@ -1000,11 +1000,11 @@ final class ModernLumenV3Manager {
             throw UmbraClientServiceError.invalidInput("The selected application is unavailable.")
         }
         let mode: QUICOptimizationMode = streamPreferences.optimizationMode == .latency ? .latency : .quality
-        var session = try await reconnect(hostID: hostID, mode: mode)
-        if !session.canBeginStart {
-            await retireForFreshStart(session: session, hostID: protocolHostID)
-            session = try await reconnect(hostID: hostID, mode: mode)
-        }
+        let session = try await startReadySession(
+            hostID: hostID,
+            protocolHostID: protocolHostID,
+            mode: mode
+        )
         guard let entry = sessions[protocolHostID], entry.session === session,
               entry.preparedStream == nil, entry.activeSessionID == nil else {
             throw ProtocolV3ClientError.invalidState
@@ -1488,6 +1488,7 @@ final class ModernLumenV3Manager {
             entry.inputSenderRelay.updateMaximumPayloadByteCount(payloadByteCount)
             entry.mediaCoordinator?.handle(event)
         case let .activeSessionAvailable(activeSessionID):
+            entry.activeSessionID = activeSessionID
             entry.activeSessionContinuation.yield(activeSessionID)
             entry.activeSessionContinuation.finish()
         case let .controlMessage(type, requestID, fields):
@@ -1622,6 +1623,39 @@ final class ModernLumenV3Manager {
         session.cancel()
         await Self.waitForTerminalEvent(terminalEvents)
         finish(session: session, hostID: hostID)
+    }
+
+    private func startReadySession(
+        hostID: HostID,
+        protocolHostID: Data,
+        mode: QUICOptimizationMode
+    ) async throws -> ProtocolV3ClientControlSession {
+        var session = try await reconnect(hostID: hostID, mode: mode)
+        for _ in 0..<2 {
+            if session.canBeginStart { return session }
+            guard let entry = sessions[protocolHostID], entry.session === session else {
+                throw ProtocolV3ClientError.invalidState
+            }
+            if let activeSessionID = entry.activeSessionID {
+                log?.record(
+                    source: "Lumen v3",
+                    level: .warning,
+                    message: "Stopping the host's orphaned protocol-v3 session before retrying START."
+                )
+                try await performStop(
+                    entry: entry,
+                    hostID: protocolHostID,
+                    sessionID: activeSessionID,
+                    quitApplication: false,
+                    reason: 1
+                )
+            } else {
+                await retireForFreshStart(session: session, hostID: protocolHostID)
+                session = try await reconnect(hostID: hostID, mode: mode)
+            }
+        }
+        guard session.canBeginStart else { throw ProtocolV3ClientError.invalidState }
+        return session
     }
 
     private func recoverAttachedSession(
