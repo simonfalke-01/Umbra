@@ -362,7 +362,7 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         let fields = descendants(of: overlay, type: NSTextField.self)
 
         XCTAssertFalse(fields.isEmpty)
-        XCTAssertEqual(grid.numberOfRows, 9)
+        XCTAssertEqual(grid.numberOfRows, 10)
         XCTAssertEqual(overlay.material, .hudWindow)
         XCTAssertEqual(overlay.blendingMode, .withinWindow)
         XCTAssertEqual(overlay.state, .active)

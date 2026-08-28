@@ -43,6 +43,31 @@ private final class RecordingProtocolV3InputSession: ProtocolV3SessionMediaContr
 }
 
 @Test
+func protocolV3InputLatencyTrackerRecordsOnlyUserTriggeredSnapshots() throws {
+    let session = RecordingProtocolV3InputSession()
+    let tracker = ProtocolV3InputLatencyTracker()
+    let sender = ProtocolV3InputStateSender(
+        session: session,
+        sessionID: Data(repeating: 0xA5, count: 16),
+        mode: .latency,
+        usesAbsolutePointer: false,
+        latencyTracker: tracker,
+        failureHandler: { _ in }
+    )
+
+    try sender.start()
+    let baseline = try #require(session.datagrams.last)
+    #expect(tracker.latestSample(upTo: baseline.objectID) == nil)
+
+    try sender.send(.mouseMove(deltaX: 1, deltaY: 0))
+    let input = try #require(session.datagrams.last)
+    let sample = try #require(tracker.latestSample(upTo: input.objectID))
+    #expect(sample.stateSequence == input.objectID)
+    #expect(sample.sampleTimeMicroseconds > 0)
+    #expect(sample.newestEdgeID == 0)
+}
+
+@Test
 func protocolV3ControllerInputUsesFormatTwoAndPreservesAdvancedState() throws {
     let session = RecordingProtocolV3InputSession()
     let sender = ProtocolV3InputStateSender(

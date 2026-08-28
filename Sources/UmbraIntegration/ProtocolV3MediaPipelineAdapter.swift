@@ -65,6 +65,43 @@ public struct ProtocolV3MediaStatistics: Equatable, Sendable {
     public let audioConcealmentFrames: UInt64
     public let audioDiscontinuities: UInt64
     public let pendingAudioPackets: Int
+    public let inputToDecodeProxy: LatencyPercentileSummary?
+    public let latestAppliedInputStateSequence: UInt64
+    public let latestAppliedInputEdgeID: UInt64
+    public let latestInputCausalFrameID: UInt64
+}
+
+private struct ProtocolV3InputLatencyWindow {
+    private var samples = Array(repeating: TimeInterval(0), count: 240)
+    private var count = 0
+    private var nextIndex = 0
+
+    mutating func record(nanoseconds: UInt64) {
+        samples[nextIndex] = TimeInterval(nanoseconds) / 1_000_000_000
+        nextIndex = (nextIndex + 1) % samples.count
+        count = min(count + 1, samples.count)
+    }
+
+    func snapshot() -> LatencyPercentileSummary? {
+        guard count > 0 else { return nil }
+        let sorted = Array(samples.prefix(count)).sorted()
+        func percentile(_ quantile: Double) -> Double {
+            let rank = max(1, Int(ceil(quantile * Double(sorted.count))))
+            return sorted[min(rank - 1, sorted.count - 1)] * 1_000
+        }
+        return LatencyPercentileSummary(
+            sampleCount: count,
+            p50Milliseconds: percentile(0.50),
+            p95Milliseconds: percentile(0.95),
+            p99Milliseconds: percentile(0.99)
+        )
+    }
+
+    mutating func reset() {
+        samples = Array(repeating: 0, count: samples.count)
+        count = 0
+        nextIndex = 0
+    }
 }
 
 struct ProtocolV3VideoFragment {
@@ -544,6 +581,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
     private let firstVideoSubmitHandler: @Sendable () -> Void
     private let nowNanoseconds: @Sendable () -> UInt64
     private let authenticatedVDDCaptureState: LumenVDDCaptureState?
+    private let inputLatencyTracker: ProtocolV3InputLatencyTracker?
     private let expected: ExpectedSelection
     private let videoReassembler: ProtocolV3VideoReassembler
     private let lock = NSLock()
@@ -567,12 +605,19 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
     private var audioDiscontinuities: UInt64 = 0
     private var stopped = false
     private var reportedFirstVideoSubmit = false
+    private var lastInputLatencySampleSequence: UInt64 = 0
+    private var pendingInputSampleMicroseconds: [UInt64: UInt64] = [:]
+    private var inputToDecodeLatency = ProtocolV3InputLatencyWindow()
+    private var latestAppliedInputStateSequence: UInt64 = 0
+    private var latestAppliedInputEdgeID: UInt64 = 0
+    private var latestInputCausalFrameID: UInt64 = 0
 
     public init(
         pipeline: StreamingMediaPipeline,
         mode: QUICOptimizationMode,
         startResponseFields: [UInt64: ProtocolV3CBORValue],
         authenticatedVDDCaptureState: LumenVDDCaptureState? = nil,
+        inputLatencyTracker: ProtocolV3InputLatencyTracker? = nil,
         firstVideoSubmitHandler: @escaping @Sendable () -> Void = {},
         diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in },
         nowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
@@ -606,6 +651,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         self.diagnosticHandler = diagnosticHandler
         self.nowNanoseconds = nowNanoseconds
         self.authenticatedVDDCaptureState = authenticatedVDDCaptureState
+        self.inputLatencyTracker = inputLatencyTracker
         expected = ExpectedSelection(
             videoTuple: videoTuple,
             audioTuple: audioTuple,
@@ -660,7 +706,11 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                 audioPacketsReceived: audioPacketsReceived,
                 audioConcealmentFrames: audioConcealmentFrames,
                 audioDiscontinuities: audioDiscontinuities,
-                pendingAudioPackets: pendingAudio.count
+                pendingAudioPackets: pendingAudio.count,
+                inputToDecodeProxy: inputToDecodeLatency.snapshot(),
+                latestAppliedInputStateSequence: latestAppliedInputStateSequence,
+                latestAppliedInputEdgeID: latestAppliedInputEdgeID,
+                latestInputCausalFrameID: latestInputCausalFrameID
             )
         }
     }
@@ -825,6 +875,9 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             videoReassembler.removeAll()
             pendingPresentationDeadlines.removeAll()
             pendingAudio.removeAll()
+            pendingInputSampleMicroseconds.removeAll()
+            inputToDecodeLatency.reset()
+            lastInputLatencySampleSequence = 0
             return true
         }
         guard shouldStop else { return }
@@ -841,6 +894,8 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             videoReassembler.suspendForReconnect()
             pendingPresentationDeadlines.removeAll(keepingCapacity: true)
             pendingAudio.removeAll(keepingCapacity: true)
+            pendingInputSampleMicroseconds.removeAll(keepingCapacity: true)
+            lastInputLatencySampleSequence = 0
         }
     }
 
@@ -913,6 +968,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             videoFramesDropped += UInt64(update.lostFrameIDs.count)
         }
         for lostFrameID in update.lostFrameIDs {
+            lock.withLock { pendingInputSampleMicroseconds[lostFrameID] = nil }
             emitVideoFeedback(affectedFrameID: lostFrameID, action: 2)
         }
         if let requestedKeyFrameID = update.requestedKeyFrameID {
@@ -932,6 +988,25 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             .annexB
         }
         for (index, frame) in frames.enumerated() {
+            let inputSample = inputLatencyTracker?.latestSample(
+                upTo: frame.appliedInputStateSequence
+            )
+            lock.withLock {
+                latestAppliedInputStateSequence = max(
+                    latestAppliedInputStateSequence,
+                    frame.appliedInputStateSequence
+                )
+                latestAppliedInputEdgeID = max(latestAppliedInputEdgeID, frame.appliedInputEdgeID)
+                if frame.appliedInputStateSequence != 0 {
+                    latestInputCausalFrameID = max(latestInputCausalFrameID, frame.frameID)
+                }
+                if let inputSample,
+                   inputSample.stateSequence > lastInputLatencySampleSequence {
+                    lastInputLatencySampleSequence = inputSample.stateSequence
+                    pendingInputSampleMicroseconds[frame.frameID] =
+                        inputSample.sampleTimeMicroseconds
+                }
+            }
             let shouldReportFirstSubmit = lock.withLock { () -> Bool in
                 guard !reportedFirstVideoSubmit else { return false }
                 reportedFirstVideoSubmit = true
@@ -976,6 +1051,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                     return pending
                 }
                 for lostFrameID in unsentFrameIDs + pendingFrameIDs {
+                    lock.withLock { pendingInputSampleMicroseconds[lostFrameID] = nil }
                     emitVideoFeedback(affectedFrameID: lostFrameID, action: 2)
                 }
                 diagnosticHandler(
@@ -992,12 +1068,20 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         switch outcome {
         case let .decoded(frameNumber):
             guard let frameID = UInt64(exactly: frameNumber) else { return }
+            let completedAtNanoseconds = nowNanoseconds()
+            let completedAtMicroseconds = completedAtNanoseconds / 1_000
             let deadlineMissMicroseconds = lock.withLock { () -> UInt32 in
                 lastDecodedVideoFrameID = max(lastDecodedVideoFrameID, frameID)
                 videoFramesDecoded += 1
+                if let sample = pendingInputSampleMicroseconds.removeValue(forKey: frameID),
+                   completedAtMicroseconds >= sample {
+                    inputToDecodeLatency.record(
+                        nanoseconds: (completedAtMicroseconds - sample) * 1_000
+                    )
+                }
                 return consumeDeadlineMissMicroseconds(
                     frameID: frameID,
-                    completedAtNanoseconds: nowNanoseconds()
+                    completedAtNanoseconds: completedAtNanoseconds
                 )
             }
             emitVideoFeedback(
@@ -1008,6 +1092,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
         case let .failed(frameNumber):
             guard let frameID = UInt64(exactly: frameNumber) else { return }
             let failure = lock.withLock { () -> ([UInt64], UInt32) in
+                pendingInputSampleMicroseconds[frameID] = nil
                 let deadlineMissMicroseconds = consumeDeadlineMissMicroseconds(
                     frameID: frameID,
                     completedAtNanoseconds: nowNanoseconds()

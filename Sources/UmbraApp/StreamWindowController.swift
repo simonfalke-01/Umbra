@@ -13,6 +13,7 @@ enum StreamPerformanceMetric: CaseIterable, Sendable {
     case videoRate
     case decodeTime
     case hostProcessingLatency
+    case inputToDecodeProxyLatency
     case receiveToSubmitLatency
     case reassemblyToSubmitLatency
     case videoToolboxLatency
@@ -32,6 +33,7 @@ enum StreamPerformanceMetric: CaseIterable, Sendable {
         case .videoRate: "Frame rate"
         case .decodeTime: "Decode"
         case .hostProcessingLatency: "Host processing"
+        case .inputToDecodeProxyLatency: "Input to decode proxy"
         case .receiveToSubmitLatency: "Receive to decoder"
         case .reassemblyToSubmitLatency: "Reassembly to decoder"
         case .videoToolboxLatency: "VideoToolbox decode"
@@ -108,6 +110,9 @@ enum StreamStatisticsPresenter {
             } ?? "Unavailable",
             .hostProcessingLatency: percentiles(
                 decoder?.latencyStatistics?.hostProcessing
+            ),
+            .inputToDecodeProxyLatency: percentiles(
+                protocolV3?.media.inputToDecodeProxy
             ),
             .receiveToSubmitLatency: percentiles(
                 decoder?.latencyStatistics?.receiveToVideoToolboxSubmit
@@ -1210,6 +1215,7 @@ final class StreamStatisticsOverlayView: NSVisualEffectView {
         [.renderQueue, .videoQueue],
         [.audioQueue, .videoPackets],
         [.audioPackets, nil],
+        [.inputToDecodeProxyLatency, nil],
         [.hostProcessingLatency, .receiveToDecodeLatency],
         [.receiveToSubmitLatency, .reassemblyToSubmitLatency],
         [.videoToolboxLatency, .decodeToMetalCommitLatency],

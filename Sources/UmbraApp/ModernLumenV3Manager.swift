@@ -437,6 +437,7 @@ final class ModernLumenV3Manager {
         var preparedStream: PreparedStream?
         var mediaCoordinator: ProtocolV3SessionMediaCoordinator?
         var inputSender: ProtocolV3InputStateSender?
+        var inputLatencyTracker: ProtocolV3InputLatencyTracker?
         var launchAttemptActive = false
         var lifecyclePrepared = false
         var stopTask: Task<Void, Error>?
@@ -1835,6 +1836,9 @@ final class ModernLumenV3Manager {
             }
 
             let inputFailureHandler = inputFailureHandler(entry: entry, hostID: hostID)
+            let inputLatencyTracker = entry.inputLatencyTracker
+                ?? ProtocolV3InputLatencyTracker()
+            entry.inputLatencyTracker = inputLatencyTracker
             let inputSender = ProtocolV3InputStateSender(
                 session: replacement,
                 sessionID: attach.sessionID,
@@ -1843,6 +1847,7 @@ final class ModernLumenV3Manager {
                 inputGeneration: attach.inputGeneration,
                 supportsCompactStateFormat: entry.serverCapabilities & 0x200 != 0,
                 maximumPayloadByteCount: entry.inputDatagramPayloadByteCount,
+                latencyTracker: inputLatencyTracker,
                 degradationHandler: { [weak self] message in
                     Task { @MainActor [weak self] in
                         self?.sessionEventHandler?(.sessionDegraded(message))
@@ -2123,10 +2128,12 @@ final class ModernLumenV3Manager {
             await output.beginSession()
 
             let startupSessionID = prepared.bootstrap.sessionID
+            let inputLatencyTracker = ProtocolV3InputLatencyTracker()
             let media = try ProtocolV3MediaPipelineAdapter(
                 pipeline: prepared.pipeline,
                 mode: prepared.offer.mode,
                 startResponseFields: fields,
+                inputLatencyTracker: inputLatencyTracker,
                 firstVideoSubmitHandler: { [startupTelemetry] in
                     startupTelemetry.record(
                         sessionID: startupSessionID,
@@ -2146,6 +2153,7 @@ final class ModernLumenV3Manager {
                 inputGeneration: inputGeneration,
                 supportsCompactStateFormat: entry.serverCapabilities & 0x200 != 0,
                 maximumPayloadByteCount: entry.inputDatagramPayloadByteCount,
+                latencyTracker: inputLatencyTracker,
                 degradationHandler: { [weak self] message in
                     Task { @MainActor [weak self] in
                         self?.sessionEventHandler?(.sessionDegraded(message))
@@ -2154,6 +2162,7 @@ final class ModernLumenV3Manager {
                 failureHandler: inputFailureHandler
             )
             entry.inputSenderRelay.install(inputSender)
+            entry.inputLatencyTracker = inputLatencyTracker
             let mediaCoordinator = ProtocolV3SessionMediaCoordinator(
                 control: entry.session,
                 media: media,
@@ -2550,6 +2559,7 @@ final class ModernLumenV3Manager {
         entry.statisticsTask = nil
         entry.mediaCoordinator = nil
         entry.inputSender = nil
+        entry.inputLatencyTracker = nil
         entry.activeSessionID = nil
         entry.attachState = nil
         entry.isRecovering = false

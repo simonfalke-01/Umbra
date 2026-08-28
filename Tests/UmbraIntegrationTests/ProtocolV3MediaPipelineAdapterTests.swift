@@ -869,6 +869,60 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(feedback.values.last?.deadlineMissMicroseconds, 1)
     }
 
+    func testInputToDecodeProxyUsesTheFrameCausalWatermark() throws {
+        let capabilities = fullyCapableClient
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 130,
+            resume: false,
+            preferences: .default,
+            capabilities: capabilities,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let selection = successfulStartResponse(offer)
+        let decoder = RationalRefreshVideoDecoder()
+        let clock = ProtocolV3DeadlineTestClock(nanoseconds: 1_025_000_000)
+        let tracker = ProtocolV3InputLatencyTracker()
+        tracker.record(stateSequence: 30, sampleTimeMicroseconds: 900_000, newestEdgeID: 40)
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: decoder,
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: capabilities.supportedVideoFormatMask
+            ),
+            mode: .latency,
+            startResponseFields: selection,
+            inputLatencyTracker: tracker,
+            nowNanoseconds: { clock.nanoseconds }
+        )
+        XCTAssertEqual(try adapter.configureVideo(fields: videoConfigurationFields(selection)), 1)
+        let codec = try XCTUnwrap(selection[5]?.mapValue)
+        try adapter.handle(videoMessage(
+            frameID: 1,
+            frameSize: 2,
+            fragmentOffset: 0,
+            fragmentIndex: 0,
+            fragmentCount: 1,
+            codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+            matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+            bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+            generation: 1,
+            bytes: Data([1, 2]),
+            receivedAtNanoseconds: 1_000_000_000
+        ))
+        decoder.emit(.decoded(frameNumber: 1))
+
+        let statistics = adapter.statistics()
+        XCTAssertEqual(statistics.latestAppliedInputStateSequence, 30)
+        XCTAssertEqual(statistics.latestAppliedInputEdgeID, 40)
+        XCTAssertEqual(statistics.latestInputCausalFrameID, 1)
+        XCTAssertEqual(
+            statistics.inputToDecodeProxy?.p50Milliseconds ?? -1,
+            125,
+            accuracy: 0.0001
+        )
+    }
+
     func testMediaAdapterRejectsUnboundedPresentationAge() throws {
         let capabilities = AppleStreamingCapabilities(
             hasMetalDevice: true,

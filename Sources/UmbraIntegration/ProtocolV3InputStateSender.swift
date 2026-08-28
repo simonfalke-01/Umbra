@@ -10,6 +10,64 @@ public enum ProtocolV3InputError: Error, Equatable, Sendable {
     case edgeWindowPressure
 }
 
+public struct ProtocolV3InputLatencySample: Sendable, Equatable {
+    public let stateSequence: UInt64
+    public let sampleTimeMicroseconds: UInt64
+    public let newestEdgeID: UInt64
+}
+
+/// Fixed-capacity causal input history shared by the sender and v3 video telemetry.
+/// State sequences are monotonic, so direct modulo slots provide bounded O(1) writes
+/// and a bounded scan when an encoded frame carries a newer applied watermark.
+public final class ProtocolV3InputLatencyTracker: @unchecked Sendable {
+    private static let capacity = 512
+    private let lock = NSLock()
+    private var sequences = Array(repeating: UInt64(0), count: capacity)
+    private var sampleTimes = Array(repeating: UInt64(0), count: capacity)
+    private var edgeIDs = Array(repeating: UInt64(0), count: capacity)
+
+    public init() {}
+
+    func record(stateSequence: UInt64, sampleTimeMicroseconds: UInt64, newestEdgeID: UInt64) {
+        guard stateSequence != 0, sampleTimeMicroseconds != 0 else { return }
+        lock.withLock {
+            let index = Int(stateSequence % UInt64(Self.capacity))
+            sequences[index] = stateSequence
+            sampleTimes[index] = sampleTimeMicroseconds
+            edgeIDs[index] = newestEdgeID
+        }
+    }
+
+    func latestSample(upTo stateSequence: UInt64) -> ProtocolV3InputLatencySample? {
+        guard stateSequence != 0 else { return nil }
+        return lock.withLock {
+            var selectedIndex: Int?
+            var selectedSequence: UInt64 = 0
+            for index in sequences.indices {
+                let candidate = sequences[index]
+                if candidate > selectedSequence, candidate <= stateSequence {
+                    selectedIndex = index
+                    selectedSequence = candidate
+                }
+            }
+            guard let selectedIndex else { return nil }
+            return ProtocolV3InputLatencySample(
+                stateSequence: sequences[selectedIndex],
+                sampleTimeMicroseconds: sampleTimes[selectedIndex],
+                newestEdgeID: edgeIDs[selectedIndex]
+            )
+        }
+    }
+
+    public func reset() {
+        lock.withLock {
+            sequences = Array(repeating: 0, count: Self.capacity)
+            sampleTimes = Array(repeating: 0, count: Self.capacity)
+            edgeIDs = Array(repeating: 0, count: Self.capacity)
+        }
+    }
+}
+
 /// Builds v3 state-format-2 snapshots and repeats unacknowledged ordered edge
 /// IDs until the host's authenticated input ACK advances past them.
 public final class ProtocolV3InputStateSender: @unchecked Sendable {
@@ -144,6 +202,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     private let supportsCompactStateFormat: Bool
     private var maximumPayloadByteCount: Int
     private let degradationHandler: @Sendable (String) -> Void
+    private let latencyTracker: ProtocolV3InputLatencyTracker?
     private var degradationReported = false
 
     public init(
@@ -154,6 +213,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         inputGeneration: UInt32 = 1,
         supportsCompactStateFormat: Bool = false,
         maximumPayloadByteCount: Int = 1_108,
+        latencyTracker: ProtocolV3InputLatencyTracker? = nil,
         degradationHandler: @escaping @Sendable (String) -> Void = { _ in },
         failureHandler: @escaping @Sendable (Error) -> Void
     ) {
@@ -164,6 +224,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         self.inputGeneration = inputGeneration
         self.supportsCompactStateFormat = supportsCompactStateFormat
         self.maximumPayloadByteCount = min(max(0, maximumPayloadByteCount), 1_108)
+        self.latencyTracker = latencyTracker
         self.degradationHandler = degradationHandler
         self.failureHandler = failureHandler
     }
@@ -331,7 +392,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
                 break
             }
         }
-        try transmitSnapshot()
+        try transmitSnapshot(trackInputLatency: true)
     }
 
     public func handleInputAcknowledgement(_ message: QUICInboundMessage) throws {
@@ -395,6 +456,7 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
     public func stop() {
         retryTask?.cancel()
         retryTask = nil
+        latencyTracker?.reset()
         lock.withLock {
             closed = true
             edges.removeAll()
@@ -429,8 +491,8 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
         lock.withLock { !closed && !edges.isEmpty }
     }
 
-    private func transmitSnapshot() throws {
-        let result = try lock.withLock { () -> ((Data, UInt64, Bool)?, String?) in
+    private func transmitSnapshot(trackInputLatency: Bool = false) throws {
+        let result = try lock.withLock { () -> ((Data, UInt64, Bool, UInt64, UInt64)?, String?) in
             guard !closed else { throw ProtocolV3InputError.closed }
             guard stateSequence < UInt64.max else { throw ProtocolV3InputError.sequenceExhausted }
             let controllerIDs = controllers.keys.sorted()
@@ -463,9 +525,11 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
                 controllerIDs: controllerIDs,
                 touchIDs: Array(representedTouchIDs)
             )
+            let sampleTimeMicroseconds = Self.monotonicMicroseconds()
+            let newestEdgeID = representedEdges.last?.id ?? lastAcknowledgedEdgeID
             var payload = Data()
-            payload.appendInteger(Self.monotonicMicroseconds())
-            payload.appendInteger(representedEdges.last?.id ?? lastAcknowledgedEdgeID)
+            payload.appendInteger(sampleTimeMicroseconds)
+            payload.appendInteger(newestEdgeID)
             payload.appendInteger(UInt16(stateBlock.count))
             payload.appendInteger(UInt16(representedEdges.count))
             payload.appendInteger(UInt16(supportsCompactStateFormat ? 3 : 2))
@@ -480,7 +544,13 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
             dirtyTouches.subtract(representedTouchIDs)
             initialBaseline = false
             degradationReported = false
-            return ((payload, stateSequence, !representedEdges.isEmpty), nil)
+            return ((
+                payload,
+                stateSequence,
+                !representedEdges.isEmpty,
+                sampleTimeMicroseconds,
+                newestEdgeID
+            ), nil)
         }
         if let degradation = result.1 { degradationHandler(degradation) }
         guard let submission = result.0 else { return }
@@ -496,6 +566,13 @@ public final class ProtocolV3InputStateSender: @unchecked Sendable {
             deadlineNanoseconds: now + (mode == .latency ? 8_000_000 : 12_000_000),
             supersessionKey: submission.2 ? nil : 1
         )
+        if trackInputLatency {
+            latencyTracker?.record(
+                stateSequence: submission.1,
+                sampleTimeMicroseconds: submission.3,
+                newestEdgeID: submission.4
+            )
+        }
     }
 
     private func stateBlock(
