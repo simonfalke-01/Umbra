@@ -976,6 +976,32 @@ final class ModernLumenV3Manager {
         preferences: StreamingPreferences,
         activationUptime: TimeInterval
     ) async throws {
+        do {
+            try await launchApplicationAttempt(
+                id: id,
+                hostID: hostID,
+                resume: resume,
+                preferences: preferences,
+                activationUptime: activationUptime
+            )
+        } catch ProtocolV3ClientError.invalidState {
+            try await launchApplicationAttempt(
+                id: id,
+                hostID: hostID,
+                resume: resume,
+                preferences: preferences,
+                activationUptime: activationUptime
+            )
+        }
+    }
+
+    private func launchApplicationAttempt(
+        id: ApplicationID,
+        hostID: HostID,
+        resume: Bool,
+        preferences: StreamingPreferences,
+        activationUptime: TimeInterval
+    ) async throws {
         guard let mediaCapabilities, let mediaProvider, output != nil,
               motionPolicy != nil, inputInstaller != nil, let lifecycle else {
             throw UmbraClientServiceError.unavailable(
@@ -1006,156 +1032,156 @@ final class ModernLumenV3Manager {
             mode: mode
         )
         guard let entry = sessions[protocolHostID], entry.session === session,
-              entry.preparedStream == nil, entry.activeSessionID == nil else {
+              entry.preparedStream == nil, entry.activeSessionID == nil,
+              !entry.lifecyclePrepared else {
             throw ProtocolV3ClientError.invalidState
         }
-        try requireStreamingDatagramCapacity(
-            entry: entry,
-            hostID: protocolHostID,
-            session: session
-        )
-        if streamPreferences.clientMicrophoneEnabled {
-            let hostAllowsMicrophone = try hasPermission(
-                hostID: protocolHostID,
-                permission: Permission.microphone
-            )
-            let authorization = hostAllowsMicrophone
-                ? await microphoneAuthorization.requestAuthorization()
-                : nil
-            let unavailableReason: String?
-            if !hostAllowsMicrophone {
-                unavailableReason = "the paired host did not grant microphone forwarding"
-            } else if authorization?.permitsCapture != true {
-                unavailableReason = "macOS microphone access is not authorized"
-            } else {
-                unavailableReason = nil
-            }
-            if let unavailableReason {
-                if streamPreferences.clientMicrophoneRequired {
-                    throw UmbraClientServiceError.unavailable(
-                        "Microphone forwarding is required, but \(unavailableReason)."
-                    )
-                }
-                streamPreferences.clientMicrophoneEnabled = false
-                sessionEventHandler?(.sessionDegraded(
-                    "Microphone forwarding is unavailable because \(unavailableReason). Umbra will stream without the microphone."
-                ))
-            }
-        }
-        var preparedMicrophoneCapture: (any ClientMicrophoneCapturing)?
-        if streamPreferences.clientMicrophoneEnabled {
-            let capture = microphoneCaptureFactory.makeCapture()
-            do {
-                try capture.start(
-                    frameHandler: { _ in },
-                    discontinuityHandler: {},
-                    failureHandler: { _ in }
-                )
-                capture.stop()
-                preparedMicrophoneCapture = capture
-            } catch {
-                capture.stop()
-                if streamPreferences.clientMicrophoneRequired {
-                    throw UmbraClientServiceError.unavailable(
-                        "Microphone forwarding is required, but capture could not start: \(error.localizedDescription)"
-                    )
-                }
-                streamPreferences.clientMicrophoneEnabled = false
-                sessionEventHandler?(.sessionDegraded(
-                    "Microphone capture is unavailable: \(error.localizedDescription). Umbra will stream without the microphone."
-                ))
-            }
-        }
-        let startIntentID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
-        let traceID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
-        let offer = try ProtocolV3StartRequestMapper.makeOffer(
-            applicationID: id.rawValue,
-            resume: resume,
-            preferences: streamPreferences,
-            capabilities: mediaCapabilities,
-            startIntentID: startIntentID,
-            traceID: traceID
-        )
-        log?.record(
-            source: "Lumen v3",
-            level: .info,
-            message: "START offer app=\(offer.fields[2]?.unsignedValue ?? 0) "
-                + "profile=\(offer.fields[3]?.unsignedValue ?? 0) "
-                + "mode=\(offer.fields[4]?.unsignedValue ?? 0)x\(offer.fields[5]?.unsignedValue ?? 0)"
-                + "@\(offer.fields[6]?.unsignedValue ?? 0)/\(offer.fields[7]?.unsignedValue ?? 0) "
-                + "bitrate_kbps=\(offer.fields[8]?.unsignedValue ?? 0) "
-                + "codecs=\(offer.fields[9]?.arrayValue?.count ?? 0) "
-                + "audio=\(offer.fields[10]?.arrayValue?.count ?? 0) "
-                + "microphone=\(offer.fields[11]?.mapValue == nil ? 0 : 1) "
-                + "semantic_datagram=\(offer.fields[12]?.unsignedValue ?? 0) "
-                + "negotiated_payload=\(entry.inputDatagramPayloadByteCount) "
-                + "hdr=\(offer.fields[14]?.arrayValue?.count ?? 0) "
-                + "presentation=\(offer.fields[15]?.arrayValue?.count ?? 0) "
-                + "resume=\(offer.fields[16]?.booleanValue == true ? 1 : 0) "
-                + "constraints=\(offer.fields[17]?.mapValue?.count ?? 0) "
-                + "host_audio=\(offer.fields[18]?.booleanValue == true ? 1 : 0)."
-        )
-        let application = StreamApplication(
-            id: applicationRecord.id,
-            name: applicationRecord.name,
-            hdrSupported: streamPreferences.enableHDR,
-            isHidden: applicationRecord.isHidden,
-            supportsDirectLaunch: applicationRecord.isDirectLaunch
-        )
-        let endpoint = NetworkEndpoint(hostname: record.hostname, port: record.port)
-        let host = StreamHost(
-            uuid: hostID.rawValue,
-            name: record.displayName,
-            applications: record.applications.map {
-                StreamApplication(
-                    id: $0.id,
-                    name: $0.name,
-                    hdrSupported: streamPreferences.enableHDR,
-                    isHidden: $0.isHidden,
-                    supportsDirectLaunch: $0.isDirectLaunch
-                )
-            },
-            status: .online,
-            pairState: .paired,
-            activeAddress: endpoint,
-            currentGameID: resume ? id.rawValue : nil,
-            appVersion: "protocol-v3",
-            maxLumaPixelsHEVC: streamPreferences.width * streamPreferences.height,
-            codecSupport: [
-                .h264, .hevc, .hevcMain10, .av1Main8, .av1Main10,
-                .h264High8YUV444, .hevcRext8YUV444, .hevcRext10YUV444,
-                .av1High8YUV444, .av1High10YUV444,
-                .h264Lossless, .hevcLossless, .av1Lossless,
-            ]
-        )
-        let bootstrap = try StreamBootstrap(
-            sessionID: Self.uuid(from: startIntentID),
-            host: host,
-            application: application,
-            preferences: streamPreferences,
-            effectivePolicy: .resolve(for: streamPreferences),
-            rtspSessionURL: nil,
-            remoteInputCredentials: RemoteInputCredentials(
-                key: Data(repeating: 0, count: 16),
-                initializationVector: Data(repeating: 0, count: 16)
-            )
-        )
-        startupTelemetry.begin(
-            sessionID: bootstrap.sessionID,
-            uiActivationTime: activationUptime
-        )
-        entry.resetStartEvents()
-        entry.resetSessionEndedEvents()
-        try requireStreamingDatagramCapacity(
-            entry: entry,
-            hostID: protocolHostID,
-            session: session
-        )
-        sessionEventHandler?(.sessionPreparing)
+        entry.lifecyclePrepared = true
         do {
-            // Claim lifecycle teardown ownership before any fallible window,
-            // audio, controller, or media preparation begins.
-            entry.lifecyclePrepared = true
+            try requireStreamingDatagramCapacity(
+                entry: entry,
+                hostID: protocolHostID,
+                session: session
+            )
+            if streamPreferences.clientMicrophoneEnabled {
+                let hostAllowsMicrophone = try hasPermission(
+                    hostID: protocolHostID,
+                    permission: Permission.microphone
+                )
+                let authorization = hostAllowsMicrophone
+                    ? await microphoneAuthorization.requestAuthorization()
+                    : nil
+                let unavailableReason: String?
+                if !hostAllowsMicrophone {
+                    unavailableReason = "the paired host did not grant microphone forwarding"
+                } else if authorization?.permitsCapture != true {
+                    unavailableReason = "macOS microphone access is not authorized"
+                } else {
+                    unavailableReason = nil
+                }
+                if let unavailableReason {
+                    if streamPreferences.clientMicrophoneRequired {
+                        throw UmbraClientServiceError.unavailable(
+                            "Microphone forwarding is required, but \(unavailableReason)."
+                        )
+                    }
+                    streamPreferences.clientMicrophoneEnabled = false
+                    sessionEventHandler?(.sessionDegraded(
+                        "Microphone forwarding is unavailable because \(unavailableReason). Umbra will stream without the microphone."
+                    ))
+                }
+            }
+            var preparedMicrophoneCapture: (any ClientMicrophoneCapturing)?
+            if streamPreferences.clientMicrophoneEnabled {
+                let capture = microphoneCaptureFactory.makeCapture()
+                do {
+                    try capture.start(
+                        frameHandler: { _ in },
+                        discontinuityHandler: {},
+                        failureHandler: { _ in }
+                    )
+                    capture.stop()
+                    preparedMicrophoneCapture = capture
+                } catch {
+                    capture.stop()
+                    if streamPreferences.clientMicrophoneRequired {
+                        throw UmbraClientServiceError.unavailable(
+                            "Microphone forwarding is required, but capture could not start: \(error.localizedDescription)"
+                        )
+                    }
+                    streamPreferences.clientMicrophoneEnabled = false
+                    sessionEventHandler?(.sessionDegraded(
+                        "Microphone capture is unavailable: \(error.localizedDescription). Umbra will stream without the microphone."
+                    ))
+                }
+            }
+            let startIntentID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
+            let traceID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
+            let offer = try ProtocolV3StartRequestMapper.makeOffer(
+                applicationID: id.rawValue,
+                resume: resume,
+                preferences: streamPreferences,
+                capabilities: mediaCapabilities,
+                startIntentID: startIntentID,
+                traceID: traceID
+            )
+            log?.record(
+                source: "Lumen v3",
+                level: .info,
+                message: "START offer app=\(offer.fields[2]?.unsignedValue ?? 0) "
+                    + "profile=\(offer.fields[3]?.unsignedValue ?? 0) "
+                    + "mode=\(offer.fields[4]?.unsignedValue ?? 0)x\(offer.fields[5]?.unsignedValue ?? 0)"
+                    + "@\(offer.fields[6]?.unsignedValue ?? 0)/\(offer.fields[7]?.unsignedValue ?? 0) "
+                    + "bitrate_kbps=\(offer.fields[8]?.unsignedValue ?? 0) "
+                    + "codecs=\(offer.fields[9]?.arrayValue?.count ?? 0) "
+                    + "audio=\(offer.fields[10]?.arrayValue?.count ?? 0) "
+                    + "microphone=\(offer.fields[11]?.mapValue == nil ? 0 : 1) "
+                    + "semantic_datagram=\(offer.fields[12]?.unsignedValue ?? 0) "
+                    + "negotiated_payload=\(entry.inputDatagramPayloadByteCount) "
+                    + "hdr=\(offer.fields[14]?.arrayValue?.count ?? 0) "
+                    + "presentation=\(offer.fields[15]?.arrayValue?.count ?? 0) "
+                    + "resume=\(offer.fields[16]?.booleanValue == true ? 1 : 0) "
+                    + "constraints=\(offer.fields[17]?.mapValue?.count ?? 0) "
+                    + "host_audio=\(offer.fields[18]?.booleanValue == true ? 1 : 0)."
+            )
+            let application = StreamApplication(
+                id: applicationRecord.id,
+                name: applicationRecord.name,
+                hdrSupported: streamPreferences.enableHDR,
+                isHidden: applicationRecord.isHidden,
+                supportsDirectLaunch: applicationRecord.isDirectLaunch
+            )
+            let endpoint = NetworkEndpoint(hostname: record.hostname, port: record.port)
+            let host = StreamHost(
+                uuid: hostID.rawValue,
+                name: record.displayName,
+                applications: record.applications.map {
+                    StreamApplication(
+                        id: $0.id,
+                        name: $0.name,
+                        hdrSupported: streamPreferences.enableHDR,
+                        isHidden: $0.isHidden,
+                        supportsDirectLaunch: $0.isDirectLaunch
+                    )
+                },
+                status: .online,
+                pairState: .paired,
+                activeAddress: endpoint,
+                currentGameID: resume ? id.rawValue : nil,
+                appVersion: "protocol-v3",
+                maxLumaPixelsHEVC: streamPreferences.width * streamPreferences.height,
+                codecSupport: [
+                    .h264, .hevc, .hevcMain10, .av1Main8, .av1Main10,
+                    .h264High8YUV444, .hevcRext8YUV444, .hevcRext10YUV444,
+                    .av1High8YUV444, .av1High10YUV444,
+                    .h264Lossless, .hevcLossless, .av1Lossless,
+                ]
+            )
+            let bootstrap = try StreamBootstrap(
+                sessionID: Self.uuid(from: startIntentID),
+                host: host,
+                application: application,
+                preferences: streamPreferences,
+                effectivePolicy: .resolve(for: streamPreferences),
+                rtspSessionURL: nil,
+                remoteInputCredentials: RemoteInputCredentials(
+                    key: Data(repeating: 0, count: 16),
+                    initializationVector: Data(repeating: 0, count: 16)
+                )
+            )
+            startupTelemetry.begin(
+                sessionID: bootstrap.sessionID,
+                uiActivationTime: activationUptime
+            )
+            entry.resetStartEvents()
+            entry.resetSessionEndedEvents()
+            try requireStreamingDatagramCapacity(
+                entry: entry,
+                hostID: protocolHostID,
+                session: session
+            )
+            sessionEventHandler?(.sessionPreparing)
+            // Lifecycle teardown ownership was claimed before the first await.
             try await lifecycle.prepare(for: bootstrap)
             let pipeline = try mediaProvider.makePipeline(
                 for: bootstrap,
@@ -1187,6 +1213,9 @@ final class ModernLumenV3Manager {
                 publishEnded: false,
                 sendMicrophoneEnd: false
             )
+            if error as? ProtocolV3ClientError == .invalidState {
+                await retireForFreshStart(session: session, hostID: protocolHostID)
+            }
             throw error
         }
     }

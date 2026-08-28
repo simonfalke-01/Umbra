@@ -120,7 +120,10 @@ final class NWQUICNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
         let options = NWProtocolQUIC.Options(alpn: [QUICTransportConfiguration.applicationProtocol])
         options.idleTimeout = configuration.profile.mode == .latency ? 15_000 : 30_000
         options.maxUDPPayloadSize = 1_350
-        options.maxDatagramFrameSize = QUICTransportProfile.semanticDatagramByteCount
+        // Advertise the full safe UDP payload. Umbra still caps semantic ULM3
+        // records at 1,152 bytes, but Lumen must observe at least that much
+        // peer DATAGRAM capacity before it will admit START.
+        options.maxDatagramFrameSize = 1_350
         options.initialMaxStreamsBidirectional = 1
         options.initialMaxStreamsUnidirectional = 8
         options.initialMaxData = configuration.profile.mode == .latency ? 8 * 1_048_576 : 64 * 1_048_576
