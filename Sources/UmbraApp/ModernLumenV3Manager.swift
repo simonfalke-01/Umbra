@@ -1288,8 +1288,10 @@ final class ModernLumenV3Manager {
     }
 
     func stopSession(quitApplication: Bool, reason: UInt64 = 1) async throws {
-        guard let (hostID, entry) = sessions.first(where: { $0.value.activeSessionID != nil }),
-              let sessionID = entry.activeSessionID else { return }
+        guard let (hostID, entry) = sessions.first(where: {
+            $0.value.activeSessionID != nil || $0.value.attachState != nil
+        }),
+              let sessionID = entry.activeSessionID ?? entry.attachState?.sessionID else { return }
         try requirePermission(
             hostID: hostID,
             permission: quitApplication ? Permission.quitApplication : Permission.stopOwnStream,

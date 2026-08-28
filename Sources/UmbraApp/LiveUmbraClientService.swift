@@ -1016,8 +1016,23 @@ final class LiveApplicationComposition {
             )
         )
         streamWindow.onStopRequested = { [weak applicationService, weak protocolV3] quitHostApplication in
+            supportLogger?.record(
+                source: "Lumen v3",
+                level: .info,
+                message: "Window-requested STOP started; awaiting STOP response and SESSION_ENDED."
+            )
             do {
-                try await protocolV3?.stopSession(quitApplication: quitHostApplication)
+                guard let protocolV3 else {
+                    throw UmbraClientServiceError.unavailable(
+                        "Secure protocol-v3 manager is unavailable during STOP."
+                    )
+                }
+                try await protocolV3.stopSession(quitApplication: quitHostApplication)
+                supportLogger?.record(
+                    source: "Lumen v3",
+                    level: .info,
+                    message: "Window-requested STOP completed after terminal confirmation."
+                )
             } catch {
                 supportLogger?.record(
                     source: "Lumen v3",
