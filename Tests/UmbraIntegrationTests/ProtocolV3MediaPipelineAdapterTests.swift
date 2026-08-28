@@ -260,7 +260,10 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             framesPerSecond: 120
         )
         XCTAssertEqual(newest.lostFrameIDs, [1])
-        XCTAssertEqual(newest.readyFrames.map(\.frameID), [2])
+        XCTAssertEqual(newest.requestedKeyFrameID, 1)
+        XCTAssertTrue(newest.readyFrames.isEmpty)
+        XCTAssertTrue(reassembler.requiresKeyFrame)
+        XCTAssertTrue(reassembler.pendingFrameIDs.isEmpty)
 
         let stale = try reassembler.accept(
             fragment(
@@ -276,6 +279,31 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         )
         XCTAssertTrue(stale.readyFrames.isEmpty)
         XCTAssertTrue(reassembler.pendingFrameIDs.isEmpty)
+
+        let dependent = try reassembler.accept(
+            fragment(
+                frameID: 3,
+                frameSize: 2,
+                bytes: Data([7, 8]),
+                receivedAtNanoseconds: 4
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertTrue(dependent.readyFrames.isEmpty)
+        XCTAssertTrue(reassembler.pendingFrameIDs.isEmpty)
+
+        let recovered = try reassembler.accept(
+            fragment(
+                frameID: 4,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([9, 10]),
+                receivedAtNanoseconds: 5
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(recovered.readyFrames.map(\.frameID), [4])
+        XCTAssertFalse(reassembler.requiresKeyFrame)
     }
 
     /// Pure negotiation-vector coverage supplements production runtime and

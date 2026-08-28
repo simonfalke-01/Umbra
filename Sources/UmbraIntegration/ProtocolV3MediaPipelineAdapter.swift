@@ -287,7 +287,7 @@ final class ProtocolV3VideoReassembler {
     private var assemblies: [UInt64: ProtocolV3VideoAssembly] = [:]
     private var highestObservedFrameID: UInt64 = 0
     private var latestReleasedFrameID: UInt64 = 0
-    private var qualityNeedsKeyFrame = false
+    private var needsKeyFrame = false
     private var qualityGapStartedAtNanoseconds: UInt64?
 
     init(mode: QUICOptimizationMode) {
@@ -299,7 +299,7 @@ final class ProtocolV3VideoReassembler {
     }
 
     var requiresKeyFrame: Bool {
-        qualityNeedsKeyFrame
+        needsKeyFrame
     }
 
     func storageAddress(frameID: UInt64) -> UInt? {
@@ -310,7 +310,7 @@ final class ProtocolV3VideoReassembler {
         assemblies.removeAll(keepingCapacity: true)
         highestObservedFrameID = 0
         latestReleasedFrameID = 0
-        qualityNeedsKeyFrame = false
+        needsKeyFrame = false
         qualityGapStartedAtNanoseconds = nil
     }
 
@@ -328,7 +328,7 @@ final class ProtocolV3VideoReassembler {
         let lost = pendingFrameIDs
         assemblies.removeAll(keepingCapacity: true)
         qualityGapStartedAtNanoseconds = nil
-        qualityNeedsKeyFrame = mode == .quality
+        needsKeyFrame = true
         return lost
     }
 
@@ -360,6 +360,9 @@ final class ProtocolV3VideoReassembler {
             throw ProtocolV3MediaPipelineError.invalidDatagram("video fragment")
         }
         var update = ProtocolV3VideoReassemblyUpdate()
+        if needsKeyFrame, fragment.flags & 0x01 == 0 {
+            return update
+        }
         if mode == .quality {
             expireQualityBlocker(
                 nowNanoseconds: fragment.receivedAtNanoseconds,
@@ -375,8 +378,17 @@ final class ProtocolV3VideoReassembler {
             if mode == .latency {
                 guard fragment.frameID >= highestObservedFrameID else { return update }
                 highestObservedFrameID = max(highestObservedFrameID, fragment.frameID)
-                update.appendLost(assemblies.keys.filter { $0 != fragment.frameID })
+                let lostFrameIDs = assemblies.keys.filter { $0 != fragment.frameID }
+                update.appendLost(lostFrameIDs)
                 assemblies = assemblies.filter { $0.key == fragment.frameID }
+                if !lostFrameIDs.isEmpty {
+                    needsKeyFrame = true
+                    update.requestedKeyFrameID = lostFrameIDs.min()
+                    guard fragment.flags & 0x01 != 0 else {
+                        assemblies.removeAll(keepingCapacity: true)
+                        return update
+                    }
+                }
             } else {
                 highestObservedFrameID = max(highestObservedFrameID, fragment.frameID)
                 if fragment.flags & 0x01 != 0 {
@@ -385,7 +397,7 @@ final class ProtocolV3VideoReassembler {
                     for frameID in superseded {
                         assemblies.removeValue(forKey: frameID)
                     }
-                } else if qualityNeedsKeyFrame {
+                } else if needsKeyFrame {
                     return update
                 }
                 if assemblies.count >= 2 {
@@ -411,6 +423,9 @@ final class ProtocolV3VideoReassembler {
                 assemblies.removeValue(forKey: fragment.frameID)
                 latestReleasedFrameID = fragment.frameID
                 update.readyFrames = [assembly.takeFrame(frameID: fragment.frameID)]
+                if fragment.flags & 0x01 != 0 {
+                    needsKeyFrame = false
+                }
             }
             return update
         }
@@ -434,13 +449,13 @@ final class ProtocolV3VideoReassembler {
                 assemblies.removeValue(forKey: frameID)
             }
             latestReleasedFrameID = keyFrameID
-            qualityNeedsKeyFrame = false
+            needsKeyFrame = false
             qualityGapStartedAtNanoseconds = nil
             update.requestedKeyFrameID = nil
             update.readyFrames.append(keyFrame.takeFrame(frameID: keyFrameID))
         }
 
-        while !qualityNeedsKeyFrame {
+        while !needsKeyFrame {
             guard latestReleasedFrameID < UInt64.max else { break }
             let expectedFrameID = latestReleasedFrameID + 1
             guard let assembly = assemblies[expectedFrameID], assembly.isComplete else { break }
@@ -499,7 +514,7 @@ final class ProtocolV3VideoReassembler {
         update.appendLost(assemblies.keys)
         assemblies.removeAll(keepingCapacity: true)
         qualityGapStartedAtNanoseconds = nil
-        qualityNeedsKeyFrame = true
+        needsKeyFrame = true
         update.requestedKeyFrameID = affectedFrameID
     }
 
