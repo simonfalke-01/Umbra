@@ -854,38 +854,50 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             let payload: EncodedVideoPayload
             switch profile.codec {
             case .h264, .hevc:
-                let parameterSets: [Data]
+                let inlineParameterSets: [Data]
                 switch frame.payloadFormat {
                 case .annexB:
                     let units = try AnnexBAccessUnit(data: frame.data, codec: profile.codec)
-                    parameterSets = units.parameterSets
+                    inlineParameterSets = units.parameterSets
                     payload = units.lengthPrefixedPayload
                 case .videoToolboxLengthPrefixed:
                     let units = try LengthPrefixedAccessUnit(data: frame.data, codec: profile.codec)
-                    parameterSets = units.parameterSets
+                    inlineParameterSets = units.parameterSets
                     payload = units.payload
                 case .av1LowOverheadOBU:
                     throw VideoDecoderError.invalidAccessUnit
                 }
-                if !parameterSets.isEmpty {
-                    lock.lock()
-                    let changed = state.session == nil
-                        || state.recovery.isRequired
-                        || state.parameterSets != parameterSets
-                    lock.unlock()
-                    if changed {
-                        let description = try makeFormatDescription(codec: profile.codec, parameterSets: parameterSets)
-                        invalidateCurrentSession(waitForFrames: true)
-                        try installSession(formatDescription: description, format: format, profile: profile)
-                        lock.lock()
-                        state.parameterSets = parameterSets
-                        lock.unlock()
-                    }
-                }
                 lock.lock()
                 let hasSession = state.session != nil
+                let requiresRecovery = state.recovery.isRequired
+                let retainedParameterSets = state.parameterSets
                 lock.unlock()
-                guard hasSession else {
+                if let parameterSets = Self.parameterSetsForSessionRecreation(
+                    inline: inlineParameterSets,
+                    retained: retainedParameterSets,
+                    isKeyFrame: frame.isKeyFrame,
+                    hasSession: hasSession,
+                    requiresRecovery: requiresRecovery
+                ) {
+                    let description = try makeFormatDescription(
+                        codec: profile.codec,
+                        parameterSets: parameterSets
+                    )
+                    invalidateCurrentSession(waitForFrames: true)
+                    try installSession(formatDescription: description, format: format, profile: profile)
+                    lock.lock()
+                    state.parameterSets = parameterSets
+                    lock.unlock()
+                } else if frame.isKeyFrame,
+                          (requiresRecovery || !hasSession),
+                          inlineParameterSets.isEmpty,
+                          retainedParameterSets.isEmpty {
+                    throw VideoDecoderError.missingParameterSets(profile.codec)
+                }
+                lock.lock()
+                let hasUsableSession = state.session != nil
+                lock.unlock()
+                guard hasUsableSession else {
                     throw VideoDecoderError.missingParameterSets(profile.codec)
                 }
             case .av1:
@@ -957,6 +969,23 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         nextConfiguration: Data
     ) -> Bool {
         !hasSession || requiresRecovery || priorConfiguration != nextConfiguration
+    }
+
+    static func parameterSetsForSessionRecreation(
+        inline: [Data],
+        retained: [Data],
+        isKeyFrame: Bool,
+        hasSession: Bool,
+        requiresRecovery: Bool
+    ) -> [Data]? {
+        let next = inline.isEmpty && isKeyFrame && (requiresRecovery || !hasSession)
+            ? retained
+            : inline
+        guard !next.isEmpty,
+              !hasSession || requiresRecovery || retained != next else {
+            return nil
+        }
+        return next
     }
 
     private func submit(

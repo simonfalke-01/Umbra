@@ -439,6 +439,34 @@ final class MediaFormatTests: XCTestCase {
         ])
     }
 
+    func testRecoveryKeyFrameReusesRetainedParameterSets() {
+        let retained = [Data([0x40, 0x01]), Data([0x42, 0x01]), Data([0x44, 0x01])]
+        XCTAssertEqual(
+            VideoToolboxDecoder.parameterSetsForSessionRecreation(
+                inline: [],
+                retained: retained,
+                isKeyFrame: true,
+                hasSession: true,
+                requiresRecovery: true
+            ),
+            retained
+        )
+        XCTAssertNil(VideoToolboxDecoder.parameterSetsForSessionRecreation(
+            inline: [],
+            retained: retained,
+            isKeyFrame: false,
+            hasSession: true,
+            requiresRecovery: true
+        ))
+        XCTAssertNil(VideoToolboxDecoder.parameterSetsForSessionRecreation(
+            inline: retained,
+            retained: retained,
+            isKeyFrame: true,
+            hasSession: true,
+            requiresRecovery: false
+        ))
+    }
+
     func testAV1LowOverheadOBUBytesRemainByteIdenticalInCoreMediaStorage() throws {
         let accessUnit = Data([
             0x12, 0x00,
