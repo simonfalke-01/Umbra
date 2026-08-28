@@ -205,18 +205,27 @@ final class MediaHardwareTests: XCTestCase {
         decoder.stop()
     }
 
-    func testLatencyCapacityOverflowDoesNotRecreateHealthyVideoToolboxSession() throws {
+    func testLatencyCapacityOverflowWithQueuedDependentsKeepsHealthyVideoToolboxSession() throws {
         let annexBFrame = try makeRealH264AnnexBKeyFrame(width: 64, height: 64)
         let encodedFrame = try AnnexBAccessUnit(
             data: annexBFrame,
             codec: .h264
         ).lengthPrefixedData
         let renderer = RealDecodeRecordingRenderer()
+        let blockSubmissions = MediaHardwareLockedBox(false)
+        let reachedBoundary = DispatchSemaphore(value: 0)
+        let resumeSubmission = DispatchSemaphore(value: 0)
+        let limiter = VideoDecodeInFlightLimiter(maximumCount: 2)
         let decoder = VideoToolboxDecoder(
             renderer: renderer,
             policy: .automatic,
-            maximumOutstandingFrames: 2,
-            capacityPolicy: .dropNewestWhenFull
+            capacityPolicy: .dropNewestWhenFull,
+            submissionBoundaryHandler: {
+                guard blockSubmissions.value else { return }
+                reachedBoundary.signal()
+                resumeSubmission.wait()
+            },
+            inFlightLimiter: limiter
         )
         XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
             codecMask: 0x0001,
@@ -237,17 +246,52 @@ final class MediaHardwareTests: XCTestCase {
         let establishedSessionGeneration = decoder.currentSessionGeneration
         XCTAssertGreaterThan(establishedSessionGeneration, 0)
 
-        XCTAssertEqual(decoder.recordCapacityOverflow(
-            depth: 2,
-            generation: decoder.currentDecodeGeneration,
-            at: 1
-        ), .requestKeyFrame)
+        let frame: @Sendable (Int, Bool) -> CompressedVideoFrame = { frameNumber, isKeyFrame in
+            CompressedVideoFrame(
+                data: encodedFrame,
+                payloadFormat: .videoToolboxLengthPrefixed,
+                frameNumber: frameNumber,
+                isKeyFrame: isKeyFrame,
+                presentationTimeMicroseconds: UInt64(frameNumber) * 8_333
+            )
+        }
+
+        blockSubmissions.value = true
+        let queuedDispositions = MediaHardwareLockedBox<[VideoFrameDisposition?]>([nil, nil])
+        let queuedFinished = DispatchSemaphore(value: 0)
+        for index in 0..<2 {
+            DispatchQueue.global(qos: .userInteractive).async {
+                let disposition = decoder.submit(frame: frame(index + 2, false))
+                queuedDispositions.withValue {
+                    $0[index] = disposition
+                }
+                queuedFinished.signal()
+            }
+        }
+        defer {
+            blockSubmissions.value = false
+            resumeSubmission.signal()
+            resumeSubmission.signal()
+        }
+        XCTAssertEqual(reachedBoundary.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(reachedBoundary.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(decoder.submit(frame: frame(4, false)), .requestKeyFrame)
+
+        blockSubmissions.value = false
+        resumeSubmission.signal()
+        resumeSubmission.signal()
+        XCTAssertEqual(queuedFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(queuedFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(queuedDispositions.value.compactMap { $0 }, [.accepted, .accepted])
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+
         XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
             data: encodedFrame,
             payloadFormat: .videoToolboxLengthPrefixed,
-            frameNumber: 2,
+            frameNumber: 5,
             isKeyFrame: true,
-            presentationTimeMicroseconds: 8_333
+            presentationTimeMicroseconds: 41_665
         )), .accepted)
         XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
         XCTAssertEqual(decoder.currentSessionGeneration, establishedSessionGeneration)
