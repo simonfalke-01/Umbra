@@ -15,6 +15,38 @@ import UmbraStreaming
 
 @MainActor
 final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
+    func testControlKeepalivePolicyRequiresEchoedProbeAndOrderedHostTimes() {
+        let fields = ProtocolV3ControlKeepalivePolicy.requestFields(
+            clientSendNanoseconds: 100,
+            probe: 7
+        )
+        XCTAssertEqual(fields, [1: .unsigned(100), 2: .unsigned(7)])
+        XCTAssertTrue(ProtocolV3ControlKeepalivePolicy.acceptsResponse(
+            [
+                1: .unsigned(100), 2: .unsigned(7),
+                3: .unsigned(200), 4: .unsigned(201),
+            ],
+            clientSendNanoseconds: 100,
+            probe: 7
+        ))
+        XCTAssertFalse(ProtocolV3ControlKeepalivePolicy.acceptsResponse(
+            [
+                1: .unsigned(100), 2: .unsigned(8),
+                3: .unsigned(200), 4: .unsigned(201),
+            ],
+            clientSendNanoseconds: 100,
+            probe: 7
+        ))
+        XCTAssertFalse(ProtocolV3ControlKeepalivePolicy.acceptsResponse(
+            [
+                1: .unsigned(100), 2: .unsigned(7),
+                3: .unsigned(202), 4: .unsigned(201),
+            ],
+            clientSendNanoseconds: 100,
+            probe: 7
+        ))
+    }
+
     private enum HostileConfiguration {
         case wrongVideoSession
         case wrongAudioGeneration

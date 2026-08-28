@@ -262,6 +262,35 @@ final class ProtocolV3MediaEventExecutor: @unchecked Sendable {
     }
 }
 
+enum ProtocolV3ControlKeepalivePolicy {
+    static let interval: Duration = .seconds(45)
+    static let responseTimeout: Duration = .seconds(5)
+
+    static func requestFields(
+        clientSendNanoseconds: UInt64,
+        probe: UInt64
+    ) -> [UInt64: ProtocolV3CBORValue] {
+        [1: .unsigned(clientSendNanoseconds), 2: .unsigned(probe)]
+    }
+
+    static func acceptsResponse(
+        _ fields: [UInt64: ProtocolV3CBORValue],
+        clientSendNanoseconds: UInt64,
+        probe: UInt64
+    ) -> Bool {
+        guard Set(fields.keys) == Set(1...4),
+              fields[1]?.unsignedValue == clientSendNanoseconds,
+              fields[2]?.unsignedValue == probe,
+              let hostReceiveNanoseconds = fields[3]?.unsignedValue,
+              hostReceiveNanoseconds > 0,
+              let hostSendNanoseconds = fields[4]?.unsignedValue,
+              hostSendNanoseconds >= hostReceiveNanoseconds else {
+            return false
+        }
+        return true
+    }
+}
+
 @MainActor
 final class ModernLumenV3Manager {
     typealias PairedSessionFactory = @MainActor (
@@ -457,6 +486,8 @@ final class ModernLumenV3Manager {
         var pendingBulkObjects: [UInt64: PendingBulkObject] = [:]
         var rejectedBulkRequestIDs = Set<UInt64>()
         var statisticsTask: Task<Void, Never>?
+        var controlKeepaliveTask: Task<Void, Never>?
+        var controlKeepaliveProbe: UInt64 = 0
         let mediaEventExecutor = ProtocolV3MediaEventExecutor()
         let configurationAcknowledgements: AsyncStream<ProtocolV3ConfigurationOutcome>
         let configurationAcknowledgementContinuation:
@@ -1289,6 +1320,7 @@ final class ModernLumenV3Manager {
         quitApplication: Bool,
         reason: UInt64
     ) async throws {
+        cancelControlKeepalive(entry: entry)
         let sessionEndedEvents = entry.sessionEndedEvents
         do {
             let stopIntentID = try ProtocolV3ClientIdentity.secureRandomBytes(count: 16)
@@ -1476,6 +1508,7 @@ final class ModernLumenV3Manager {
             guard !entry.isRecovering else { return }
             entry.isRecovering = true
             entry.isAuthenticated = false
+            cancelControlKeepalive(entry: entry)
             entry.mediaEventExecutor.pause()
             entry.mediaCoordinator?.suspendForReconnect()
             inputInstaller?.installInputSink(nil)
@@ -1901,6 +1934,7 @@ final class ModernLumenV3Manager {
             connectionStatuses[hostID] = .online
             publishCatalog()
             sessionEventHandler?(.sessionStreaming)
+            startControlKeepalive(entry: entry, hostID: hostID)
         } catch {
             await failAttachedRecovery(entry: entry, hostID: hostID, error: error)
         }
@@ -2302,6 +2336,7 @@ final class ModernLumenV3Manager {
             ))
             await lifecycle.commitStreaming(for: prepared.bootstrap)
             sessionEventHandler?(.sessionStreaming)
+            startControlKeepalive(entry: entry, hostID: hostID)
             entry.startContinuation.yield(.success(StartResult(sessionID: sessionID, fields: fields)))
             entry.startContinuation.finish()
         } catch {
@@ -2558,6 +2593,7 @@ final class ModernLumenV3Manager {
         let prepared = entry.preparedStream
         let coordinator = entry.mediaCoordinator
         let inputSender = entry.inputSender
+        cancelControlKeepalive(entry: entry)
         await entry.mediaEventExecutor.clearAndWait()
         entry.preparedStream = nil
         entry.statisticsTask?.cancel()
@@ -2587,6 +2623,68 @@ final class ModernLumenV3Manager {
             publishCatalog()
         }
         if publishEnded { sessionEventHandler?(.sessionEnded) }
+    }
+
+    private func startControlKeepalive(entry: RetainedSession, hostID: Data) {
+        cancelControlKeepalive(entry: entry)
+        let expectedSession = entry.session
+        entry.controlKeepaliveTask = Task { @MainActor [weak self, weak entry] in
+            guard let self, let entry else { return }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: ProtocolV3ControlKeepalivePolicy.interval)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled,
+                      self.sessions[hostID] === entry,
+                      entry.session === expectedSession,
+                      entry.activeSessionID != nil,
+                      entry.attachState != nil,
+                      !entry.isRecovering else {
+                    return
+                }
+                entry.controlKeepaliveProbe = entry.controlKeepaliveProbe == UInt64.max
+                    ? 1
+                    : entry.controlKeepaliveProbe + 1
+                let probe = entry.controlKeepaliveProbe
+                let clientSendNanoseconds = max(DispatchTime.now().uptimeNanoseconds, 1)
+                do {
+                    let response = try await self.requestControl(
+                        entry: entry,
+                        requestType: 0x0005,
+                        responseType: 0x0006,
+                        fields: ProtocolV3ControlKeepalivePolicy.requestFields(
+                            clientSendNanoseconds: clientSendNanoseconds,
+                            probe: probe
+                        ),
+                        timeout: ProtocolV3ControlKeepalivePolicy.responseTimeout
+                    )
+                    guard ProtocolV3ControlKeepalivePolicy.acceptsResponse(
+                        response.fields,
+                        clientSendNanoseconds: clientSendNanoseconds,
+                        probe: probe
+                    ) else {
+                        throw ProtocolV3ClientError.invalidMessage("PING response")
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    self.log?.record(
+                        source: "Lumen v3",
+                        level: .error,
+                        message: "Authenticated control keepalive failed: \(error)."
+                    )
+                    expectedSession.cancel()
+                    return
+                }
+            }
+        }
+    }
+
+    private func cancelControlKeepalive(entry: RetainedSession) {
+        entry.controlKeepaliveTask?.cancel()
+        entry.controlKeepaliveTask = nil
     }
 
     private func receiveBulkHeader(
