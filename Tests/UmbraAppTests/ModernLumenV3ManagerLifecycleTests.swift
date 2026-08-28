@@ -312,7 +312,7 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
                 1: .unsigned(0),
                 2: selection[3]!,
                 3: stopFields[4]!,
-                4: .boolean(false),
+                4: .boolean(true),
             ],
             codec: fixture.codec
         )
@@ -329,6 +329,7 @@ final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
         let stoppedEvents = await lifecycle.snapshot()
         XCTAssertEqual(Array(stoppedEvents.suffix(2)), [.finishPresentation, .finish])
         XCTAssertEqual(output.endCount, 1)
+        XCTAssertEqual(try fixture.catalog.host(hostID: fixture.hostID)?.runningApplicationID, 1)
         await fixture.manager.stopAll()
     }
 

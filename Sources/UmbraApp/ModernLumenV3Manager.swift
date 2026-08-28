@@ -457,6 +457,7 @@ final class ModernLumenV3Manager {
         var activeSessionContinuation: AsyncStream<Data>.Continuation
         var sessionEndedEvents: AsyncStream<Data>
         var sessionEndedContinuation: AsyncStream<Data>.Continuation
+        var applicationRunningAfterStop: Bool?
         var isAuthenticated = false
         var serverCapabilities: UInt64 = 0
         var inputDatagramPayloadByteCount = 0
@@ -1346,9 +1347,10 @@ final class ModernLumenV3Manager {
                   response.fields[1]?.unsignedValue == 0,
                   response.fields[2]?.bytesValue == sessionID,
                   response.fields[3]?.bytesValue == stopIntentID,
-                  response.fields[4]?.booleanValue != nil else {
+                  let applicationRunning = response.fields[4]?.booleanValue else {
                 throw ProtocolV3ClientError.invalidMessage("STOP response")
             }
+            entry.applicationRunningAfterStop = applicationRunning
             try await Self.waitForSessionEnded(
                 sessionEndedEvents,
                 sessionID: sessionID,
@@ -1636,6 +1638,9 @@ final class ModernLumenV3Manager {
             }
             if type == 0x0133, requestID == 0 {
                 if let sessionID = fields[1]?.bytesValue {
+                    if entry.stopTask == nil {
+                        entry.applicationRunningAfterStop = fields[4]?.booleanValue
+                    }
                     entry.sessionEndedContinuation.yield(sessionID)
                     entry.sessionEndedContinuation.finish()
                 }
@@ -2615,6 +2620,8 @@ final class ModernLumenV3Manager {
         entry.isRecovering = false
         let lifecycleWasPrepared = entry.lifecyclePrepared
         entry.lifecyclePrepared = false
+        let applicationRunningAfterStop = entry.applicationRunningAfterStop
+        entry.applicationRunningAfterStop = nil
         clearBulkState(entry: entry, reason: "stream teardown")
         inputInstaller?.installInputSink(nil)
         entry.inputSenderRelay.install(nil)
@@ -2627,7 +2634,9 @@ final class ModernLumenV3Manager {
             await lifecycle?.finish()
         }
         if var record = try? hostCatalog.host(hostID: hostID) {
-            record.runningApplicationID = nil
+            if applicationRunningAfterStop != true {
+                record.runningApplicationID = nil
+            }
             try? hostCatalog.upsert(record)
             publishCatalog()
         }
