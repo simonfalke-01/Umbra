@@ -782,6 +782,7 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
 
     private func sendVideoFeedback(_ feedback: ProtocolV3VideoFeedback) {
         guard let sessionID = lock.withLock({ stopped ? nil : self.sessionID }) else { return }
+        let scheduling = Self.videoFeedbackScheduling(feedback)
         var payload = Data()
         Self.append(feedback.lastReassembledFrameID, to: &payload)
         Self.append(feedback.lastDecodedFrameID, to: &payload)
@@ -796,11 +797,17 @@ public final class ProtocolV3SessionMediaCoordinator: @unchecked Sendable {
             channel: 2,
             kind: 3,
             flags: 0,
-            objectID: feedback.affectedFrameID,
+            objectID: scheduling.objectID,
             payload: payload,
             deadlineNanoseconds: nil,
-            supersessionKey: feedback.affectedFrameID
+            supersessionKey: scheduling.supersessionKey
         )
+    }
+
+    static func videoFeedbackScheduling(
+        _ feedback: ProtocolV3VideoFeedback
+    ) -> (objectID: UInt64, supersessionKey: UInt64?) {
+        (feedback.affectedFrameID, nil)
     }
 
     private static func monotonicMicroseconds() -> UInt64 {
