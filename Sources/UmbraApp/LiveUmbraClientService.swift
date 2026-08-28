@@ -1016,37 +1016,35 @@ final class LiveApplicationComposition {
             )
         )
         streamWindow.onStopRequested = { [weak applicationService, weak protocolV3] quitHostApplication in
-            Task {
-                do {
-                    try await protocolV3?.stopSession(quitApplication: quitHostApplication)
-                } catch {
-                    supportLogger?.record(
-                        source: "Lumen v3",
-                        level: .error,
-                        message: "Window-requested STOP failed: \(error)."
-                    )
-                    if quitHostApplication {
-                        do {
-                            try await protocolV3?.stopSession(quitApplication: false)
-                            supportLogger?.record(
-                                source: "Lumen v3",
-                                level: .warning,
-                                message: "The host did not grant remote app quit; Umbra detached the stream and left the app running."
-                            )
-                        } catch {
-                            supportLogger?.record(
-                                source: "Lumen v3",
-                                level: .error,
-                                message: "Fallback stream detach also failed: \(error)."
-                            )
-                        }
+            do {
+                try await protocolV3?.stopSession(quitApplication: quitHostApplication)
+            } catch {
+                supportLogger?.record(
+                    source: "Lumen v3",
+                    level: .error,
+                    message: "Window-requested STOP failed: \(error)."
+                )
+                if quitHostApplication {
+                    do {
+                        try await protocolV3?.stopSession(quitApplication: false)
+                        supportLogger?.record(
+                            source: "Lumen v3",
+                            level: .warning,
+                            message: "The host did not grant remote app quit; Umbra detached the stream and left the app running."
+                        )
+                    } catch {
+                        supportLogger?.record(
+                            source: "Lumen v3",
+                            level: .error,
+                            message: "Fallback stream detach also failed: \(error)."
+                        )
                     }
                 }
-                if let applicationService {
-                    _ = try? await applicationService.stopSession(
-                        quitHostApplication: quitHostApplication
-                    )
-                }
+            }
+            if let applicationService {
+                _ = try? await applicationService.stopSession(
+                    quitHostApplication: quitHostApplication
+                )
             }
         }
         Task { await compatibilityUpdater.refresh(applicationService) }

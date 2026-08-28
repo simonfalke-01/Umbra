@@ -250,7 +250,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     let videoRenderer: NativeVideoRendererRouter
     let windowModeCoordinator: WindowModeCoordinator
 
-    var onStopRequested: ((Bool) -> Void)?
+    var onStopRequested: ((Bool) async -> Void)?
     var onStatisticsToggle: (() -> Void)?
     var onControllerMouseModeChanged: ((Bool) -> Void)?
     var isStreamWindowVisible: Bool { window.isVisible }
@@ -287,6 +287,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private var activeSystemShortcutCaptureMode: SystemShortcutCaptureMode = .off
     private var fullscreenTeardown = StreamWindowTeardownStateMachine()
     private var presentationFinishTask: Task<Void, Never>?
+    private var stopRequestTask: Task<Void, Never>?
     private var streamWindowRequiresReopen = false
     private var activeRendererGeneration: UInt64?
     private var presentationRevealed = false
@@ -508,6 +509,10 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     }
 
     func prepare(for bootstrap: StreamBootstrap) async throws {
+        if let stopRequestTask {
+            await stopRequestTask.value
+            self.stopRequestTask = nil
+        }
         presentationFinishTask = nil
         windowModeCoordinator.setWindowActivationSuppressed(true)
         fullscreenTeardown = StreamWindowTeardownStateMachine()
@@ -921,9 +926,16 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         isStopRequested = true
         self.quitHostApplication = quitHostApplication
         windowModeCoordinator.setWindowActivationSuppressed(true)
-        dismissStreamSurfaceAndRestoreApplicationWindows()
-        startPresentationFinish()
-        onStopRequested?(quitHostApplication)
+        let stopHandler = onStopRequested
+        stopRequestTask = Task { @MainActor [weak self] in
+            if let stopHandler {
+                await stopHandler(quitHostApplication)
+            }
+            guard let self else { return }
+            dismissStreamSurfaceAndRestoreApplicationWindows()
+            startPresentationFinish()
+            stopRequestTask = nil
+        }
     }
 
     private func startPresentationFinish() {

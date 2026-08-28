@@ -734,9 +734,13 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         _ = NSApplication.shared
         let controller = try StreamWindowController(device: nil)
         var stopRequests: [Bool] = []
+        let stopRequested = expectation(description: "active disconnect requested STOP")
         var statisticsToggles = 0
         var mouseModes: [Bool] = []
-        controller.onStopRequested = { stopRequests.append($0) }
+        controller.onStopRequested = {
+            stopRequests.append($0)
+            stopRequested.fulfill()
+        }
         controller.onStatisticsToggle = { statisticsToggles += 1 }
         controller.onControllerMouseModeChanged = { mouseModes.append($0) }
 
@@ -753,6 +757,7 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         controller.handleControllerLocalAction(.mouseModeChanged(false))
         controller.handleControllerLocalAction(.disconnect)
         controller.handleControllerLocalAction(.disconnect)
+        await fulfillment(of: [stopRequested], timeout: 1)
 
         XCTAssertEqual(statisticsToggles, 1)
         XCTAssertEqual(mouseModes, [true, false])
@@ -773,7 +778,13 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         )
         let driver = try XCTUnwrap(installedDriver)
         var stopRequests: [Bool] = []
-        controller.onStopRequested = { stopRequests.append($0) }
+        var stopStarted: XCTestExpectation?
+        var stopContinuation: CheckedContinuation<Void, Never>?
+        controller.onStopRequested = {
+            stopRequests.append($0)
+            stopStarted?.fulfill()
+            await withCheckedContinuation { stopContinuation = $0 }
+        }
 
         for expectedSessionCount in 1 ... 2 {
             try await controller.prepare(for: makeBootstrap(windowMode: .fullscreen))
@@ -790,18 +801,23 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             XCTAssertEqual(driver.windowWasVisibleAtNativeEntry.last, true)
             XCTAssertTrue(controller.isStreamWindowVisible)
 
+            let currentStopStarted = expectation(
+                description: "STOP handler started for session \(expectedSessionCount)"
+            )
+            stopStarted = currentStopStarted
             controller.handleControllerLocalAction(.disconnect)
+            await fulfillment(of: [currentStopStarted], timeout: 1)
 
-            XCTAssertFalse(
+            XCTAssertTrue(
                 controller.isStreamWindowVisible,
-                "The quit action must synchronously remove the stream surface."
+                "The stream surface must remain until the retained STOP task completes."
             )
-            XCTAssertEqual(
-                driver.dismissalResetCount,
-                expectedSessionCount * 2 - 1
-            )
+            stopContinuation?.resume()
+            stopContinuation = nil
+            stopStarted = nil
             await controller.finish()
-            XCTAssertEqual(driver.dismissalResetCount, expectedSessionCount * 2)
+            XCTAssertFalse(controller.isStreamWindowVisible)
+            XCTAssertEqual(driver.dismissalResetCount, expectedSessionCount)
         }
 
         XCTAssertEqual(stopRequests, [false, false])
