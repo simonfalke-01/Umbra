@@ -15,6 +15,18 @@ import UmbraStreaming
 
 @MainActor
 final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
+    func testStopWithoutRetainedSessionFailsClosed() async throws {
+        let fixture = try makeFixture(applications: [])
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        do {
+            try await fixture.manager.stopSession(quitApplication: false)
+            XCTFail("STOP without retained session must fail closed.")
+        } catch let error as ProtocolV3ClientError {
+            XCTAssertEqual(error, .invalidState)
+        }
+    }
+
     func testControlKeepalivePolicyRequiresEchoedProbeAndOrderedHostTimes() {
         let fields = ProtocolV3ControlKeepalivePolicy.requestFields(
             clientSendNanoseconds: 100,

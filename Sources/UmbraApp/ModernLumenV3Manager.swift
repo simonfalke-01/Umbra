@@ -1291,7 +1291,14 @@ final class ModernLumenV3Manager {
         guard let (hostID, entry) = sessions.first(where: {
             $0.value.activeSessionID != nil || $0.value.attachState != nil
         }),
-              let sessionID = entry.activeSessionID ?? entry.attachState?.sessionID else { return }
+              let sessionID = entry.activeSessionID ?? entry.attachState?.sessionID else {
+            log?.record(
+                source: "Lumen v3",
+                level: .error,
+                message: "STOP requested without a retained active or attached session."
+            )
+            throw ProtocolV3ClientError.invalidState
+        }
         try requirePermission(
             hostID: hostID,
             permission: quitApplication ? Permission.quitApplication : Permission.stopOwnStream,

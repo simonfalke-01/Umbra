@@ -1015,18 +1015,13 @@ final class LiveApplicationComposition {
                 capabilities: mediaCapabilities
             )
         )
-        streamWindow.onStopRequested = { [weak applicationService, weak protocolV3] quitHostApplication in
+        streamWindow.onStopRequested = { [applicationService, protocolV3] quitHostApplication in
             supportLogger?.record(
                 source: "Lumen v3",
                 level: .info,
                 message: "Window-requested STOP started; awaiting STOP response and SESSION_ENDED."
             )
             do {
-                guard let protocolV3 else {
-                    throw UmbraClientServiceError.unavailable(
-                        "Secure protocol-v3 manager is unavailable during STOP."
-                    )
-                }
                 try await protocolV3.stopSession(quitApplication: quitHostApplication)
                 supportLogger?.record(
                     source: "Lumen v3",
@@ -1041,7 +1036,7 @@ final class LiveApplicationComposition {
                 )
                 if quitHostApplication {
                     do {
-                        try await protocolV3?.stopSession(quitApplication: false)
+                        try await protocolV3.stopSession(quitApplication: false)
                         supportLogger?.record(
                             source: "Lumen v3",
                             level: .warning,
@@ -1056,11 +1051,9 @@ final class LiveApplicationComposition {
                     }
                 }
             }
-            if let applicationService {
-                _ = try? await applicationService.stopSession(
-                    quitHostApplication: quitHostApplication
-                )
-            }
+            _ = try? await applicationService.stopSession(
+                quitHostApplication: quitHostApplication
+            )
         }
         Task { await compatibilityUpdater.refresh(applicationService) }
     }
