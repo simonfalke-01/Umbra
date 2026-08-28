@@ -1488,7 +1488,9 @@ private final class ManagerAudioDecoder: UmbraStreaming.AudioDecoding, @unchecke
 @MainActor
 private final class ManagerInputInstaller: PlatformInputSinkInstalling {
     private(set) var installations: [Bool] = []
+    private var sink: (any PlatformInputPacketSink)?
     func installInputSink(_ sink: (any PlatformInputPacketSink)?) {
+        self.sink = sink
         installations.append(sink != nil)
     }
 }

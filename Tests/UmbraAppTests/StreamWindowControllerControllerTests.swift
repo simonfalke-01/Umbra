@@ -12,6 +12,42 @@ import XCTest
 
 @MainActor
 final class StreamWindowControllerControllerTests: XCTestCase {
+    func testInstalledInputSinkIsRetainedAndReceivesKeyboardReleaseBeforeUninstall() throws {
+        let controller = try StreamWindowController(device: nil)
+        weak var weakSink: RecordingPlatformInputSink?
+
+        func installEphemeralSink() {
+            let sink = RecordingPlatformInputSink()
+            weakSink = sink
+            controller.installInputSink(sink)
+        }
+        installEphemeralSink()
+        var sink: RecordingPlatformInputSink? = try XCTUnwrap(weakSink)
+        let keyDown = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 1,
+            windowNumber: 0,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+        XCTAssertTrue(controller.handleKeyboardEventForTesting(keyDown))
+        XCTAssertEqual(sink?.packets.count, 1)
+
+        controller.installInputSink(nil)
+        XCTAssertEqual(sink?.packets.count, 2)
+        XCTAssertEqual(sink?.packets.compactMap { packet -> KeyAction? in
+            guard case let .keyboard(keyboard) = packet else { return nil }
+            return keyboard.action
+        }, [.down, .up])
+        sink = nil
+        XCTAssertNil(weakSink)
+    }
+
     func testLatencyRendererPolicyRejectsStaleFuturePacingOverride() {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .latency
@@ -1031,6 +1067,16 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             presentationTime: CMTime(value: 1, timescale: 60),
             frameNumber: frameNumber
         )
+    }
+}
+
+private final class RecordingPlatformInputSink: PlatformInputPacketSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedPackets: [PlatformInputPacket] = []
+    var packets: [PlatformInputPacket] { lock.withLock { storedPackets } }
+
+    func platformInputDidProduce(_ packet: PlatformInputPacket) {
+        lock.withLock { storedPackets.append(packet) }
     }
 }
 

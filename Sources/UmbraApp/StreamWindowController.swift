@@ -291,6 +291,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private var activeRendererGeneration: UInt64?
     private var presentationRevealed = false
     private var activeSessionID: UUID?
+    private var installedInputSink: (any PlatformInputPacketSink)?
     private weak var returnApplicationWindow: NSWindow?
     nonisolated(unsafe) private var screenObservers: [NSObjectProtocol] = []
 
@@ -488,14 +489,22 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     }
 
     func installInputSink(_ sink: (any PlatformInputPacketSink)?) {
+        let previousSink = installedInputSink
         if sink == nil {
             keyboard.releaseAllKeys()
             contentView.resetVirtualTrackpad()
         }
+        installedInputSink = sink
         keyboard.sink = sink
         pointer.sink = sink
         controllers.sink = sink
         contentView.inputSink = sink
+        withExtendedLifetime(previousSink) {}
+    }
+
+    @discardableResult
+    func handleKeyboardEventForTesting(_ event: NSEvent) -> Bool {
+        keyboard.handle(event)
     }
 
     func prepare(for bootstrap: StreamBootstrap) async throws {
