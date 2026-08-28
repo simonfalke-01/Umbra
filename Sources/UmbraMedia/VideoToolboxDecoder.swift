@@ -497,6 +497,12 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         return state.decodeGeneration
     }
 
+    var currentSessionGeneration: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return state.sessionGeneration
+    }
+
     public func statistics(at time: TimeInterval = ProcessInfo.processInfo.systemUptime) -> MediaPipelineStatistics {
         lock.lock()
         defer { lock.unlock() }
@@ -824,7 +830,9 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             return .accepted
         }
         state.lastError = .queueFull
-        state.recovery.requireRecovery()
+        // The adapter gates dependent frames and requests an IDR for this drop.
+        // Keep the existing VideoToolbox session alive: capacity exhaustion is
+        // backpressure, not evidence that the decoder session itself is corrupt.
         state.statistics.record(.submitted, at: time)
         state.statistics.record(.dropped(.queueOverflow), at: time)
         state.statistics.record(.decoderError, at: time)
