@@ -437,6 +437,7 @@ final class ModernLumenV3Manager {
         var preparedStream: PreparedStream?
         var mediaCoordinator: ProtocolV3SessionMediaCoordinator?
         var inputSender: ProtocolV3InputStateSender?
+        var launchAttemptActive = false
         var lifecyclePrepared = false
         var stopTask: Task<Void, Error>?
         var activeStartRequestID: UInt64?
@@ -807,7 +808,8 @@ final class ModernLumenV3Manager {
         var cursor: UInt64 = 0
         var revision: UInt64?
         var applicationRecords: [ModernLumenV3ApplicationRecord] = []
-        repeat {
+        var paginationRestarts = 0
+        while true {
             var request: [UInt64: ProtocolV3CBORValue] = [
                 1: .unsigned(cursor),
                 2: .unsigned(128),
@@ -824,6 +826,13 @@ final class ModernLumenV3Manager {
                 fields: request
             )
             let page = try Self.decodeApplicationPage(response.fields)
+            if page.status == 8, cursor != 0, paginationRestarts == 0 {
+                paginationRestarts += 1
+                cursor = 0
+                revision = nil
+                applicationRecords.removeAll(keepingCapacity: true)
+                continue
+            }
             guard page.status == 0 else {
                 throw ProtocolV3ClientError.invalidMessage("application-list status")
             }
@@ -863,9 +872,9 @@ final class ModernLumenV3Manager {
                 }
                 cursor = nextCursor
             } else {
-                cursor = 0
+                break
             }
-        } while cursor != 0
+        }
 
         let localPreferences = Dictionary(uniqueKeysWithValues: record.applications.map {
             ($0.id, ($0.isHidden, $0.isDirectLaunch))
@@ -1052,10 +1061,11 @@ final class ModernLumenV3Manager {
         )
         guard let entry = sessions[protocolHostID], entry.session === session,
               entry.preparedStream == nil, entry.activeSessionID == nil,
-              !entry.lifecyclePrepared else {
+              !entry.launchAttemptActive, !entry.lifecyclePrepared else {
             throw ProtocolV3ClientError.invalidState
         }
-        entry.lifecyclePrepared = true
+        entry.launchAttemptActive = true
+        defer { entry.launchAttemptActive = false }
         do {
             try requireStreamingDatagramCapacity(
                 entry: entry,
@@ -1200,7 +1210,8 @@ final class ModernLumenV3Manager {
                 session: session
             )
             sessionEventHandler?(.sessionPreparing)
-            // Lifecycle teardown ownership was claimed before the first await.
+            // Claim lifecycle cleanup before entering the fallible preparation boundary.
+            entry.lifecyclePrepared = true
             try await lifecycle.prepare(for: bootstrap)
             let pipeline = try mediaProvider.makePipeline(
                 for: bootstrap,
@@ -1559,6 +1570,22 @@ final class ModernLumenV3Manager {
             entry.activeSessionContinuation.yield(activeSessionID)
             entry.activeSessionContinuation.finish()
         case let .controlMessage(type, requestID, fields):
+            if type == 0x0101,
+               let cancelledOffer = entry.cancelledStartOffers.removeValue(forKey: requestID) {
+                guard fields[2] == cancelledOffer.fields[1] else {
+                    session.cancel()
+                    return
+                }
+                return
+            }
+            if type == 0x0132, requestID == 0 {
+                guard fields[1]?.bytesValue == entry.activeSessionID else { return }
+                inputInstaller?.installInputSink(nil)
+                entry.inputSenderRelay.install(nil)
+                entry.inputSender?.stop()
+                entry.inputSender = nil
+                return
+            }
             if type == 0x0133, requestID == 0 {
                 if let sessionID = fields[1]?.bytesValue {
                     entry.sessionEndedContinuation.yield(sessionID)
@@ -3012,9 +3039,12 @@ final class ModernLumenV3Manager {
               !entry.isRecovering else {
             throw ProtocolV3ClientError.invalidState
         }
-        guard entry.inputDatagramPayloadByteCount > 0 else {
+        let requiredPayloadByteCount = QUICTransportProfile.semanticDatagramPayloadByteCount
+        guard entry.inputDatagramPayloadByteCount >= requiredPayloadByteCount else {
             throw UmbraClientServiceError.unavailable(
-                "Secure streaming requires QUIC DATAGRAM support, but this connection negotiated control streams only. "
+                "Secure streaming requires QUIC DATAGRAM support with the complete "
+                    + "\(requiredPayloadByteCount)-byte phase-one payload, but this connection negotiated "
+                    + "\(entry.inputDatagramPayloadByteCount) bytes (control streams only or insufficient capacity). "
                     + "Pairing and application browsing remain available; no stream was started."
             )
         }

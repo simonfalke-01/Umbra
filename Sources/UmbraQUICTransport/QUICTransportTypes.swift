@@ -65,6 +65,9 @@ public struct QUICTransportTimeoutProfile: Equatable, Sendable {
 
 public struct QUICTransportProfile: Equatable, Sendable {
     public static let semanticDatagramByteCount = 1_152
+    public static let datagramHeaderByteCount = 44
+    public static let semanticDatagramPayloadByteCount =
+        semanticDatagramByteCount - datagramHeaderByteCount
     public static let maximumMalformedMessagesPerWindow = 32
     public static let malformedWindowNanoseconds: UInt64 = 10_000_000_000
     public static let maximumInvalidDatagramsPerSecond = 256

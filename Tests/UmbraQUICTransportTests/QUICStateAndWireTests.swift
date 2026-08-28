@@ -29,6 +29,14 @@ struct QUICStateAndWireTests {
         #expect(try state.applicationAuthenticationCompleted(success: true) == .ready)
     }
 
+    @Test("phase-one DATAGRAM admission requires the complete semantic record")
+    func phaseOneDatagramAdmission() {
+        #expect(QUICTransportCore.admittedDatagramPayloadByteCount(wireByteCount: 0) == nil)
+        #expect(QUICTransportCore.admittedDatagramPayloadByteCount(wireByteCount: 1_151) == nil)
+        #expect(QUICTransportCore.admittedDatagramPayloadByteCount(wireByteCount: 1_152) == 1_108)
+        #expect(QUICTransportCore.admittedDatagramPayloadByteCount(wireByteCount: 1_350) == 1_108)
+    }
+
     @Test("temporary waiting restores the exact prior state")
     func waitingRecovery() throws {
         let state = QUICSessionStateMachine()

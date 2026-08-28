@@ -2,7 +2,7 @@ import Foundation
 
 enum QUICWireCodec {
     static let controlHeaderByteCount = 24
-    static let datagramHeaderByteCount = 44
+    static let datagramHeaderByteCount = QUICTransportProfile.datagramHeaderByteCount
     static let maximumControlPayloadByteCount = 1_048_576
 
     enum WireError: Error, Equatable {
