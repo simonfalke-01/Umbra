@@ -385,6 +385,7 @@ final class ProtocolV3VideoReassembler {
             throw ProtocolV3MediaPipelineError.invalidDatagram("video fragment")
         }
         var update = ProtocolV3VideoReassemblyUpdate()
+        let wasRecovering = needsKeyFrame
         if needsKeyFrame {
             guard pendingRecoveryKeyFrameID == nil else { return update }
             guard fragment.flags & 0x01 != 0 else { return update }
@@ -410,6 +411,18 @@ final class ProtocolV3VideoReassembler {
             if mode == .latency {
                 guard fragment.frameID >= highestObservedFrameID else { return update }
                 highestObservedFrameID = max(highestObservedFrameID, fragment.frameID)
+                if !wasRecovering,
+                   latestReleasedFrameID != 0,
+                   latestReleasedFrameID < UInt64.max {
+                    let expectedFrameID = latestReleasedFrameID + 1
+                    if fragment.frameID > expectedFrameID {
+                        update.appendLost([expectedFrameID])
+                        needsKeyFrame = true
+                        update.requestedKeyFrameID = expectedFrameID
+                        assemblies.removeAll(keepingCapacity: true)
+                        guard fragment.flags & 0x01 != 0 else { return update }
+                    }
+                }
                 let lostFrameIDs = assemblies.keys.filter { $0 != fragment.frameID }
                 update.appendLost(lostFrameIDs)
                 assemblies = assemblies.filter { $0.key == fragment.frameID }
