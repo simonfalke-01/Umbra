@@ -411,6 +411,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
     private let firstFrameHandler: @Sendable (Int) -> Void
     private let firstFrameMetadataHandler: @Sendable (VideoColorMetadata, OSType) -> Void
     private let submissionBoundaryHandler: (@Sendable () -> Void)?
+    private let accessUnitCapture: VideoAccessUnitCapture?
     private let decodeQueue = DispatchQueue(label: "app.umbra.media.videotoolbox", qos: .userInteractive)
     private let lifecycleLock = NSLock()
     private let lock = NSLock()
@@ -436,6 +437,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         self.firstFrameHandler = firstFrameHandler
         self.firstFrameMetadataHandler = firstFrameMetadataHandler
         self.submissionBoundaryHandler = nil
+        accessUnitCapture = VideoAccessUnitCapture.fromEnvironment()
         state.latencyStatistics = VideoLatencyStatisticsAccumulator(
             profile: telemetryProfile,
             client: telemetryClient
@@ -458,6 +460,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         firstFrameHandler: @escaping @Sendable (Int) -> Void = { _ in },
         firstFrameMetadataHandler: @escaping @Sendable (VideoColorMetadata, OSType) -> Void = { _, _ in },
         submissionBoundaryHandler: (@Sendable () -> Void)? = nil,
+        accessUnitCapture: VideoAccessUnitCapture? = VideoAccessUnitCapture.fromEnvironment(),
         inFlightLimiter: VideoDecodeInFlightLimiter
     ) {
         self.renderer = renderer
@@ -468,6 +471,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         self.firstFrameHandler = firstFrameHandler
         self.firstFrameMetadataHandler = firstFrameMetadataHandler
         self.submissionBoundaryHandler = submissionBoundaryHandler
+        self.accessUnitCapture = accessUnitCapture
         state.latencyStatistics = VideoLatencyStatisticsAccumulator(
             profile: telemetryProfile,
             client: telemetryClient
@@ -885,6 +889,14 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                 case .annexB:
                     let units = try AnnexBAccessUnit(data: frame.data, codec: profile.codec)
                     inlineParameterSets = units.parameterSets
+                    if let accessUnitCapture {
+                        accessUnitCapture.capture(
+                            frame: frame,
+                            codec: profile.codec,
+                            annexB: frame.data,
+                            lengthPrefixed: units.lengthPrefixedData
+                        )
+                    }
                     payload = units.lengthPrefixedPayload
                 case .videoToolboxLengthPrefixed:
                     let units = try LengthPrefixedAccessUnit(data: frame.data, codec: profile.codec)

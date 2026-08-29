@@ -1088,6 +1088,50 @@ final class MediaHardwareTests: XCTestCase {
         decoder.stop()
     }
 
+    func testDiagnosticCaptureSeamRecordsRealHEVCBeforeVideoToolbox() throws {
+        let root = "/tmp/UmbraAUDecoderCaptureTests-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let capture = try VideoAccessUnitCapture(directoryPath: root)
+        let frames = try makeRealHEVCAnnexBFrames(width: 64, height: 64)
+        let renderer = RealDecodeRecordingRenderer()
+        let decoder = VideoToolboxDecoder(
+            renderer: renderer,
+            policy: .automatic,
+            capacityPolicy: .dropNewestWhenFull,
+            accessUnitCapture: capture,
+            inFlightLimiter: VideoDecodeInFlightLimiter(maximumCount: 2)
+        )
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0100,
+            width: 64,
+            height: 64,
+            redrawRate: 120
+        )))
+        decoder.start()
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: frames.idr,
+            payloadFormat: .annexB,
+            frameNumber: 1,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 0
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: frames.delta,
+            payloadFormat: .annexB,
+            frameNumber: 2,
+            isKeyFrame: false,
+            presentationTimeMicroseconds: 8_333
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        decoder.stop()
+
+        let files = try FileManager.default.contentsOfDirectory(atPath: root)
+        XCTAssertEqual(files.filter { $0.hasSuffix(".json") }.count, 2)
+        XCTAssertEqual(files.filter { $0.hasSuffix(".annexb") }.count, 2)
+        XCTAssertEqual(files.filter { $0.hasSuffix(".length-prefixed") }.count, 2)
+    }
+
     private func makeMetalFrame(
         frameNumber: Int,
         color: VideoColorMetadata
