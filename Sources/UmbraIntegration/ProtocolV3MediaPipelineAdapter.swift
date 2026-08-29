@@ -385,8 +385,9 @@ final class ProtocolV3VideoReassembler {
             throw ProtocolV3MediaPipelineError.invalidDatagram("video fragment")
         }
         var update = ProtocolV3VideoReassemblyUpdate()
-        if needsKeyFrame, fragment.flags & 0x01 == 0 {
-            return update
+        if needsKeyFrame {
+            guard pendingRecoveryKeyFrameID == nil else { return update }
+            guard fragment.flags & 0x01 != 0 else { return update }
         }
         if resynchronizeOnNextDependent {
             if fragment.flags & 0x01 == 0 {
