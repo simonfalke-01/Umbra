@@ -47,18 +47,21 @@ final class MediaHardwareTests: XCTestCase {
     }
 
     func testLatencyDecoderInFlightLimiterReportsFullWithoutBlockingAtMaximumDepth() {
-        let limiter = VideoDecodeInFlightLimiter(maximumCount: 2)
+        let limiter = VideoDecodeInFlightLimiter(maximumCount: 3)
         limiter.start()
         XCTAssertEqual(limiter.admit(using: .dropNewestWhenFull), .admitted(depth: 1))
         XCTAssertEqual(limiter.admit(using: .dropNewestWhenFull), .admitted(depth: 2))
+        XCTAssertEqual(limiter.admit(using: .dropNewestWhenFull), .admitted(depth: 3))
 
         let start = ProcessInfo.processInfo.systemUptime
-        XCTAssertEqual(limiter.admit(using: .dropNewestWhenFull), .full(depth: 2))
+        XCTAssertEqual(limiter.admit(using: .dropNewestWhenFull), .full(depth: 3))
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.050)
         XCTAssertEqual(
             limiter.snapshot,
-            VideoDecodeInFlightLimiter.Snapshot(outstandingCount: 2, maximumObservedCount: 2)
+            VideoDecodeInFlightLimiter.Snapshot(outstandingCount: 3, maximumObservedCount: 3)
         )
+        XCTAssertEqual(limiter.release(), 2)
+        XCTAssertEqual(limiter.admit(using: .dropNewestWhenFull), .admitted(depth: 3))
         limiter.stop()
     }
 

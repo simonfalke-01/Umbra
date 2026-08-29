@@ -1250,6 +1250,64 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 5, 7])
     }
 
+    func testLatencyCapacityThreeAdmitsStartupBurstWithoutFalseRecovery() throws {
+        var preferences = StreamingPreferences.default
+        preferences.optimizationMode = .latency
+        let offer = try ProtocolV3StartRequestMapper.makeOffer(
+            applicationID: 133,
+            resume: false,
+            preferences: preferences,
+            capabilities: fullyCapableClient,
+            startIntentID: Data(1...16),
+            traceID: Data(17...32)
+        )
+        let selection = successfulStartResponse(offer)
+        let decoder = RationalRefreshVideoDecoder(maximumOutstandingFrames: 3)
+        let feedback = ProtocolV3FeedbackRecorder()
+        let adapter = try ProtocolV3MediaPipelineAdapter(
+            pipeline: StreamingMediaPipeline(
+                videoDecoder: decoder,
+                audioDecoder: RationalRefreshAudioDecoder(),
+                availableVideoFormats: fullyCapableClient.supportedVideoFormatMask
+            ),
+            mode: .latency,
+            startResponseFields: selection
+        )
+        adapter.installVideoFeedbackHandler { feedback.append($0) }
+        XCTAssertEqual(try adapter.configureVideo(fields: videoConfigurationFields(selection)), 1)
+        let codec = try XCTUnwrap(selection[5]?.mapValue)
+
+        func send(frameID: UInt64, flags: UInt8 = 0) throws {
+            try adapter.handle(videoMessage(
+                frameID: frameID,
+                frameSize: 2,
+                fragmentOffset: 0,
+                fragmentIndex: 0,
+                fragmentCount: 1,
+                codecID: UInt8(try XCTUnwrap(codec[1]?.unsignedValue)),
+                matrix: UInt8(try XCTUnwrap(codec[7]?.unsignedValue)),
+                bitDepth: UInt8(try XCTUnwrap(codec[3]?.unsignedValue)),
+                generation: 1,
+                flags: flags,
+                bytes: Data([UInt8(truncatingIfNeeded: frameID), 0x7f]),
+                receivedAtNanoseconds: frameID
+            ))
+        }
+
+        try send(frameID: 1, flags: 0x01)
+        try send(frameID: 2)
+        try send(frameID: 3)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3])
+        XCTAssertEqual(decoder.outstandingFrameNumbers, [1, 2, 3])
+        XCTAssertFalse(feedback.values.contains { $0.action == 2 || $0.action == 4 })
+
+        decoder.emit(.decoded(frameNumber: 1))
+        try send(frameID: 4)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 4])
+        XCTAssertEqual(decoder.outstandingFrameNumbers, [2, 3, 4])
+        XCTAssertFalse(feedback.values.contains { $0.action == 2 || $0.action == 4 })
+    }
+
     func testLatencyAdjacentDatagramReorderSubmitsFramesInOrderWithoutFalseRecovery() throws {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .latency
@@ -2228,12 +2286,19 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     private var decodeOutcomeHandler: (@Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void)?
     private var storedSubmittedFrameNumbers: [Int] = []
     private var dispositions: [Int: UmbraStreaming.VideoFrameDisposition] = [:]
+    private var outstandingFrames = Set<Int>()
+    private let maximumOutstandingFrames: Int?
+
+    init(maximumOutstandingFrames: Int? = nil) {
+        self.maximumOutstandingFrames = maximumOutstandingFrames
+    }
 
     var configuredFormats: [UmbraStreaming.VideoStreamFormat] { lock.withLock { formats } }
     var hdrMode: (enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?)? {
         lock.withLock { storedHDRMode }
     }
     var submittedFrameNumbers: [Int] { lock.withLock { storedSubmittedFrameNumbers } }
+    var outstandingFrameNumbers: [Int] { lock.withLock { outstandingFrames.sorted() } }
 
     func setDisposition(
         _ disposition: UmbraStreaming.VideoFrameDisposition,
@@ -2255,7 +2320,15 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     ) -> UmbraStreaming.VideoFrameDisposition {
         lock.withLock {
             storedSubmittedFrameNumbers.append(frame.frameNumber)
-            return dispositions[frame.frameNumber] ?? .accepted
+            let disposition = dispositions[frame.frameNumber] ?? {
+                if let maximumOutstandingFrames,
+                   outstandingFrames.count >= maximumOutstandingFrames {
+                    return .requestKeyFrame
+                }
+                return .accepted
+            }()
+            if disposition == .accepted { outstandingFrames.insert(frame.frameNumber) }
+            return disposition
         }
     }
 
@@ -2273,7 +2346,14 @@ private final class RationalRefreshVideoDecoder: UmbraStreaming.VideoDecoding,
     }
 
     func emit(_ outcome: UmbraStreaming.VideoDecodeOutcome) {
-        lock.withLock { decodeOutcomeHandler }?(outcome)
+        let handler = lock.withLock { () -> (@Sendable (UmbraStreaming.VideoDecodeOutcome) -> Void)? in
+            switch outcome {
+            case let .decoded(frameNumber), let .failed(frameNumber):
+                outstandingFrames.remove(frameNumber)
+            }
+            return decodeOutcomeHandler
+        }
+        handler?(outcome)
     }
 
     func setHDRMode(enabled: Bool, metadata: UmbraStreaming.StreamingHDRMetadata?) {

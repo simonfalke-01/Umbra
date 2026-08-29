@@ -21,7 +21,7 @@ final class RuntimePreferenceEffectsTests: XCTestCase {
         XCTAssertEqual(StreamingConfiguration.clampedVideoDecodeQueueCapacity(16), 15)
     }
 
-    func testLatencyPolicyMapsToHardwareOnlyNonblockingTwoFrameDecoder() {
+    func testLatencyPolicyMapsToHardwareOnlyNonblockingThreeFrameDecoder() {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .latency
 
@@ -31,11 +31,11 @@ final class RuntimePreferenceEffectsTests: XCTestCase {
 
         XCTAssertEqual(configuration.policy, .hardwareOnly)
         XCTAssertEqual(configuration.upstreamMoonlightQueueCapacity, 1)
-        XCTAssertEqual(configuration.maximumOutstandingFrames, 2)
+        XCTAssertEqual(configuration.maximumOutstandingFrames, 3)
         XCTAssertEqual(configuration.capacityPolicy, .dropNewestWhenFull)
         XCTAssertEqual(configuration.rendererQueueDepth, 1)
         XCTAssertTrue(configuration.backlogDiagnostic.contains("compressed Moonlight=1"))
-        XCTAssertTrue(configuration.backlogDiagnostic.contains("in-flight capacity=2"))
+        XCTAssertTrue(configuration.backlogDiagnostic.contains("in-flight capacity=3"))
     }
 
     func testQualityPolicyMapsToAutomaticBoundedFiveFrameDecoder() {
@@ -63,7 +63,7 @@ final class RuntimePreferenceEffectsTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration.policy, .softwareOnly)
-        XCTAssertEqual(configuration.maximumOutstandingFrames, 2)
+        XCTAssertEqual(configuration.maximumOutstandingFrames, 3)
         XCTAssertEqual(configuration.capacityPolicy, .dropNewestWhenFull)
     }
 
