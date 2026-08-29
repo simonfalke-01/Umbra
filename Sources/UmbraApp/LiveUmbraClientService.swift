@@ -300,8 +300,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
         if preferences.settings.enableMDNS {
             protocolV3?.startDiscovery()
         }
-        let modernHosts = try protocolV3?.displayHosts() ?? []
+        var modernHosts = try protocolV3?.displayHosts() ?? []
         if !modernHosts.isEmpty {
+            if let protocolV3 {
+                let mode = Self.quicMode(preferences.settings.optimizationMode)
+                for host in modernHosts {
+                    _ = try? await protocolV3.reconnect(hostID: host.id, mode: mode)
+                }
+                modernHosts = try protocolV3.displayHosts()
+            }
             startLegacyDiscoveryBootstrap()
             return lastLegacyHosts + modernHosts
         }
