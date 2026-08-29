@@ -361,6 +361,10 @@ struct VideoDecodeRecoveryGate: Sendable, Equatable {
         isRequired = true
     }
 
+    mutating func invalidatePendingCallbacks() {
+        epoch &+= 1
+    }
+
     mutating func recordSuccessfulDecode(
         isKeyFrame: Bool,
         frameSessionGeneration: UInt64,
@@ -501,6 +505,12 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         lock.lock()
         defer { lock.unlock() }
         return state.sessionGeneration
+    }
+
+    var currentRecoveryEpoch: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return state.recovery.submissionEpoch
     }
 
     public func statistics(at time: TimeInterval = ProcessInfo.processInfo.systemUptime) -> MediaPipelineStatistics {
@@ -739,6 +749,12 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         }
         lock.unlock()
 
+        if frame.requiresIndependentDecode,
+           !Self.isIndependentlyDecodable(frame: frame, codec: profile.codec) {
+            setError(.invalidAccessUnit)
+            return .requestKeyFrame
+        }
+
         let admission = inFlightLimiter.admit(
             generation: decodeGeneration,
             using: capacityPolicy
@@ -830,6 +846,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             return .accepted
         }
         state.lastError = .queueFull
+        state.recovery.invalidatePendingCallbacks()
         // The adapter gates dependent frames and requests an IDR for this drop.
         // Keep the existing VideoToolbox session alive: capacity exhaustion is
         // backpressure, not evidence that the decoder session itself is corrupt.
@@ -847,6 +864,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         generation: UInt64,
         recoveryEpochAtSubmission: UInt64
     ) -> Bool {
+        var effectiveRecoveryEpoch = recoveryEpochAtSubmission
         lock.lock()
         guard state.running,
               state.decodeGeneration == generation,
@@ -895,6 +913,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                     try installSession(formatDescription: description, format: format, profile: profile)
                     lock.lock()
                     state.parameterSets = parameterSets
+                    effectiveRecoveryEpoch = state.recovery.submissionEpoch
                     lock.unlock()
                 } else if frame.isKeyFrame,
                           (requiresRecovery || !hasSession),
@@ -948,6 +967,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                     try installSession(formatDescription: description, format: format, profile: profile)
                     lock.lock()
                     state.parameterSets = [accessUnit.codecConfigurationRecord]
+                    effectiveRecoveryEpoch = state.recovery.submissionEpoch
                     lock.unlock()
                 }
                 payload = try EncodedVideoPayload(retaining: frame.data)
@@ -958,7 +978,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                 frame: frame,
                 format: format,
                 generation: generation,
-                recoveryEpochAtSubmission: recoveryEpochAtSubmission
+                recoveryEpochAtSubmission: effectiveRecoveryEpoch
             )
             return true
         } catch let error as VideoDecoderError {
@@ -994,6 +1014,31 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             return nil
         }
         return next
+    }
+
+    private static func isIndependentlyDecodable(
+        frame: CompressedVideoFrame,
+        codec: VideoCodec
+    ) -> Bool {
+        guard frame.isKeyFrame else { return false }
+        do {
+            switch frame.payloadFormat {
+            case .annexB:
+                return try AnnexBAccessUnit(
+                    data: frame.data,
+                    codec: codec
+                ).isIndependentlyDecodable
+            case .videoToolboxLengthPrefixed:
+                return try LengthPrefixedAccessUnit(
+                    data: frame.data,
+                    codec: codec
+                ).isIndependentlyDecodable
+            case .av1LowOverheadOBU:
+                return codec == .av1
+            }
+        } catch {
+            return false
+        }
     }
 
     private func submit(
@@ -1195,6 +1240,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         let session = state.session
         state.session = nil
         state.formatDescription = nil
+        if session != nil { state.sessionGeneration &+= 1 }
         lock.unlock()
         guard let session else { return }
         if waitForFrames {
@@ -1221,6 +1267,8 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             recordAsynchronousDecodeFailure(
                 .decodeFailed(status),
                 generation: context.decodeGeneration,
+                sessionGeneration: context.sessionGeneration,
+                recoveryEpoch: context.recoveryEpochAtSubmission,
                 frameNumber: context.frameNumber,
                 at: now
             )
@@ -1230,6 +1278,8 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             recordAsynchronousDecodeFailure(
                 .frameDropped,
                 generation: context.decodeGeneration,
+                sessionGeneration: context.sessionGeneration,
+                recoveryEpoch: context.recoveryEpochAtSubmission,
                 frameNumber: context.frameNumber,
                 at: now
             )
@@ -1239,7 +1289,9 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             generation: context.decodeGeneration
         ) else { return }
         lock.lock()
-        guard state.running, state.decodeGeneration == context.decodeGeneration else {
+        guard state.running,
+              state.decodeGeneration == context.decodeGeneration,
+              state.sessionGeneration == context.sessionGeneration else {
             lock.unlock()
             return
         }
@@ -1322,17 +1374,24 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
     func recordAsynchronousDecodeFailure(
         _ error: VideoDecoderError,
         generation: UInt64? = nil,
+        sessionGeneration: UInt64? = nil,
+        recoveryEpoch: UInt64? = nil,
         frameNumber: Int? = nil,
         at time: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
         lock.lock()
         let failureGeneration = generation ?? state.decodeGeneration
+        let failureSessionGeneration = sessionGeneration ?? state.sessionGeneration
+        let failureRecoveryEpoch = recoveryEpoch ?? state.recovery.submissionEpoch
         lock.unlock()
         guard let outstandingDepth = inFlightLimiter.release(
             generation: failureGeneration
         ) else { return }
         lock.lock()
-        guard state.running, state.decodeGeneration == failureGeneration else {
+        guard state.running,
+              state.decodeGeneration == failureGeneration,
+              state.sessionGeneration == failureSessionGeneration,
+              state.recovery.submissionEpoch == failureRecoveryEpoch else {
             lock.unlock()
             return
         }
@@ -1400,6 +1459,17 @@ private func copyParameterSets(
     }
 }
 
+private func isIndependentlyDecodableNAL(codec: VideoCodec, header: UInt8) -> Bool {
+    switch codec {
+    case .h264:
+        return header & 0x1F == 5
+    case .hevc:
+        return [19, 20].contains((header >> 1) & 0x3F)
+    case .av1:
+        return false
+    }
+}
+
 struct LengthPrefixedAccessUnit {
     private struct ParameterSetRanges {
         var first: Range<Int>?
@@ -1437,6 +1507,7 @@ struct LengthPrefixedAccessUnit {
     let unitCount: Int
     let parameterSets: [Data]
     let payload: EncodedVideoPayload
+    let isIndependentlyDecodable: Bool
 
     init(data: Data, codec: VideoCodec) throws {
         guard EncodedVideoPayload.isValidByteCount(data.count) else {
@@ -1444,6 +1515,7 @@ struct LengthPrefixedAccessUnit {
         }
         var ranges = ParameterSetRanges()
         var count = 0
+        var containsIndependentNAL = false
         var offset = 0
         try data.withUnsafeBytes { bytes in
             while offset < bytes.count {
@@ -1460,6 +1532,8 @@ struct LengthPrefixedAccessUnit {
                 }
                 let range = offset..<(offset + length)
                 ranges.capture(codec: codec, header: bytes[offset], range: range)
+                containsIndependentNAL = containsIndependentNAL
+                    || isIndependentlyDecodableNAL(codec: codec, header: bytes[offset])
                 offset += length
                 count += 1
             }
@@ -1470,6 +1544,7 @@ struct LengthPrefixedAccessUnit {
         unitCount = count
         parameterSets = try ranges.copiedData(from: data, codec: codec)
         payload = try EncodedVideoPayload(retaining: data)
+        isIndependentlyDecodable = containsIndependentNAL
     }
 }
 
@@ -1511,11 +1586,13 @@ struct AnnexBAccessUnit {
         let unitCount: Int
         let payloadByteCount: Int
         let parameterSetRanges: ParameterSetRanges
+        let isIndependentlyDecodable: Bool
     }
 
     let unitCount: Int
     let parameterSets: [Data]
     let lengthPrefixedPayload: EncodedVideoPayload
+    let isIndependentlyDecodable: Bool
 
     var lengthPrefixedData: Data { lengthPrefixedPayload.copiedData() }
 
@@ -1533,6 +1610,7 @@ struct AnnexBAccessUnit {
         }
         unitCount = scan.unitCount
         parameterSets = try scan.parameterSetRanges.copiedData(from: data, codec: codec)
+        isIndependentlyDecodable = scan.isIndependentlyDecodable
 
         let payload = try EncodedVideoPayload(
             allocating: scan.payloadByteCount,
@@ -1574,6 +1652,7 @@ struct AnnexBAccessUnit {
     ) throws -> ScanResult {
         var payloadByteCount = 0
         var parameterSetRanges = ParameterSetRanges()
+        var isIndependentlyDecodable = false
         let unitCount = try forEachUnit(in: bytes) { range in
             guard range.count <= Int(UInt32.max),
                   payloadByteCount <= EncodedVideoPayload.maximumByteCount - MemoryLayout<UInt32>.size,
@@ -1588,6 +1667,11 @@ struct AnnexBAccessUnit {
                 header: bytes[range.lowerBound],
                 range: range
             )
+            isIndependentlyDecodable = isIndependentlyDecodable
+                || isIndependentlyDecodableNAL(
+                    codec: codec,
+                    header: bytes[range.lowerBound]
+                )
         }
         guard unitCount > 0, EncodedVideoPayload.isValidByteCount(payloadByteCount) else {
             throw VideoDecoderError.invalidAccessUnit
@@ -1595,7 +1679,8 @@ struct AnnexBAccessUnit {
         return ScanResult(
             unitCount: unitCount,
             payloadByteCount: payloadByteCount,
-            parameterSetRanges: parameterSetRanges
+            parameterSetRanges: parameterSetRanges,
+            isIndependentlyDecodable: isIndependentlyDecodable
         )
     }
 
