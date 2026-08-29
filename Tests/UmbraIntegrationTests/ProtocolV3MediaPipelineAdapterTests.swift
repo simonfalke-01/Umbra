@@ -997,10 +997,16 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         try send(frameID: 4)
         XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3])
         XCTAssertEqual(feedback.values.filter { $0.action == 4 }.count, 1)
+        decoder.emit(.failed(frameNumber: 3))
+        XCTAssertEqual(feedback.values.filter { $0.action == 3 }.count, 0)
+        XCTAssertEqual(feedback.values.filter { $0.action == 4 }.count, 1)
 
-        decoder.emit(.decoded(frameNumber: 3))
-        try send(frameID: 5)
+        try send(frameID: 5, flags: 0x01)
+        try send(frameID: 6)
         XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 5])
+        decoder.emit(.decoded(frameNumber: 5))
+        try send(frameID: 7)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 5, 7])
     }
 
     func testInputToDecodeProxyUsesTheFrameCausalWatermark() throws {

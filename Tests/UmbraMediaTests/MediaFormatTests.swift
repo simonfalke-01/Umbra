@@ -276,6 +276,7 @@ final class MediaFormatTests: XCTestCase {
         ])
         let converted = try AnnexBAccessUnit(data: accessUnit, codec: .h264)
         XCTAssertEqual(converted.unitCount, 3)
+        XCTAssertTrue(converted.isIndependentlyDecodable)
         XCTAssertEqual(converted.parameterSets, [Data([0x67, 0x64, 0x1F]), Data([0x68, 0xEE])])
         XCTAssertEqual(
             converted.lengthPrefixedData,
@@ -332,6 +333,7 @@ final class MediaFormatTests: XCTestCase {
 
         let accessUnit = try LengthPrefixedAccessUnit(data: data, codec: .h264)
         XCTAssertEqual(accessUnit.unitCount, 3)
+        XCTAssertTrue(accessUnit.isIndependentlyDecodable)
         XCTAssertEqual(accessUnit.parameterSets, [Data([0x67, 0x64, 0x1F]), Data([0x68, 0xEE])])
         XCTAssertEqual(UInt(bitPattern: accessUnit.payload.baseAddress), sourceAddress)
         let blockBuffer = try accessUnit.payload.makeBlockBuffer()
@@ -373,6 +375,7 @@ final class MediaFormatTests: XCTestCase {
         ])
         let accessUnit = try LengthPrefixedAccessUnit(data: data, codec: .hevc)
         XCTAssertEqual(accessUnit.unitCount, 4)
+        XCTAssertTrue(accessUnit.isIndependentlyDecodable)
         XCTAssertEqual(accessUnit.parameterSets, [
             Data([0x40, 0x01, 0xAA]),
             Data([0x42, 0x01, 0xBB, 0xCC]),
@@ -389,6 +392,8 @@ final class MediaFormatTests: XCTestCase {
         ])
         let converted = try AnnexBAccessUnit(data: accessUnit, codec: .hevc)
 
+        XCTAssertTrue(converted.isIndependentlyDecodable)
+
         XCTAssertEqual(converted.parameterSets, [
             Data([0x40, 0x01, 0xAA]),
             Data([0x42, 0x01, 0xBB, 0xCC]),
@@ -400,6 +405,20 @@ final class MediaFormatTests: XCTestCase {
             0, 0, 0, 3, 0x44, 0x01, 0xDD,
             0, 0, 0, 4, 0x26, 0x01, 0xEE, 0xFF,
         ]))
+    }
+
+    func testAccessUnitsDoNotTreatDependentOrCRAFramesAsRecoveryIDR() throws {
+        let h264 = try LengthPrefixedAccessUnit(
+            data: Data([0, 0, 0, 2, 0x41, 0xAA]),
+            codec: .h264
+        )
+        XCTAssertFalse(h264.isIndependentlyDecodable)
+
+        let hevcCRA = try AnnexBAccessUnit(
+            data: Data([0, 0, 0, 1, 0x2A, 0x01, 0xBB]),
+            codec: .hevc
+        )
+        XCTAssertFalse(hevcCRA.isIndependentlyDecodable)
     }
 
     func testParameterSetExtractionUsesSliceRelativeByteOffsets() throws {

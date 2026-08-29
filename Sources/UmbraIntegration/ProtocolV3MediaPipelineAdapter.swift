@@ -133,6 +133,7 @@ struct ProtocolV3ReassembledVideoFrame {
     let videoGeneration: UInt32
     let matrix: UInt8
     let flags: UInt8
+    let requiresIndependentDecode: Bool
     let firstReceivedAtNanoseconds: UInt64
     let receivedAtNanoseconds: UInt64
 }
@@ -260,7 +261,10 @@ private final class ProtocolV3VideoAssembly {
         return true
     }
 
-    func takeFrame(frameID: UInt64) -> ProtocolV3ReassembledVideoFrame {
+    func takeFrame(
+        frameID: UInt64,
+        requiresIndependentDecode: Bool = false
+    ) -> ProtocolV3ReassembledVideoFrame {
         guard let completionReceiveTimeNanoseconds else {
             preconditionFailure("incomplete video frame handoff")
         }
@@ -274,6 +278,7 @@ private final class ProtocolV3VideoAssembly {
             videoGeneration: videoGeneration,
             matrix: matrix,
             flags: flags,
+            requiresIndependentDecode: requiresIndependentDecode,
             firstReceivedAtNanoseconds: firstReceiveTimeNanoseconds,
             receivedAtNanoseconds: completionReceiveTimeNanoseconds
         )
@@ -448,7 +453,11 @@ final class ProtocolV3VideoReassembler {
             if assembly.isComplete {
                 assemblies.removeValue(forKey: fragment.frameID)
                 latestReleasedFrameID = fragment.frameID
-                update.readyFrames = [assembly.takeFrame(frameID: fragment.frameID)]
+                let isRecoveryKeyFrame = needsKeyFrame && fragment.flags & 0x01 != 0
+                update.readyFrames = [assembly.takeFrame(
+                    frameID: fragment.frameID,
+                    requiresIndependentDecode: isRecoveryKeyFrame
+                )]
                 if fragment.flags & 0x01 != 0 {
                     if needsKeyFrame {
                         pendingRecoveryKeyFrameID = fragment.frameID
@@ -488,7 +497,10 @@ final class ProtocolV3VideoReassembler {
             }
             qualityGapStartedAtNanoseconds = nil
             update.requestedKeyFrameID = nil
-            update.readyFrames.append(keyFrame.takeFrame(frameID: keyFrameID))
+            update.readyFrames.append(keyFrame.takeFrame(
+                frameID: keyFrameID,
+                requiresIndependentDecode: isRecoveryKeyFrame
+            ))
             if isRecoveryKeyFrame { return }
         }
 
@@ -1081,6 +1093,7 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
                 payloadFormat: payloadFormat,
                 frameNumber: Int(clamping: frame.frameID),
                 isKeyFrame: frame.flags & 0x01 != 0,
+                requiresIndependentDecode: frame.requiresIndependentDecode,
                 hostProcessingLatencyTenthsOfMillisecond: UInt16(
                     clamping: frame.encoderCompleteDeltaMicroseconds / 100
                 ),
@@ -1096,20 +1109,23 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             ))
             if disposition == .requestKeyFrame {
                 let unsentFrameIDs = frames.dropFirst(index + 1).map(\.frameID)
-                let pendingFrameIDs = lock.withLock { () -> [UInt64] in
+                let recovery = lock.withLock { () -> (pending: [UInt64], shouldRequest: Bool) in
                     pendingPresentationDeadlines.removeValue(forKey: frame.frameID)
+                    let shouldRequest = !videoReassembler.requiresKeyFrame
                     let pending = videoReassembler.requireKeyFrame()
                     videoFramesDropped += UInt64(unsentFrameIDs.count + pending.count)
-                    return pending
+                    return (pending, shouldRequest)
                 }
-                for lostFrameID in unsentFrameIDs + pendingFrameIDs {
+                for lostFrameID in unsentFrameIDs + recovery.pending {
                     lock.withLock { pendingInputSampleMicroseconds[lostFrameID] = nil }
                     emitVideoFeedback(affectedFrameID: lostFrameID, action: 2)
                 }
-                diagnosticHandler(
-                    "Protocol v3 VideoToolbox requested a key frame after frame \(frame.frameID)."
-                )
-                emitVideoFeedback(affectedFrameID: frame.frameID, action: 4)
+                if recovery.shouldRequest {
+                    diagnosticHandler(
+                        "Protocol v3 VideoToolbox requested a key frame after frame \(frame.frameID)."
+                    )
+                    emitVideoFeedback(affectedFrameID: frame.frameID, action: 4)
+                }
                 break
             }
             lock.withLock { videoFramesSubmitted += 1 }
@@ -1144,24 +1160,27 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             )
         case let .failed(frameNumber):
             guard let frameID = UInt64(exactly: frameNumber) else { return }
-            let failure = lock.withLock { () -> ([UInt64], UInt32) in
+            let failure = lock.withLock { () -> ([UInt64], UInt32, Bool) in
                 pendingInputSampleMicroseconds[frameID] = nil
                 let deadlineMissMicroseconds = consumeDeadlineMissMicroseconds(
                     frameID: frameID,
                     completedAtNanoseconds: nowNanoseconds()
                 )
+                let shouldReportRecovery = !videoReassembler.requiresKeyFrame
                 let pending = videoReassembler.requireKeyFrame()
                 videoFramesDropped += 1 + UInt64(pending.count)
-                return (pending, deadlineMissMicroseconds)
+                return (pending, deadlineMissMicroseconds, shouldReportRecovery)
             }
             for pendingFrameID in failure.0 {
                 emitVideoFeedback(affectedFrameID: pendingFrameID, action: 2)
             }
-            emitVideoFeedback(
-                affectedFrameID: frameID,
-                action: 3,
-                deadlineMissMicroseconds: failure.1
-            )
+            if failure.2 {
+                emitVideoFeedback(
+                    affectedFrameID: frameID,
+                    action: 3,
+                    deadlineMissMicroseconds: failure.1
+                )
+            }
         }
     }
 

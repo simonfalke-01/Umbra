@@ -205,6 +205,43 @@ final class MediaHardwareTests: XCTestCase {
         decoder.stop()
     }
 
+    func testPreOverflowCallbackFailureCannotPoisonAdvancedRecoveryEpoch() throws {
+        let decoder = VideoToolboxDecoder(
+            policy: .softwareOnly,
+            capacityPolicy: .dropNewestWhenFull
+        )
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0001,
+            width: 1_280,
+            height: 720,
+            redrawRate: 120
+        )))
+        decoder.start()
+        let decodeGeneration = decoder.currentDecodeGeneration
+        let sessionGeneration = decoder.currentSessionGeneration
+        let preOverflowEpoch = decoder.currentRecoveryEpoch
+
+        XCTAssertEqual(decoder.recordCapacityOverflow(
+            depth: 2,
+            generation: decodeGeneration,
+            at: 1
+        ), .requestKeyFrame)
+        XCTAssertGreaterThan(decoder.currentRecoveryEpoch, preOverflowEpoch)
+        let overflowStatistics = decoder.statistics(at: 1)
+
+        decoder.recordAsynchronousDecodeFailure(
+            .decodeFailed(-12_909),
+            generation: decodeGeneration,
+            sessionGeneration: sessionGeneration,
+            recoveryEpoch: preOverflowEpoch,
+            frameNumber: 1,
+            at: 2
+        )
+        XCTAssertEqual(decoder.statistics(at: 2).decoderErrors, overflowStatistics.decoderErrors)
+        XCTAssertEqual(decoder.lastError, .queueFull)
+        decoder.stop()
+    }
+
     func testLatencyCapacityOverflowWithQueuedDependentsKeepsHealthyVideoToolboxSession() throws {
         let annexBFrame = try makeRealH264AnnexBKeyFrame(width: 64, height: 64)
         let encodedFrame = try AnnexBAccessUnit(
@@ -295,6 +332,107 @@ final class MediaHardwareTests: XCTestCase {
         )), .accepted)
         XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
         XCTAssertEqual(decoder.currentSessionGeneration, establishedSessionGeneration)
+        XCTAssertNil(decoder.lastError)
+        decoder.stop()
+    }
+
+    func testRecoveryRejectsFlaggedNonIDRSampleBeforeVideoToolbox() throws {
+        let annexBFrame = try makeRealH264AnnexBKeyFrame(width: 64, height: 64)
+        let encodedFrame = try AnnexBAccessUnit(
+            data: annexBFrame,
+            codec: .h264
+        ).lengthPrefixedData
+        let renderer = RealDecodeRecordingRenderer()
+        let decoder = VideoToolboxDecoder(
+            renderer: renderer,
+            policy: .automatic,
+            capacityPolicy: .dropNewestWhenFull
+        )
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0001,
+            width: 64,
+            height: 64,
+            redrawRate: 120
+        )))
+        decoder.start()
+
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 1,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 0
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        let sessionGeneration = decoder.currentSessionGeneration
+
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: try replacingH264IDRWithDependentSlice(encodedFrame),
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 2,
+            isKeyFrame: true,
+            requiresIndependentDecode: true,
+            presentationTimeMicroseconds: 8_333
+        )), .requestKeyFrame)
+        XCTAssertEqual(decoder.lastError, .invalidAccessUnit)
+        XCTAssertEqual(decoder.currentSessionGeneration, sessionGeneration)
+        decoder.stop()
+    }
+
+    func testLatePreRecoverySessionFailureCannotPoisonRecoveredGeneration() throws {
+        let annexBFrame = try makeRealH264AnnexBKeyFrame(width: 64, height: 64)
+        let encodedFrame = try AnnexBAccessUnit(
+            data: annexBFrame,
+            codec: .h264
+        ).lengthPrefixedData
+        let renderer = RealDecodeRecordingRenderer()
+        let decoder = VideoToolboxDecoder(renderer: renderer, policy: .automatic)
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0001,
+            width: 64,
+            height: 64,
+            redrawRate: 120
+        )))
+        decoder.start()
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 1,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 0
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+
+        let decodeGeneration = decoder.currentDecodeGeneration
+        let lostSessionGeneration = decoder.currentSessionGeneration
+        decoder.recordAsynchronousDecodeFailure(
+            .decodeFailed(-12_909),
+            generation: decodeGeneration,
+            sessionGeneration: lostSessionGeneration,
+            frameNumber: 2,
+            at: 1
+        )
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 3,
+            isKeyFrame: true,
+            requiresIndependentDecode: true,
+            presentationTimeMicroseconds: 16_666
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertGreaterThan(decoder.currentSessionGeneration, lostSessionGeneration)
+        XCTAssertNil(decoder.lastError)
+        let recoveredStatistics = decoder.statistics(at: 2)
+
+        decoder.recordAsynchronousDecodeFailure(
+            .decodeFailed(-12_909),
+            generation: decodeGeneration,
+            sessionGeneration: lostSessionGeneration,
+            frameNumber: 2,
+            at: 3
+        )
+        XCTAssertEqual(decoder.statistics(at: 3).decoderErrors, recoveredStatistics.decoderErrors)
         XCTAssertNil(decoder.lastError)
         decoder.stop()
     }
@@ -983,6 +1121,34 @@ private func makeRealH264AnnexBKeyFrame(width: Int32, height: Int32) throws -> D
         throw MediaHardwareTestError.compression(output.status)
     }
     return try makeAnnexBKeyFrame(from: sampleBuffer)
+}
+
+private func replacingH264IDRWithDependentSlice(_ data: Data) throws -> Data {
+    var output = data
+    var replaced = false
+    try output.withUnsafeMutableBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+            guard bytes.count - offset >= 4 else {
+                throw MediaHardwareTestError.missingCompressedSample
+            }
+            let length = Int(UInt32(bytes[offset]) << 24
+                | UInt32(bytes[offset + 1]) << 16
+                | UInt32(bytes[offset + 2]) << 8
+                | UInt32(bytes[offset + 3]))
+            offset += 4
+            guard length > 0, length <= bytes.count - offset else {
+                throw MediaHardwareTestError.missingCompressedSample
+            }
+            if bytes[offset] & 0x1F == 5 {
+                bytes[offset] = (bytes[offset] & 0xE0) | 1
+                replaced = true
+            }
+            offset += length
+        }
+    }
+    guard replaced else { throw MediaHardwareTestError.missingCompressedSample }
+    return output
 }
 
 private func activeImageBytes(from imageBuffer: CVPixelBuffer) throws -> Data {

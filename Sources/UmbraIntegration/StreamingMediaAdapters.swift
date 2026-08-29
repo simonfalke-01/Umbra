@@ -153,6 +153,7 @@ public final class NativeVideoDecoderAdapter: UmbraStreaming.VideoDecoding, Umbr
             payloadFormat: payloadFormat,
             frameNumber: frame.frameNumber,
             isKeyFrame: frame.isKeyFrame,
+            requiresIndependentDecode: frame.requiresIndependentDecode,
             hostProcessingLatencyTenthsOfMillisecond: frame.hostProcessingLatencyTenthsOfMillisecond,
             receiveTimeMicroseconds: frame.receiveTimeMicroseconds,
             enqueueTimeMicroseconds: frame.enqueueTimeMicroseconds,
