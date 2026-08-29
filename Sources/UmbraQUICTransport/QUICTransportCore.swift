@@ -288,19 +288,19 @@ final class QUICTransportCore: QUICTransportProtocol, @unchecked Sendable {
                 recordPremature(terminal: false)
                 return
             }
-            guard let payloadCount = Self.admittedDatagramPayloadByteCount(
+            guard let payloadCount = Self.usableDatagramPayloadByteCount(
                 wireByteCount: wireByteCount
             ) else {
-                currentDatagramPayloadCap = nil
-                scheduler.updateUsableDatagramPayloadSize(0)
-                endMediaSession("QUIC path cannot carry the complete phase-one ULM3 record")
-                emit(.datagramCapacityChanged(wireByteCount: wireByteCount, payloadByteCount: 0))
+                emit(.datagramCapacityChanged(
+                    wireByteCount: wireByteCount,
+                    payloadByteCount: currentDatagramPayloadCap ?? 0
+                ))
                 return
             }
             currentDatagramPayloadCap = payloadCount
             scheduler.updateUsableDatagramPayloadSize(payloadCount)
             emit(.datagramCapacityChanged(
-                wireByteCount: QUICTransportProfile.semanticDatagramByteCount,
+                wireByteCount: wireByteCount,
                 payloadByteCount: payloadCount
             ))
             pump()
@@ -750,6 +750,14 @@ final class QUICTransportCore: QUICTransportProtocol, @unchecked Sendable {
     static func admittedDatagramPayloadByteCount(wireByteCount: Int) -> Int? {
         guard wireByteCount >= QUICTransportProfile.semanticDatagramByteCount else { return nil }
         return QUICTransportProfile.semanticDatagramPayloadByteCount
+    }
+
+    static func usableDatagramPayloadByteCount(wireByteCount: Int) -> Int? {
+        guard wireByteCount > QUICTransportProfile.datagramHeaderByteCount else { return nil }
+        return min(
+            wireByteCount - QUICTransportProfile.datagramHeaderByteCount,
+            QUICTransportProfile.semanticDatagramPayloadByteCount
+        )
     }
 
     private func emit(_ event: QUICTransportEvent) {

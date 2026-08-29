@@ -37,6 +37,60 @@ struct QUICStateAndWireTests {
         #expect(QUICTransportCore.admittedDatagramPayloadByteCount(wireByteCount: 1_350) == 1_108)
     }
 
+    @Test("active media survives transient DATAGRAM capacity downgrades")
+    func activeMediaSurvivesCapacityDowngrades() throws {
+        let pin = Data(repeating: 7, count: 32)
+        let adapter = CapacityChangeNetworkAdapter()
+        let events = CapacityChangeEventRecorder()
+        let ready = DispatchSemaphore(value: 0)
+        let core = try QUICTransportCore(
+            configuration: QUICTransportConfiguration(
+                endpoint: .init(host: "127.0.0.1", port: 48_030),
+                expectedLeafSPKISHA256: pin,
+                mode: .latency
+            ),
+            adapter: adapter
+        )
+        core.eventHandler = { event in
+            events.append(event)
+            if case .stateChanged(.ready) = event { ready.signal() }
+        }
+        core.authenticationHandler = { _ in }
+        try core.start()
+        adapter.emit(.peerVerificationStarted)
+        adapter.emit(.peerVerified(pin))
+        adapter.emit(.ready(
+            alpn: QUICTransportConfiguration.applicationProtocol,
+            usableDatagramByteCount: QUICTransportProfile.semanticDatagramByteCount
+        ))
+        core.applicationHelloDidComplete(success: true)
+        core.applicationAuthenticationDidComplete(success: true)
+        #expect(ready.wait(timeout: .now() + 1) == .success)
+        try core.setActiveSessionID(Data(repeating: 1, count: 16))
+
+        adapter.emit(.datagramCapacityChanged(0))
+        adapter.emit(.datagramCapacityChanged(
+            QUICTransportProfile.datagramHeaderByteCount + 128
+        ))
+
+        let snapshot = events.snapshot()
+        #expect(!snapshot.contains { event in
+            if case .mediaSessionEnded = event { true } else { false }
+        })
+        let capacities = snapshot.compactMap { event -> (Int, Int)? in
+            if case let .datagramCapacityChanged(wireByteCount, payloadByteCount) = event {
+                return (wireByteCount, payloadByteCount)
+            }
+            return nil
+        }
+        #expect(capacities.count == 2)
+        #expect(capacities[0].0 == 0)
+        #expect(capacities[0].1 == QUICTransportProfile.semanticDatagramPayloadByteCount)
+        #expect(capacities[1].0 == QUICTransportProfile.datagramHeaderByteCount + 128)
+        #expect(capacities[1].1 == 128)
+        core.cancel()
+    }
+
     @Test("temporary waiting restores the exact prior state")
     func waitingRecovery() throws {
         let state = QUICSessionStateMachine()
@@ -499,4 +553,34 @@ struct QUICStateAndWireTests {
 
 private extension Array {
     var only: Element? { count == 1 ? self[0] : nil }
+}
+
+private final class CapacityChangeNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
+    var eventHandler: (@Sendable (QUICNetworkAdapterEvent) -> Void)?
+
+    func start(configuration: QUICTransportConfiguration) {}
+    func submit(
+        _ submission: QUICNetworkSubmission,
+        completion: @escaping @Sendable (String?) -> Void
+    ) { completion(nil) }
+    func setInboundBulkEnabled(_ enabled: Bool) {}
+    func decideInboundBulk(requestID: UInt64, objectID: UInt64, accept: Bool) {}
+    func cancel() {}
+
+    func emit(_ event: QUICNetworkAdapterEvent) {
+        eventHandler?(event)
+    }
+}
+
+private final class CapacityChangeEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events = [QUICTransportEvent]()
+
+    func append(_ event: QUICTransportEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    func snapshot() -> [QUICTransportEvent] {
+        lock.withLock { events }
+    }
 }
