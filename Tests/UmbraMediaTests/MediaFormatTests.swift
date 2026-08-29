@@ -407,6 +407,24 @@ final class MediaFormatTests: XCTestCase {
         ]))
     }
 
+    func testHEVCAnnexBConversionTrimsByteStreamPaddingAcrossStartCodeVariants() throws {
+        let accessUnit = Data([
+            0,
+            0, 0, 0, 1, 0x26, 0x01, 0xAA,
+            0,
+            0, 0, 1, 0x02, 0x01, 0xBB,
+            0, 0,
+        ])
+        let converted = try AnnexBAccessUnit(data: accessUnit, codec: .hevc)
+
+        XCTAssertTrue(converted.isIndependentlyDecodable)
+        XCTAssertEqual(converted.unitCount, 2)
+        XCTAssertEqual(converted.lengthPrefixedData, Data([
+            0, 0, 0, 3, 0x26, 0x01, 0xAA,
+            0, 0, 0, 3, 0x02, 0x01, 0xBB,
+        ]))
+    }
+
     func testAccessUnitsDoNotTreatDependentOrCRAFramesAsRecoveryIDR() throws {
         let h264 = try LengthPrefixedAccessUnit(
             data: Data([0, 0, 0, 2, 0x41, 0xAA]),

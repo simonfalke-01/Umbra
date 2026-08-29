@@ -1700,7 +1700,10 @@ struct AnnexBAccessUnit {
         var unitCount = 0
         while true {
             let next = nextStartCode(in: bytes, startingAt: payloadStart)
-            let payloadEnd = next?.offset ?? bytes.count
+            var payloadEnd = next?.offset ?? bytes.count
+            while payloadEnd > payloadStart, bytes[payloadEnd - 1] == 0 {
+                payloadEnd -= 1
+            }
             guard payloadStart < payloadEnd else {
                 throw VideoDecoderError.invalidAccessUnit
             }
