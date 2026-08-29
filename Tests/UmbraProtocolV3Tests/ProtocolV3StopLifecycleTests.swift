@@ -23,6 +23,29 @@ import UmbraQUICTransport
     #expect(unsupported.contains("status 10"))
 }
 
+@Test func genericControlFailureMetadataIsBoundedAndContainsNoPayload() {
+    struct MetadataError: Error, CustomStringConvertible {
+        let description = "local cleanup failed\n" + String(repeating: "x", count: 512)
+    }
+    let context = ProtocolV3ClientControlSession.genericControlFailureContext(
+        type: 0x0133,
+        flags: 0,
+        requestID: 0,
+        payloadByteCount: 128,
+        state: "stopping",
+        error: MetadataError()
+    )
+
+    #expect(context.contains("type=0x0133"))
+    #expect(context.contains("flags=0x00"))
+    #expect(context.contains("requestID=0"))
+    #expect(context.contains("payloadBytes=128"))
+    #expect(context.contains("state=stopping"))
+    #expect(context.contains("MetadataError"))
+    #expect(!context.contains("\n"))
+    #expect(context.count < 512)
+}
+
 @Test func stopWaitsForSessionEndedAndReusesAuthenticatedControl() async throws {
     let codec = ProtocolV3CBORCodec()
     let identity = try ProtocolV3ClientIdentity(privateSeed: Data(0..<32))
@@ -224,6 +247,8 @@ import UmbraQUICTransport
         fields: stopLifecycleStopResponse(sessionID: secondSessionID, intent: secondStopIntent),
         codec: codec
     )
+    try await stopLifecycleWait { transport.currentActiveSessionID == nil }
+    transport.failNextActiveSessionClear()
     transport.receive(
         type: 0x0133,
         requestID: 0,
@@ -234,6 +259,9 @@ import UmbraQUICTransport
     try await stopLifecycleWait {
         recorder.endedSessionIDs == [firstSessionID, secondSessionID]
     }
+    #expect(recorder.failureCount == 0)
+    #expect(transport.cancelCount == 0)
+    #expect(session.canBeginStart)
 
     let cancelledIntent = Data(repeating: 0x75, count: 16)
     let cancelledStartID = try session.beginStart(
@@ -274,6 +302,7 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
     private var requests: [QUICOutboundRequest] = []
     private var activeSessionID: Data?
     private var storedCancelCount = 0
+    private var activeSessionClearFailuresRemaining = 0
     var eventHandler: (@Sendable (QUICTransportEvent) -> Void)?
     var authenticationHandler: (@Sendable (QUICApplicationAuthenticationHandoff) -> Void)?
 
@@ -293,7 +322,17 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
     }
 
     func setActiveSessionID(_ sessionID: Data?) throws {
-        lock.withLock { activeSessionID = sessionID }
+        try lock.withLock {
+            if sessionID == nil, activeSessionClearFailuresRemaining > 0 {
+                activeSessionClearFailuresRemaining -= 1
+                throw QUICTransportError.invalidState
+            }
+            activeSessionID = sessionID
+        }
+    }
+
+    func failNextActiveSessionClear() {
+        lock.withLock { activeSessionClearFailuresRemaining += 1 }
     }
 
     func applicationHelloDidComplete(success _: Bool) {}
