@@ -289,7 +289,7 @@ private final class ProtocolV3VideoAssembly {
 /// QUIC receive path and its direct state-machine tests.
 final class ProtocolV3VideoReassembler {
     static let recoveryRequestRetryNanoseconds: UInt64 = 250_000_000
-    private static let latencyAssemblyCapacity = 3
+    private static let latencyAssemblyCapacity = 4
 
     private let mode: QUICOptimizationMode
     private var assemblies: [UInt64: ProtocolV3VideoAssembly] = [:]
@@ -439,9 +439,9 @@ final class ProtocolV3VideoReassembler {
                     let expectedFrameID = latestReleasedFrameID + 1
                     if fragment.frameID > expectedFrameID,
                        assemblies[expectedFrameID] == nil {
-                        // Continuous latency delivery may put N+2 and N+1 on the
-                        // wire before the first fragment of N. Retain exactly the
-                        // bounded three-frame decode window; any farther frame
+                        // Continuous latency delivery may put N+3 through N+1 on
+                        // the wire before the first fragment of N. Retain exactly
+                        // the bounded four-frame decode window; any farther frame
                         // confirms real whole-frame loss.
                         let lookahead = expectedFrameID.addingReportingOverflow(
                             UInt64(Self.latencyAssemblyCapacity - 1)

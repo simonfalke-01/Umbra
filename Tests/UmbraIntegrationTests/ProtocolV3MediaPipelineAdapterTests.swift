@@ -551,7 +551,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(keyFrame.readyFrames.first?.data, Data([3, 4]))
     }
 
-    func testLatencyRetainsTwoAdjacentFutureFramesUntilExpectedFrameArrives() throws {
+    func testLatencyRetainsThreeAdjacentFutureFramesUntilExpectedFrameArrives() throws {
         let reassembler = ProtocolV3VideoReassembler(mode: .latency)
         let initial = try reassembler.accept(
             fragment(
@@ -567,9 +567,9 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
 
         let farFuture = try reassembler.accept(
             fragment(
-                frameID: 4,
+                frameID: 5,
                 frameSize: 2,
-                bytes: Data([7, 8]),
+                bytes: Data([9, 10]),
                 receivedAtNanoseconds: 2
             ),
             framesPerSecond: 120
@@ -578,41 +578,55 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertNil(farFuture.requestedKeyFrameID)
         XCTAssertTrue(farFuture.readyFrames.isEmpty)
         XCTAssertFalse(reassembler.requiresKeyFrame)
-        XCTAssertEqual(reassembler.pendingFrameIDs, [4])
+        XCTAssertEqual(reassembler.pendingFrameIDs, [5])
+
+        let middleFuture = try reassembler.accept(
+            fragment(
+                frameID: 4,
+                frameSize: 2,
+                bytes: Data([7, 8]),
+                receivedAtNanoseconds: 3
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertTrue(middleFuture.lostFrameIDs.isEmpty)
+        XCTAssertNil(middleFuture.requestedKeyFrameID)
+        XCTAssertTrue(middleFuture.readyFrames.isEmpty)
+        XCTAssertEqual(reassembler.pendingFrameIDs, [4, 5])
 
         let nearFuture = try reassembler.accept(
             fragment(
                 frameID: 3,
                 frameSize: 2,
                 bytes: Data([3, 4]),
-                receivedAtNanoseconds: 3
+                receivedAtNanoseconds: 4
             ),
             framesPerSecond: 120
         )
         XCTAssertTrue(nearFuture.lostFrameIDs.isEmpty)
         XCTAssertNil(nearFuture.requestedKeyFrameID)
         XCTAssertTrue(nearFuture.readyFrames.isEmpty)
-        XCTAssertEqual(reassembler.pendingFrameIDs, [3, 4])
+        XCTAssertEqual(reassembler.pendingFrameIDs, [3, 4, 5])
 
         let ordered = try reassembler.accept(
             fragment(
                 frameID: 2,
                 frameSize: 2,
                 bytes: Data([5, 6]),
-                receivedAtNanoseconds: 4
+                receivedAtNanoseconds: 5
             ),
             framesPerSecond: 120
         )
-        XCTAssertEqual(ordered.readyFrames.map(\.frameID), [2, 3, 4])
+        XCTAssertEqual(ordered.readyFrames.map(\.frameID), [2, 3, 4, 5])
         XCTAssertEqual(
             ordered.readyFrames.map(\.data),
-            [Data([5, 6]), Data([3, 4]), Data([7, 8])]
+            [Data([5, 6]), Data([3, 4]), Data([7, 8]), Data([9, 10])]
         )
         XCTAssertTrue(reassembler.pendingFrameIDs.isEmpty)
         XCTAssertFalse(reassembler.requiresKeyFrame)
     }
 
-    func testLatencyFourthDistinctAssemblyTriggersBoundedRecovery() throws {
+    func testLatencyFifthDistinctAssemblyTriggersBoundedRecovery() throws {
         let reassembler = ProtocolV3VideoReassembler(mode: .latency)
         _ = try reassembler.accept(
             fragment(
@@ -635,7 +649,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             ),
             framesPerSecond: 120
         )
-        for frameID in UInt64(3)...4 {
+        for frameID in UInt64(3)...5 {
             _ = try reassembler.accept(
                 fragment(
                     frameID: frameID,
@@ -646,19 +660,19 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
                 framesPerSecond: 120
             )
         }
-        XCTAssertEqual(reassembler.pendingFrameIDs, [2, 3, 4])
+        XCTAssertEqual(reassembler.pendingFrameIDs, [2, 3, 4, 5])
 
         let overflow = try reassembler.accept(
             fragment(
-                frameID: 5,
+                frameID: 6,
                 frameSize: 2,
-                bytes: Data([5, 0x7f]),
-                receivedAtNanoseconds: 5
+                bytes: Data([6, 0x7f]),
+                receivedAtNanoseconds: 6
             ),
             framesPerSecond: 120
         )
 
-        XCTAssertEqual(Set(overflow.lostFrameIDs), Set([2, 3, 4]))
+        XCTAssertEqual(Set(overflow.lostFrameIDs), Set([2, 3, 4, 5]))
         XCTAssertEqual(overflow.requestedKeyFrameID, 2)
         XCTAssertTrue(overflow.readyFrames.isEmpty)
         XCTAssertTrue(reassembler.requiresKeyFrame)
@@ -1320,7 +1334,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 5, 7])
     }
 
-    func testLatencyCapacityThreeAdmitsStartupBurstWithoutFalseRecovery() throws {
+    func testLatencyCapacityFourAdmitsStartupBurstWithoutFalseRecovery() throws {
         var preferences = StreamingPreferences.default
         preferences.optimizationMode = .latency
         let offer = try ProtocolV3StartRequestMapper.makeOffer(
@@ -1332,7 +1346,7 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
             traceID: Data(17...32)
         )
         let selection = successfulStartResponse(offer)
-        let decoder = RationalRefreshVideoDecoder(maximumOutstandingFrames: 3)
+        let decoder = RationalRefreshVideoDecoder(maximumOutstandingFrames: 4)
         let feedback = ProtocolV3FeedbackRecorder()
         let adapter = try ProtocolV3MediaPipelineAdapter(
             pipeline: StreamingMediaPipeline(
@@ -1367,14 +1381,15 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         try send(frameID: 1, flags: 0x01)
         try send(frameID: 2)
         try send(frameID: 3)
-        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3])
-        XCTAssertEqual(decoder.outstandingFrameNumbers, [1, 2, 3])
+        try send(frameID: 4)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 4])
+        XCTAssertEqual(decoder.outstandingFrameNumbers, [1, 2, 3, 4])
         XCTAssertFalse(feedback.values.contains { $0.action == 2 || $0.action == 4 })
 
         decoder.emit(.decoded(frameNumber: 1))
-        try send(frameID: 4)
-        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 4])
-        XCTAssertEqual(decoder.outstandingFrameNumbers, [2, 3, 4])
+        try send(frameID: 5)
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 4, 5])
+        XCTAssertEqual(decoder.outstandingFrameNumbers, [2, 3, 4, 5])
         XCTAssertFalse(feedback.values.contains { $0.action == 2 || $0.action == 4 })
     }
 
@@ -1424,16 +1439,17 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
 
         try send(frameID: 1, flags: 0x01)
         decoder.emit(.decoded(frameNumber: 1))
+        try send(frameID: 5)
         try send(frameID: 4)
         try send(frameID: 3)
         XCTAssertEqual(decoder.submittedFrameNumbers, [1])
         XCTAssertFalse(feedback.values.contains { $0.action == 2 || $0.action == 4 })
 
         try send(frameID: 2)
-        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 4])
+        XCTAssertEqual(decoder.submittedFrameNumbers, [1, 2, 3, 4, 5])
         let statistics = adapter.statistics()
-        XCTAssertEqual(statistics.videoFramesReassembled, 4)
-        XCTAssertEqual(statistics.videoFramesSubmitted, 4)
+        XCTAssertEqual(statistics.videoFramesReassembled, 5)
+        XCTAssertEqual(statistics.videoFramesSubmitted, 5)
         XCTAssertEqual(statistics.videoFramesDropped, 0)
         XCTAssertFalse(feedback.values.contains { $0.action == 2 || $0.action == 4 })
     }
