@@ -52,7 +52,9 @@ import UmbraQUICTransport
             }
         }
     )
-    session.setEventHandler { event in recorder.record(event) }
+    session.setEventHandler { event in
+        recorder.record(event, cancelCount: transport.cancelCount)
+    }
 
     try session.start()
     let clientHello = try await transport.request(at: 0)
@@ -262,6 +264,7 @@ import UmbraQUICTransport
         codec: codec
     )
     try await stopLifecycleWait { recorder.failureCount == 1 }
+    #expect(recorder.failureCancelCounts == [0])
     #expect(transport.cancelCount == 1)
 }
 
@@ -333,6 +336,7 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
 private final class StopLifecycleEventRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [ProtocolV3ClientEvent] = []
+    private var storedFailureCancelCounts: [Int] = []
 
     var authenticatedCount: Int {
         lock.withLock { events.count { if case .authenticated = $0 { true } else { false } } }
@@ -392,8 +396,13 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
         lock.withLock { events.count { if case .failed = $0 { true } else { false } } }
     }
 
-    func record(_ event: ProtocolV3ClientEvent) {
-        lock.withLock { events.append(event) }
+    var failureCancelCounts: [Int] { lock.withLock { storedFailureCancelCounts } }
+
+    func record(_ event: ProtocolV3ClientEvent, cancelCount: Int) {
+        lock.withLock {
+            events.append(event)
+            if case .failed = event { storedFailureCancelCounts.append(cancelCount) }
+        }
     }
 }
 

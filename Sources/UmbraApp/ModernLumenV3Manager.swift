@@ -3262,10 +3262,11 @@ final class ModernLumenV3Manager {
         )
     }
 
-    private static func isRecoverableConnectionLoss(_ event: ProtocolV3ClientEvent) -> Bool {
+    static func isRecoverableConnectionLoss(_ event: ProtocolV3ClientEvent) -> Bool {
         switch event {
-        case .failed,
-             .transport(.stateChanged(.failed)),
+        // Protocol-level failures close authentication/session authority. Only
+        // transport loss may retain the host session for a pinned ATTACH.
+        case .transport(.stateChanged(.failed)),
              .transport(.stateChanged(.cancelled)):
             true
         default:

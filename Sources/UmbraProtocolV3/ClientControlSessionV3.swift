@@ -797,8 +797,10 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         } else if failedState == .authorization {
             transport.applicationAuthenticationDidComplete(success: false)
         }
-        transport.cancel()
         eventHandler?(.failed(error))
+        // Publish terminal authority loss before transport cancellation can
+        // emit a superficially recoverable state change to higher layers.
+        transport.cancel()
     }
 
     private static func validateStartRequest(_ fields: [UInt64: ProtocolV3CBORValue]) throws {
