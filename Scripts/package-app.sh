@@ -103,9 +103,12 @@ validate_packaged_app() {
 
     local info_plist="$candidate/Contents/Info.plist"
     local executable="$candidate/Contents/MacOS/Umbra"
+    local awdl_helper="$candidate/Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper"
+    local awdl_daemon_plist="$candidate/Contents/Library/LaunchDaemons/app.umbra.Umbra.AWDLHelper.plist"
     local resource_directory="$candidate/Contents/Resources"
-    [[ -f "$info_plist" && -f "$executable" && -d "$resource_directory" ]] || {
-        fail "Umbra's packaged executable, Info.plist, or resources are missing."
+    [[ -f "$info_plist" && -f "$executable" && -x "$awdl_helper"
+        && -f "$awdl_daemon_plist" && -d "$resource_directory" ]] || {
+        fail "Umbra's packaged executable, AWDL helper, launch daemon, Info.plist, or resources are missing."
     }
 
     local app_identifier
@@ -119,6 +122,27 @@ validate_packaged_app() {
     [[ "$(plutil -extract NSBonjourServices.0 raw "$info_plist")" == "_nvstream._tcp"
         && "$(plutil -extract NSBonjourServices.1 raw "$info_plist")" == "_lumen-v3._udp" ]] || {
         fail "Umbra's legacy and secure protocol-v3 Bonjour declarations are incomplete."
+    }
+    plutil -lint "$awdl_daemon_plist" >/dev/null
+    python3 - "$awdl_daemon_plist" "$expected_app_identifier" <<'PY' || {
+import plistlib
+import sys
+from pathlib import Path
+
+value = plistlib.loads(Path(sys.argv[1]).read_bytes())
+valid = (
+    value.get("Label") == "app.umbra.Umbra.AWDLHelper"
+    and value.get("BundleProgram")
+        == "Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper"
+    and value.get("AssociatedBundleIdentifiers") == [sys.argv[2]]
+    and value.get("MachServices")
+        == {"app.umbra.Umbra.AWDLHelper": True}
+    and value.get("RunAtLoad") is True
+    and value.get("KeepAlive") is True
+)
+raise SystemExit(0 if valid else 1)
+PY
+        fail "Umbra's AWDL launch daemon contract is invalid."
     }
 
     local packaged_resource_bundle="$resource_directory/Umbra_UmbraApp.bundle"
@@ -154,7 +178,7 @@ validate_packaged_app() {
     }
 
     local dynamic_dependencies
-    dynamic_dependencies="$(otool -L "$executable")"
+    dynamic_dependencies="$(otool -L "$executable"; otool -L "$awdl_helper")"
     if [[ "$dynamic_dependencies" == *"/opt/homebrew"*
         || "$dynamic_dependencies" == *"/usr/local"*
         || "$dynamic_dependencies" == *"libopus"*
@@ -170,7 +194,11 @@ validate_packaged_app() {
     [[ "$(lipo -archs "$executable")" == "arm64" ]] || {
         fail "Umbra release executable must be arm64-only."
     }
+    [[ "$(lipo -archs "$awdl_helper")" == "arm64" ]] || {
+        fail "Umbra AWDL helper must be arm64-only."
+    }
 
+    codesign --verify --strict --verbose=2 "$awdl_helper"
     codesign --verify --deep --strict --verbose=2 "$candidate"
     if [[ "$qualifying_build" == "1" ]]; then
         require_qualifying_identity
@@ -180,6 +208,14 @@ validate_packaged_app() {
             && "$signature_details" != *"TeamIdentifier=not set"*
             && "$signature_details" == *"Authority=$CODE_SIGN_IDENTITY"* ]] || {
             fail "Umbra package is not signed by the approved non-ad-hoc identity."
+        }
+        local helper_signature_details
+        helper_signature_details="$(codesign --display --verbose=4 "$awdl_helper" 2>&1)"
+        [[ "$helper_signature_details" != *"Signature=adhoc"*
+            && "$helper_signature_details" != *"TeamIdentifier=not set"*
+            && "$helper_signature_details" == *"Identifier=app.umbra.Umbra.AWDLHelper"*
+            && "$helper_signature_details" == *"Authority=$CODE_SIGN_IDENTITY"* ]] || {
+            fail "Umbra's AWDL helper is not signed by the approved identity."
         }
         echo "$signature_details" | grep -Eq 'flags=.*\(.*runtime.*\)' || {
             fail "Umbra qualifying signature is missing hardened-runtime flags."
@@ -261,10 +297,21 @@ elif [[ "$configuration" == "release" ]]; then
 fi
 build_root="$(env -u CC -u CXX swift build "${swift_build_args[@]}" --show-bin-path)"
 env -u CC -u CXX swift build "${swift_build_args[@]}" --product Umbra
+env -u CC -u CXX swift build "${swift_build_args[@]}" --product UmbraAWDLHelper
 
 rm -rf "$app_root"
-mkdir -p "$app_root/Contents/MacOS" "$app_root/Contents/Resources"
+mkdir -p \
+    "$app_root/Contents/MacOS" \
+    "$app_root/Contents/Resources" \
+    "$app_root/Contents/Library/HelperTools" \
+    "$app_root/Contents/Library/LaunchDaemons"
 cp "$build_root/Umbra" "$app_root/Contents/MacOS/Umbra"
+cp \
+    "$build_root/UmbraAWDLHelper" \
+    "$app_root/Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper"
+cp \
+    "$repository_root/Resources/Umbra/app.umbra.Umbra.AWDLHelper.plist" \
+    "$app_root/Contents/Library/LaunchDaemons/app.umbra.Umbra.AWDLHelper.plist"
 cp "$repository_root/Resources/Umbra/Info.plist" "$app_root/Contents/Info.plist"
 app_identifier="$(plutil -extract CFBundleIdentifier raw "$app_root/Contents/Info.plist")"
 [[ "$app_identifier" == "$expected_app_identifier" ]] || fail \
@@ -320,10 +367,29 @@ if [[ "$qualifying_build" == "1" ]]; then
     if [[ -n "$signing_entitlements_path" ]]; then
         codesign_arguments+=(--entitlements "$signing_entitlements_path")
     fi
+    codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --identifier app.umbra.Umbra.AWDLHelper \
+        --sign "$CODE_SIGN_IDENTITY" \
+        "$app_root/Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper"
     codesign "${codesign_arguments[@]}" "$app_root"
 elif [[ -n "${CODE_SIGN_IDENTITY:-}" ]]; then
+    codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --identifier app.umbra.Umbra.AWDLHelper \
+        --sign "$CODE_SIGN_IDENTITY" \
+        "$app_root/Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper"
     codesign --force --options runtime --timestamp --sign "$CODE_SIGN_IDENTITY" "$app_root"
 else
+    codesign \
+        --force \
+        --sign - \
+        --identifier app.umbra.Umbra.AWDLHelper \
+        "$app_root/Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper"
     codesign \
         --force \
         --sign - \

@@ -30,6 +30,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "Umbra", targets: ["UmbraApp"]),
+        .executable(name: "UmbraAWDLHelper", targets: ["UmbraAWDLHelper"]),
     ],
     targets: [
         .systemLibrary(
@@ -145,8 +146,17 @@ let package = Package(
             path: "Sources/UmbraProtocolV3",
         ),
         .target(
+            name: "UmbraAWDL",
+            path: "Sources/UmbraAWDL",
+            linkerSettings: [
+                .linkedFramework("Security"),
+                .linkedFramework("ServiceManagement"),
+            ]
+        ),
+        .target(
             name: "UmbraIntegration",
             dependencies: [
+                "UmbraAWDL",
                 "UmbraCore",
                 "UmbraNetworking",
                 "UmbraPairing",
@@ -180,6 +190,7 @@ let package = Package(
                 "UmbraCLI",
                 "UmbraCLIExecution",
                 "UmbraDiagnostics",
+                "UmbraAWDL",
                 "UmbraMicrophone",
                 "UmbraProtocolV3",
                 "UmbraQUICTransport",
@@ -193,6 +204,11 @@ let package = Package(
                 .process("Resources/en.lproj"),
             ],
             linkerSettings: releaseStaticLinkerSettings
+        ),
+        .executableTarget(
+            name: "UmbraAWDLHelper",
+            dependencies: ["UmbraAWDL"],
+            path: "Sources/UmbraAWDLHelper"
         ),
         .testTarget(
             name: "UmbraCoreTests",
@@ -256,8 +272,14 @@ let package = Package(
             path: "Tests/UmbraProtocolV3Tests",
         ),
         .testTarget(
+            name: "UmbraAWDLTests",
+            dependencies: ["UmbraAWDL"],
+            path: "Tests/UmbraAWDLTests"
+        ),
+        .testTarget(
             name: "UmbraIntegrationTests",
             dependencies: [
+                "UmbraAWDL",
                 "UmbraIntegration",
                 "UmbraCore",
                 "UmbraNetworking",

@@ -298,7 +298,7 @@ final class RuntimePreferenceEffectsTests: XCTestCase {
         let enabledBootstrap = try makeBootstrap(preferences: enabled)
         try await lifecycle.prepare(for: enabledBootstrap)
         XCTAssertEqual(presence.recordedEvents(), [])
-        await lifecycle.commitStreaming(for: enabledBootstrap)
+        try await lifecycle.commitStreaming(for: enabledBootstrap)
         await lifecycle.finishPresentation()
         XCTAssertEqual(presence.recordedEvents(), [.updated("Desktop"), .cleared])
     }

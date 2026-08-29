@@ -1448,7 +1448,9 @@ private actor RecordingManagerLifecycle: StreamSessionLifecycleCoordinating {
     private(set) var values: [Event] = []
     func prepare(for bootstrap: StreamBootstrap) async throws { values.append(.prepare) }
     func updatePreparation(for bootstrap: StreamBootstrap) async throws { values.append(.updatePreparation) }
-    func commitStreaming(for bootstrap: StreamBootstrap) async { values.append(.commitStreaming) }
+    func commitStreaming(for bootstrap: StreamBootstrap) async throws {
+        values.append(.commitStreaming)
+    }
     func finishPresentation() async { values.append(.finishPresentation) }
     func finish() async { values.append(.finish) }
     func snapshot() -> [Event] { values }

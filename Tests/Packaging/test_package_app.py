@@ -57,6 +57,37 @@ class PackageAppQualifyingTests(unittest.TestCase):
         executable.parent.mkdir(parents=True)
         executable.write_bytes(b"Mach-O fixture")
         executable.chmod(0o755)
+        helper = (
+            self.app
+            / "Contents"
+            / "Library"
+            / "HelperTools"
+            / "app.umbra.Umbra.AWDLHelper"
+        )
+        helper.parent.mkdir(parents=True)
+        helper.write_bytes(b"Mach-O helper fixture")
+        helper.chmod(0o755)
+        daemon = (
+            self.app
+            / "Contents"
+            / "Library"
+            / "LaunchDaemons"
+            / "app.umbra.Umbra.AWDLHelper.plist"
+        )
+        daemon.parent.mkdir(parents=True)
+        daemon.write_bytes(
+            plistlib.dumps(
+                {
+                    "AssociatedBundleIdentifiers": ["app.umbra.Umbra"],
+                    "BundleProgram": "Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper",
+                    "KeepAlive": True,
+                    "Label": "app.umbra.Umbra.AWDLHelper",
+                    "MachServices": {"app.umbra.Umbra.AWDLHelper": True},
+                    "ProcessType": "Background",
+                    "RunAtLoad": True,
+                }
+            )
+        )
         (self.app / "Contents" / "Info.plist").write_text("fixture", encoding="utf-8")
         for base in (resources, resources / "Umbra_UmbraApp.bundle"):
             localization = base / "en.lproj"
@@ -84,6 +115,10 @@ class PackageAppQualifyingTests(unittest.TestCase):
                 "NSLocalNetworkUsageDescription": "network",
                 "NSInputMonitoringUsageDescription": "input",
                 "NSMicrophoneUsageDescription": "microphone",
+                "Label": "app.umbra.Umbra.AWDLHelper",
+                "BundleProgram": "Contents/Library/HelperTools/app.umbra.Umbra.AWDLHelper",
+                "AssociatedBundleIdentifiers.0": "app.umbra.Umbra",
+                "MachServices.app.umbra.Umbra.AWDLHelper": "true",
             }
             print(values[key])
             """,
@@ -139,6 +174,7 @@ class PackageAppQualifyingTests(unittest.TestCase):
                 identity = os.environ["STUB_CODE_SIGN_IDENTITY"]
                 flags = os.environ["STUB_RUNTIME_FLAGS"]
                 print(f"Authority={identity}", file=sys.stderr)
+                print("Identifier=app.umbra.Umbra.AWDLHelper", file=sys.stderr)
                 print("TeamIdentifier=ABCDE12345", file=sys.stderr)
                 print(flags, file=sys.stderr)
             """,
@@ -207,6 +243,19 @@ class PackageAppQualifyingTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("non-system dynamic dependencies", completed.stderr)
+
+    def test_missing_awdl_helper_contract_is_rejected(self) -> None:
+        helper = (
+            self.app
+            / "Contents"
+            / "Library"
+            / "HelperTools"
+            / "app.umbra.Umbra.AWDLHelper"
+        )
+        helper.unlink()
+        completed = self.run_validation()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("AWDL helper", completed.stderr)
 
 
 if __name__ == "__main__":

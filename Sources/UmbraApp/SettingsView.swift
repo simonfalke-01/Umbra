@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 import UmbraCore
+import UmbraAWDL
 import UmbraMicrophone
 import UmbraPlatform
 
@@ -1187,6 +1188,7 @@ private struct ControllerSettingsView: View {
 
 private struct AdvancedSettingsView: View {
     @ObservedObject var preferences: PreferencesStore
+    @StateObject private var awdlHelper = AWDLHelperSettingsModel()
     @State private var showsResetConfirmation = false
 
     var body: some View {
@@ -1261,6 +1263,21 @@ private struct AdvancedSettingsView: View {
                     message: "Displays real-time stream performance information over the video.",
                     binding: preferences.binding(for: \.showPerformanceOverlay)
                 )
+                SettingsRow(
+                    "AWDL stream helper",
+                    message: awdlHelper.detail
+                ) {
+                    HStack(spacing: UmbraLayout.space3) {
+                        Text(awdlHelper.title)
+                            .foregroundStyle(awdlHelper.status == .enabled ? .green : .secondary)
+                        if awdlHelper.status == .notRegistered,
+                           !awdlHelper.registrationWasAttempted {
+                            Button("Install Once…") { awdlHelper.requestRegistration() }
+                        } else if awdlHelper.status == .requiresApproval {
+                            Button("Open Login Items") { awdlHelper.openApprovalSettings() }
+                        }
+                    }
+                }
             }
 
             SettingsSection("Defaults") {
@@ -1286,6 +1303,18 @@ private struct AdvancedSettingsView: View {
         } message: {
             Text("This cannot be undone.")
         }
+        .alert(
+            "AWDL Helper Error",
+            isPresented: Binding(
+                get: { awdlHelper.errorMessage != nil },
+                set: { if !$0 { awdlHelper.errorMessage = nil } }
+            )
+        ) {
+            Button("OK") { awdlHelper.errorMessage = nil }
+        } message: {
+            Text(awdlHelper.errorMessage ?? "The helper could not be registered.")
+        }
+        .onAppear { awdlHelper.refresh() }
     }
 
 }

@@ -293,7 +293,7 @@ public actor DiscordRichPresenceLifecycleCoordinator: StreamSessionLifecycleCoor
     public func prepare(for bootstrap: StreamBootstrap) async throws {
     }
 
-    public func commitStreaming(for bootstrap: StreamBootstrap) async {
+    public func commitStreaming(for bootstrap: StreamBootstrap) async throws {
         guard bootstrap.preferences.richPresence else { return }
         presence.update(applicationName: bootstrap.application.name, startedAt: Date())
         active = true
@@ -345,9 +345,18 @@ public struct CompositeStreamSessionLifecycleCoordinator: StreamSessionLifecycle
         }
     }
 
-    public func commitStreaming(for bootstrap: StreamBootstrap) async {
-        for coordinator in coordinators {
-            await coordinator.commitStreaming(for: bootstrap)
+    public func commitStreaming(for bootstrap: StreamBootstrap) async throws {
+        var committed: [any StreamSessionLifecycleCoordinating] = []
+        do {
+            for coordinator in coordinators {
+                try await coordinator.commitStreaming(for: bootstrap)
+                committed.append(coordinator)
+            }
+        } catch {
+            for coordinator in committed.reversed() {
+                await coordinator.finishPresentation()
+            }
+            throw error
         }
     }
 

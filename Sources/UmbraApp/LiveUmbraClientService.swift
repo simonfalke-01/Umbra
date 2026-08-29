@@ -963,7 +963,17 @@ final class LiveApplicationComposition {
             windowController: streamWindow,
             audio: mediaProvider.audioSessionController
         )
+        let awdlLifecycle = AWDLStreamLifecycleCoordinator(
+            diagnosticHandler: { [supportLogger] message in
+                supportLogger?.record(
+                    source: "AWDL",
+                    level: message.hasPrefix("AWDL restoration") ? .error : .info,
+                    message: message
+                )
+            }
+        )
         let lifecycle = CompositeStreamSessionLifecycleCoordinator([
+            awdlLifecycle,
             appLifecycle,
             DiscordRichPresenceLifecycleCoordinator(),
         ])

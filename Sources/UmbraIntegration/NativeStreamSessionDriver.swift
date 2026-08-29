@@ -694,7 +694,7 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
                 phase: .running(preparedSession.generation)
             )
             if let failure = relay.failure { throw failure }
-            await lifecycle.commitStreaming(for: effectiveBootstrap)
+            try await lifecycle.commitStreaming(for: effectiveBootstrap)
             try ensureCurrent(
                 generation: preparedSession.generation,
                 phase: .running(preparedSession.generation)

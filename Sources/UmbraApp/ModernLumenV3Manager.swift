@@ -2345,7 +2345,7 @@ final class ModernLumenV3Manager {
                 motionPolicy: motionPolicy,
                 failureHandler: inputFailureHandler
             ))
-            await lifecycle.commitStreaming(for: prepared.bootstrap)
+            try await lifecycle.commitStreaming(for: prepared.bootstrap)
             sessionEventHandler?(.sessionStreaming)
             startControlKeepalive(entry: entry, hostID: hostID)
             entry.startContinuation.yield(.success(StartResult(sessionID: sessionID, fields: fields)))

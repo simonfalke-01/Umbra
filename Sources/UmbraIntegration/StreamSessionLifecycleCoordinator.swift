@@ -1,4 +1,5 @@
 import Foundation
+import UmbraAWDL
 import UmbraCore
 import UmbraMedia
 import UmbraPlatform
@@ -9,7 +10,7 @@ public protocol StreamSessionLifecycleCoordinating: Sendable {
     /// Applies capability-dependent preferences resolved after the native control
     /// channel starts without rebuilding or revealing the prepared presentation.
     func updatePreparation(for bootstrap: StreamBootstrap) async throws
-    func commitStreaming(for bootstrap: StreamBootstrap) async
+    func commitStreaming(for bootstrap: StreamBootstrap) async throws
     /// Dismisses local presentation without touching callback-owned media resources.
     /// The native session may still be delivering stop-phase callbacks when this runs.
     func finishPresentation() async
@@ -20,7 +21,7 @@ public protocol StreamSessionLifecycleCoordinating: Sendable {
 
 public extension StreamSessionLifecycleCoordinating {
     func updatePreparation(for bootstrap: StreamBootstrap) async throws {}
-    func commitStreaming(for bootstrap: StreamBootstrap) async {}
+    func commitStreaming(for bootstrap: StreamBootstrap) async throws {}
     func finishPresentation() async {}
 }
 
@@ -28,6 +29,59 @@ public struct NoOpStreamSessionLifecycleCoordinator: StreamSessionLifecycleCoord
     public init() {}
     public func prepare(for bootstrap: StreamBootstrap) async throws {}
     public func finish() async {}
+}
+
+public actor AWDLStreamLifecycleCoordinator: StreamSessionLifecycleCoordinating {
+    private let helper: any AWDLPrivilegedHelperControlling
+    private let diagnosticHandler: @Sendable (String) -> Void
+    private var prepared = false
+    private var activeLeaseIdentifier: String?
+
+    public init(
+        helper: any AWDLPrivilegedHelperControlling = AWDLPrivilegedHelperClient(),
+        diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
+        self.helper = helper
+        self.diagnosticHandler = diagnosticHandler
+    }
+
+    public func prepare(for bootstrap: StreamBootstrap) async throws {
+        guard activeLeaseIdentifier == nil else { throw AWDLHelperError.busy }
+        let status = try await helper.status()
+        guard status.leaseIdentifier == nil else { throw AWDLHelperError.busy }
+        prepared = true
+    }
+
+    public func commitStreaming(for bootstrap: StreamBootstrap) async throws {
+        guard prepared, activeLeaseIdentifier == nil else { throw AWDLHelperError.busy }
+        let leaseIdentifier = UUID().uuidString
+        _ = try await helper.down(leaseIdentifier: leaseIdentifier)
+        activeLeaseIdentifier = leaseIdentifier
+        diagnosticHandler("awdl0 was disabled for the active stream.")
+    }
+
+    public func finishPresentation() async {
+        await restoreIfNeeded()
+        prepared = false
+    }
+
+    public func finish() async {
+        await restoreIfNeeded()
+        prepared = false
+    }
+
+    private func restoreIfNeeded() async {
+        guard let activeLeaseIdentifier else { return }
+        do {
+            _ = try await helper.up(leaseIdentifier: activeLeaseIdentifier)
+            self.activeLeaseIdentifier = nil
+            diagnosticHandler("awdl0 was restored to its pre-stream state.")
+        } catch {
+            diagnosticHandler(
+                "AWDL restoration is pending in the privileged helper: \(error.localizedDescription)"
+            )
+        }
+    }
 }
 
 @MainActor
