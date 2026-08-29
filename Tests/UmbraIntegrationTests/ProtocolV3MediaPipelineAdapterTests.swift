@@ -299,6 +299,71 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertFalse(reassembler.requiresKeyFrame)
     }
 
+    func testLatencyWholeFrameGapRequiresDecodedRecoveryIDR() throws {
+        let reassembler = ProtocolV3VideoReassembler(mode: .latency)
+
+        let initial = try reassembler.accept(
+            fragment(
+                frameID: 4,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([1, 2]),
+                receivedAtNanoseconds: 1
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(initial.readyFrames.map(\.frameID), [4])
+
+        let gap = try reassembler.accept(
+            fragment(
+                frameID: 33,
+                frameSize: 2,
+                bytes: Data([3, 4]),
+                receivedAtNanoseconds: 2
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertTrue(gap.readyFrames.isEmpty)
+        XCTAssertEqual(gap.lostFrameIDs, [5])
+        XCTAssertEqual(gap.requestedKeyFrameID, 5)
+        XCTAssertTrue(reassembler.requiresKeyFrame)
+
+        let recovery = try reassembler.accept(
+            fragment(
+                frameID: 34,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([5, 6]),
+                receivedAtNanoseconds: 3
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(recovery.readyFrames.map(\.frameID), [34])
+        let heldDependent = try reassembler.accept(
+            fragment(
+                frameID: 35,
+                frameSize: 2,
+                bytes: Data([7, 8]),
+                receivedAtNanoseconds: 4
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertTrue(heldDependent.readyFrames.isEmpty)
+        XCTAssertTrue(reassembler.confirmDecodedRecoveryKeyFrame(frameID: 34))
+
+        let resumed = try reassembler.accept(
+            fragment(
+                frameID: 35,
+                frameSize: 2,
+                bytes: Data([7, 8]),
+                receivedAtNanoseconds: 5
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(resumed.readyFrames.map(\.frameID), [35])
+        XCTAssertFalse(reassembler.requiresKeyFrame)
+    }
+
     func testQualityCompletedKeyFrameSupersedesOlderIncompleteFrame() throws {
         let reassembler = ProtocolV3VideoReassembler(mode: .quality)
         _ = try reassembler.accept(
