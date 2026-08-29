@@ -15,6 +15,21 @@ import UmbraStreaming
 
 @MainActor
 final class ModernLumenV3ManagerLifecycleTests: XCTestCase {
+    func testAttachRecoveryRequiresTransportLossNotTerminalProtocolFailure() {
+        XCTAssertTrue(ModernLumenV3Manager.isRecoverableConnectionLoss(
+            .transport(.stateChanged(.failed("network unavailable")))
+        ))
+        XCTAssertTrue(ModernLumenV3Manager.isRecoverableConnectionLoss(
+            .transport(.stateChanged(.cancelled))
+        ))
+        XCTAssertFalse(ModernLumenV3Manager.isRecoverableConnectionLoss(
+            .failed(.invalidMessage("v3 control"))
+        ))
+        XCTAssertFalse(ModernLumenV3Manager.isRecoverableConnectionLoss(
+            .failed(.authenticationFailed)
+        ))
+    }
+
     func testStopWithoutRetainedSessionFailsClosed() async throws {
         let fixture = try makeFixture(applications: [])
         defer { try? FileManager.default.removeItem(at: fixture.root) }

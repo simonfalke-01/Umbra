@@ -32,6 +32,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
     public let payloadFormat: EncodedVideoPayloadFormat
     public let frameNumber: Int
     public let isKeyFrame: Bool
+    public let requiresIndependentDecode: Bool
     public let hostProcessingLatencyTenthsOfMillisecond: UInt16
     public let receiveTimeMicroseconds: UInt64
     public let enqueueTimeMicroseconds: UInt64
@@ -49,6 +50,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
         payloadFormat: EncodedVideoPayloadFormat = .annexB,
         frameNumber: Int,
         isKeyFrame: Bool,
+        requiresIndependentDecode: Bool = false,
         hostProcessingLatencyTenthsOfMillisecond: UInt16 = 0,
         receiveTimeMicroseconds: UInt64 = 0,
         enqueueTimeMicroseconds: UInt64 = 0,
@@ -65,6 +67,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
         self.payloadFormat = payloadFormat
         self.frameNumber = frameNumber
         self.isKeyFrame = isKeyFrame
+        self.requiresIndependentDecode = requiresIndependentDecode
         self.hostProcessingLatencyTenthsOfMillisecond = hostProcessingLatencyTenthsOfMillisecond
         self.receiveTimeMicroseconds = receiveTimeMicroseconds
         self.enqueueTimeMicroseconds = enqueueTimeMicroseconds

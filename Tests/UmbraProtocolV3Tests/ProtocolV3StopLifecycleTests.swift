@@ -23,6 +23,29 @@ import UmbraQUICTransport
     #expect(unsupported.contains("status 10"))
 }
 
+@Test func genericControlFailureMetadataIsBoundedAndContainsNoPayload() {
+    struct MetadataError: Error, CustomStringConvertible {
+        let description = "local cleanup failed\n" + String(repeating: "x", count: 512)
+    }
+    let context = ProtocolV3ClientControlSession.genericControlFailureContext(
+        type: 0x0133,
+        flags: 0,
+        requestID: 0,
+        payloadByteCount: 128,
+        state: "stopping",
+        error: MetadataError()
+    )
+
+    #expect(context.contains("type=0x0133"))
+    #expect(context.contains("flags=0x00"))
+    #expect(context.contains("requestID=0"))
+    #expect(context.contains("payloadBytes=128"))
+    #expect(context.contains("state=stopping"))
+    #expect(context.contains("MetadataError"))
+    #expect(!context.contains("\n"))
+    #expect(context.count < 512)
+}
+
 @Test func stopWaitsForSessionEndedAndReusesAuthenticatedControl() async throws {
     let codec = ProtocolV3CBORCodec()
     let identity = try ProtocolV3ClientIdentity(privateSeed: Data(0..<32))
@@ -52,7 +75,9 @@ import UmbraQUICTransport
             }
         }
     )
-    session.setEventHandler { event in recorder.record(event) }
+    session.setEventHandler { event in
+        recorder.record(event, cancelCount: transport.cancelCount)
+    }
 
     try session.start()
     let clientHello = try await transport.request(at: 0)
@@ -81,12 +106,13 @@ import UmbraQUICTransport
     transport.receive(type: 0x0002, requestID: 1, flags: 1, fields: serverHelloFields, codec: codec)
 
     let authorization = try await transport.request(at: 1)
+    let resumedSessionID = Data(repeating: 0x5a, count: 16)
     var authorizationResponseFields: [UInt64: ProtocolV3CBORValue] = [
         1: .unsigned(0),
         2: .bytes(identity.clientID),
         3: .unsigned(0x12),
         4: .unsigned(1),
-        5: .null,
+        5: .bytes(resumedSessionID),
         6: .bytes(Data(repeating: 0x41, count: 16)),
     ]
     let unsignedAuthorizationResponse = try stopLifecycleFrame(
@@ -115,6 +141,11 @@ import UmbraQUICTransport
     )
     try await stopLifecycleWait { recorder.authenticatedCount == 1 }
     #expect(recorder.serverCapabilities == 0x37f)
+    #expect(recorder.activeSessionIDs == [resumedSessionID])
+    #expect(transport.currentActiveSessionID == nil)
+    #expect(recorder.failureCount == 0)
+    #expect(transport.cancelCount == 0)
+    #expect(session.canBeginStart)
 
     var missingHostAudio = stopLifecycleStartFields(intent: Data(repeating: 0x5f, count: 16))
     missingHostAudio.removeValue(forKey: 18)
@@ -131,7 +162,12 @@ import UmbraQUICTransport
     let firstIntent = Data(repeating: 0x62, count: 16)
     let firstStartID = try session.beginStart(fields: stopLifecycleStartFields(intent: firstIntent))
     #expect(firstStartID == 5)
-    _ = try await transport.request(at: 2)
+    let firstStart = try await transport.request(at: 2)
+    guard case let .control(_, firstStartType, _) = firstStart.wireMetadata else {
+        Issue.record("Expected START control metadata")
+        return
+    }
+    #expect(firstStartType == 0x0100)
     transport.receive(
         type: 0x0101,
         requestID: firstStartID,
@@ -222,6 +258,8 @@ import UmbraQUICTransport
         fields: stopLifecycleStopResponse(sessionID: secondSessionID, intent: secondStopIntent),
         codec: codec
     )
+    try await stopLifecycleWait { transport.currentActiveSessionID == nil }
+    transport.failNextActiveSessionClear()
     transport.receive(
         type: 0x0133,
         requestID: 0,
@@ -232,6 +270,37 @@ import UmbraQUICTransport
     try await stopLifecycleWait {
         recorder.endedSessionIDs == [firstSessionID, secondSessionID]
     }
+    #expect(recorder.failureCount == 0)
+    #expect(transport.cancelCount == 0)
+    #expect(session.canBeginStart)
+
+    let attachID = try session.sendControlRequest(
+        type: 0x0102,
+        fields: [1: .bytes(resumedSessionID)]
+    )
+    transport.receive(
+        type: 0x0103,
+        requestID: attachID,
+        flags: 1,
+        fields: [
+            1: .unsigned(0), 2: .bytes(resumedSessionID),
+            3: .unsigned(1), 4: .unsigned(1), 5: .boolean(false), 6: .map([:]),
+        ],
+        codec: codec
+    )
+    try await stopLifecycleWait { transport.currentActiveSessionID == resumedSessionID }
+    #expect(!session.canBeginStart)
+    transport.receive(
+        type: 0x0133,
+        requestID: 0,
+        flags: 0,
+        fields: stopLifecycleEndedFields(sessionID: resumedSessionID),
+        codec: codec
+    )
+    try await stopLifecycleWait {
+        recorder.endedSessionIDs == [firstSessionID, secondSessionID, resumedSessionID]
+    }
+    #expect(session.canBeginStart)
 
     let cancelledIntent = Data(repeating: 0x75, count: 16)
     let cancelledStartID = try session.beginStart(
@@ -262,6 +331,7 @@ import UmbraQUICTransport
         codec: codec
     )
     try await stopLifecycleWait { recorder.failureCount == 1 }
+    #expect(recorder.failureCancelCounts == [0])
     #expect(transport.cancelCount == 1)
 }
 
@@ -271,6 +341,8 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
     private var requests: [QUICOutboundRequest] = []
     private var activeSessionID: Data?
     private var storedCancelCount = 0
+    private var activeSessionClearFailuresRemaining = 0
+    private var applicationAuthenticationComplete = false
     var eventHandler: (@Sendable (QUICTransportEvent) -> Void)?
     var authenticationHandler: (@Sendable (QUICApplicationAuthenticationHandoff) -> Void)?
 
@@ -290,11 +362,26 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
     }
 
     func setActiveSessionID(_ sessionID: Data?) throws {
-        lock.withLock { activeSessionID = sessionID }
+        try lock.withLock {
+            if sessionID != nil, !applicationAuthenticationComplete {
+                throw QUICTransportError.invalidState
+            }
+            if sessionID == nil, activeSessionClearFailuresRemaining > 0 {
+                activeSessionClearFailuresRemaining -= 1
+                throw QUICTransportError.invalidState
+            }
+            activeSessionID = sessionID
+        }
+    }
+
+    func failNextActiveSessionClear() {
+        lock.withLock { activeSessionClearFailuresRemaining += 1 }
     }
 
     func applicationHelloDidComplete(success _: Bool) {}
-    func applicationAuthenticationDidComplete(success _: Bool) {}
+    func applicationAuthenticationDidComplete(success: Bool) {
+        lock.withLock { applicationAuthenticationComplete = success }
+    }
     func acceptInboundBulk(requestID _: UInt64, objectID _: UInt64) {}
     func rejectInboundBulk(requestID _: UInt64, objectID _: UInt64) {}
 
@@ -333,6 +420,7 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
 private final class StopLifecycleEventRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [ProtocolV3ClientEvent] = []
+    private var storedFailureCancelCounts: [Int] = []
 
     var authenticatedCount: Int {
         lock.withLock { events.count { if case .authenticated = $0 { true } else { false } } }
@@ -345,6 +433,15 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
                 return capabilities
             }
             return capabilities.last
+        }
+    }
+
+    var activeSessionIDs: [Data] {
+        lock.withLock {
+            events.compactMap {
+                guard case let .activeSessionAvailable(sessionID) = $0 else { return nil }
+                return sessionID
+            }
         }
     }
 
@@ -392,8 +489,13 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
         lock.withLock { events.count { if case .failed = $0 { true } else { false } } }
     }
 
-    func record(_ event: ProtocolV3ClientEvent) {
-        lock.withLock { events.append(event) }
+    var failureCancelCounts: [Int] { lock.withLock { storedFailureCancelCounts } }
+
+    func record(_ event: ProtocolV3ClientEvent, cancelCount: Int) {
+        lock.withLock {
+            events.append(event)
+            if case .failed = event { storedFailureCancelCounts.append(cancelCount) }
+        }
     }
 }
 

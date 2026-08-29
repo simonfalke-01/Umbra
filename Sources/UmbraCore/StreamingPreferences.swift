@@ -362,7 +362,7 @@ public struct EffectiveStreamingPolicy: Equatable, Sendable {
             ModeDefaults(
                 inputCoalescingWindow: .microseconds(250),
                 inputDeliveryIntent: .stateBasedUnreliableSequenced,
-                maximumDecodeSubmissions: 2,
+                maximumDecodeSubmissions: 4,
                 maximumCompressedDecodeQueueFrames: 1,
                 decoderIntent: .hardwareOnly,
                 codecIntent: .lowestMeasuredP99,

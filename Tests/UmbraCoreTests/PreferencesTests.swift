@@ -336,7 +336,7 @@ final class PreferencesTests: XCTestCase {
 
         XCTAssertEqual(latency.inputCoalescingWindow, .microseconds(250))
         XCTAssertEqual(latency.inputDeliveryIntent, .stateBasedUnreliableSequenced)
-        XCTAssertEqual(latency.maximumDecodeSubmissions, 2)
+        XCTAssertEqual(latency.maximumDecodeSubmissions, 4)
         XCTAssertEqual(latency.maximumCompressedDecodeQueueFrames, 1)
         XCTAssertEqual(latency.rendererQueueDepth, 1)
         XCTAssertEqual(latency.presentationIntent, .immediateTearingAllowed)

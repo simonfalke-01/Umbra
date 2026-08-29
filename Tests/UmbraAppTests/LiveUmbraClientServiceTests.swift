@@ -135,7 +135,7 @@ final class LiveUmbraClientServiceTests: XCTestCase {
             resolution.effectivePolicy.inputDeliveryIntent,
             .stateBasedUnreliableSequenced
         )
-        XCTAssertEqual(resolution.effectivePolicy.maximumDecodeSubmissions, 2)
+        XCTAssertEqual(resolution.effectivePolicy.maximumDecodeSubmissions, 4)
         XCTAssertEqual(resolution.effectivePolicy.maximumCompressedDecodeQueueFrames, 1)
         XCTAssertEqual(resolution.effectivePolicy.rendererQueueDepth, 1)
         XCTAssertEqual(resolution.effectivePolicy.presentationIntent, .immediateTearingAllowed)

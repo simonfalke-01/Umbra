@@ -1003,18 +1003,17 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         statisticsTimer?.invalidate()
         statisticsTimer = nil
         guard visible else { return }
-        statisticsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStatistics() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        statisticsTimer = timer
     }
 
     private func refreshStatistics() {
         guard showsStatistics else { return }
-        let rendererStatistics = activePreferences?.rendererPreference == .avSampleBufferDisplayLayer
-            ? nil
-            : renderer?.statistics()
         contentView.setStatisticsPresentation(StreamStatisticsPresenter.make(
-            renderer: rendererStatistics,
+            renderer: nil,
             decoder: videoPipelineStatistics,
             transport: streamStatistics,
             protocolV3: protocolV3Statistics
@@ -1023,17 +1022,14 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     func updateStreamingStatistics(_ statistics: StreamTransportStatistics) {
         streamStatistics = statistics
-        refreshStatistics()
     }
 
     func updateVideoPipelineStatistics(_ statistics: MediaPipelineStatistics) {
         videoPipelineStatistics = statistics
-        refreshStatistics()
     }
 
     func updateProtocolV3Statistics(_ statistics: ProtocolV3SessionStatistics) {
         protocolV3Statistics = statistics
-        refreshStatistics()
     }
 
     private func setPointerCapture(_ active: Bool) {
@@ -1414,6 +1410,9 @@ final class StreamMetalView: NSView {
     private let statisticsOverlay = StreamStatisticsOverlayView()
     private let controllerModeLabel = NSTextField(labelWithString: "")
     private var controllerModeTimer: Timer?
+    private var statisticsPresentation: StreamStatisticsPresentation?
+    private var lastLayoutSize: CGSize?
+    private var lastLayoutScale: CGFloat?
     weak var sampleBufferLayer: AVSampleBufferDisplayLayer?
     var videoSize: CGSize = .init(width: 1_280, height: 720) {
         didSet {
@@ -1459,6 +1458,23 @@ final class StreamMetalView: NSView {
 
     override func layout() {
         super.layout()
+        layoutStatisticsOverlay()
+        controllerModeLabel.sizeToFit()
+        controllerModeLabel.frame.size.width += 24
+        controllerModeLabel.frame.size.height += 12
+        controllerModeLabel.frame.origin = CGPoint(
+            x: max(12, (bounds.width - controllerModeLabel.frame.width) / 2),
+            y: 20
+        )
+        let scale = window?.backingScaleFactor ?? 2
+        guard lastLayoutSize != bounds.size || lastLayoutScale != scale else { return }
+        lastLayoutSize = bounds.size
+        lastLayoutScale = scale
+        sampleBufferLayer?.frame = bounds
+        onLayout?(bounds.size, scale)
+    }
+
+    private func layoutStatisticsOverlay() {
         let overlayFittingSize = statisticsOverlay.fittingSize
         statisticsOverlay.frame.size = CGSize(
             width: min(
@@ -1469,15 +1485,6 @@ final class StreamMetalView: NSView {
             height: overlayFittingSize.height
         )
         statisticsOverlay.frame.origin = CGPoint(x: UmbraLayout.space3, y: UmbraLayout.space3)
-        controllerModeLabel.sizeToFit()
-        controllerModeLabel.frame.size.width += 24
-        controllerModeLabel.frame.size.height += 12
-        controllerModeLabel.frame.origin = CGPoint(
-            x: max(12, (bounds.width - controllerModeLabel.frame.width) / 2),
-            y: 20
-        )
-        sampleBufferLayer?.frame = bounds
-        onLayout?(bounds.size, window?.backingScaleFactor ?? 2)
     }
 
     override func keyDown(with event: NSEvent) { keyboard?.consumeInStreamView(event) }
@@ -1584,8 +1591,10 @@ final class StreamMetalView: NSView {
     }
 
     func setStatisticsPresentation(_ presentation: StreamStatisticsPresentation?) {
+        guard presentation != statisticsPresentation else { return }
+        statisticsPresentation = presentation
         statisticsOverlay.setPresentation(presentation)
-        needsLayout = true
+        layoutStatisticsOverlay()
     }
 
     func showControllerModeNotification(_ message: String) {

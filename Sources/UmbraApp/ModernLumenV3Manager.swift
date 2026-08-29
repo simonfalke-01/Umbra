@@ -485,7 +485,6 @@ final class ModernLumenV3Manager {
         var bulkHeaders: [UInt64: QUICInboundBulkHeader] = [:]
         var pendingBulkObjects: [UInt64: PendingBulkObject] = [:]
         var rejectedBulkRequestIDs = Set<UInt64>()
-        var statisticsTask: Task<Void, Never>?
         var controlKeepaliveTask: Task<Void, Never>?
         var controlKeepaliveProbe: UInt64 = 0
         let mediaEventExecutor = ProtocolV3MediaEventExecutor()
@@ -1614,7 +1613,6 @@ final class ModernLumenV3Manager {
             entry.inputSenderRelay.updateMaximumPayloadByteCount(payloadByteCount)
             entry.mediaCoordinator?.handle(event)
         case let .activeSessionAvailable(activeSessionID):
-            entry.activeSessionID = activeSessionID
             entry.activeSessionContinuation.yield(activeSessionID)
             entry.activeSessionContinuation.finish()
         case let .controlMessage(type, requestID, fields):
@@ -1778,23 +1776,8 @@ final class ModernLumenV3Manager {
             guard let entry = sessions[protocolHostID], entry.session === session else {
                 throw ProtocolV3ClientError.invalidState
             }
-            if let activeSessionID = entry.activeSessionID {
-                log?.record(
-                    source: "Lumen v3",
-                    level: .warning,
-                    message: "Stopping the host's orphaned protocol-v3 session before retrying START."
-                )
-                try await performStop(
-                    entry: entry,
-                    hostID: protocolHostID,
-                    sessionID: activeSessionID,
-                    quitApplication: false,
-                    reason: 1
-                )
-            } else {
-                await retireForFreshStart(session: session, hostID: protocolHostID)
-                session = try await reconnect(hostID: hostID, mode: mode)
-            }
+            await retireForFreshStart(session: session, hostID: protocolHostID)
+            session = try await reconnect(hostID: hostID, mode: mode)
         }
         guard session.canBeginStart else { throw ProtocolV3ClientError.invalidState }
         return session
@@ -2306,18 +2289,6 @@ final class ModernLumenV3Manager {
             entry.preparedStream = prepared
             entry.mediaCoordinator = mediaCoordinator
             entry.inputSender = inputSender
-            entry.statisticsTask?.cancel()
-            entry.statisticsTask = Task { [weak entry, output] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(1))
-                    guard let entry, let coordinator = entry.mediaCoordinator else { return }
-                    let statistics = coordinator.statistics()
-                    output.handleProtocolV3Statistics(statistics)
-                    if let video = statistics.media.videoPipeline {
-                        output.handleVideoStatistics(video)
-                    }
-                }
-            }
             mediaCoordinator.handle(.startAccepted(sessionID: sessionID, fields: fields))
             entry.mediaEventExecutor.installAndResume(mediaCoordinator)
             // Lumen pipelines configuration requests behind START. Do not expose
@@ -2605,8 +2576,6 @@ final class ModernLumenV3Manager {
         cancelControlKeepalive(entry: entry)
         await entry.mediaEventExecutor.clearAndWait()
         entry.preparedStream = nil
-        entry.statisticsTask?.cancel()
-        entry.statisticsTask = nil
         entry.mediaCoordinator = nil
         entry.inputSender = nil
         entry.inputLatencyTracker = nil
@@ -3256,10 +3225,11 @@ final class ModernLumenV3Manager {
         )
     }
 
-    private static func isRecoverableConnectionLoss(_ event: ProtocolV3ClientEvent) -> Bool {
+    static func isRecoverableConnectionLoss(_ event: ProtocolV3ClientEvent) -> Bool {
         switch event {
-        case .failed,
-             .transport(.stateChanged(.failed)),
+        // Protocol-level failures close authentication/session authority. Only
+        // transport loss may retain the host session for a pinned ATTACH.
+        case .transport(.stateChanged(.failed)),
              .transport(.stateChanged(.cancelled)):
             true
         default:

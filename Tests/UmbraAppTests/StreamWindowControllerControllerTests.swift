@@ -517,6 +517,37 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         )
     }
 
+    func testRepeatedStatisticsUpdatesDoNotRelayoutStreamOrRendererGeometry() throws {
+        let streamView = StreamMetalView(frame: NSRect(x: 0, y: 0, width: 720, height: 520))
+        streamView.wantsLayer = true
+        streamView.layer = CAMetalLayer()
+        var streamLayoutCount = 0
+        streamView.onLayout = { _, _ in streamLayoutCount += 1 }
+        streamView.needsLayout = true
+        streamView.layoutSubtreeIfNeeded()
+        let baselineLayoutCount = streamLayoutCount
+        let baselineDrawableSize = streamView.metalLayer.drawableSize
+
+        for update in 0..<20 {
+            let presentation = StreamStatisticsPresentation(values: Dictionary(
+                uniqueKeysWithValues: StreamPerformanceMetric.allCases.map {
+                    ($0, "cached value \(update)")
+                }
+            ))
+            streamView.setStatisticsPresentation(presentation)
+            streamView.layoutSubtreeIfNeeded()
+        }
+
+        let overlay = try XCTUnwrap(
+            descendants(of: streamView, type: StreamStatisticsOverlayView.self).first
+        )
+        XCTAssertEqual(streamLayoutCount, baselineLayoutCount)
+        XCTAssertEqual(streamView.metalLayer.drawableSize, baselineDrawableSize)
+        XCTAssertFalse(streamView.needsLayout)
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertTrue(streamView.bounds.contains(overlay.frame))
+    }
+
     func testOnlyDirectTouchscreensEnterTheRawTouchPipeline() {
         XCTAssertTrue(StreamTouchInputPolicy.shouldForwardRawTouch(.direct))
         XCTAssertFalse(

@@ -37,6 +37,53 @@ struct QUICStateAndWireTests {
         #expect(QUICTransportCore.admittedDatagramPayloadByteCount(wireByteCount: 1_350) == 1_108)
     }
 
+    @Test("authentication completion binds an active session atomically")
+    func authenticationCompletionBindsActiveSessionAtomically() throws {
+        let pin = Data(repeating: 7, count: 32)
+        let adapter = CapacityChangeNetworkAdapter()
+        let events = CapacityChangeEventRecorder()
+        let ready = DispatchSemaphore(value: 0)
+        let transportQueue = DispatchQueue(label: "test.quic.auth-order")
+        let core = try QUICTransportCore(
+            configuration: QUICTransportConfiguration(
+                endpoint: .init(host: "127.0.0.1", port: 48_030),
+                expectedLeafSPKISHA256: pin,
+                mode: .latency
+            ),
+            adapter: adapter,
+            queue: transportQueue
+        )
+        core.eventHandler = { event in
+            events.append(event)
+            if case .stateChanged(.ready) = event { ready.signal() }
+        }
+        core.authenticationHandler = { _ in }
+        try core.start()
+        adapter.emit(.peerVerificationStarted)
+        adapter.emit(.peerVerified(pin))
+        adapter.emit(.ready(
+            alpn: QUICTransportConfiguration.applicationProtocol,
+            usableDatagramByteCount: QUICTransportProfile.semanticDatagramByteCount
+        ))
+        core.applicationHelloDidComplete(success: true)
+        let activeSessionID = Data(repeating: 1, count: 16)
+        try transportQueue.sync {
+            core.applicationAuthenticationDidComplete(success: true)
+            try core.setActiveSessionID(activeSessionID)
+        }
+        #expect(ready.wait(timeout: .now() + 1) == .success)
+        try core.setActiveSessionID(activeSessionID)
+
+        let snapshot = events.snapshot()
+        #expect(snapshot.contains { event in
+            if case .stateChanged(.ready) = event { true } else { false }
+        })
+        #expect(!snapshot.contains { event in
+            if case .stateChanged(.failed) = event { true } else { false }
+        })
+        core.cancel()
+    }
+
     @Test("temporary waiting restores the exact prior state")
     func waitingRecovery() throws {
         let state = QUICSessionStateMachine()
@@ -499,4 +546,34 @@ struct QUICStateAndWireTests {
 
 private extension Array {
     var only: Element? { count == 1 ? self[0] : nil }
+}
+
+private final class CapacityChangeNetworkAdapter: QUICNetworkAdapter, @unchecked Sendable {
+    var eventHandler: (@Sendable (QUICNetworkAdapterEvent) -> Void)?
+
+    func start(configuration: QUICTransportConfiguration) {}
+    func submit(
+        _ submission: QUICNetworkSubmission,
+        completion: @escaping @Sendable (String?) -> Void
+    ) { completion(nil) }
+    func setInboundBulkEnabled(_ enabled: Bool) {}
+    func decideInboundBulk(requestID: UInt64, objectID: UInt64, accept: Bool) {}
+    func cancel() {}
+
+    func emit(_ event: QUICNetworkAdapterEvent) {
+        eventHandler?(event)
+    }
+}
+
+private final class CapacityChangeEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events = [QUICTransportEvent]()
+
+    func append(_ event: QUICTransportEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    func snapshot() -> [QUICTransportEvent] {
+        lock.withLock { events }
+    }
 }

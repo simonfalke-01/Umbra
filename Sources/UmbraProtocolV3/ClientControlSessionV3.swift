@@ -117,6 +117,19 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         case streaming
         case stopping
         case closed
+
+        var label: String {
+            switch self {
+            case .idle: "idle"
+            case .serverHello: "serverHello"
+            case .authorization: "authorization"
+            case .ready: "ready"
+            case .starting: "starting"
+            case .streaming: "streaming"
+            case .stopping: "stopping"
+            case .closed: "closed"
+            }
+        }
     }
 
     private let transport: any QUICTransportProtocol
@@ -407,7 +420,14 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         } catch let error as ProtocolV3ClientError {
             fail(error)
         } catch {
-            fail(.invalidMessage("v3 control"))
+            fail(.invalidMessage(Self.genericControlFailureContext(
+                type: message.controlType,
+                flags: message.controlFlags,
+                requestID: message.requestID,
+                payloadByteCount: message.payload.count,
+                state: state.label,
+                error: error
+            )))
         }
     }
 
@@ -558,14 +578,8 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
                 )
             ) else { throw ProtocolV3ClientError.authenticationFailed }
             permissions = granted
-            if let activeSessionID {
-                try transport.setActiveSessionID(activeSessionID)
-                self.activeSessionID = activeSessionID
-                state = .streaming
-            } else {
-                state = .ready
-            }
             transport.applicationAuthenticationDidComplete(success: true)
+            state = .ready
             if let activeSessionID {
                 eventHandler?(.activeSessionAvailable(activeSessionID))
             }
@@ -688,7 +702,7 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
                 throw ProtocolV3ClientError.invalidMessage("v3 response type")
             }
             if requestType == 0x0130, type == 0x0131, fields[1]?.unsignedValue == 0 {
-                try transport.setActiveSessionID(nil)
+                try clearTransportSessionForValidatedShutdown()
                 hostRequests.removeAll(keepingCapacity: false)
                 pendingRequests.removeAll(keepingCapacity: false)
                 startRequestID = nil
@@ -722,12 +736,46 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
                   fields[8]?.unsignedValue != nil else {
                 throw ProtocolV3ClientError.invalidMessage("SESSION_ENDED")
             }
-            try transport.setActiveSessionID(nil)
+            try clearTransportSessionForValidatedShutdown()
             activeSessionID = nil
             hostRequests.removeAll()
             state = .ready
         }
         eventHandler?(.controlMessage(type: type, requestID: requestID, fields: fields))
+    }
+
+    private func clearTransportSessionForValidatedShutdown() throws {
+        do {
+            try transport.setActiveSessionID(nil)
+        } catch QUICTransportError.invalidState {
+            // The authenticated STOP/SESSION_ENDED record already established
+            // shutdown authority. The media route may have been cleared first
+            // by local path teardown; that idempotent cleanup race does not make
+            // the host's validated control record malformed.
+        }
+    }
+
+    static func genericControlFailureContext(
+        type: UInt16?,
+        flags: UInt8?,
+        requestID: UInt64?,
+        payloadByteCount: Int,
+        state: String,
+        error: Error
+    ) -> String {
+        let typeDescription = type.map { String(format: "0x%04x", $0) } ?? "nil"
+        let flagsDescription = flags.map { String(format: "0x%02x", $0) } ?? "nil"
+        let requestDescription = requestID.map(String.init) ?? "nil"
+        let errorType = String(String(describing: Swift.type(of: error)).prefix(96))
+        let errorDescription = String(
+            String(describing: error)
+                .split(whereSeparator: { $0.isWhitespace })
+                .joined(separator: " ")
+                .prefix(192)
+        )
+        return "v3 control type=\(typeDescription) flags=\(flagsDescription) "
+            + "requestID=\(requestDescription) payloadBytes=\(max(payloadByteCount, 0)) "
+            + "state=\(state) cause=\(errorType):\(errorDescription)"
     }
 
     private func allocateRequestID(type: UInt16) throws -> UInt64 {
@@ -797,8 +845,10 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
         } else if failedState == .authorization {
             transport.applicationAuthenticationDidComplete(success: false)
         }
-        transport.cancel()
         eventHandler?(.failed(error))
+        // Publish terminal authority loss before transport cancellation can
+        // emit a superficially recoverable state change to higher layers.
+        transport.cancel()
     }
 
     private static func validateStartRequest(_ fields: [UInt64: ProtocolV3CBORValue]) throws {
