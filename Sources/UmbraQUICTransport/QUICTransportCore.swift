@@ -184,24 +184,29 @@ final class QUICTransportCore: QUICTransportProtocol, @unchecked Sendable {
     }
 
     func applicationAuthenticationDidComplete(success: Bool) {
-        queue.async { [weak self] in
-            guard let self, !stateMachine.isTerminal, helloComplete else {
-                self?.terminateFailed("authentication completed before HELLO")
+        let apply = {
+            guard !self.stateMachine.isTerminal, self.helloComplete else {
+                self.terminateFailed("authentication completed before HELLO")
                 return
             }
-            cancelDeadline(.authentication)
+            self.cancelDeadline(.authentication)
             guard success else {
-                terminateFailed("application authentication failed")
+                self.terminateFailed("application authentication failed")
                 return
             }
             do {
-                let state = try stateMachine.applicationAuthenticationCompleted(success: true)
-                adapter.setInboundBulkEnabled(true)
-                emit(.stateChanged(state))
-                pump() // Atomic on this queue: all post-auth lanes become eligible here.
+                let state = try self.stateMachine.applicationAuthenticationCompleted(success: true)
+                self.adapter.setInboundBulkEnabled(true)
+                self.emit(.stateChanged(state))
+                self.pump() // Atomic on this queue: all post-auth lanes become eligible here.
             } catch {
-                terminateFailed("invalid authentication transition")
+                self.terminateFailed("invalid authentication transition")
             }
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            apply()
+        } else {
+            queue.sync(execute: apply)
         }
     }
 

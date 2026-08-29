@@ -43,13 +43,15 @@ struct QUICStateAndWireTests {
         let adapter = CapacityChangeNetworkAdapter()
         let events = CapacityChangeEventRecorder()
         let ready = DispatchSemaphore(value: 0)
+        let transportQueue = DispatchQueue(label: "test.quic.auth-order")
         let core = try QUICTransportCore(
             configuration: QUICTransportConfiguration(
                 endpoint: .init(host: "127.0.0.1", port: 48_030),
                 expectedLeafSPKISHA256: pin,
                 mode: .latency
             ),
-            adapter: adapter
+            adapter: adapter,
+            queue: transportQueue
         )
         core.eventHandler = { event in
             events.append(event)
@@ -64,9 +66,13 @@ struct QUICStateAndWireTests {
             usableDatagramByteCount: QUICTransportProfile.semanticDatagramByteCount
         ))
         core.applicationHelloDidComplete(success: true)
-        core.applicationAuthenticationDidComplete(success: true)
+        let activeSessionID = Data(repeating: 1, count: 16)
+        try transportQueue.sync {
+            core.applicationAuthenticationDidComplete(success: true)
+            try core.setActiveSessionID(activeSessionID)
+        }
         #expect(ready.wait(timeout: .now() + 1) == .success)
-        try core.setActiveSessionID(Data(repeating: 1, count: 16))
+        try core.setActiveSessionID(activeSessionID)
 
         adapter.emit(.datagramCapacityChanged(0))
         adapter.emit(.datagramCapacityChanged(

@@ -106,12 +106,13 @@ import UmbraQUICTransport
     transport.receive(type: 0x0002, requestID: 1, flags: 1, fields: serverHelloFields, codec: codec)
 
     let authorization = try await transport.request(at: 1)
+    let resumedSessionID = Data(repeating: 0x5a, count: 16)
     var authorizationResponseFields: [UInt64: ProtocolV3CBORValue] = [
         1: .unsigned(0),
         2: .bytes(identity.clientID),
         3: .unsigned(0x12),
         4: .unsigned(1),
-        5: .null,
+        5: .bytes(resumedSessionID),
         6: .bytes(Data(repeating: 0x41, count: 16)),
     ]
     let unsignedAuthorizationResponse = try stopLifecycleFrame(
@@ -140,6 +141,20 @@ import UmbraQUICTransport
     )
     try await stopLifecycleWait { recorder.authenticatedCount == 1 }
     #expect(recorder.serverCapabilities == 0x37f)
+    #expect(recorder.activeSessionIDs == [resumedSessionID])
+    #expect(transport.currentActiveSessionID == resumedSessionID)
+    #expect(recorder.failureCount == 0)
+    #expect(transport.cancelCount == 0)
+
+    transport.receive(
+        type: 0x0133,
+        requestID: 0,
+        flags: 0,
+        fields: stopLifecycleEndedFields(sessionID: resumedSessionID),
+        codec: codec
+    )
+    try await stopLifecycleWait { recorder.endedSessionIDs == [resumedSessionID] }
+    #expect(session.canBeginStart)
 
     var missingHostAudio = stopLifecycleStartFields(intent: Data(repeating: 0x5f, count: 16))
     missingHostAudio.removeValue(forKey: 18)
@@ -218,7 +233,7 @@ import UmbraQUICTransport
         fields: stopLifecycleEndedFields(sessionID: firstSessionID),
         codec: codec
     )
-    try await stopLifecycleWait { recorder.endedSessionIDs == [firstSessionID] }
+    try await stopLifecycleWait { recorder.endedSessionIDs == [resumedSessionID, firstSessionID] }
 
     let secondSessionID = Data(repeating: 0x72, count: 16)
     let secondIntent = Data(repeating: 0x73, count: 16)
@@ -257,7 +272,7 @@ import UmbraQUICTransport
         codec: codec
     )
     try await stopLifecycleWait {
-        recorder.endedSessionIDs == [firstSessionID, secondSessionID]
+        recorder.endedSessionIDs == [resumedSessionID, firstSessionID, secondSessionID]
     }
     #expect(recorder.failureCount == 0)
     #expect(transport.cancelCount == 0)
@@ -303,6 +318,7 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
     private var activeSessionID: Data?
     private var storedCancelCount = 0
     private var activeSessionClearFailuresRemaining = 0
+    private var applicationAuthenticationComplete = false
     var eventHandler: (@Sendable (QUICTransportEvent) -> Void)?
     var authenticationHandler: (@Sendable (QUICApplicationAuthenticationHandoff) -> Void)?
 
@@ -323,6 +339,9 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
 
     func setActiveSessionID(_ sessionID: Data?) throws {
         try lock.withLock {
+            if sessionID != nil, !applicationAuthenticationComplete {
+                throw QUICTransportError.invalidState
+            }
             if sessionID == nil, activeSessionClearFailuresRemaining > 0 {
                 activeSessionClearFailuresRemaining -= 1
                 throw QUICTransportError.invalidState
@@ -336,7 +355,9 @@ private final class StopLifecycleTransport: QUICTransportProtocol, @unchecked Se
     }
 
     func applicationHelloDidComplete(success _: Bool) {}
-    func applicationAuthenticationDidComplete(success _: Bool) {}
+    func applicationAuthenticationDidComplete(success: Bool) {
+        lock.withLock { applicationAuthenticationComplete = success }
+    }
     func acceptInboundBulk(requestID _: UInt64, objectID _: UInt64) {}
     func rejectInboundBulk(requestID _: UInt64, objectID _: UInt64) {}
 
@@ -388,6 +409,15 @@ private final class StopLifecycleEventRecorder: @unchecked Sendable {
                 return capabilities
             }
             return capabilities.last
+        }
+    }
+
+    var activeSessionIDs: [Data] {
+        lock.withLock {
+            events.compactMap {
+                guard case let .activeSessionAvailable(sessionID) = $0 else { return nil }
+                return sessionID
+            }
         }
     }
 
