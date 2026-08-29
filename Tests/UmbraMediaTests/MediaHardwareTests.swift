@@ -1055,6 +1055,39 @@ final class MediaHardwareTests: XCTestCase {
         XCTAssertEqual(decodedImages[0], decodedImages[1])
     }
 
+    func testRealHEVCIDRAndDeltaDecodeAcrossMixedAnnexBStartCodes() throws {
+        let frames = try makeRealHEVCAnnexBFrames(width: 64, height: 64)
+        let renderer = RealDecodeRecordingRenderer()
+        let decoder = VideoToolboxDecoder(renderer: renderer, policy: .automatic)
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0100,
+            width: 64,
+            height: 64,
+            redrawRate: 120
+        )))
+        decoder.start()
+
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: try mixedStartCodeAnnexB(frames.idr),
+            payloadFormat: .annexB,
+            frameNumber: 1,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 0
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: try mixedStartCodeAnnexB(frames.delta),
+            payloadFormat: .annexB,
+            frameNumber: 2,
+            isKeyFrame: false,
+            presentationTimeMicroseconds: 8_333
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(renderer.frame?.frameNumber, 2)
+        XCTAssertNil(decoder.lastError)
+        decoder.stop()
+    }
+
     private func makeMetalFrame(
         frameNumber: Int,
         color: VideoColorMetadata
@@ -1100,6 +1133,34 @@ private final class RealH264CompressionOutput: @unchecked Sendable {
         lock.withLock {
             storedStatus = status
             storedSampleBuffer = sampleBuffer
+        }
+        completed.signal()
+    }
+}
+
+private let realHEVCCompressionOutputCallback: VTCompressionOutputCallback = {
+    outputCallbackRefCon, _, status, _, sampleBuffer in
+    guard let outputCallbackRefCon else { return }
+    let output = Unmanaged<RealHEVCCompressionOutput>
+        .fromOpaque(outputCallbackRefCon)
+        .takeUnretainedValue()
+    output.record(status: status, sampleBuffer: sampleBuffer)
+}
+
+private final class RealHEVCCompressionOutput: @unchecked Sendable {
+    let completed = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private var storedStatus: OSStatus = noErr
+    private var storedSampleBuffers: [CMSampleBuffer] = []
+
+    var status: OSStatus { lock.withLock { storedStatus } }
+    var sampleBuffers: [CMSampleBuffer] { lock.withLock { storedSampleBuffers } }
+
+    func record(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
+        lock.withLock {
+            storedStatus = status
+            if let sampleBuffer { storedSampleBuffers.append(sampleBuffer) }
         }
         completed.signal()
     }
@@ -1227,6 +1288,200 @@ private func replacingH264IDRWithDependentSlice(_ data: Data) throws -> Data {
         }
     }
     guard replaced else { throw MediaHardwareTestError.missingCompressedSample }
+    return output
+}
+
+private func makeRealHEVCAnnexBFrames(
+    width: Int32,
+    height: Int32
+) throws -> (idr: Data, delta: Data) {
+    let output = RealHEVCCompressionOutput()
+    var compressionSession: VTCompressionSession?
+    var status = VTCompressionSessionCreate(
+        allocator: kCFAllocatorDefault,
+        width: width,
+        height: height,
+        codecType: kCMVideoCodecType_HEVC,
+        encoderSpecification: nil,
+        imageBufferAttributes: nil,
+        compressedDataAllocator: nil,
+        outputCallback: realHEVCCompressionOutputCallback,
+        refcon: Unmanaged.passUnretained(output).toOpaque(),
+        compressionSessionOut: &compressionSession
+    )
+    guard status == noErr, let compressionSession else {
+        throw MediaHardwareTestError.compression(status)
+    }
+    defer { VTCompressionSessionInvalidate(compressionSession) }
+
+    for (key, value) in [
+        (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue as CFTypeRef),
+        (kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse as CFTypeRef),
+        (kVTCompressionPropertyKey_MaxKeyFrameInterval, 120 as CFNumber),
+        (kVTCompressionPropertyKey_ExpectedFrameRate, 120 as CFNumber),
+    ] {
+        status = VTSessionSetProperty(compressionSession, key: key, value: value)
+        guard status == noErr else { throw MediaHardwareTestError.compression(status) }
+    }
+    status = VTCompressionSessionPrepareToEncodeFrames(compressionSession)
+    guard status == noErr else { throw MediaHardwareTestError.compression(status) }
+
+    var imageBuffer: CVPixelBuffer?
+    status = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        Int(width),
+        Int(height),
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+        &imageBuffer
+    )
+    guard status == kCVReturnSuccess, let imageBuffer else {
+        throw MediaHardwareTestError.pixelBuffer(status)
+    }
+
+    for frameIndex in 0..<2 {
+        CVPixelBufferLockBaseAddress(imageBuffer, [])
+        if let luma = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0) {
+            memset(
+                luma,
+                frameIndex == 0 ? 0x40 : 0x60,
+                CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0) * Int(height)
+            )
+        }
+        if let chroma = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1) {
+            memset(
+                chroma,
+                0x80,
+                CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1) * Int(height / 2)
+            )
+        }
+        CVPixelBufferUnlockBaseAddress(imageBuffer, [])
+
+        var infoFlags = VTEncodeInfoFlags()
+        let frameProperties: CFDictionary? = frameIndex == 0
+            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+            : nil
+        status = VTCompressionSessionEncodeFrame(
+            compressionSession,
+            imageBuffer: imageBuffer,
+            presentationTimeStamp: CMTime(value: CMTimeValue(frameIndex), timescale: 120),
+            duration: CMTime(value: 1, timescale: 120),
+            frameProperties: frameProperties,
+            sourceFrameRefcon: nil,
+            infoFlagsOut: &infoFlags
+        )
+        guard status == noErr else { throw MediaHardwareTestError.compression(status) }
+    }
+    status = VTCompressionSessionCompleteFrames(
+        compressionSession,
+        untilPresentationTimeStamp: .invalid
+    )
+    guard status == noErr else { throw MediaHardwareTestError.compression(status) }
+    guard output.completed.wait(timeout: .now() + 2) == .success,
+          output.completed.wait(timeout: .now() + 2) == .success else {
+        throw MediaHardwareTestError.compressionTimedOut
+    }
+    guard output.status == noErr, output.sampleBuffers.count == 2 else {
+        throw MediaHardwareTestError.compression(output.status)
+    }
+    return (
+        try makeHEVCAnnexBFrame(from: output.sampleBuffers[0], includeParameterSets: true),
+        try makeHEVCAnnexBFrame(from: output.sampleBuffers[1], includeParameterSets: false)
+    )
+}
+
+private func makeHEVCAnnexBFrame(
+    from sampleBuffer: CMSampleBuffer,
+    includeParameterSets: Bool
+) throws -> Data {
+    guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+          let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+        throw MediaHardwareTestError.missingCompressedSample
+    }
+    var annexB = Data()
+    var parameterSetCount = 0
+    var nalUnitHeaderLength: Int32 = 0
+    if includeParameterSets {
+        for index in 0..<3 {
+            var parameterSet: UnsafePointer<UInt8>?
+            var parameterSetSize = 0
+            let status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                formatDescription,
+                parameterSetIndex: index,
+                parameterSetPointerOut: &parameterSet,
+                parameterSetSizeOut: &parameterSetSize,
+                parameterSetCountOut: &parameterSetCount,
+                nalUnitHeaderLengthOut: &nalUnitHeaderLength
+            )
+            guard status == noErr, let parameterSet else {
+                throw MediaHardwareTestError.parameterSet(status)
+            }
+            annexB.append(contentsOf: [0, 0, 0, 1])
+            annexB.append(parameterSet, count: parameterSetSize)
+        }
+        guard parameterSetCount >= 3, nalUnitHeaderLength == 4 else {
+            throw MediaHardwareTestError.missingCompressedSample
+        }
+    }
+
+    let compressedLength = CMBlockBufferGetDataLength(dataBuffer)
+    var compressed = Data(count: compressedLength)
+    let copyStatus = compressed.withUnsafeMutableBytes { bytes in
+        CMBlockBufferCopyDataBytes(
+            dataBuffer,
+            atOffset: 0,
+            dataLength: compressedLength,
+            destination: bytes.baseAddress!
+        )
+    }
+    guard copyStatus == noErr else { throw MediaHardwareTestError.compression(copyStatus) }
+
+    try compressed.withUnsafeBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+            guard offset <= bytes.count - 4 else {
+                throw MediaHardwareTestError.missingCompressedSample
+            }
+            let length = Int(bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian)
+            offset += 4
+            guard length > 0, length <= bytes.count - offset else {
+                throw MediaHardwareTestError.missingCompressedSample
+            }
+            annexB.append(contentsOf: [0, 0, 0, 1])
+            annexB.append(contentsOf: bytes.bindMemory(to: UInt8.self)[offset..<(offset + length)])
+            offset += length
+        }
+    }
+    return annexB
+}
+
+private func mixedStartCodeAnnexB(_ data: Data) throws -> Data {
+    let lengthPrefixed = try AnnexBAccessUnit(data: data, codec: .hevc).lengthPrefixedData
+    var output = Data([0])
+    var offset = 0
+    var unitIndex = 0
+    try lengthPrefixed.withUnsafeBytes { bytes in
+        while offset < bytes.count {
+            guard bytes.count - offset >= 4 else {
+                throw MediaHardwareTestError.missingCompressedSample
+            }
+            let length = Int(UInt32(bytes[offset]) << 24
+                | UInt32(bytes[offset + 1]) << 16
+                | UInt32(bytes[offset + 2]) << 8
+                | UInt32(bytes[offset + 3]))
+            offset += 4
+            guard length > 0, length <= bytes.count - offset else {
+                throw MediaHardwareTestError.missingCompressedSample
+            }
+            output.append(contentsOf: unitIndex.isMultiple(of: 2)
+                ? [0, 0, 0, 1]
+                : [0, 0, 1])
+            output.append(contentsOf: bytes.bindMemory(to: UInt8.self)[offset..<(offset + length)])
+            offset += length
+            unitIndex += 1
+        }
+    }
+    output.append(contentsOf: [0, 0])
     return output
 }
 
