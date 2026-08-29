@@ -288,12 +288,16 @@ private final class ProtocolV3VideoAssembly {
 /// Bounded frame reassembly and dependency ordering shared by the production
 /// QUIC receive path and its direct state-machine tests.
 final class ProtocolV3VideoReassembler {
+    static let recoveryRequestRetryNanoseconds: UInt64 = 250_000_000
+
     private let mode: QUICOptimizationMode
     private var assemblies: [UInt64: ProtocolV3VideoAssembly] = [:]
     private var highestObservedFrameID: UInt64 = 0
     private var latestReleasedFrameID: UInt64 = 0
     private var needsKeyFrame = false
     private var pendingRecoveryKeyFrameID: UInt64?
+    private var recoveryRequestFrameID: UInt64?
+    private var lastRecoveryRequestAtNanoseconds: UInt64?
     private var resynchronizeOnNextDependent = false
     private var qualityGapStartedAtNanoseconds: UInt64?
 
@@ -319,6 +323,8 @@ final class ProtocolV3VideoReassembler {
         latestReleasedFrameID = 0
         needsKeyFrame = false
         pendingRecoveryKeyFrameID = nil
+        recoveryRequestFrameID = nil
+        lastRecoveryRequestAtNanoseconds = nil
         resynchronizeOnNextDependent = false
         qualityGapStartedAtNanoseconds = nil
     }
@@ -327,6 +333,7 @@ final class ProtocolV3VideoReassembler {
         assemblies.removeAll(keepingCapacity: true)
         if pendingRecoveryKeyFrameID != nil { needsKeyFrame = true }
         pendingRecoveryKeyFrameID = nil
+        lastRecoveryRequestAtNanoseconds = nil
         resynchronizeOnNextDependent = false
         qualityGapStartedAtNanoseconds = nil
     }
@@ -334,6 +341,8 @@ final class ProtocolV3VideoReassembler {
     func removeAll() {
         assemblies.removeAll()
         pendingRecoveryKeyFrameID = nil
+        recoveryRequestFrameID = nil
+        lastRecoveryRequestAtNanoseconds = nil
         resynchronizeOnNextDependent = false
         qualityGapStartedAtNanoseconds = nil
     }
@@ -344,8 +353,17 @@ final class ProtocolV3VideoReassembler {
         qualityGapStartedAtNanoseconds = nil
         needsKeyFrame = true
         pendingRecoveryKeyFrameID = nil
+        lastRecoveryRequestAtNanoseconds = nil
         resynchronizeOnNextDependent = false
         return lost
+    }
+
+    func recordRecoveryRequest(
+        affectedFrameID: UInt64,
+        at nanoseconds: UInt64
+    ) {
+        recoveryRequestFrameID = affectedFrameID
+        lastRecoveryRequestAtNanoseconds = nanoseconds
     }
 
     @discardableResult
@@ -353,6 +371,8 @@ final class ProtocolV3VideoReassembler {
         guard pendingRecoveryKeyFrameID == frameID else { return false }
         pendingRecoveryKeyFrameID = nil
         needsKeyFrame = false
+        recoveryRequestFrameID = nil
+        lastRecoveryRequestAtNanoseconds = nil
         resynchronizeOnNextDependent = mode == .quality
         return true
     }
@@ -388,7 +408,12 @@ final class ProtocolV3VideoReassembler {
         let wasRecovering = needsKeyFrame
         if needsKeyFrame {
             guard pendingRecoveryKeyFrameID == nil else { return update }
-            guard fragment.flags & 0x01 != 0 else { return update }
+            guard fragment.flags & 0x01 != 0 else {
+                update.requestedKeyFrameID = recoveryRequestIfDue(
+                    nowNanoseconds: fragment.receivedAtNanoseconds
+                )
+                return update
+            }
         }
         if resynchronizeOnNextDependent {
             if fragment.flags & 0x01 == 0 {
@@ -419,6 +444,10 @@ final class ProtocolV3VideoReassembler {
                         update.appendLost([expectedFrameID])
                         needsKeyFrame = true
                         update.requestedKeyFrameID = expectedFrameID
+                        recordRecoveryRequest(
+                            affectedFrameID: expectedFrameID,
+                            at: fragment.receivedAtNanoseconds
+                        )
                         assemblies.removeAll(keepingCapacity: true)
                         guard fragment.flags & 0x01 != 0 else { return update }
                     }
@@ -429,6 +458,12 @@ final class ProtocolV3VideoReassembler {
                 if !lostFrameIDs.isEmpty {
                     needsKeyFrame = true
                     update.requestedKeyFrameID = lostFrameIDs.min()
+                    if let requestedKeyFrameID = update.requestedKeyFrameID {
+                        recordRecoveryRequest(
+                            affectedFrameID: requestedKeyFrameID,
+                            at: fragment.receivedAtNanoseconds
+                        )
+                    }
                     guard fragment.flags & 0x01 != 0 else {
                         assemblies.removeAll(keepingCapacity: true)
                         return update
@@ -451,7 +486,11 @@ final class ProtocolV3VideoReassembler {
                         assemblies.removeAll(keepingCapacity: true)
                         qualityGapStartedAtNanoseconds = nil
                     } else {
-                        transitionToQualityRecovery(affectedFrameID: fragment.frameID, update: &update)
+                        transitionToQualityRecovery(
+                            affectedFrameID: fragment.frameID,
+                            requestedAtNanoseconds: fragment.receivedAtNanoseconds,
+                            update: &update
+                        )
                         return update
                     }
                 }
@@ -566,12 +605,14 @@ final class ProtocolV3VideoReassembler {
         }
         transitionToQualityRecovery(
             affectedFrameID: assemblies.keys.min() ?? latestReleasedFrameID,
+            requestedAtNanoseconds: nowNanoseconds,
             update: &update
         )
     }
 
     private func transitionToQualityRecovery(
         affectedFrameID: UInt64,
+        requestedAtNanoseconds: UInt64,
         update: inout ProtocolV3VideoReassemblyUpdate
     ) {
         update.appendLost(assemblies.keys)
@@ -579,6 +620,24 @@ final class ProtocolV3VideoReassembler {
         qualityGapStartedAtNanoseconds = nil
         needsKeyFrame = true
         update.requestedKeyFrameID = affectedFrameID
+        recordRecoveryRequest(
+            affectedFrameID: affectedFrameID,
+            at: requestedAtNanoseconds
+        )
+    }
+
+    private func recoveryRequestIfDue(nowNanoseconds: UInt64) -> UInt64? {
+        guard let affectedFrameID = recoveryRequestFrameID else { return nil }
+        guard let last = lastRecoveryRequestAtNanoseconds else {
+            lastRecoveryRequestAtNanoseconds = nowNanoseconds
+            return affectedFrameID
+        }
+        guard nowNanoseconds >= last,
+              nowNanoseconds - last >= Self.recoveryRequestRetryNanoseconds else {
+            return nil
+        }
+        lastRecoveryRequestAtNanoseconds = nowNanoseconds
+        return affectedFrameID
     }
 
     static func qualityWaitNanoseconds(
@@ -1123,10 +1182,17 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             ))
             if disposition == .requestKeyFrame {
                 let unsentFrameIDs = frames.dropFirst(index + 1).map(\.frameID)
+                let requestTime = nowNanoseconds()
                 let recovery = lock.withLock { () -> (pending: [UInt64], shouldRequest: Bool) in
                     pendingPresentationDeadlines.removeValue(forKey: frame.frameID)
                     let shouldRequest = !videoReassembler.requiresKeyFrame
                     let pending = videoReassembler.requireKeyFrame()
+                    if shouldRequest {
+                        videoReassembler.recordRecoveryRequest(
+                            affectedFrameID: frame.frameID,
+                            at: requestTime
+                        )
+                    }
                     videoFramesDropped += UInt64(unsentFrameIDs.count + pending.count)
                     return (pending, shouldRequest)
                 }
@@ -1174,14 +1240,21 @@ public final class ProtocolV3MediaPipelineAdapter: @unchecked Sendable {
             )
         case let .failed(frameNumber):
             guard let frameID = UInt64(exactly: frameNumber) else { return }
+            let failureTime = nowNanoseconds()
             let failure = lock.withLock { () -> ([UInt64], UInt32, Bool) in
                 pendingInputSampleMicroseconds[frameID] = nil
                 let deadlineMissMicroseconds = consumeDeadlineMissMicroseconds(
                     frameID: frameID,
-                    completedAtNanoseconds: nowNanoseconds()
+                    completedAtNanoseconds: failureTime
                 )
                 let shouldReportRecovery = !videoReassembler.requiresKeyFrame
                 let pending = videoReassembler.requireKeyFrame()
+                if shouldReportRecovery {
+                    videoReassembler.recordRecoveryRequest(
+                        affectedFrameID: frameID,
+                        at: failureTime
+                    )
+                }
                 videoFramesDropped += 1 + UInt64(pending.count)
                 return (pending, deadlineMissMicroseconds, shouldReportRecovery)
             }
