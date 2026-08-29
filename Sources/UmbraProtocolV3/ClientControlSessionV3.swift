@@ -579,13 +579,7 @@ public final class ProtocolV3ClientControlSession: @unchecked Sendable {
             ) else { throw ProtocolV3ClientError.authenticationFailed }
             permissions = granted
             transport.applicationAuthenticationDidComplete(success: true)
-            if let activeSessionID {
-                try transport.setActiveSessionID(activeSessionID)
-                self.activeSessionID = activeSessionID
-                state = .streaming
-            } else {
-                state = .ready
-            }
+            state = .ready
             if let activeSessionID {
                 eventHandler?(.activeSessionAvailable(activeSessionID))
             }

@@ -142,18 +142,9 @@ import UmbraQUICTransport
     try await stopLifecycleWait { recorder.authenticatedCount == 1 }
     #expect(recorder.serverCapabilities == 0x37f)
     #expect(recorder.activeSessionIDs == [resumedSessionID])
-    #expect(transport.currentActiveSessionID == resumedSessionID)
+    #expect(transport.currentActiveSessionID == nil)
     #expect(recorder.failureCount == 0)
     #expect(transport.cancelCount == 0)
-
-    transport.receive(
-        type: 0x0133,
-        requestID: 0,
-        flags: 0,
-        fields: stopLifecycleEndedFields(sessionID: resumedSessionID),
-        codec: codec
-    )
-    try await stopLifecycleWait { recorder.endedSessionIDs == [resumedSessionID] }
     #expect(session.canBeginStart)
 
     var missingHostAudio = stopLifecycleStartFields(intent: Data(repeating: 0x5f, count: 16))
@@ -171,7 +162,12 @@ import UmbraQUICTransport
     let firstIntent = Data(repeating: 0x62, count: 16)
     let firstStartID = try session.beginStart(fields: stopLifecycleStartFields(intent: firstIntent))
     #expect(firstStartID == 5)
-    _ = try await transport.request(at: 2)
+    let firstStart = try await transport.request(at: 2)
+    guard case let .control(_, firstStartType, _) = firstStart.wireMetadata else {
+        Issue.record("Expected START control metadata")
+        return
+    }
+    #expect(firstStartType == 0x0100)
     transport.receive(
         type: 0x0101,
         requestID: firstStartID,
@@ -233,7 +229,7 @@ import UmbraQUICTransport
         fields: stopLifecycleEndedFields(sessionID: firstSessionID),
         codec: codec
     )
-    try await stopLifecycleWait { recorder.endedSessionIDs == [resumedSessionID, firstSessionID] }
+    try await stopLifecycleWait { recorder.endedSessionIDs == [firstSessionID] }
 
     let secondSessionID = Data(repeating: 0x72, count: 16)
     let secondIntent = Data(repeating: 0x73, count: 16)
@@ -272,10 +268,38 @@ import UmbraQUICTransport
         codec: codec
     )
     try await stopLifecycleWait {
-        recorder.endedSessionIDs == [resumedSessionID, firstSessionID, secondSessionID]
+        recorder.endedSessionIDs == [firstSessionID, secondSessionID]
     }
     #expect(recorder.failureCount == 0)
     #expect(transport.cancelCount == 0)
+    #expect(session.canBeginStart)
+
+    let attachID = try session.sendControlRequest(
+        type: 0x0102,
+        fields: [1: .bytes(resumedSessionID)]
+    )
+    transport.receive(
+        type: 0x0103,
+        requestID: attachID,
+        flags: 1,
+        fields: [
+            1: .unsigned(0), 2: .bytes(resumedSessionID),
+            3: .unsigned(1), 4: .unsigned(1), 5: .boolean(false), 6: .map([:]),
+        ],
+        codec: codec
+    )
+    try await stopLifecycleWait { transport.currentActiveSessionID == resumedSessionID }
+    #expect(!session.canBeginStart)
+    transport.receive(
+        type: 0x0133,
+        requestID: 0,
+        flags: 0,
+        fields: stopLifecycleEndedFields(sessionID: resumedSessionID),
+        codec: codec
+    )
+    try await stopLifecycleWait {
+        recorder.endedSessionIDs == [firstSessionID, secondSessionID, resumedSessionID]
+    }
     #expect(session.canBeginStart)
 
     let cancelledIntent = Data(repeating: 0x75, count: 16)

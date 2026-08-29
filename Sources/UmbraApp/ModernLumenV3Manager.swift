@@ -1614,7 +1614,6 @@ final class ModernLumenV3Manager {
             entry.inputSenderRelay.updateMaximumPayloadByteCount(payloadByteCount)
             entry.mediaCoordinator?.handle(event)
         case let .activeSessionAvailable(activeSessionID):
-            entry.activeSessionID = activeSessionID
             entry.activeSessionContinuation.yield(activeSessionID)
             entry.activeSessionContinuation.finish()
         case let .controlMessage(type, requestID, fields):
@@ -1779,23 +1778,8 @@ final class ModernLumenV3Manager {
             guard let entry = sessions[protocolHostID], entry.session === session else {
                 throw ProtocolV3ClientError.invalidState
             }
-            if let activeSessionID = entry.activeSessionID {
-                log?.record(
-                    source: "Lumen v3",
-                    level: .warning,
-                    message: "Stopping the host's orphaned protocol-v3 session before retrying START."
-                )
-                try await performStop(
-                    entry: entry,
-                    hostID: protocolHostID,
-                    sessionID: activeSessionID,
-                    quitApplication: false,
-                    reason: 1
-                )
-            } else {
-                await retireForFreshStart(session: session, hostID: protocolHostID)
-                session = try await reconnect(hostID: hostID, mode: mode)
-            }
+            await retireForFreshStart(session: session, hostID: protocolHostID)
+            session = try await reconnect(hostID: hostID, mode: mode)
         }
         guard session.canBeginStart else { throw ProtocolV3ClientError.invalidState }
         return session
