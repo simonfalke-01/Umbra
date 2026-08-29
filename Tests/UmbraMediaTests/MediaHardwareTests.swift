@@ -437,6 +437,85 @@ final class MediaHardwareTests: XCTestCase {
         decoder.stop()
     }
 
+    func testRecoveryIDRCallbackGenerationSurvivesOverflowAndLateFailure() throws {
+        let annexBFrame = try makeRealH264AnnexBKeyFrame(width: 64, height: 64)
+        let encodedFrame = try AnnexBAccessUnit(
+            data: annexBFrame,
+            codec: .h264
+        ).lengthPrefixedData
+        let renderer = RealDecodeRecordingRenderer()
+        let decoder = VideoToolboxDecoder(renderer: renderer, policy: .automatic)
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0001,
+            width: 64,
+            height: 64,
+            redrawRate: 120
+        )))
+        decoder.start()
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 1,
+            isKeyFrame: true,
+            presentationTimeMicroseconds: 0
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+
+        let decodeGeneration = decoder.currentDecodeGeneration
+        let lostSessionGeneration = decoder.currentSessionGeneration
+        let preOverflowEpoch = decoder.currentRecoveryEpoch
+        XCTAssertEqual(decoder.recordCapacityOverflow(
+            depth: 2,
+            generation: decodeGeneration,
+            at: 1
+        ), .requestKeyFrame)
+        let recoveryEpoch = decoder.currentRecoveryEpoch
+        XCTAssertGreaterThan(recoveryEpoch, preOverflowEpoch)
+
+        decoder.recordAsynchronousDecodeFailure(
+            .decodeFailed(-12_909),
+            generation: decodeGeneration,
+            sessionGeneration: lostSessionGeneration,
+            recoveryEpoch: preOverflowEpoch,
+            frameNumber: 2,
+            at: 2
+        )
+        XCTAssertEqual(decoder.lastError, .queueFull)
+        decoder.recordAsynchronousDecodeFailure(
+            .decodeFailed(-12_909),
+            generation: decodeGeneration,
+            sessionGeneration: lostSessionGeneration,
+            recoveryEpoch: recoveryEpoch,
+            frameNumber: 2,
+            at: 3
+        )
+
+        XCTAssertEqual(decoder.submit(frame: CompressedVideoFrame(
+            data: encodedFrame,
+            payloadFormat: .videoToolboxLengthPrefixed,
+            frameNumber: 3,
+            isKeyFrame: true,
+            requiresIndependentDecode: true,
+            presentationTimeMicroseconds: 16_666
+        )), .accepted)
+        XCTAssertEqual(renderer.decoded.wait(timeout: .now() + 2), .success)
+        XCTAssertGreaterThan(decoder.currentSessionGeneration, lostSessionGeneration)
+        XCTAssertNil(decoder.lastError)
+
+        let recoveredStatistics = decoder.statistics(at: 4)
+        decoder.recordAsynchronousDecodeFailure(
+            .decodeFailed(-12_909),
+            generation: decodeGeneration,
+            sessionGeneration: lostSessionGeneration,
+            recoveryEpoch: preOverflowEpoch,
+            frameNumber: 2,
+            at: 5
+        )
+        XCTAssertEqual(decoder.statistics(at: 5).decoderErrors, recoveredStatistics.decoderErrors)
+        XCTAssertNil(decoder.lastError)
+        decoder.stop()
+    }
+
     func testStopBetweenAdmissionAndEnqueueCancelsOldGenerationBeforeReopen() throws {
         let reachedBoundary = DispatchSemaphore(value: 0)
         let resumeSubmission = DispatchSemaphore(value: 0)
