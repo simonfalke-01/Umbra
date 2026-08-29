@@ -293,7 +293,6 @@ final class ProtocolV3VideoReassembler {
 
     private let mode: QUICOptimizationMode
     private var assemblies: [UInt64: ProtocolV3VideoAssembly] = [:]
-    private var highestObservedFrameID: UInt64 = 0
     private var latestReleasedFrameID: UInt64 = 0
     private var needsKeyFrame = false
     private var pendingRecoveryKeyFrameID: UInt64?
@@ -320,7 +319,6 @@ final class ProtocolV3VideoReassembler {
 
     func resetForConfiguration() {
         assemblies.removeAll(keepingCapacity: true)
-        highestObservedFrameID = 0
         latestReleasedFrameID = 0
         needsKeyFrame = false
         pendingRecoveryKeyFrameID = nil
@@ -435,23 +433,29 @@ final class ProtocolV3VideoReassembler {
         if !alreadyPresent {
             guard fragment.frameID > latestReleasedFrameID else { return update }
             if mode == .latency {
-                guard fragment.frameID >= highestObservedFrameID else { return update }
-                highestObservedFrameID = max(highestObservedFrameID, fragment.frameID)
                 if !wasRecovering,
                    latestReleasedFrameID != 0,
                    latestReleasedFrameID < UInt64.max {
                     let expectedFrameID = latestReleasedFrameID + 1
                     if fragment.frameID > expectedFrameID,
                        assemblies[expectedFrameID] == nil {
-                        update.appendLost([expectedFrameID])
-                        needsKeyFrame = true
-                        update.requestedKeyFrameID = expectedFrameID
-                        recordRecoveryRequest(
-                            affectedFrameID: expectedFrameID,
-                            at: fragment.receivedAtNanoseconds
-                        )
-                        assemblies.removeAll(keepingCapacity: true)
-                        guard fragment.flags & 0x01 != 0 else { return update }
+                        // Two retained host objects may deliver N+1 before the first
+                        // fragment of N. Hold exactly that adjacent lookahead; a
+                        // second future frame confirms real whole-frame loss.
+                        let canRetainAdjacentReorder = expectedFrameID < UInt64.max
+                            && fragment.frameID == expectedFrameID + 1
+                            && assemblies.count < Self.latencyAssemblyCapacity
+                        if !canRetainAdjacentReorder {
+                            update.appendLost([expectedFrameID])
+                            needsKeyFrame = true
+                            update.requestedKeyFrameID = expectedFrameID
+                            recordRecoveryRequest(
+                                affectedFrameID: expectedFrameID,
+                                at: fragment.receivedAtNanoseconds
+                            )
+                            assemblies.removeAll(keepingCapacity: true)
+                            guard fragment.flags & 0x01 != 0 else { return update }
+                        }
                     }
                 }
                 if fragment.flags & 0x01 != 0 {
@@ -474,7 +478,6 @@ final class ProtocolV3VideoReassembler {
                     guard fragment.flags & 0x01 != 0 else { return update }
                 }
             } else {
-                highestObservedFrameID = max(highestObservedFrameID, fragment.frameID)
                 if fragment.flags & 0x01 != 0 {
                     let superseded = assemblies.keys.filter { $0 < fragment.frameID }
                     update.appendLost(superseded)
@@ -516,20 +519,42 @@ final class ProtocolV3VideoReassembler {
     }
 
     private func drainLatencyFrames(update: inout ProtocolV3VideoReassemblyUpdate) {
-        while let frameID = assemblies.keys.min(),
-              let assembly = assemblies[frameID],
-              assembly.isComplete {
-            assemblies.removeValue(forKey: frameID)
+        if needsKeyFrame {
+            guard let frameID = assemblies
+                .filter({ $0.value.isComplete && $0.value.flags & 0x01 != 0 })
+                .map(\.key)
+                .min(),
+                  let assembly = assemblies.removeValue(forKey: frameID) else {
+                return
+            }
             latestReleasedFrameID = frameID
-            let isRecoveryKeyFrame = needsKeyFrame && assembly.flags & 0x01 != 0
+            pendingRecoveryKeyFrameID = frameID
             update.readyFrames.append(assembly.takeFrame(
                 frameID: frameID,
-                requiresIndependentDecode: isRecoveryKeyFrame
+                requiresIndependentDecode: true
             ))
-            if assembly.flags & 0x01 != 0 {
-                pendingRecoveryKeyFrameID = isRecoveryKeyFrame ? frameID : nil
-            }
-            if isRecoveryKeyFrame { return }
+            return
+        }
+
+        if latestReleasedFrameID == 0,
+           let initialFrameID = assemblies.keys.min(),
+           let initial = assemblies[initialFrameID],
+           initial.isComplete {
+            assemblies.removeValue(forKey: initialFrameID)
+            latestReleasedFrameID = initialFrameID
+            pendingRecoveryKeyFrameID = nil
+            update.readyFrames.append(initial.takeFrame(frameID: initialFrameID))
+        }
+
+        // Latency mode may discard stale pixels, but it cannot submit a dependent
+        // frame ahead of the immediately preceding reference frame.
+        while latestReleasedFrameID < UInt64.max {
+            let frameID = latestReleasedFrameID + 1
+            guard let assembly = assemblies[frameID], assembly.isComplete else { return }
+            assemblies.removeValue(forKey: frameID)
+            latestReleasedFrameID = frameID
+            pendingRecoveryKeyFrameID = nil
+            update.readyFrames.append(assembly.takeFrame(frameID: frameID))
         }
     }
 
