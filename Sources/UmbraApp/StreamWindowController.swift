@@ -1023,12 +1023,10 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     func updateStreamingStatistics(_ statistics: StreamTransportStatistics) {
         streamStatistics = statistics
-        refreshStatistics()
     }
 
     func updateVideoPipelineStatistics(_ statistics: MediaPipelineStatistics) {
         videoPipelineStatistics = statistics
-        refreshStatistics()
     }
 
     func updateProtocolV3Statistics(_ statistics: ProtocolV3SessionStatistics) {
