@@ -364,6 +364,154 @@ final class ProtocolV3MediaPipelineAdapterTests: XCTestCase {
         XCTAssertFalse(reassembler.requiresKeyFrame)
     }
 
+    func testLatencyRecoveryRetriesLostRFIAtBoundedCadence() throws {
+        XCTAssertEqual(
+            ProtocolV3VideoReassembler.recoveryRequestRetryNanoseconds,
+            250_000_000
+        )
+        let reassembler = ProtocolV3VideoReassembler(mode: .latency)
+        _ = try reassembler.accept(
+            fragment(
+                frameID: 4,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([1, 2]),
+                receivedAtNanoseconds: 1
+            ),
+            framesPerSecond: 120
+        )
+        let initialRequestTime: UInt64 = 1_000_000_000
+        let gap = try reassembler.accept(
+            fragment(
+                frameID: 33,
+                frameSize: 2,
+                bytes: Data([3, 4]),
+                receivedAtNanoseconds: initialRequestTime
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(gap.requestedKeyFrameID, 5)
+
+        let early = try reassembler.accept(
+            fragment(
+                frameID: 34,
+                frameSize: 2,
+                bytes: Data([5, 6]),
+                receivedAtNanoseconds: initialRequestTime + 249_999_999
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertNil(early.requestedKeyFrameID)
+        let retry = try reassembler.accept(
+            fragment(
+                frameID: 35,
+                frameSize: 2,
+                bytes: Data([7, 8]),
+                receivedAtNanoseconds: initialRequestTime + 250_000_000
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(retry.requestedKeyFrameID, 5)
+        let coalesced = try reassembler.accept(
+            fragment(
+                frameID: 36,
+                frameSize: 2,
+                bytes: Data([9, 10]),
+                receivedAtNanoseconds: initialRequestTime + 250_000_001
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertNil(coalesced.requestedKeyFrameID)
+
+        let recovery = try reassembler.accept(
+            fragment(
+                frameID: 37,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([11, 12]),
+                receivedAtNanoseconds: initialRequestTime + 300_000_000
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(recovery.readyFrames.map(\.frameID), [37])
+        let paused = try reassembler.accept(
+            fragment(
+                frameID: 38,
+                frameSize: 2,
+                bytes: Data([13, 14]),
+                receivedAtNanoseconds: initialRequestTime + 800_000_000
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertNil(paused.requestedKeyFrameID)
+
+        _ = reassembler.requireKeyFrame()
+        let rearmed = try reassembler.accept(
+            fragment(
+                frameID: 39,
+                frameSize: 2,
+                bytes: Data([15, 16]),
+                receivedAtNanoseconds: initialRequestTime + 800_000_001
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(rearmed.requestedKeyFrameID, 5)
+        let finalRecovery = try reassembler.accept(
+            fragment(
+                frameID: 40,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([17, 18]),
+                receivedAtNanoseconds: initialRequestTime + 900_000_000
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(finalRecovery.readyFrames.map(\.frameID), [40])
+        XCTAssertTrue(reassembler.confirmDecodedRecoveryKeyFrame(frameID: 40))
+        let resumed = try reassembler.accept(
+            fragment(
+                frameID: 41,
+                frameSize: 2,
+                bytes: Data([19, 20]),
+                receivedAtNanoseconds: initialRequestTime + 900_000_001
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(resumed.readyFrames.map(\.frameID), [41])
+
+        let wrapSafe = ProtocolV3VideoReassembler(mode: .latency)
+        _ = try wrapSafe.accept(
+            fragment(
+                frameID: 1,
+                frameSize: 2,
+                flags: 0x01,
+                bytes: Data([1, 2]),
+                receivedAtNanoseconds: 1
+            ),
+            framesPerSecond: 120
+        )
+        let nearWrap = try wrapSafe.accept(
+            fragment(
+                frameID: 3,
+                frameSize: 2,
+                bytes: Data([3, 4]),
+                receivedAtNanoseconds: UInt64.max - 100
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertEqual(nearWrap.requestedKeyFrameID, 2)
+        let wrappedClock = try wrapSafe.accept(
+            fragment(
+                frameID: 4,
+                frameSize: 2,
+                bytes: Data([5, 6]),
+                receivedAtNanoseconds: 50
+            ),
+            framesPerSecond: 120
+        )
+        XCTAssertNil(wrappedClock.requestedKeyFrameID)
+    }
+
     func testQualityCompletedKeyFrameSupersedesOlderIncompleteFrame() throws {
         let reassembler = ProtocolV3VideoReassembler(mode: .quality)
         _ = try reassembler.accept(
