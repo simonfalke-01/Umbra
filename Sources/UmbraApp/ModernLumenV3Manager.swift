@@ -486,7 +486,6 @@ final class ModernLumenV3Manager {
         var bulkHeaders: [UInt64: QUICInboundBulkHeader] = [:]
         var pendingBulkObjects: [UInt64: PendingBulkObject] = [:]
         var rejectedBulkRequestIDs = Set<UInt64>()
-        var statisticsTask: Task<Void, Never>?
         var controlKeepaliveTask: Task<Void, Never>?
         var controlKeepaliveProbe: UInt64 = 0
         let mediaEventExecutor = ProtocolV3MediaEventExecutor()
@@ -2308,18 +2307,6 @@ final class ModernLumenV3Manager {
             entry.preparedStream = prepared
             entry.mediaCoordinator = mediaCoordinator
             entry.inputSender = inputSender
-            entry.statisticsTask?.cancel()
-            entry.statisticsTask = Task { [weak entry, output] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(1))
-                    guard let entry, let coordinator = entry.mediaCoordinator else { return }
-                    let statistics = coordinator.statistics()
-                    output.handleProtocolV3Statistics(statistics)
-                    if let video = statistics.media.videoPipeline {
-                        output.handleVideoStatistics(video)
-                    }
-                }
-            }
             mediaCoordinator.handle(.startAccepted(sessionID: sessionID, fields: fields))
             entry.mediaEventExecutor.installAndResume(mediaCoordinator)
             // Lumen pipelines configuration requests behind START. Do not expose
@@ -2607,8 +2594,6 @@ final class ModernLumenV3Manager {
         cancelControlKeepalive(entry: entry)
         await entry.mediaEventExecutor.clearAndWait()
         entry.preparedStream = nil
-        entry.statisticsTask?.cancel()
-        entry.statisticsTask = nil
         entry.mediaCoordinator = nil
         entry.inputSender = nil
         entry.inputLatencyTracker = nil
