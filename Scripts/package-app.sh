@@ -116,6 +116,9 @@ validate_packaged_app() {
     [[ "$(plutil -extract NSBonjourServices.0 raw "$info_plist")" == "_nvstream._tcp" ]] || {
         fail "Umbra's legacy GameStream Bonjour declaration is missing."
     }
+    [[ "$(plutil -extract NSBonjourServices.1 raw "$info_plist")" == "_lumen-stream._udp" ]] || {
+        fail "Umbra's Lumen Streaming Protocol Bonjour declaration is missing."
+    }
 
     local packaged_resource_bundle="$resource_directory/Umbra_UmbraApp.bundle"
     local localizable_strings="$resource_directory/en.lproj/Localizable.strings"
@@ -267,6 +270,10 @@ app_identifier="$(plutil -extract CFBundleIdentifier raw "$app_root/Contents/Inf
     "Umbra's bundle identifier must remain $expected_app_identifier for macOS privacy permissions."
 [[ "$(plutil -extract NSBonjourServices.0 raw "$app_root/Contents/Info.plist")" == "_nvstream._tcp" ]] || {
     echo "Umbra's legacy GameStream Bonjour declaration is missing." >&2
+    exit 1
+}
+[[ "$(plutil -extract NSBonjourServices.1 raw "$app_root/Contents/Info.plist")" == "_lumen-stream._udp" ]] || {
+    echo "Umbra's Lumen Streaming Protocol Bonjour declaration is missing." >&2
     exit 1
 }
 cp "$repository_root/LICENSE" "$app_root/Contents/Resources/LICENSE"

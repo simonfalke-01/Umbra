@@ -88,6 +88,21 @@ final class BonjourDiscoveryTests: XCTestCase {
         XCTAssertEqual(factory.requestedKinds, [.legacyGameStream])
         discovery.stop()
     }
+
+    func testExplicitLSPDiscoveryRequestsUDPService() {
+        let factory = RecordingBonjourBrowserFactory()
+        let discovery = NetworkBonjourDiscovery(
+            queue: DispatchQueue(label: "test.umbra.bonjour-lsp"),
+            browserFactory: factory,
+            retryScheduler: ManualBonjourRetryScheduler(),
+            serviceKind: .lumenStreamingProtocol
+        )
+
+        discovery.start { _ in }
+
+        XCTAssertEqual(factory.requestedKinds, [.lumenStreamingProtocol])
+        discovery.stop()
+    }
 }
 
 private final class RecordingBonjourBrowserFactory: BonjourBrowserCreating, @unchecked Sendable {

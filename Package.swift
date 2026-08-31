@@ -30,6 +30,9 @@ let package = Package(
     ],
     products: [
         .executable(name: "Umbra", targets: ["UmbraApp"]),
+        .library(name: "CLSPCore", targets: ["CLSPCore"]),
+        .library(name: "UmbraLSPTransport", targets: ["UmbraLSPTransport"]),
+        .library(name: "UmbraLSP", targets: ["UmbraLSP"]),
     ],
     targets: [
         .systemLibrary(
@@ -47,6 +50,15 @@ let package = Package(
             providers: releaseDependencyPrefix == nil ? [
                 .brew(["opus"]),
             ] : []
+        ),
+        .target(
+            name: "CLSPCore",
+            path: "Vendor/CLSPCore",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .unsafeFlags(["-std=c++23", "-fno-exceptions", "-fno-rtti"]),
+            ],
+            plugins: ["CLSPCoreSyncPlugin"]
         ),
         .target(
             name: "UmbraCore",
@@ -78,6 +90,16 @@ let package = Package(
             name: "UmbraServices",
             dependencies: ["UmbraCore", "UmbraNetworking"],
             path: "Sources/UmbraServices"
+        ),
+        .target(
+            name: "UmbraLSPTransport",
+            dependencies: ["CLSPCore"],
+            path: "Sources/UmbraLSPTransport"
+        ),
+        .target(
+            name: "UmbraLSP",
+            dependencies: ["UmbraCore", "UmbraNetworking", "UmbraLSPTransport"],
+            path: "Sources/UmbraLSP"
         ),
         .target(
             name: "CMoonlightBridge",
@@ -217,6 +239,16 @@ let package = Package(
             path: "Tests/UmbraServicesTests"
         ),
         .testTarget(
+            name: "UmbraLSPTransportTests",
+            dependencies: ["CLSPCore", "UmbraLSPTransport"],
+            path: "Tests/UmbraLSPTransportTests"
+        ),
+        .testTarget(
+            name: "UmbraLSPTests",
+            dependencies: ["UmbraCore", "UmbraNetworking", "UmbraLSP", "UmbraLSPTransport"],
+            path: "Tests/UmbraLSPTests"
+        ),
+        .testTarget(
             name: "UmbraMediaTests",
             dependencies: ["UmbraMedia"],
             path: "Tests/UmbraMediaTests"
@@ -262,6 +294,11 @@ let package = Package(
             name: "UmbraAppTests",
             dependencies: ["UmbraApp", "UmbraCore", "UmbraMedia"],
             path: "Tests/UmbraAppTests"
+        ),
+        .plugin(
+            name: "CLSPCoreSyncPlugin",
+            capability: .buildTool(),
+            path: "Plugins/CLSPCoreSyncPlugin"
         ),
     ]
 )

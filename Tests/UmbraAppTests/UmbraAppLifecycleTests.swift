@@ -75,7 +75,7 @@ final class UmbraAppLifecycleTests: XCTestCase {
         XCTAssertEqual(replies, [true])
     }
 
-    func testPackagedInfoPlistRegistersOnlyLegacyDiscovery() throws {
+    func testPackagedInfoPlistRegistersLegacyAndLSPDiscovery() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -87,7 +87,10 @@ final class UmbraAppLifecycleTests: XCTestCase {
         )
 
         XCTAssertNil(plist["CFBundleURLTypes"])
-        XCTAssertEqual(plist["NSBonjourServices"] as? [String], ["_nvstream._tcp"])
+        XCTAssertEqual(
+            plist["NSBonjourServices"] as? [String],
+            ["_nvstream._tcp", "_lumen-stream._udp"]
+        )
     }
 }
 

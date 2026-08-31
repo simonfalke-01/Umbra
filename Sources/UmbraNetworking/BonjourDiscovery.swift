@@ -1,6 +1,15 @@
 import Foundation
 import Network
 
+/// Network protocol advertised by a discovered host service.
+public enum DiscoveredHostProtocol: Hashable, Sendable {
+    /// Moonlight-compatible GameStream over `_nvstream._tcp`.
+    case legacyGameStream
+
+    /// Native Lumen Streaming Protocol over `_lumen-stream._udp`.
+    case lumenStreamingProtocol
+}
+
 public struct DiscoveredHostService: Hashable, Sendable, Identifiable {
     public var name: String
     public var type: String
@@ -60,6 +69,16 @@ protocol BonjourBrowsing: AnyObject, Sendable {
 
 enum BonjourServiceKind: Hashable, Sendable {
     case legacyGameStream
+    case lumenStreamingProtocol
+
+    init(_ serviceProtocol: DiscoveredHostProtocol) {
+        switch serviceProtocol {
+        case .legacyGameStream:
+            self = .legacyGameStream
+        case .lumenStreamingProtocol:
+            self = .lumenStreamingProtocol
+        }
+    }
 }
 
 protocol BonjourBrowserCreating: Sendable {
@@ -107,6 +126,9 @@ private final class NWBonjourBrowser: BonjourBrowsing, @unchecked Sendable {
         case .legacyGameStream:
             parameters = .tcp
             descriptor = .bonjour(type: "_nvstream._tcp", domain: "local.")
+        case .lumenStreamingProtocol:
+            parameters = .udp
+            descriptor = .bonjour(type: "_lumen-stream._udp", domain: "local.")
         }
         parameters.includePeerToPeer = true
         browser = NWBrowser(for: descriptor, using: parameters)
@@ -189,7 +211,7 @@ private final class DispatchBonjourRetryCancellation: BonjourRetryCancellable, @
     }
 }
 
-/// Discovers GameStream/Sunshine hosts using Moonlight's `_nvstream._tcp.local.` service.
+/// Discovers either legacy GameStream or native LSP hosts through Bonjour.
 public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Sendable {
     private let queue: DispatchQueue
     private let browserFactory: any BonjourBrowserCreating
@@ -214,6 +236,24 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
             retryScheduler: DispatchBonjourRetryScheduler(),
             retryPolicy: .default,
             serviceKind: .legacyGameStream
+        )
+    }
+
+    /// Creates a discovery browser for one explicit streaming protocol.
+    ///
+    /// - Parameters:
+    ///   - serviceProtocol: Legacy GameStream or native LSP service family.
+    ///   - queue: Private browser and retry queue.
+    public convenience init(
+        serviceProtocol: DiscoveredHostProtocol,
+        queue: DispatchQueue = DispatchQueue(label: "app.umbra.bonjour-discovery")
+    ) {
+        self.init(
+            queue: queue,
+            browserFactory: NWBonjourBrowserFactory(),
+            retryScheduler: DispatchBonjourRetryScheduler(),
+            retryPolicy: .default,
+            serviceKind: BonjourServiceKind(serviceProtocol)
         )
     }
 

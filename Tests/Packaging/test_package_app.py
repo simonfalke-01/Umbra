@@ -78,6 +78,7 @@ class PackageAppQualifyingTests(unittest.TestCase):
             values = {
                 "CFBundleIdentifier": "app.umbra.Umbra",
                 "NSBonjourServices.0": "_nvstream._tcp",
+                "NSBonjourServices.1": "_lumen-stream._udp",
                 "CFBundleDisplayName": "Umbra",
                 "NSLocalNetworkUsageDescription": "network",
                 "NSInputMonitoringUsageDescription": "input",
