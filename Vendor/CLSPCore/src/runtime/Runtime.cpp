@@ -789,6 +789,13 @@ namespace umbra::lsp {
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_RESOURCE_EXHAUSTED;
       }
+      video_reassembler_.emplace(configuration.maximum_access_unit_bytes);
+      if (!video_reassembler_->ready()) {
+        video_reassembler_.reset();
+        release_retained_frame_pool(pool);
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
       const std::array<int, 3> encrypted_extensions{
         configuration.frame_id_extension,
         configuration.input_watermark_extension,
@@ -799,18 +806,19 @@ namespace umbra::lsp {
         encrypted_extensions
       );
       if (security_status != CLSP_STATUS_OK) {
+        video_reassembler_.reset();
         release_retained_frame_pool(pool);
         pthread_mutex_unlock(&mutex_);
         return security_status;
       }
       if (!video_decoder_credit_.configure(configuration.decoder_surfaces)) {
+        video_reassembler_.reset();
         release_retained_frame_pool(pool);
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
       video_configuration_ = configuration;
       video_frame_pool_ = pool;
-      video_reassembler_.emplace(configuration.maximum_access_unit_bytes);
       video_metadata_ = {};
       video_retired_frames_ = {};
       video_sequence_initialized_ = false;
@@ -2482,12 +2490,6 @@ namespace umbra::lsp {
         erase_video_metadata(key);
         return false;
       }
-      auto retained =
-        lumen::lsp::media::retained_packet_slice::copy(chunk.bytes());
-      if (!retained) {
-        erase_video_metadata(key);
-        return false;
-      }
       const auto result = video_reassembler_->add(
         {
           .key = key,
@@ -2498,7 +2500,7 @@ namespace umbra::lsp {
           .starts_frame = parsed->extensions.starts_frame,
           .ends_frame = parsed->extensions.ends_frame,
           .marker = parsed->header.marker,
-          .payload = std::move(*retained),
+          .payload = chunk.bytes(),
         },
         now
       );
@@ -2510,7 +2512,8 @@ namespace umbra::lsp {
             lumen::lsp::media::frame_reassembly_status::malformed ||
           result.status ==
             lumen::lsp::media::frame_reassembly_status::frame_too_large ||
-          result.status == lumen::lsp::media::frame_reassembly_status::expired) {
+          result.status == lumen::lsp::media::frame_reassembly_status::expired ||
+          result.status == lumen::lsp::media::frame_reassembly_status::resource_exhausted) {
         retire_video_frame(key);
         erase_video_metadata(key);
         if (result.status ==
@@ -2525,21 +2528,23 @@ namespace umbra::lsp {
       if (result.status != lumen::lsp::media::frame_reassembly_status::completed) {
         return true;
       }
-      const auto *completed = result.frame.get();
-      if (completed == nullptr || completed->frame_id() == 0 ||
-          completed->frame_id() != metadata->frame_id || completed->size() == 0 ||
-          completed->size() > video_configuration_.maximum_access_unit_bytes) {
+      const auto completed = result.frame;
+      if (!completed || completed.frame_id == 0 ||
+          completed.frame_id != metadata->frame_id || completed.total_size == 0 ||
+          completed.total_size > video_configuration_.maximum_access_unit_bytes) {
+        (void) video_reassembler_->release(completed);
         retire_video_frame(key);
         erase_video_metadata(key);
         return false;
       }
       pthread_mutex_lock(&mutex_);
       video_largest_complete_frame_id_ =
-        std::max(video_largest_complete_frame_id_, completed->frame_id());
+        std::max(video_largest_complete_frame_id_, completed.frame_id);
       pthread_mutex_unlock(&mutex_);
       auto *buffer =
-        acquire_retained_frame_buffer(video_frame_pool_, completed->size());
+        acquire_retained_frame_buffer(video_frame_pool_, completed.total_size);
       if (buffer == nullptr) {
+        (void) video_reassembler_->release(completed);
         coalesce_video_status(
           lumen::lsp::transport::lspv_decoder_status::surface_exhausted,
           lumen::lsp::transport::lspv_event::capacity_transition,
@@ -2551,9 +2556,9 @@ namespace umbra::lsp {
       }
       auto destination = mutable_retained_frame_bytes(buffer);
       std::size_t offset = 0;
-      for (const auto &slice : completed->slices()) {
-        const auto source = slice.bytes();
+      for (const auto source : completed.slices) {
         if (source.size() > destination.size() - offset) {
+          (void) video_reassembler_->release(completed);
           clsp_buffer_release(buffer);
           retire_video_frame(key);
           erase_video_metadata(key);
@@ -2563,6 +2568,13 @@ namespace umbra::lsp {
         offset += source.size();
       }
       if (offset != destination.size()) {
+        (void) video_reassembler_->release(completed);
+        clsp_buffer_release(buffer);
+        retire_video_frame(key);
+        erase_video_metadata(key);
+        return false;
+      }
+      if (!video_reassembler_->release(completed)) {
         clsp_buffer_release(buffer);
         retire_video_frame(key);
         erase_video_metadata(key);
@@ -2600,7 +2612,7 @@ namespace umbra::lsp {
         .structure_size = sizeof(clsp_video_frame_event_t),
         .video_generation = video_configuration_.video_generation,
         .rtp_timestamp = parsed->header.timestamp,
-        .frame_id = completed->frame_id(),
+        .frame_id = completed.frame_id,
         .receive_time_microseconds = now,
         .capture_time_microseconds = metadata->capture_time_microseconds,
         .input_state_sequence = metadata->input_state_sequence,
@@ -3200,7 +3212,7 @@ namespace umbra::lsp {
     clsp_audio_configuration_t audio_configuration_ {};  ///< Installed audio generation/SSRC/PT tuple.
     clsp_video_configuration_t video_configuration_ {};  ///< Immutable active video generation mapping.
     retained_frame_pool *video_frame_pool_ {};  ///< Preallocated complete-frame ABI storage.
-    std::optional<lumen::lsp::media::video_frame_reassembler> video_reassembler_ {};  ///< Two incomplete frames.
+    std::optional<lumen::lsp::media::pooled_video_frame_reassembler> video_reassembler_ {};  ///< Allocation-free two-frame storage.
     lumen::lsp::media::decoder_credit_state video_decoder_credit_;  ///< Two-to-four hardware submissions.
     lumen::lsp::transport::lspv_coalescer lspv_coalescer_;  ///< Protected 500-microsecond status coalescer.
     std::array<VideoFrameMetadata, 2> video_metadata_ {};  ///< Repeated metadata for two incomplete frames.

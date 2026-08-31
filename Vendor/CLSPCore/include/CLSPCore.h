@@ -17,7 +17,7 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(1)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "987605e2ffe1aafed40d8eb6df622a3737541926f75328b66c12cb7c8e783593"
+#define CLSP_CORE_SOURCE_DIGEST "aabe7048d657dc27d248bfbb2878c7274401d7ecee15dc30e304924c1ef60681"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
