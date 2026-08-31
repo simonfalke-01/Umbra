@@ -138,6 +138,19 @@ namespace umbra::lsp {
       bool rtcp
     ) noexcept;
 
+    /** @brief Install one video-specific inbound context with RFC6904 encrypted extension IDs. */
+    [[nodiscard]] clsp_status_t configure_video_inbound(
+      std::uint32_t ssrc,
+      std::span<const int> encrypted_extension_ids
+    ) noexcept;
+
+    /** @brief Authenticate/decrypt one packet through the video-specific context. */
+    [[nodiscard]] clsp_status_t unprotect_video(
+      std::span<std::uint8_t> packet,
+      std::size_t &length,
+      bool rtcp
+    ) noexcept;
+
     /** @brief Return whether both directional contexts are live. */
     [[nodiscard]] bool ready() const noexcept;
 

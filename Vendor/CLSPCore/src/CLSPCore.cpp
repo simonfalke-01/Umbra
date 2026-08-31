@@ -6,13 +6,16 @@
 #include "CLSPCore.h"
 
 #include "core/core.h"
+#include "runtime/BufferInternal.h"
 #include "runtime/Runtime.h"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <new>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <new>
 
 extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
   clsp_apple_input_capture_t *capture,
@@ -39,6 +42,7 @@ struct clsp_core {
   std::atomic<std::uint32_t> state {CLSP_LIFECYCLE_CREATED};  ///< Coarse lifecycle state.
   std::atomic<bool> callback_active {false};  ///< Rejects reentrant ABI operations.
   std::atomic<bool> audio_callback_active {false};  ///< Prevents recursive complete-audio delivery.
+  std::atomic<bool> video_callback_active {false};  ///< Prevents recursive complete-frame delivery.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
   clsp_apple_input_capture_t *apple_capture {};  ///< Active native controller-output owner.
   umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
@@ -66,8 +70,116 @@ struct clsp_buffer {
   std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
   const std::uint8_t *data = nullptr;  ///< Native-owned immutable bytes.
   std::size_t length = 0;  ///< Immutable byte count.
+  void *context = nullptr;  ///< Private storage owner or slot context.
   void (*destroy)(clsp_buffer_t *) = nullptr;  ///< Native storage destruction function.
 };
+
+namespace umbra::lsp {
+  /** @brief One preallocated complete-frame slot embedded in its owning pool. */
+  struct retained_frame_slot {
+    clsp_buffer_t abi;  ///< Public opaque buffer prefix.
+    std::atomic<bool> occupied {false};  ///< Lock-free slot admission flag.
+    retained_frame_pool *owner {};  ///< Pool retained while this slot is externally owned.
+    std::uint8_t *storage {};  ///< Fixed-capacity bytes inside the pool allocation.
+  };
+
+  /** @brief Ref-counted allocation containing every complete-frame slot and byte region. */
+  struct retained_frame_pool {
+    std::atomic<std::uint32_t> references {1};  ///< Runtime owner plus outstanding ABI handles.
+    std::size_t maximum_frame_bytes {};  ///< Capacity of each slot.
+    std::size_t slot_count {};  ///< Number of fixed slots.
+    std::unique_ptr<std::uint8_t[]> bytes;  ///< Contiguous complete-frame storage.
+    std::unique_ptr<retained_frame_slot[]> slots;  ///< Fixed slot metadata.
+  };
+
+  namespace {
+    /** @brief Release one pool reference and its entire preallocated storage at zero. */
+    void release_pool_reference(retained_frame_pool *pool) noexcept {
+      if (pool != nullptr && pool->references.fetch_sub(1, std::memory_order_acq_rel) == 1U) {
+        delete pool;
+      }
+    }
+
+    /** @brief Return one buffer slot to the pool after its final external release. */
+    void recycle_retained_frame_buffer(clsp_buffer_t *buffer) noexcept {
+      if (buffer == nullptr || buffer->context == nullptr) {
+        return;
+      }
+      auto *slot = static_cast<retained_frame_slot *>(buffer->context);
+      auto *owner = slot->owner;
+      buffer->data = nullptr;
+      buffer->length = 0;
+      slot->occupied.store(false, std::memory_order_release);
+      release_pool_reference(owner);
+    }
+  }  // namespace
+
+  retained_frame_pool *create_retained_frame_pool(
+    const std::size_t maximum_frame_bytes,
+    const std::size_t slot_count
+  ) noexcept {
+    if (maximum_frame_bytes == 0 || slot_count == 0 ||
+        maximum_frame_bytes > std::numeric_limits<std::size_t>::max() / slot_count) {
+      return nullptr;
+    }
+    auto pool = std::unique_ptr<retained_frame_pool> {new (std::nothrow) retained_frame_pool};
+    if (!pool) {
+      return nullptr;
+    }
+    pool->bytes.reset(new (std::nothrow) std::uint8_t[maximum_frame_bytes * slot_count]);
+    pool->slots.reset(new (std::nothrow) retained_frame_slot[slot_count]);
+    if (!pool->bytes || !pool->slots) {
+      return nullptr;
+    }
+    pool->maximum_frame_bytes = maximum_frame_bytes;
+    pool->slot_count = slot_count;
+    for (std::size_t index = 0; index < slot_count; ++index) {
+      auto &slot = pool->slots[index];
+      slot.owner = pool.get();
+      slot.storage = pool->bytes.get() + index * maximum_frame_bytes;
+      slot.abi.context = &slot;
+      slot.abi.destroy = recycle_retained_frame_buffer;
+    }
+    return pool.release();
+  }
+
+  void release_retained_frame_pool(retained_frame_pool *pool) noexcept {
+    release_pool_reference(pool);
+  }
+
+  clsp_buffer_t *acquire_retained_frame_buffer(
+    retained_frame_pool *pool,
+    const std::size_t frame_bytes
+  ) noexcept {
+    if (pool == nullptr || frame_bytes == 0 || frame_bytes > pool->maximum_frame_bytes) {
+      return nullptr;
+    }
+    for (std::size_t index = 0; index < pool->slot_count; ++index) {
+      auto &slot = pool->slots[index];
+      auto expected = false;
+      if (!slot.occupied.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        continue;
+      }
+      pool->references.fetch_add(1, std::memory_order_relaxed);
+      slot.abi.references.store(1, std::memory_order_relaxed);
+      slot.abi.data = slot.storage;
+      slot.abi.length = frame_bytes;
+      return &slot.abi;
+    }
+    return nullptr;
+  }
+
+  std::span<std::uint8_t> mutable_retained_frame_bytes(clsp_buffer_t *buffer) noexcept {
+    if (buffer == nullptr || buffer->context == nullptr || buffer->data == nullptr || buffer->length == 0) {
+      return {};
+    }
+    const auto *slot = static_cast<const retained_frame_slot *>(buffer->context);
+    if (&slot->abi != buffer || !slot->occupied.load(std::memory_order_acquire) || slot->storage != buffer->data) {
+      return {};
+    }
+    return {slot->storage, buffer->length};
+  }
+}  // namespace umbra::lsp
 
 namespace {
   /** @brief Return provider flags compiled into this target. */
@@ -169,6 +281,40 @@ namespace {
     clsp_core_retain(core);
     core->callbacks.audio_timing(core->callbacks.context, &event);
     core->audio_callback_active.store(false, std::memory_order_release);
+    clsp_core_release(core);
+  }
+
+  /** @brief Transfer one retained complete frame to the coarse product callback.
+   */
+  void runtime_video_frame(void *context, const clsp_video_frame_event_t &event) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    if (core->callbacks.video_frame == nullptr) {
+      clsp_buffer_release(event.frame);
+      return;
+    }
+    auto expected = false;
+    if (!core->video_callback_active.compare_exchange_strong(
+          expected,
+          true,
+          std::memory_order_acq_rel
+        )) {
+      clsp_buffer_release(event.frame);
+      return;
+    }
+    expected = false;
+    if (!core->callback_active.compare_exchange_strong(
+          expected,
+          true,
+          std::memory_order_acq_rel
+        )) {
+      core->video_callback_active.store(false, std::memory_order_release);
+      clsp_buffer_release(event.frame);
+      return;
+    }
+    clsp_core_retain(core);
+    core->callbacks.video_frame(core->callbacks.context, &event);
+    core->callback_active.store(false, std::memory_order_release);
+    core->video_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
   }
 
@@ -328,6 +474,7 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
       .controller_output = runtime_controller_output,
       .audio_packet = runtime_audio_packet,
       .audio_timing = runtime_audio_timing,
+      .video_frame = runtime_video_frame,
     },
   };
   if (runtime == nullptr) {
@@ -457,6 +604,43 @@ extern "C" clsp_status_t clsp_core_mark_microphone_discontinuity(clsp_core_t *co
 extern "C" clsp_status_t clsp_core_stop_microphone(clsp_core_t *core) {
   if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
   return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->stop_microphone();
+}
+
+extern "C" clsp_status_t
+clsp_core_configure_video(clsp_core_t *core, const clsp_video_configuration_t *configuration) {
+  if (core == nullptr || configuration == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->configure_video(*configuration);
+}
+
+extern "C" clsp_status_t clsp_core_report_video_decode(
+  clsp_core_t *core,
+  const std::uint32_t video_generation,
+  const std::uint64_t frame_id,
+  const std::uint32_t recovery_epoch,
+  const std::uint8_t decoder_status,
+  const std::uint8_t decoder_credit,
+  const std::uint8_t render_mailbox_occupancy
+) {
+  if (core == nullptr ||
+      decoder_status > CLSP_VIDEO_DECODER_UNRECOVERABLE_ERROR ||
+      render_mailbox_occupancy > 1U) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->report_video_decode(video_generation, frame_id, recovery_epoch, decoder_status, decoder_credit, render_mailbox_occupancy);
+}
+
+extern "C" clsp_status_t clsp_core_report_video_commit(
+  clsp_core_t *core,
+  const std::uint32_t video_generation,
+  const std::uint64_t frame_id,
+  const std::uint8_t render_mailbox_occupancy
+) {
+  if (core == nullptr || render_mailbox_occupancy > 1U) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->report_video_commit(video_generation, frame_id, render_mailbox_occupancy);
 }
 
 extern "C" clsp_status_t clsp_core_submit_pointer(

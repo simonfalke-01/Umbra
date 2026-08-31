@@ -190,6 +190,61 @@ extern "C" {
     uint8_t dtx;  ///< Boolean Opus DTX selection.
   } clsp_microphone_configuration_t;
 
+  /** @brief Exact first-slice SDR H.264/HEVC native video admission mapping. */
+  typedef struct clsp_video_configuration {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_video_configuration_t)`.
+    uint32_t stream_generation;  ///< Nonzero stream generation.
+    uint32_t video_generation;  ///< Nonzero video configuration generation.
+    uint32_t primary_ssrc;  ///< Nonzero primary video SSRC.
+    uint32_t clock_rate;  ///< Exactly 90,000.
+    uint32_t width;  ///< Selected coded width.
+    uint32_t height;  ///< Selected coded height.
+    uint32_t refresh_numerator;  ///< Nonzero rational refresh numerator.
+    uint32_t refresh_denominator;  ///< Nonzero rational refresh denominator.
+    uint32_t bitrate;  ///< Selected source bitrate.
+    uint32_t maximum_access_unit_bytes;  ///< Bounded complete-AU size.
+    uint32_t maximum_frame_age_microseconds;  ///< Client receive/reassembly deadline budget.
+    uint64_t frame_id_origin;  ///< Nonzero initial frame ID.
+    uint32_t recovery_epoch;  ///< Nonzero recovery epoch.
+    uint16_t udp_payload_size;  ///< Exactly 1,200 for the first slice.
+    uint8_t primary_payload_type;  ///< Dynamic RTP PT 96 through 127.
+    uint8_t codec;  ///< One H.264 or two HEVC.
+    uint8_t profile;  ///< One H.264 High or two HEVC Main.
+    uint8_t decoder_surfaces;  ///< Two through four.
+    uint8_t frame_marking_extension;  ///< RFC8285 ID.
+    uint8_t absolute_capture_extension;  ///< RFC8285 ID.
+    uint8_t frame_id_extension;  ///< Encrypted RFC8285 ID.
+    uint8_t input_watermark_extension;  ///< Encrypted RFC8285 ID.
+    uint8_t encoder_timing_extension;  ///< Encrypted RFC8285 ID.
+  } clsp_video_configuration_t;
+
+  /** @brief One retained complete Annex-B access unit transferred across the C ABI. */
+  typedef struct clsp_video_frame_event {
+    uint32_t abi_version;  ///< Event ABI version.
+    uint32_t structure_size;  ///< Size of this event.
+    uint32_t video_generation;  ///< Exact installed video generation.
+    uint32_t rtp_timestamp;  ///< 90-kHz RTP timestamp.
+    uint64_t frame_id;  ///< Nonzero frame ID.
+    uint64_t receive_time_microseconds;  ///< Client monotonic completion time.
+    uint64_t capture_time_microseconds;  ///< Absolute-capture time when present.
+    uint64_t input_state_sequence;  ///< Applied input watermark state.
+    uint64_t input_edge_id;  ///< Applied input watermark edge.
+    uint32_t recovery_epoch;  ///< Current recovery epoch.
+    uint8_t independent;  ///< Codec-independent frame marking.
+    uint8_t codec;  ///< One H.264 or two HEVC.
+    uint16_t reserved_zero;  ///< Reserved and zero.
+    clsp_buffer_t *frame;  ///< Owning retained complete-frame handle transferred to callback.
+  } clsp_video_frame_event_t;
+
+  /** @brief Decoder outcome values carried unchanged in protected LSPV. */
+  typedef enum clsp_video_decoder_status {
+    CLSP_VIDEO_DECODER_READY = 0,  ///< Frame decoded and the hardware decoder remains ready.
+    CLSP_VIDEO_DECODER_SURFACE_EXHAUSTED = 1,  ///< Hardware submission capacity is exhausted.
+    CLSP_VIDEO_DECODER_RECOVERABLE_ERROR = 2,  ///< Reference repair or bounded recovery is required.
+    CLSP_VIDEO_DECODER_UNRECOVERABLE_ERROR = 3,  ///< An independent recovery frame is required.
+  } clsp_video_decoder_status_t;
+
   /** @brief Exact input-only START_RESPONSE mapping installed in the native worker. */
   typedef struct clsp_input_configuration {
     uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
@@ -331,6 +386,9 @@ extern "C" {
   /** @brief Authenticated low-rate audio sender-report callback. */
   typedef void (*clsp_audio_timing_callback_t)(void *context, const clsp_audio_timing_event_t *event);
 
+  /** @brief Complete retained access-unit callback; never invoked per RTP packet. */
+  typedef void (*clsp_video_frame_callback_t)(void *context, const clsp_video_frame_event_t *event);
+
   /**
    * @brief Retain an explicitly owned callback context.
    *
@@ -360,6 +418,7 @@ extern "C" {
     clsp_control_callback_t control;  ///< Optional authenticated control-frame callback.
     clsp_audio_packet_callback_t audio_packet;  ///< Optional complete Opus packet callback.
     clsp_audio_timing_callback_t audio_timing;  ///< Optional authenticated sender-report callback.
+    clsp_video_frame_callback_t video_frame;  ///< Optional retained complete access-unit callback.
   } clsp_callbacks_t;
 
   /**
@@ -490,6 +549,31 @@ extern "C" {
 
   /** @brief Stop reverse microphone and discard all queued stale packets. */
   clsp_status_t clsp_core_stop_microphone(clsp_core_t *core);
+
+  /** @brief Install exact native video mapping before VIDEO_CONFIG_ACK. */
+  clsp_status_t clsp_core_configure_video(
+    clsp_core_t *core,
+    const clsp_video_configuration_t *configuration
+  );
+
+  /** @brief Report one terminal decoder result and current hardware credit. */
+  clsp_status_t clsp_core_report_video_decode(
+    clsp_core_t *core,
+    uint32_t video_generation,
+    uint64_t frame_id,
+    uint32_t recovery_epoch,
+    uint8_t decoder_status,
+    uint8_t decoder_credit,
+    uint8_t render_mailbox_occupancy
+  );
+
+  /** @brief Report one Metal commit for LSPV state. */
+  clsp_status_t clsp_core_report_video_commit(
+    clsp_core_t *core,
+    uint32_t video_generation,
+    uint64_t frame_id,
+    uint8_t render_mailbox_occupancy
+  );
 
   /** @brief Install one exact authenticated input-only START_RESPONSE mapping. */
   clsp_status_t clsp_core_configure_input(

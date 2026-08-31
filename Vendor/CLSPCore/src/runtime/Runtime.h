@@ -27,6 +27,7 @@ namespace umbra::lsp {
     /** @brief Deliver one authenticated complete Opus RTP payload. */
     using AudioPacket = void (*)(void *context, const clsp_audio_packet_event_t &event) noexcept;
     using AudioTiming = void (*)(void *context, const clsp_audio_timing_event_t &event) noexcept;
+    using VideoFrame = void (*)(void *context, const clsp_video_frame_event_t &event) noexcept;
 
     void *context {};  ///< Opaque C ABI owner.
     Lifecycle lifecycle {};  ///< Required lifecycle callback.
@@ -35,6 +36,7 @@ namespace umbra::lsp {
     ControllerOutput controller_output {};  ///< Optional generation-checked GameController output callback.
     AudioPacket audio_packet {};  ///< Optional complete Opus packet callback.
     AudioTiming audio_timing {};  ///< Optional authenticated sender-report callback.
+    VideoFrame video_frame {};  ///< Optional retained complete access-unit callback.
   };
 
   /** @brief Runtime telemetry counter identifiers. */
@@ -124,6 +126,26 @@ namespace umbra::lsp {
 
     /** @brief Stop the microphone sender and discard queued stale packets. */
     [[nodiscard]] clsp_status_t stop_microphone() noexcept;
+
+    /** @brief Install exact video SSRC/PT/generation and encrypted extension admission. */
+    [[nodiscard]] clsp_status_t configure_video(const clsp_video_configuration_t &configuration) noexcept;
+
+    /** @brief Update native LSPV decode state. */
+    [[nodiscard]] clsp_status_t report_video_decode(
+      std::uint32_t video_generation,
+      std::uint64_t frame_id,
+      std::uint32_t recovery_epoch,
+      std::uint8_t decoder_status,
+      std::uint8_t decoder_credit,
+      std::uint8_t render_mailbox_occupancy
+    ) noexcept;
+
+    /** @brief Update native LSPV Metal-commit state. */
+    [[nodiscard]] clsp_status_t report_video_commit(
+      std::uint32_t video_generation,
+      std::uint64_t frame_id,
+      std::uint8_t render_mailbox_occupancy
+    ) noexcept;
 
     /** @brief Install an authenticated input-only START_RESPONSE mapping. */
     [[nodiscard]] clsp_status_t configure_input(const clsp_input_configuration_t &configuration) noexcept;

@@ -537,6 +537,10 @@ namespace umbra::lsp {
       if (outbound_ != nullptr) {
         srtp_dealloc(outbound_);
       }
+      if (video_inbound_ != nullptr) {
+        srtp_dealloc(video_inbound_);
+      }
+      clear_secret(inbound_master_key_);
     }
 
     /** @brief Install exact AEAD AES-128-GCM policies. */
@@ -554,6 +558,7 @@ namespace umbra::lsp {
       std::copy_n(exporter.data() + 32U, 12U, outbound_key.data() + 16U);
       std::copy_n(exporter.data() + 16U, 16U, inbound_key.data());
       std::copy_n(exporter.data() + 44U, 12U, inbound_key.data() + 16U);
+      inbound_master_key_ = inbound_key;
 
       srtp_policy_t outbound_policy {};
       srtp_crypto_policy_set_aes_gcm_128_16_auth(&outbound_policy.rtp);
@@ -637,9 +642,56 @@ namespace umbra::lsp {
       return inbound_ != nullptr && outbound_ != nullptr;
     }
 
+    [[nodiscard]] clsp_status_t configure_video_inbound(
+      const std::uint32_t ssrc,
+      const std::span<const int> encrypted_extension_ids
+    ) noexcept {
+      if (ssrc == 0 || encrypted_extension_ids.empty() ||
+          encrypted_extension_ids.size() > encrypted_extensions_.size()) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      if (video_inbound_ != nullptr) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      std::copy(encrypted_extension_ids.begin(), encrypted_extension_ids.end(), encrypted_extensions_.begin());
+      srtp_policy_t policy {};
+      srtp_crypto_policy_set_aes_gcm_128_16_auth(&policy.rtp);
+      srtp_crypto_policy_set_aes_gcm_128_16_auth(&policy.rtcp);
+      policy.ssrc.type = ssrc_specific;
+      policy.ssrc.value = ssrc;
+      policy.key = inbound_master_key_.data();
+      policy.window_size = 128;
+      policy.allow_repeat_tx = 0;
+      policy.enc_xtn_hdr = encrypted_extensions_.data();
+      policy.enc_xtn_hdr_count = static_cast<int>(encrypted_extension_ids.size());
+      return srtp_create(&video_inbound_, &policy) == srtp_err_status_ok ? CLSP_STATUS_OK : CLSP_STATUS_SRTP_FAILURE;
+    }
+
+    [[nodiscard]] clsp_status_t unprotect_video(
+      const std::span<std::uint8_t> packet,
+      std::size_t &length,
+      const bool rtcp
+    ) noexcept {
+      if (video_inbound_ == nullptr || length > packet.size() ||
+          length > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      auto encoded_length = static_cast<int>(length);
+      const auto status = rtcp ? srtp_unprotect_rtcp(video_inbound_, packet.data(), &encoded_length) :
+                                 srtp_unprotect(video_inbound_, packet.data(), &encoded_length);
+      if (status != srtp_err_status_ok || encoded_length < 0) {
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      length = static_cast<std::size_t>(encoded_length);
+      return CLSP_STATUS_OK;
+    }
+
   private:
     srtp_t inbound_ {};  ///< Server-write inbound replay/authentication context.
     srtp_t outbound_ {};  ///< Client-write outbound replay/authentication context.
+    srtp_t video_inbound_ {};  ///< Video-specific RFC6904 inbound context.
+    std::array<std::uint8_t, 28> inbound_master_key_ {};  ///< Retained server-write video key+salt.
+    std::array<int, 3> encrypted_extensions_ {};  ///< Installed RFC6904 extension IDs.
 #else
     /** @brief No-op destructor for dependency-free builds. */
     ~Impl() = default;
@@ -647,6 +699,8 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t unprotect(std::span<std::uint8_t>, std::size_t &, bool) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
     [[nodiscard]] clsp_status_t protect(std::span<std::uint8_t>, std::size_t &, bool) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
     [[nodiscard]] bool ready() const noexcept { return false; }
+    [[nodiscard]] clsp_status_t configure_video_inbound(std::uint32_t, std::span<const int>) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
+    [[nodiscard]] clsp_status_t unprotect_video(std::span<std::uint8_t>, std::size_t &, bool) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
 #endif
   };
 
@@ -680,5 +734,20 @@ namespace umbra::lsp {
 
   bool SrtpSession::ready() const noexcept {
     return impl_ != nullptr && impl_->ready();
+  }
+
+  clsp_status_t SrtpSession::configure_video_inbound(
+    const std::uint32_t ssrc,
+    const std::span<const int> encrypted_extension_ids
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_video_inbound(ssrc, encrypted_extension_ids);
+  }
+
+  clsp_status_t SrtpSession::unprotect_video(
+    const std::span<std::uint8_t> packet,
+    std::size_t &length,
+    const bool rtcp
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->unprotect_video(packet, length, rtcp);
   }
 }  // namespace umbra::lsp
