@@ -274,9 +274,22 @@ namespace umbra::lsp {
       }
       pthread_mutex_lock(&mutex_);
       pending_input_configuration_ = configuration;
+      const auto token = input_configuration_requested_.fetch_add(1, std::memory_order_acq_rel) + 1U;
+      pending_input_configuration_token_ = token;
       input_configuration_pending_ = true;
       pthread_mutex_unlock(&mutex_);
       wake_worker();
+      timespec deadline {};
+      if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      deadline.tv_nsec += 100'000'000L;
+      if (deadline.tv_nsec >= 1'000'000'000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1'000'000'000L; }
+      pthread_mutex_lock(&mutex_);
+      while (input_configuration_completed_.load(std::memory_order_acquire) < token) {
+        const auto wait = pthread_cond_timedwait(&condition_, &mutex_, &deadline);
+        if (wait == ETIMEDOUT) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_TIMEOUT; }
+        if (wait != 0) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_INTERNAL_FAILURE; }
+      }
+      pthread_mutex_unlock(&mutex_);
       return CLSP_STATUS_OK;
 #else
       (void)configuration;
@@ -693,15 +706,22 @@ namespace umbra::lsp {
     /** @brief Install a pending input authority on the socket-owner thread. */
     [[nodiscard]] clsp_status_t process_input_configuration() noexcept {
       clsp_input_configuration_t selected {};
+      std::uint64_t token = 0;
       pthread_mutex_lock(&mutex_);
       if (!input_configuration_pending_) {
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_OK;
       }
       selected = pending_input_configuration_;
+      token = pending_input_configuration_token_;
       input_configuration_pending_ = false;
       pthread_mutex_unlock(&mutex_);
 
+      const auto restoring_same_mapping = input_configured_ &&
+                                          input_configuration_.input_generation == selected.input_generation &&
+                                          input_configuration_.input_ssrc == selected.input_ssrc &&
+                                          input_configuration_.acknowledgement_ssrc == selected.acknowledgement_ssrc &&
+                                          input_configuration_.input_payload_type == selected.input_payload_type;
       input_configuration_ = selected;
       if (!pointer_composer_.reset(1, 1) || !edge_sender_.reset(selected.input_generation)) {
         return CLSP_STATUS_INTERNAL_FAILURE;
@@ -719,10 +739,16 @@ namespace umbra::lsp {
       latest_edge_id_ = 0;
       latest_state_sequence_ = 2;
       next_state_sequence_ = 2;
-      rtp_sequence_ = static_cast<std::uint16_t>(arc4random());
+      if (!restoring_same_mapping) {
+        rtp_sequence_ = static_cast<std::uint16_t>(arc4random());
+      }
       input_tokens_bits_ = selected.reserved_input_wire_bits_per_second / 500U;
       input_last_credit_us_ = monotonic_microseconds();
       last_pointer_sent_us_ = 0;
+      input_configuration_completed_.store(token, std::memory_order_release);
+      pthread_mutex_lock(&mutex_);
+      pthread_cond_broadcast(&condition_);
+      pthread_mutex_unlock(&mutex_);
       return CLSP_STATUS_OK;
     }
 
@@ -1486,12 +1512,15 @@ namespace umbra::lsp {
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::atomic<std::uint64_t> neutralize_requested_ {0};  ///< Latest synchronous neutralize token.
     std::atomic<std::uint64_t> neutralize_completed_ {0};  ///< Worker-completed neutralize token.
+    std::atomic<std::uint64_t> input_configuration_requested_ {0};  ///< Latest synchronous mapping token.
+    std::atomic<std::uint64_t> input_configuration_completed_ {0};  ///< Worker-installed mapping token.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.
     std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
     std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
+    std::uint64_t pending_input_configuration_token_ {};  ///< Token paired with pending START/ATTACH mapping.
     std::uint32_t connection_generation_ {};  ///< Zero through CLIENT_HELLO, then host-assigned generation.
     std::uint64_t baseline_id_ {};  ///< Current random neutral-baseline identifier.
     std::uint64_t baseline_last_sent_us_ {};  ///< Most recent baseline submission time.

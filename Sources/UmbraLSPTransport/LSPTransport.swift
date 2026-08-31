@@ -263,7 +263,7 @@ public final class LSPTransport: @unchecked Sendable {
     public static let abiVersion: UInt32 = 1
 
     /// Expected source digest for Lumen's mirrored portable protocol core.
-    public static let sourceDigest = "587cdc5f65b445162d02bf4bb0d54487967c93811c5565d2548321c526fbc0e5"
+    public static let sourceDigest = "987605e2ffe1aafed40d8eb6df622a3737541926f75328b66c12cb7c8e783593"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {

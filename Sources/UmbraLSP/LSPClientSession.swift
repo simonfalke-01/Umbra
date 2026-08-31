@@ -192,48 +192,61 @@ public actor LSPClientSession {
     ) async throws -> LSPAttachResponse {
         guard state == .authenticated, let hello else { throw LSPTransportError.notAuthenticated }
         let prior = try await previous.activeInputAuthority()
+        var neutralizationAttempted = false
         do {
+            neutralizationAttempted = true
             try previous.neutralizeInput()
         } catch let error as LSPTransportError {
             if reason == .plannedRekey || (error != .notAuthenticated && error != .invalidState) {
+                if reason == .plannedRekey, neutralizationAttempted {
+                    try await previous.restoreInputAuthority(prior)
+                }
                 throw error
             }
         }
-        let intentID = UUID()
-        let request = LSPAttachRequest(
-            sessionID: prior.sessionID,
-            attachToken: prior.attachToken,
-            intentID: intentID
-        )
-        let event = try await transport.request(
-            messageType: LSPControlMessageType.attach.rawValue,
-            payload: try LSPControlWire.attach(request)
-        )
-        let response = try LSPControlWire.attachResponse(from: event)
-        guard response.sessionID == prior.sessionID,
-              response.connectionGeneration == hello.connectionGeneration,
-              event.connectionGeneration == hello.connectionGeneration,
-              response.nativeConfiguration.streamGeneration == prior.nativeConfiguration.streamGeneration,
-              response.nativeConfiguration.inputGeneration != prior.nativeConfiguration.inputGeneration,
-              response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.inputSSRC,
-              response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.acknowledgementSSRC,
-              response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.inputSSRC,
-              response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.acknowledgementSSRC,
-              response.replacementAttachToken != prior.attachToken
-        else {
-            throw LSPTransportError.internalFailure
+        do {
+            let intentID = UUID()
+            let request = LSPAttachRequest(
+                sessionID: prior.sessionID,
+                attachToken: prior.attachToken,
+                intentID: intentID
+            )
+            let event = try await transport.request(
+                messageType: LSPControlMessageType.attach.rawValue,
+                payload: try LSPControlWire.attach(request)
+            )
+            let response = try LSPControlWire.attachResponse(from: event)
+            guard response.sessionID == prior.sessionID,
+                  response.connectionGeneration == hello.connectionGeneration,
+                  event.connectionGeneration == hello.connectionGeneration,
+                  response.nativeConfiguration.streamGeneration == prior.nativeConfiguration.streamGeneration,
+                  response.nativeConfiguration.inputGeneration != prior.nativeConfiguration.inputGeneration,
+                  response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.inputSSRC,
+                  response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.acknowledgementSSRC,
+                  response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.inputSSRC,
+                  response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.acknowledgementSSRC,
+                  response.replacementAttachToken != prior.attachToken
+            else {
+                throw LSPTransportError.internalFailure
+            }
+            try transport.configureInput(response.nativeConfiguration)
+            inputAuthority = LSPActiveInputAuthority(
+                applicationID: prior.applicationID,
+                sessionID: response.sessionID,
+                attachToken: response.replacementAttachToken,
+                connectionGeneration: response.connectionGeneration,
+                nativeConfiguration: response.nativeConfiguration
+            )
+            state = .inputActive
+            await previous.retireAfterAttach()
+            return response
+        } catch {
+            let attachError = error
+            if reason == .plannedRekey, neutralizationAttempted {
+                try await previous.restoreInputAuthority(prior)
+            }
+            throw attachError
         }
-        try transport.configureInput(response.nativeConfiguration)
-        inputAuthority = LSPActiveInputAuthority(
-            applicationID: prior.applicationID,
-            sessionID: response.sessionID,
-            attachToken: response.replacementAttachToken,
-            connectionGeneration: response.connectionGeneration,
-            nativeConfiguration: response.nativeConfiguration
-        )
-        state = .inputActive
-        await previous.retireAfterAttach()
-        return response
     }
 
     /// Returns current single-use authority only to the reconnect coordinator.
@@ -312,6 +325,14 @@ public actor LSPClientSession {
         hello = nil
         clientNonce = nil
         state = .stopped
+    }
+
+    /// Reopens a still-authoritative planned-rekey source with a fresh baseline.
+    private func restoreInputAuthority(_ authority: LSPActiveInputAuthority) throws {
+        guard state == .inputActive, inputAuthority == authority else {
+            throw LSPTransportError.invalidState
+        }
+        try transport.configureInput(authority.nativeConfiguration)
     }
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {
