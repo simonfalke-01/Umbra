@@ -62,6 +62,8 @@ namespace umbra::lsp {
     constexpr std::uint8_t maximum_path_probe_attempts = 3;  ///< RFC 8899 default MAX_PROBES.
     constexpr std::uint64_t compound_rtcp_interval_microseconds = 1'000'000U;  ///< Regular RR/SDES cadence.
     constexpr std::uint64_t path_mtu_raise_interval_microseconds = 600'000'000U;  ///< RFC 8899 PMTU_RAISE_TIMER.
+    constexpr std::uint64_t recovery_lspv_repeat_interval_microseconds = 20'000U;  ///< Recovery evidence repeat cadence.
+    constexpr std::size_t video_frame_state_extension_bytes = 12;  ///< Encrypted frame ID plus epoch bytes.
     constexpr std::array<std::uint8_t, 4> annex_b_start_code{
       0,
       0,
@@ -153,11 +155,141 @@ namespace umbra::lsp {
       bool has_input_watermark{};                 ///< Whether applied-input watermark was present.
       bool has_encoder_timing{};                  ///< Whether encoder timing was present.
       std::uint64_t frame_id{};                   ///< Parsed nonzero repeated frame ID.
+      std::uint32_t recovery_epoch{};             ///< Parsed nonzero repeated recovery epoch.
       std::uint64_t capture_time_microseconds{};  ///< NTP fixed-point absolute
                                                   ///< capture value in microseconds.
       std::uint64_t input_state_sequence{};       ///< Applied input state sequence.
       std::uint64_t input_edge_id{};              ///< Applied input edge identifier.
     };
+
+    /** @brief Authenticated recovery-epoch disposition for one video packet. */
+    enum class VideoEpochDisposition : std::uint8_t {
+      current,  ///< Packet belongs to the active recovery epoch.
+      stale,  ///< Packet belongs to an older recovery epoch and must be dropped.
+      advance,  ///< Independent-frame metadata advances exactly one epoch.
+      invalid,  ///< Epoch jumped, wrapped, or advanced on a dependent frame.
+    };
+
+    /**
+     * @brief Classify one authenticated per-frame recovery epoch.
+     *
+     * @param current Nonzero active epoch.
+     * @param incoming Nonzero epoch carried by the encrypted frame-state extension.
+     * @param independent Whether repeated authenticated frame marking is independent.
+     * @return Exact transition disposition.
+     */
+    [[nodiscard]] constexpr VideoEpochDisposition classify_video_epoch(
+      const std::uint32_t current,
+      const std::uint32_t incoming,
+      const bool independent
+    ) noexcept {
+      if (current == 0 || incoming == 0) {
+        return VideoEpochDisposition::invalid;
+      }
+      if (incoming < current) {
+        return VideoEpochDisposition::stale;
+      }
+      if (incoming == current) {
+        return VideoEpochDisposition::current;
+      }
+      if (current != std::numeric_limits<std::uint32_t>::max() && incoming == current + 1U && independent) {
+        return VideoEpochDisposition::advance;
+      }
+      return VideoEpochDisposition::invalid;
+    }
+
+    /** @brief Return whether latched recovery evidence needs another protected LSPV. */
+    [[nodiscard]] constexpr bool recovery_lspv_repeat_due(
+      const bool pending,
+      const std::uint64_t last_submission_microseconds,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      return pending &&
+             (last_submission_microseconds == 0 || now_microseconds < last_submission_microseconds ||
+              now_microseconds - last_submission_microseconds >= recovery_lspv_repeat_interval_microseconds);
+    }
+
+    static_assert(classify_video_epoch(7, 7, false) == VideoEpochDisposition::current);
+    static_assert(classify_video_epoch(7, 6, true) == VideoEpochDisposition::stale);
+    static_assert(classify_video_epoch(7, 8, true) == VideoEpochDisposition::advance);
+    static_assert(classify_video_epoch(7, 8, false) == VideoEpochDisposition::invalid);
+    static_assert(classify_video_epoch(7, 9, true) == VideoEpochDisposition::invalid);
+    static_assert(recovery_lspv_repeat_due(true, 0, 1));
+    static_assert(!recovery_lspv_repeat_due(true, 10, 20'009));
+    static_assert(recovery_lspv_repeat_due(true, 10, 20'010));
+    static_assert(!recovery_lspv_repeat_due(false, 10, 30'000));
+
+    /** @brief Return whether epoch advancement retires a provisional key. */
+    [[nodiscard]] constexpr bool retire_on_video_epoch_advance(
+      const bool occupied,
+      const lumen::lsp::media::frame_key candidate,
+      const lumen::lsp::media::frame_key current
+    ) noexcept {
+      return occupied && candidate != current;
+    }
+
+    static_assert(!retire_on_video_epoch_advance(true, {9, 10}, {9, 10}));
+    static_assert(retire_on_video_epoch_advance(true, {9, 9}, {9, 10}));
+    static_assert(!retire_on_video_epoch_advance(false, {9, 9}, {9, 10}));
+
+    /** @brief New-epoch recovery evidence derived from the validated current frame deadline. */
+    struct VideoEpochAdvanceEvidence {
+      bool deadline_miss {};  ///< Whether the current recovery frame already expired.
+      bool repeat_feedback {};  ///< Whether protected LSPV must repeat until a later ready decode.
+      std::uint64_t decoded_watermark {};  ///< Decode watermark that must advance to clear evidence.
+    };
+
+    /** @brief Build clean or deadline-latched evidence for an atomic epoch advance. */
+    [[nodiscard]] constexpr VideoEpochAdvanceEvidence video_epoch_advance_evidence(
+      const bool current_frame_expired,
+      const std::uint64_t decoded_watermark
+    ) noexcept {
+      return {
+        .deadline_miss = current_frame_expired,
+        .repeat_feedback = current_frame_expired,
+        .decoded_watermark = current_frame_expired ? decoded_watermark : 0,
+      };
+    }
+
+    static_assert(video_epoch_advance_evidence(true, 41).deadline_miss);
+    static_assert(video_epoch_advance_evidence(true, 41).repeat_feedback);
+    static_assert(video_epoch_advance_evidence(true, 41).decoded_watermark == 41);
+    static_assert(!video_epoch_advance_evidence(false, 41).deadline_miss);
+    static_assert(video_epoch_advance_evidence(false, 41).decoded_watermark == 0);
+
+    /** @brief Why one video frame key entered the bounded late-packet fence. */
+    enum class VideoRetirementReason : std::uint8_t {
+      expired_incomplete,  ///< Receive deadline elapsed before completion.
+      evicted_incomplete,  ///< A newer provisional frame displaced this key.
+      stale_epoch,  ///< Authenticated media belonged to an older recovery epoch.
+      malformed,  ///< Authenticated fragments or repeated metadata conflicted.
+      completed,  ///< The key reached complete-frame terminal handling.
+    };
+
+    /** @brief Validate late +1 recovery against the retired key's reason and bound identity. */
+    [[nodiscard]] constexpr bool permit_late_video_epoch_advance(
+      const VideoRetirementReason reason,
+      const std::uint64_t bound_frame_id,
+      const std::uint32_t bound_epoch,
+      const std::uint64_t incoming_frame_id,
+      const std::uint32_t incoming_epoch
+    ) noexcept {
+      if (reason != VideoRetirementReason::expired_incomplete || incoming_frame_id == 0 || incoming_epoch == 0) {
+        return false;
+      }
+      if (bound_frame_id == 0 && bound_epoch == 0) {
+        return true;
+      }
+      return bound_frame_id != 0 && bound_epoch != 0 &&
+             bound_frame_id == incoming_frame_id && bound_epoch == incoming_epoch;
+    }
+
+    static_assert(permit_late_video_epoch_advance(VideoRetirementReason::expired_incomplete, 0, 0, 90, 2));
+    static_assert(permit_late_video_epoch_advance(VideoRetirementReason::expired_incomplete, 90, 2, 90, 2));
+    static_assert(!permit_late_video_epoch_advance(VideoRetirementReason::completed, 90, 2, 90, 2));
+    static_assert(!permit_late_video_epoch_advance(VideoRetirementReason::malformed, 0, 0, 90, 2));
+    static_assert(!permit_late_video_epoch_advance(VideoRetirementReason::expired_incomplete, 89, 2, 90, 2));
+    static_assert(!permit_late_video_epoch_advance(VideoRetirementReason::expired_incomplete, 90, 1, 90, 2));
 
     /** @brief Authenticated RTP payload and negotiated boundary metadata. */
     struct ParsedVideoPacket {
@@ -180,8 +312,7 @@ namespace umbra::lsp {
              ((static_cast<std::uint64_t>(fraction) * 1'000'000U) >> 32U);
     }
 
-    /** @brief Return whether the five negotiated RFC8285 IDs are unique values one
-     * through fourteen. */
+    /** @brief Return whether the five RFC8285 IDs equal the frozen LSP assignments. */
     [[nodiscard]] constexpr bool valid_video_extension_ids(
       const clsp_video_configuration_t &configuration
     ) noexcept {
@@ -192,17 +323,7 @@ namespace umbra::lsp {
         configuration.input_watermark_extension,
         configuration.encoder_timing_extension,
       };
-      for (std::size_t index = 0; index < ids.size(); ++index) {
-        if (ids[index] == 0 || ids[index] > 14U) {
-          return false;
-        }
-        for (std::size_t other = index + 1; other < ids.size(); ++other) {
-          if (ids[index] == ids[other]) {
-            return false;
-          }
-        }
-      }
-      return true;
+      return ids == std::array<std::uint8_t, 5> {1, 2, 3, 4, 5};
     }
 
     /** @brief Parse exact RFC8285 one-byte video extensions and locate the codec
@@ -285,12 +406,13 @@ namespace umbra::lsp {
             );
             break;
           case 2:
-            if (length != 8U) {
+            if (length != video_frame_state_extension_bytes) {
               return std::nullopt;
             }
             extensions.has_frame_id = true;
-            extensions.frame_id = lumen::lsp::wire::read_be<std::uint64_t>(value);
-            if (extensions.frame_id == 0) {
+            extensions.frame_id = lumen::lsp::wire::read_be<std::uint64_t>(value.first(8));
+            extensions.recovery_epoch = lumen::lsp::wire::read_be<std::uint32_t>(value.subspan(8, 4));
+            if (extensions.frame_id == 0 || extensions.recovery_epoch == 0) {
               return std::nullopt;
             }
             break;
@@ -864,8 +986,10 @@ namespace umbra::lsp {
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
       video_configuration_ = configuration;
+      video_current_recovery_epoch_ = configuration.recovery_epoch;
       video_frame_pool_ = pool;
       video_metadata_ = {};
+      delivered_video_frames_ = {};
       video_retired_frames_ = {};
       authenticated_video_fingerprints_ = {};
       video_sequence_initialized_ = false;
@@ -879,6 +1003,9 @@ namespace umbra::lsp {
       video_next_retirement_order_ = 1;
       video_render_mailbox_occupancy_ = 0;
       video_deadline_miss_latched_ = false;
+      video_recovery_feedback_pending_ = false;
+      video_recovery_evidence_watermark_ = 0;
+      last_recovery_lspv_microseconds_ = 0;
       video_delivery_active_.store(false, std::memory_order_release);
       video_feedback_.reset(monotonic_microseconds());
       video_reception_.reset();
@@ -1100,9 +1227,9 @@ namespace umbra::lsp {
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_INVALID_STATE;
       }
-      if (video_generation != video_configuration_.video_generation ||
+      auto *delivered = find_delivered_video_frame(frame_id, recovery_epoch);
+      if (video_generation != video_configuration_.video_generation || delivered == nullptr ||
           frame_id == 0 || frame_id > video_largest_complete_frame_id_ ||
-          recovery_epoch != video_configuration_.recovery_epoch ||
           decoder_status > static_cast<std::uint8_t>(
                              lumen::lsp::transport::lspv_decoder_status::
                                unrecoverable_error
@@ -1114,6 +1241,7 @@ namespace umbra::lsp {
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
+      *delivered = {};
       (void)video_decoder_credit_.release();
       video_render_mailbox_occupancy_ = render_mailbox_occupancy;
       const auto typed_status =
@@ -1122,10 +1250,30 @@ namespace umbra::lsp {
         video_largest_decoded_frame_id_ =
           std::max(video_largest_decoded_frame_id_, frame_id);
       }
-      const auto status = current_lspv_status(typed_status);
+      const auto current_epoch = recovery_epoch == video_current_recovery_epoch_;
+      const auto decoder_error =
+        typed_status == lumen::lsp::transport::lspv_decoder_status::recoverable_error ||
+        typed_status == lumen::lsp::transport::lspv_decoder_status::unrecoverable_error;
+      const auto recovery_relevant_error =
+        current_epoch && decoder_error && frame_id > video_largest_decoded_frame_id_;
+      const auto decode_event_relevant = current_epoch && (!decoder_error || recovery_relevant_error);
+      if (current_epoch && typed_status == lumen::lsp::transport::lspv_decoder_status::ready &&
+          video_recovery_feedback_pending_ && frame_id > video_recovery_evidence_watermark_) {
+        video_recovery_feedback_pending_ = false;
+        video_recovery_evidence_watermark_ = 0;
+        video_deadline_miss_latched_ = false;
+      } else if (recovery_relevant_error) {
+        video_recovery_feedback_pending_ = true;
+        video_recovery_evidence_watermark_ =
+          std::max(video_recovery_evidence_watermark_, video_largest_decoded_frame_id_);
+      }
+      const auto status = current_lspv_status(
+        decode_event_relevant ? typed_status : current_decoder_capacity_status()
+      );
       const auto update = lspv_coalescer_.update(
         status,
-        lumen::lsp::transport::lspv_event::decode_completion
+        decode_event_relevant ? lumen::lsp::transport::lspv_event::decode_completion :
+                                lumen::lsp::transport::lspv_event::capacity_transition
       );
       pthread_mutex_unlock(&mutex_);
       if (update != lumen::lsp::transport::lspv_update_result::accepted) {
@@ -1166,8 +1314,7 @@ namespace umbra::lsp {
       video_largest_metal_frame_id_ =
         std::max(video_largest_metal_frame_id_, frame_id);
       video_render_mailbox_occupancy_ = render_mailbox_occupancy;
-      const auto decoder_status =
-        video_decoder_credit_.available() == 0 ? lumen::lsp::transport::lspv_decoder_status::surface_exhausted : lumen::lsp::transport::lspv_decoder_status::ready;
+      const auto decoder_status = current_decoder_capacity_status();
       const auto update = lspv_coalescer_.update(
         current_lspv_status(decoder_status),
         lumen::lsp::transport::lspv_event::capacity_transition
@@ -1444,6 +1591,7 @@ namespace umbra::lsp {
       std::uint64_t deadline_microseconds {};  ///< Fixed deadline shared by every fragment.
       std::uint64_t arrival_order {};  ///< Oldest-frame bounded eviction order.
       std::uint64_t frame_id {};  ///< Repeated nonzero frame identifier when observed.
+      std::uint32_t recovery_epoch {};  ///< Repeated nonzero recovery epoch when observed.
       std::uint64_t capture_time_microseconds {};  ///< Repeated absolute capture time when observed.
       std::uint64_t input_state_sequence {};  ///< Repeated applied state watermark.
       std::uint64_t input_edge_id {};  ///< Repeated applied edge watermark.
@@ -1453,10 +1601,21 @@ namespace umbra::lsp {
       bool independent {};  ///< Whether any repeated frame marking says independent.
     };
 
+    /** @brief Exact native-to-Swift frame tuple retained until terminal decode reporting. */
+    struct DeliveredVideoFrame {
+      std::uint64_t frame_id {};  ///< Nonzero delivered frame identifier.
+      std::uint32_t recovery_epoch {};  ///< Authenticated per-frame recovery epoch.
+      bool independent {};  ///< Authenticated independent-frame marking.
+      bool occupied {};  ///< Whether this decoder-credit slot awaits a terminal report.
+    };
+
     /** @brief Recently retired frame key preventing late-packet resurrection. */
     struct VideoRetiredFrame {
       bool occupied {};  ///< Whether a key is retained.
       lumen::lsp::media::frame_key key {};  ///< Completed, expired, or evicted frame key.
+      VideoRetirementReason reason {VideoRetirementReason::malformed};  ///< Terminal retirement classification.
+      std::uint64_t frame_id {};  ///< Bound authenticated frame ID, or zero when not yet known.
+      std::uint32_t recovery_epoch {};  ///< Bound authenticated epoch, or zero when not yet known.
       std::uint64_t retirement_order {};  ///< Bounded oldest-key replacement order.
     };
 
@@ -1608,7 +1767,7 @@ namespace umbra::lsp {
       return {
         .session_generation = video_configuration_.stream_generation,
         .video_generation = video_configuration_.video_generation,
-        .recovery_epoch = video_configuration_.recovery_epoch,
+        .recovery_epoch = video_current_recovery_epoch_,
         .largest_complete_frame_id = video_largest_complete_frame_id_,
         .largest_decoded_frame_id = video_largest_decoded_frame_id_,
         .largest_metal_committed_frame_id = video_largest_metal_frame_id_,
@@ -1618,6 +1777,64 @@ namespace umbra::lsp {
         .maximum_decode_submissions = video_decoder_credit_.capacity(),
         .render_mailbox_occupancy = video_render_mailbox_occupancy_,
       };
+    }
+
+    /** @brief Derive current decoder capacity without replacing latched recovery evidence. */
+    [[nodiscard]] lumen::lsp::transport::lspv_decoder_status current_decoder_capacity_status() const noexcept {
+      return video_decoder_credit_.available() == 0 ?
+               lumen::lsp::transport::lspv_decoder_status::surface_exhausted :
+               lumen::lsp::transport::lspv_decoder_status::ready;
+    }
+
+    /**
+     * @brief Retain one exact delivered frame in the fixed decoder-credit table.
+     *
+     * @param frame_id Nonzero completed frame ID.
+     * @param recovery_epoch Authenticated frame epoch.
+     * @param independent Authenticated independent-frame marking.
+     * @return True only when a unique empty slot was populated.
+     */
+    [[nodiscard]] bool remember_delivered_video_frame(
+      const std::uint64_t frame_id,
+      const std::uint32_t recovery_epoch,
+      const bool independent
+    ) noexcept {
+      if (frame_id == 0 || recovery_epoch == 0 ||
+          std::ranges::any_of(delivered_video_frames_, [frame_id](const DeliveredVideoFrame &frame) {
+            return frame.occupied && frame.frame_id == frame_id;
+          })) {
+        return false;
+      }
+      const auto empty = std::ranges::find_if(delivered_video_frames_, [](const DeliveredVideoFrame &frame) {
+        return !frame.occupied;
+      });
+      if (empty == delivered_video_frames_.end()) {
+        return false;
+      }
+      *empty = {
+        .frame_id = frame_id,
+        .recovery_epoch = recovery_epoch,
+        .independent = independent,
+        .occupied = true,
+      };
+      return true;
+    }
+
+    /**
+     * @brief Find one exact delivered frame awaiting Swift's terminal decoder report.
+     *
+     * @param frame_id Reported frame ID.
+     * @param recovery_epoch Reported per-frame recovery epoch.
+     * @return Matching fixed-table entry, or null.
+     */
+    [[nodiscard]] DeliveredVideoFrame *find_delivered_video_frame(
+      const std::uint64_t frame_id,
+      const std::uint32_t recovery_epoch
+    ) noexcept {
+      const auto found = std::ranges::find_if(delivered_video_frames_, [&](const DeliveredVideoFrame &frame) {
+        return frame.occupied && frame.frame_id == frame_id && frame.recovery_epoch == recovery_epoch;
+      });
+      return found == delivered_video_frames_.end() ? nullptr : &*found;
     }
 
     /** @brief Release runtime-owned video storage after the socket worker is
@@ -1639,6 +1856,7 @@ namespace umbra::lsp {
       pending_video_delivery_count_ = 0;
       video_reassembler_.reset();
       video_metadata_ = {};
+      delivered_video_frames_ = {};
       video_retired_frames_ = {};
       authenticated_video_fingerprints_ = {};
       outbound_path_probe_ = {};
@@ -1656,6 +1874,10 @@ namespace umbra::lsp {
       path_intent_control_ = {};
       compound_rtcp_sent_ = false;
       pending_rtcp_ = {};
+      video_current_recovery_epoch_ = 0;
+      video_recovery_feedback_pending_ = false;
+      video_recovery_evidence_watermark_ = 0;
+      last_recovery_lspv_microseconds_ = 0;
       auto *pool = video_frame_pool_;
       video_frame_pool_ = nullptr;
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
@@ -2267,7 +2489,13 @@ namespace umbra::lsp {
                 );
               }
             }
-            if (!handle_authenticated_realtime(plaintext, rtcp, arrival_microseconds)) {
+            const auto handled = handle_authenticated_realtime(plaintext, rtcp, arrival_microseconds);
+            if (realtime_failure_status_ != CLSP_STATUS_OK) {
+              const auto failure = realtime_failure_status_;
+              realtime_failure_status_ = CLSP_STATUS_OK;
+              return failure;
+            }
+            if (!handled) {
               increment(RuntimeCounter::dropped);
             }
             break;
@@ -3335,6 +3563,12 @@ namespace umbra::lsp {
           increment(RuntimeCounter::congestion_feedback_packets);
         } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::microphone_report) {
           microphone_last_report_us_ = now;
+        } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::lspv) {
+          pthread_mutex_lock(&mutex_);
+          if (video_recovery_feedback_pending_) {
+            last_recovery_lspv_microseconds_ = now;
+          }
+          pthread_mutex_unlock(&mutex_);
         }
         pending_rtcp_ = {};
         increment(RuntimeCounter::transmitted);
@@ -3500,19 +3734,48 @@ namespace umbra::lsp {
       return candidate;
     }
 
-    /** @brief Return whether a completed, expired, or evicted key must reject
-     * late packets. */
-    [[nodiscard]] bool
-    video_frame_retired(const lumen::lsp::media::frame_key key) const noexcept {
-      return std::ranges::any_of(video_retired_frames_, [&](const VideoRetiredFrame &entry) {
+    /** @brief Return the exact bounded retirement record for one frame key. */
+    [[nodiscard]] std::optional<VideoRetiredFrame>
+    retired_video_frame(const lumen::lsp::media::frame_key key) const noexcept {
+      const auto found = std::ranges::find_if(video_retired_frames_, [&](const VideoRetiredFrame &entry) {
         return entry.occupied && entry.key == key;
       });
+      return found == video_retired_frames_.end() ? std::nullopt : std::optional<VideoRetiredFrame> {*found};
     }
 
-    /** @brief Retain one recently retired key in a fixed-size late-packet fence.
+    /** @brief Return whether a terminal key must reject ordinary late packets. */
+    [[nodiscard]] bool video_frame_retired(const lumen::lsp::media::frame_key key) const noexcept {
+      return retired_video_frame(key).has_value();
+    }
+
+    /**
+     * @brief Retain one recently retired key, reason, and optional authenticated identity.
+     *
+     * @param key Terminal provisional frame key.
+     * @param reason Why the key retired.
+     * @param frame_id Bound frame ID, or zero only with a zero epoch.
+     * @param recovery_epoch Bound epoch, or zero only with a zero frame ID.
      */
-    void retire_video_frame(const lumen::lsp::media::frame_key key) noexcept {
-      if (video_frame_retired(key)) {
+    void retire_video_frame(
+      const lumen::lsp::media::frame_key key,
+      const VideoRetirementReason reason,
+      const std::uint64_t frame_id = 0,
+      const std::uint32_t recovery_epoch = 0
+    ) noexcept {
+      if ((frame_id == 0) != (recovery_epoch == 0)) {
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+        return;
+      }
+      const auto existing = std::ranges::find_if(video_retired_frames_, [&](const VideoRetiredFrame &entry) {
+        return entry.occupied && entry.key == key;
+      });
+      if (existing != video_retired_frames_.end()) {
+        if (existing->reason == VideoRetirementReason::expired_incomplete &&
+            existing->frame_id == 0 && existing->recovery_epoch == 0 &&
+            reason == VideoRetirementReason::expired_incomplete && frame_id != 0) {
+          existing->frame_id = frame_id;
+          existing->recovery_epoch = recovery_epoch;
+        }
         return;
       }
       auto *selected = static_cast<VideoRetiredFrame *>(nullptr);
@@ -3532,6 +3795,9 @@ namespace umbra::lsp {
       *selected = {
         .occupied = true,
         .key = key,
+        .reason = reason,
+        .frame_id = frame_id,
+        .recovery_epoch = recovery_epoch,
         .retirement_order = video_next_retirement_order_++,
       };
     }
@@ -3546,6 +3812,14 @@ namespace umbra::lsp {
       pthread_mutex_lock(&mutex_);
       video_deadline_miss_latched_ =
         video_deadline_miss_latched_ || deadline_miss;
+      const auto decoder_error =
+        decoder_status == lumen::lsp::transport::lspv_decoder_status::recoverable_error ||
+        decoder_status == lumen::lsp::transport::lspv_decoder_status::unrecoverable_error;
+      if (decoder_error || deadline_miss) {
+        video_recovery_feedback_pending_ = true;
+        video_recovery_evidence_watermark_ =
+          std::max(video_recovery_evidence_watermark_, video_largest_decoded_frame_id_);
+      }
       const auto update =
         lspv_coalescer_.update(current_lspv_status(decoder_status), event);
       pthread_mutex_unlock(&mutex_);
@@ -3561,14 +3835,84 @@ namespace umbra::lsp {
       pthread_mutex_lock(&mutex_);
       video_deadline_miss_latched_ =
         video_deadline_miss_latched_ || deadline_miss;
-      const auto status =
-        video_decoder_credit_.available() == 0 ? lumen::lsp::transport::lspv_decoder_status::surface_exhausted : lumen::lsp::transport::lspv_decoder_status::ready;
+      if (deadline_miss) {
+        video_recovery_feedback_pending_ = true;
+        video_recovery_evidence_watermark_ =
+          std::max(video_recovery_evidence_watermark_, video_largest_decoded_frame_id_);
+      }
+      const auto status = current_decoder_capacity_status();
       const auto update =
         lspv_coalescer_.update(current_lspv_status(status), event);
       pthread_mutex_unlock(&mutex_);
       if (update == lumen::lsp::transport::lspv_update_result::accepted) {
         wake_worker();
       }
+    }
+
+    /** @brief Classify encrypted epoch metadata without changing recovery state. */
+    [[nodiscard]] VideoEpochDisposition pending_video_epoch(const VideoExtensions &extensions) noexcept {
+      if (!extensions.has_frame_id) {
+        return VideoEpochDisposition::current;
+      }
+      pthread_mutex_lock(&mutex_);
+      const auto disposition = classify_video_epoch(
+        video_current_recovery_epoch_,
+        extensions.recovery_epoch,
+        extensions.has_frame_marking && extensions.independent
+      );
+      pthread_mutex_unlock(&mutex_);
+      return disposition;
+    }
+
+    /**
+     * @brief Commit one already validated +1 epoch and retire only older provisional frames.
+     *
+     * @param key Current authenticated provisional frame key to preserve.
+     * @param extensions Validated repeated metadata carrying the next epoch.
+     * @param current_frame_expired Whether the validated current frame is already retired or expired.
+     * @return True only when the epoch and coalescer advanced atomically.
+     */
+    [[nodiscard]] bool advance_video_epoch(
+      const lumen::lsp::media::frame_key key,
+      const VideoExtensions &extensions,
+      const bool current_frame_expired
+    ) noexcept {
+      pthread_mutex_lock(&mutex_);
+      if (classify_video_epoch(
+            video_current_recovery_epoch_,
+            extensions.recovery_epoch,
+            extensions.has_frame_marking && extensions.independent
+          ) != VideoEpochDisposition::advance) {
+        pthread_mutex_unlock(&mutex_);
+        return false;
+      }
+      video_current_recovery_epoch_ = extensions.recovery_epoch;
+      const auto evidence = video_epoch_advance_evidence(current_frame_expired, video_largest_decoded_frame_id_);
+      video_deadline_miss_latched_ = evidence.deadline_miss;
+      video_recovery_feedback_pending_ = evidence.repeat_feedback;
+      video_recovery_evidence_watermark_ = evidence.decoded_watermark;
+      last_recovery_lspv_microseconds_ = 0;
+      const auto update = lspv_coalescer_.update(
+        current_lspv_status(current_decoder_capacity_status()),
+        lumen::lsp::transport::lspv_event::capacity_transition
+      );
+      pthread_mutex_unlock(&mutex_);
+      if (update != lumen::lsp::transport::lspv_update_result::accepted) {
+        return false;
+      }
+      for (auto &metadata : video_metadata_) {
+        if (retire_on_video_epoch_advance(metadata.occupied, metadata.key, key)) {
+          retire_video_frame(
+            metadata.key,
+            VideoRetirementReason::evicted_incomplete,
+            metadata.frame_id,
+            metadata.recovery_epoch
+          );
+          metadata = {};
+        }
+      }
+      wake_worker();
+      return true;
     }
 
     /** @brief Expire incomplete frames, retire their keys, and report an LSPV
@@ -3580,7 +3924,12 @@ namespace umbra::lsp {
       std::size_t expired = 0;
       for (auto &metadata : video_metadata_) {
         if (metadata.occupied && metadata.deadline_microseconds <= now) {
-          retire_video_frame(metadata.key);
+          retire_video_frame(
+            metadata.key,
+            VideoRetirementReason::expired_incomplete,
+            metadata.frame_id,
+            metadata.recovery_epoch
+          );
           metadata = {};
           ++expired;
         }
@@ -3594,13 +3943,19 @@ namespace umbra::lsp {
       }
     }
 
+    /** @brief Find bounded metadata for one provisional video frame without creating it. */
+    [[nodiscard]] VideoFrameMetadata *find_video_metadata(const lumen::lsp::media::frame_key key) noexcept {
+      const auto found = std::ranges::find_if(video_metadata_, [&](const VideoFrameMetadata &metadata) {
+        return metadata.occupied && metadata.key == key;
+      });
+      return found == video_metadata_.end() ? nullptr : &*found;
+    }
+
     /** @brief Find or create bounded metadata for one provisional video frame. */
     [[nodiscard]] VideoFrameMetadata *
     video_metadata_for(const lumen::lsp::media::frame_key key, const std::uint64_t now) noexcept {
-      for (auto &metadata : video_metadata_) {
-        if (metadata.occupied && metadata.key == key) {
-          return &metadata;
-        }
+      if (auto *metadata = find_video_metadata(key); metadata != nullptr) {
+        return metadata;
       }
       auto *selected = static_cast<VideoFrameMetadata *>(nullptr);
       for (auto &metadata : video_metadata_) {
@@ -3641,10 +3996,12 @@ namespace umbra::lsp {
     merge_video_metadata(VideoFrameMetadata &metadata, const VideoExtensions &extensions) noexcept {
       if (extensions.has_frame_id) {
         if (extensions.frame_id < video_configuration_.frame_id_origin ||
-            (metadata.frame_id != 0 && metadata.frame_id != extensions.frame_id)) {
+            (metadata.frame_id != 0 && metadata.frame_id != extensions.frame_id) ||
+            (metadata.recovery_epoch != 0 && metadata.recovery_epoch != extensions.recovery_epoch)) {
           return false;
         }
         metadata.frame_id = extensions.frame_id;
+        metadata.recovery_epoch = extensions.recovery_epoch;
       }
       if (extensions.has_capture_time) {
         if (metadata.has_capture_time && metadata.capture_time_microseconds !=
@@ -3683,10 +4040,38 @@ namespace umbra::lsp {
         return false;
       }
       const auto parsed = parse_video_packet(packet, video_configuration_);
-      if (!parsed || parsed->header.marker != parsed->extensions.ends_frame ||
+      if (!parsed) {
+        return false;
+      }
+      const auto key = lumen::lsp::media::frame_key{
+        .ssrc = parsed->header.ssrc,
+        .extended_timestamp = extend_video_timestamp(parsed->header.timestamp),
+      };
+      if (parsed->header.marker != parsed->extensions.ends_frame ||
           ((parsed->extensions.starts_frame || parsed->extensions.ends_frame) &&
            (!parsed->extensions.has_frame_id ||
             !parsed->extensions.has_frame_marking))) {
+        retire_video_frame(
+          key,
+          VideoRetirementReason::malformed,
+          parsed->extensions.frame_id,
+          parsed->extensions.recovery_epoch
+        );
+        return false;
+      }
+      const auto epoch = pending_video_epoch(parsed->extensions);
+      if (epoch == VideoEpochDisposition::stale) {
+        retire_video_frame(
+          key,
+          VideoRetirementReason::stale_epoch,
+          parsed->extensions.frame_id,
+          parsed->extensions.recovery_epoch
+        );
+        erase_video_metadata(key);
+        return true;
+      }
+      if (epoch == VideoEpochDisposition::invalid) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
         return false;
       }
       lumen::lsp::packet_slab<maximum_depacketized_video_bytes> chunk;
@@ -3699,6 +4084,12 @@ namespace umbra::lsp {
               (parsed->payload[1] & 0x80U) == 0)) ||
             (parsed->extensions.ends_frame &&
              (parsed->payload.size() < 2U || (parsed->payload[1] & 0x40U) == 0))) {
+          retire_video_frame(
+            key,
+            VideoRetirementReason::malformed,
+            parsed->extensions.frame_id,
+            parsed->extensions.recovery_epoch
+          );
           return false;
         }
       }
@@ -3709,26 +4100,79 @@ namespace umbra::lsp {
               (parsed->payload[2] & 0x80U) == 0)) ||
             (parsed->extensions.ends_frame &&
              (parsed->payload.size() < 3U || (parsed->payload[2] & 0x40U) == 0))) {
+          retire_video_frame(
+            key,
+            VideoRetirementReason::malformed,
+            parsed->extensions.frame_id,
+            parsed->extensions.recovery_epoch
+          );
           return false;
         }
       }
       const auto depacketized = video_configuration_.codec == 1U ? depacketize_h264(parsed->payload, chunk) : depacketize_hevc(parsed->payload, chunk);
       if (!depacketized) {
+        retire_video_frame(
+          key,
+          VideoRetirementReason::malformed,
+          parsed->extensions.frame_id,
+          parsed->extensions.recovery_epoch
+        );
         return false;
       }
-      const auto key = lumen::lsp::media::frame_key{
-        .ssrc = parsed->header.ssrc,
-        .extended_timestamp = extend_video_timestamp(parsed->header.timestamp),
-      };
-      expire_video_frames(now);
-      if (video_frame_retired(key)) {
+      const auto retired_before_validation = retired_video_frame(key);
+      if (epoch != VideoEpochDisposition::advance && retired_before_validation) {
         return true;
+      }
+      if (epoch == VideoEpochDisposition::advance && retired_before_validation &&
+          !permit_late_video_epoch_advance(
+            retired_before_validation->reason,
+            retired_before_validation->frame_id,
+            retired_before_validation->recovery_epoch,
+            parsed->extensions.frame_id,
+            parsed->extensions.recovery_epoch
+          )) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
+        return false;
       }
       auto *metadata = video_metadata_for(key, now);
       if (metadata == nullptr ||
           !merge_video_metadata(*metadata, parsed->extensions)) {
+        if (metadata != nullptr) {
+          retire_video_frame(
+            key,
+            VideoRetirementReason::malformed,
+            metadata->frame_id,
+            metadata->recovery_epoch
+          );
+        }
         erase_video_metadata(key);
         return false;
+      }
+      const auto current_frame_expired = retired_before_validation.has_value() || metadata->deadline_microseconds <= now;
+      if (epoch == VideoEpochDisposition::advance &&
+          !advance_video_epoch(key, parsed->extensions, current_frame_expired)) {
+        erase_video_metadata(key);
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+        return false;
+      }
+      if (current_frame_expired) {
+        if (epoch == VideoEpochDisposition::advance) {
+          retire_video_frame(
+            key,
+            VideoRetirementReason::expired_incomplete,
+            metadata->frame_id,
+            metadata->recovery_epoch
+          );
+          erase_video_metadata(key);
+          (void)video_reassembler_->expire(now);
+        } else {
+          expire_video_frames(now);
+        }
+        return true;
+      }
+      expire_video_frames(now);
+      if (video_frame_retired(key)) {
+        return true;
       }
       const auto result = video_reassembler_->add(
         {
@@ -3745,7 +4189,13 @@ namespace umbra::lsp {
         now
       );
       if (result.evicted) {
-        retire_video_frame(*result.evicted);
+        const auto *evicted = find_video_metadata(*result.evicted);
+        retire_video_frame(
+          *result.evicted,
+          VideoRetirementReason::evicted_incomplete,
+          evicted == nullptr ? 0 : evicted->frame_id,
+          evicted == nullptr ? 0 : evicted->recovery_epoch
+        );
         erase_video_metadata(*result.evicted);
       }
       if (result.status ==
@@ -3754,7 +4204,14 @@ namespace umbra::lsp {
             lumen::lsp::media::frame_reassembly_status::frame_too_large ||
           result.status == lumen::lsp::media::frame_reassembly_status::expired ||
           result.status == lumen::lsp::media::frame_reassembly_status::resource_exhausted) {
-        retire_video_frame(key);
+        retire_video_frame(
+          key,
+          result.status == lumen::lsp::media::frame_reassembly_status::expired ?
+            VideoRetirementReason::expired_incomplete :
+            VideoRetirementReason::malformed,
+          metadata->frame_id,
+          metadata->recovery_epoch
+        );
         erase_video_metadata(key);
         if (result.status ==
             lumen::lsp::media::frame_reassembly_status::expired) {
@@ -3770,10 +4227,11 @@ namespace umbra::lsp {
       }
       const auto completed = result.frame;
       if (!completed || completed.frame_id == 0 ||
-          completed.frame_id != metadata->frame_id || completed.total_size == 0 ||
+          completed.frame_id != metadata->frame_id || metadata->recovery_epoch == 0 ||
+          !metadata->has_independent_marking || completed.total_size == 0 ||
           completed.total_size > video_configuration_.maximum_access_unit_bytes) {
         (void) video_reassembler_->release(completed);
-        retire_video_frame(key);
+        retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
         return false;
       }
@@ -3790,7 +4248,7 @@ namespace umbra::lsp {
           lumen::lsp::transport::lspv_event::capacity_transition,
           false
         );
-        retire_video_frame(key);
+        retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
         return true;
       }
@@ -3800,7 +4258,7 @@ namespace umbra::lsp {
         if (source.size() > destination.size() - offset) {
           (void) video_reassembler_->release(completed);
           clsp_buffer_release(buffer);
-          retire_video_frame(key);
+          retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
           erase_video_metadata(key);
           return false;
         }
@@ -3810,15 +4268,26 @@ namespace umbra::lsp {
       if (offset != destination.size()) {
         (void) video_reassembler_->release(completed);
         clsp_buffer_release(buffer);
-        retire_video_frame(key);
+        retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
         return false;
       }
       if (!video_reassembler_->release(completed)) {
         clsp_buffer_release(buffer);
-        retire_video_frame(key);
+        retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
         return false;
+      }
+      if (pending_video_delivery_count_ >= pending_video_deliveries_.size()) {
+        clsp_buffer_release(buffer);
+        retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
+        erase_video_metadata(key);
+        coalesce_video_status(
+          lumen::lsp::transport::lspv_decoder_status::surface_exhausted,
+          lumen::lsp::transport::lspv_event::capacity_transition,
+          false
+        );
+        return true;
       }
       pthread_mutex_lock(&mutex_);
       if (!video_decoder_credit_.try_acquire()) {
@@ -3830,17 +4299,24 @@ namespace umbra::lsp {
         );
         pthread_mutex_unlock(&mutex_);
         clsp_buffer_release(buffer);
-        retire_video_frame(key);
+        retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
         if (update == lumen::lsp::transport::lspv_update_result::accepted) {
           wake_worker();
         }
         return true;
       }
+      if (!remember_delivered_video_frame(completed.frame_id, metadata->recovery_epoch, metadata->independent)) {
+        (void)video_decoder_credit_.release();
+        pthread_mutex_unlock(&mutex_);
+        clsp_buffer_release(buffer);
+        retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
+        erase_video_metadata(key);
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+        return false;
+      }
       const auto update = lspv_coalescer_.update(
-        current_lspv_status(
-          video_decoder_credit_.available() == 0 ? lumen::lsp::transport::lspv_decoder_status::surface_exhausted : lumen::lsp::transport::lspv_decoder_status::ready
-        ),
+        current_lspv_status(current_decoder_capacity_status()),
         lumen::lsp::transport::lspv_event::capacity_transition
       );
       pthread_mutex_unlock(&mutex_);
@@ -3857,26 +4333,14 @@ namespace umbra::lsp {
         .capture_time_microseconds = metadata->capture_time_microseconds,
         .input_state_sequence = metadata->input_state_sequence,
         .input_edge_id = metadata->input_edge_id,
-        .recovery_epoch = video_configuration_.recovery_epoch,
+        .recovery_epoch = metadata->recovery_epoch,
         .independent = static_cast<std::uint8_t>(metadata->independent),
         .codec = video_configuration_.codec,
         .reserved_zero = 0,
         .frame = buffer,
       };
-      retire_video_frame(key);
+      retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
       erase_video_metadata(key);
-      if (pending_video_delivery_count_ >= pending_video_deliveries_.size()) {
-        pthread_mutex_lock(&mutex_);
-        (void)video_decoder_credit_.release();
-        pthread_mutex_unlock(&mutex_);
-        clsp_buffer_release(buffer);
-        coalesce_video_status(
-          lumen::lsp::transport::lspv_decoder_status::surface_exhausted,
-          lumen::lsp::transport::lspv_event::capacity_transition,
-          false
-        );
-        return true;
-      }
       pending_video_deliveries_[pending_video_delivery_count_++] = event;
       return true;
     }
@@ -3907,6 +4371,16 @@ namespace umbra::lsp {
       lumen::lsp::transport::lspv_status status;
       lumen::lsp::transport::lspv_event event;
       pthread_mutex_lock(&mutex_);
+      if (recovery_lspv_repeat_due(video_recovery_feedback_pending_, last_recovery_lspv_microseconds_, now)) {
+        const auto repeated = lspv_coalescer_.update(
+          current_lspv_status(current_decoder_capacity_status()),
+          lumen::lsp::transport::lspv_event::capacity_transition
+        );
+        if (repeated != lumen::lsp::transport::lspv_update_result::accepted) {
+          pthread_mutex_unlock(&mutex_);
+          return CLSP_STATUS_INTERNAL_FAILURE;
+        }
+      }
       const auto available = lspv_coalescer_.take(now, status, event);
       if (available && status.deadline_miss) {
         video_deadline_miss_latched_ = false;
@@ -4518,6 +4992,7 @@ namespace umbra::lsp {
 
     clsp_configuration_t configuration_ {};  ///< Copied immutable core configuration.
     RuntimeCallbacks callbacks_ {};  ///< Stable C ABI owner callbacks.
+    clsp_status_t realtime_failure_status_ {CLSP_STATUS_OK};  ///< Fatal authenticated parser result bubbled to the worker.
     WolfSSLDtlsClient dtls_;  ///< Exact-policy DTLS client.
     SrtpSession srtp_;  ///< Directional AEAD AES-128-GCM contexts.
     lumen::lsp::selective_ack_window receive_window_;  ///< Peer logical-frame receive/ACK state.
@@ -4557,6 +5032,7 @@ namespace umbra::lsp {
     native_rtp_reception_stats audio_reception_;  ///< Cumulative host-audio RR loss/jitter/SR state.
     std::optional<lumen::lsp::transport::path_mtu_discovery> path_mtu_ {};  ///< RFC 8899 search state.
     std::array<VideoFrameMetadata, 2> video_metadata_ {};  ///< Repeated metadata for two incomplete frames.
+    std::array<DeliveredVideoFrame, video_delivery_queue_capacity> delivered_video_frames_ {};  ///< Exact native-to-Swift decoder submissions.
     std::array<VideoRetiredFrame, 128> video_retired_frames_ {};  ///< Mirrors the inbound SRTP replay window.
     std::array<AuthenticatedRtpFingerprint, 128> authenticated_video_fingerprints_ {};  ///< Exact video replay identities.
     std::array<AuthenticatedRtpFingerprint, 128> authenticated_audio_fingerprints_ {};  ///< Exact audio replay identities.
@@ -4608,6 +5084,9 @@ namespace umbra::lsp {
     std::uint64_t video_largest_complete_frame_id_ {};  ///< LSPV complete watermark.
     std::uint64_t video_largest_decoded_frame_id_ {};  ///< LSPV hardware-decode watermark.
     std::uint64_t video_largest_metal_frame_id_ {};  ///< LSPV Metal-commit watermark.
+    std::uint64_t video_recovery_evidence_watermark_ {};  ///< Decoded watermark that must advance to clear repeated recovery evidence.
+    std::uint64_t last_recovery_lspv_microseconds_ {};  ///< Last submitted recovery-relevant LSPV.
+    std::uint32_t video_current_recovery_epoch_ {};  ///< Dynamic epoch seeded by VIDEO_CONFIG and advanced by authenticated media.
     std::uint8_t video_render_mailbox_occupancy_ {};  ///< Current Swift render mailbox occupancy.
     std::uint16_t last_acknowledged_probe_size_ {};  ///< Idempotent confirmed payload size.
     std::uint16_t last_received_probe_size_ {};  ///< Idempotent received payload size.
@@ -4643,6 +5122,7 @@ namespace umbra::lsp {
     bool feedback_sequence_initialized_ {};  ///< Whether CCFB sequence expansion has an origin.
     bool audio_feedback_sequence_initialized_ {};  ///< Whether audio CCFB expansion has an origin.
     bool video_deadline_miss_latched_ {};  ///< Deadline miss retained until LSPV consumption.
+    bool video_recovery_feedback_pending_ {};  ///< Recovery evidence must repeat until a later ready decode or epoch.
     bool path_probe_notification_pending_ {};  ///< Swift has not queued the emitted client intent.
     bool compound_rtcp_sent_ {};  ///< RFC 5506 reduced-size feedback is unlocked.
     bool input_configured_ {};  ///< Worker has an active input mapping.

@@ -461,7 +461,7 @@ public final class LSPTransport: @unchecked Sendable {
     public static let abiVersion: UInt32 = 1
 
     /// Expected source digest for the pinned Photon portable protocol core.
-    public static let sourceDigest = "fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4"
+    public static let sourceDigest = "dae452bffdcb05a60a9632f4020d23c1e5258972dce71b475e2b82f14915e1b0"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {
@@ -750,7 +750,7 @@ public final class LSPTransport: @unchecked Sendable {
         try Self.requireSuccess(clsp_core_confirm_path_probe(core, probeID, receivedPayloadSize))
     }
 
-    /// Reports one terminal decoder outcome and current bounded capacities.
+    /// Reports one terminal decoder outcome for the exact authenticated per-frame epoch and current bounded capacities.
     public func reportVideoDecode(
         videoGeneration: UInt32,
         frameID: UInt64,

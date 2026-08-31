@@ -17,7 +17,7 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(1)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4"
+#define CLSP_CORE_SOURCE_DIGEST "dae452bffdcb05a60a9632f4020d23c1e5258972dce71b475e2b82f14915e1b0"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
@@ -206,7 +206,7 @@ extern "C" {
     uint32_t maximum_access_unit_bytes;  ///< Bounded complete-AU size.
     uint32_t maximum_frame_age_microseconds;  ///< Client receive/reassembly deadline budget.
     uint64_t frame_id_origin;  ///< Nonzero initial frame ID.
-    uint32_t recovery_epoch;  ///< Nonzero recovery epoch.
+    uint32_t recovery_epoch;  ///< Nonzero initial recovery-epoch seed.
     uint16_t udp_payload_size;  ///< Exactly 1,200 for the first slice.
     uint8_t primary_payload_type;  ///< Dynamic RTP PT 96 through 127.
     uint8_t codec;  ///< One H.264 or two HEVC.
@@ -230,7 +230,7 @@ extern "C" {
     uint64_t capture_time_microseconds;  ///< Absolute-capture time when present.
     uint64_t input_state_sequence;  ///< Applied input watermark state.
     uint64_t input_edge_id;  ///< Applied input watermark edge.
-    uint32_t recovery_epoch;  ///< Current recovery epoch.
+    uint32_t recovery_epoch;  ///< Authenticated per-frame recovery epoch.
     uint8_t independent;  ///< Codec-independent frame marking.
     uint8_t codec;  ///< One H.264 or two HEVC.
     uint16_t reserved_zero;  ///< Reserved and zero.
@@ -622,7 +622,7 @@ extern "C" {
     uint16_t received_payload_size
   );
 
-  /** @brief Report one terminal decoder result and current hardware credit. */
+  /** @brief Report one terminal decoder result for an exact delivered frame/epoch and current hardware credit. */
   clsp_status_t clsp_core_report_video_decode(
     clsp_core_t *core,
     uint32_t video_generation,

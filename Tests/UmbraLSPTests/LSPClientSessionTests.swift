@@ -72,7 +72,7 @@ final class LSPClientSessionTests: XCTestCase {
         maximumBitsPerSecond: 20_000_000
     )
 
-    func testVideoConfigParsesKey28FrameAgeAndEncodesFiveKeyAck() throws {
+    func testVideoConfigV2ParsesExactEightKeysAndEncodesExactFiveKeyAck() throws {
         let sessionID = UUID()
         let selection = DeterministicCBORValue.map((1...28).map { key in
             let value: DeterministicCBORValue = switch key {
@@ -99,7 +99,7 @@ final class LSPClientSessionTests: XCTestCase {
             return .init(key: UInt64(key), value: value)
         })
         let payload = try DeterministicCBOR.encode(.map([
-            .init(key: 1, value: .unsigned(1)),
+            .init(key: 1, value: .unsigned(2)),
             .init(key: 2, value: .bytes(LSPControlWire.uuidBytes(sessionID))),
             .init(key: 3, value: .unsigned(7)),
             .init(key: 4, value: selection),
@@ -117,6 +117,7 @@ final class LSPClientSessionTests: XCTestCase {
             payload: payload
         ))
         XCTAssertEqual(request.nativeConfiguration.maximumFrameAgeMicroseconds, 33_333)
+        XCTAssertEqual(request.nativeConfiguration.recoveryEpoch, 1)
         let ack = try DeterministicCBOR.exactMap(
             DeterministicCBOR.decode(try LSPControlWire.videoConfigAck(
                 status: .success,
@@ -126,7 +127,42 @@ final class LSPClientSessionTests: XCTestCase {
             )),
             count: 5
         )
+        XCTAssertEqual(ack[0], .unsigned(2))
         XCTAssertEqual(ack[4], .unsigned(3))
+
+        for invalidVersion in [UInt64(1), 3] {
+            var invalidValues = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(payload), count: 8)
+            invalidValues[0] = .unsigned(invalidVersion)
+            let invalidPayload = try DeterministicCBOR.encode(.map(invalidValues.enumerated().map {
+                .init(key: UInt64($0.offset + 1), value: $0.element)
+            }))
+            XCTAssertThrowsError(try LSPControlWire.videoConfig(from: LSPControlEvent(
+                messageType: LSPControlMessageType.videoConfig.rawValue,
+                flags: [.acknowledgementRequired],
+                connectionGeneration: 1,
+                messageID: 1,
+                requestID: 2,
+                payload: invalidPayload
+            )))
+        }
+
+        var invalidSelection = try DeterministicCBOR.exactMap(selection, count: 28)
+        invalidSelection[22] = .unsigned(6)
+        var invalidExtensionValues = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(payload), count: 8)
+        invalidExtensionValues[3] = .map(invalidSelection.enumerated().map {
+            .init(key: UInt64($0.offset + 1), value: $0.element)
+        })
+        let invalidExtensionPayload = try DeterministicCBOR.encode(.map(invalidExtensionValues.enumerated().map {
+            .init(key: UInt64($0.offset + 1), value: $0.element)
+        }))
+        XCTAssertThrowsError(try LSPControlWire.videoConfig(from: LSPControlEvent(
+            messageType: LSPControlMessageType.videoConfig.rawValue,
+            flags: [.acknowledgementRequired],
+            connectionGeneration: 1,
+            messageID: 1,
+            requestID: 2,
+            payload: invalidExtensionPayload
+        )))
     }
 
     func testPathProbeIntentAndAcknowledgementUseExactThreeKeySchemas() throws {

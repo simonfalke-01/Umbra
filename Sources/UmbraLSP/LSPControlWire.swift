@@ -251,6 +251,8 @@ public struct LSPPathProbeIntent: Equatable, Sendable {
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
 public enum LSPControlWire {
+    private static let videoSchemaVersion: UInt64 = 2
+
     public static func clientHello(clientNonce: Data) throws -> Data {
         try fixed(clientNonce, count: 32)
         return try encodeMap([
@@ -600,7 +602,7 @@ public enum LSPControlWire {
             throw DeterministicCBORError.malformed
         }
         let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 8)
-        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        guard try uint(values[0]) == videoSchemaVersion else { throw DeterministicCBORError.malformed }
         let sessionID = try uuid(try bytes(values[1], count: 16))
         let streamGeneration = try uint32(values[2], nonzero: true)
         let selection = try videoSelection(value: values[3], streamGeneration: streamGeneration)
@@ -642,7 +644,7 @@ public enum LSPControlWire {
     ) throws -> Data {
         guard videoGeneration != 0, (2...4).contains(decoderCredit) else { throw DeterministicCBORError.malformed }
         return try encodeMap([
-            .unsigned(1), .unsigned(UInt64(status.rawValue)), .bytes(uuidBytes(sessionID)),
+            .unsigned(videoSchemaVersion), .unsigned(UInt64(status.rawValue)), .bytes(uuidBytes(sessionID)),
             .unsigned(UInt64(videoGeneration)), .unsigned(UInt64(decoderCredit)),
         ])
     }
@@ -886,7 +888,7 @@ public enum LSPControlWire {
               case .boolean(false) = values[15], try uint(values[16]) == 1_200,
               (2...4).contains(try uint(values[17])), try uint(values[18]) == 1,
               try uint(values[19]) == 1,
-              extensionIDs.allSatisfy({ (1...14).contains($0) }), Set(extensionIDs).count == 5,
+              extensionIDs == [1, 2, 3, 4, 5],
               case .boolean(false) = values[25], case .boolean(false) = values[26],
               ((codec == 1 && profile == 1) || (codec == 2 && profile == 2)),
               (96...127).contains(payloadType), clock == 90_000
