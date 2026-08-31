@@ -10,6 +10,9 @@ final class LSPAppKitInputCapture {
 
     private var monitor: Any?
     private var session: LSPClientSession?
+    private var nativeCapture: LSPAppleInputCapture?
+    private var activationObservers: [NSObjectProtocol] = []
+    private var appKitActive = false
     private var priorMouseCoalescing = true
     private var heldKeys: Set<UInt16> = []
     private var heldPointerButtons: Set<UInt16> = []
@@ -22,8 +25,41 @@ final class LSPAppKitInputCapture {
     func start(session: LSPClientSession) {
         stop()
         self.session = session
+        let center = NotificationCenter.default
+        activationObservers = [
+            center.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.stopSources() }
+            },
+            center.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.startSources() }
+            },
+        ]
+        startSources()
+    }
+
+    private func startSources() {
+        guard nativeCapture == nil, monitor == nil, let session, NSApp.isActive else { return }
+        do {
+            nativeCapture = try session.startAppleInputCapture()
+            return
+        } catch LSPTransportError.inputPermissionDenied, LSPTransportError.inputUnavailable {
+            // Native start quiesces completely before returning, so AppKit now
+            // becomes the sole keyboard/pointer owner.
+        } catch {
+            failureHandler?(error)
+            return
+        }
         priorMouseCoalescing = NSEvent.isMouseCoalescingEnabled
         NSEvent.isMouseCoalescingEnabled = false
+        appKitActive = true
         let mask: NSEvent.EventTypeMask = [
             .mouseMoved,
             .leftMouseDragged,
@@ -47,7 +83,21 @@ final class LSPAppKitInputCapture {
 
     /// Emits releases, neutralizes native authority, restores coalescing, and removes callbacks.
     func stop() {
-        guard let session else { return }
+        stopSources()
+        let center = NotificationCenter.default
+        for observer in activationObservers {
+            center.removeObserver(observer)
+        }
+        activationObservers.removeAll(keepingCapacity: true)
+        self.session = nil
+    }
+
+    private func stopSources() {
+        if let nativeCapture {
+            nativeCapture.stop()
+            self.nativeCapture = nil
+        }
+        guard appKitActive, let session else { return }
         let timestamp = Self.monotonicMicroseconds()
         for usage in heldKeys.sorted() {
             try? session.submitInputEdge(
@@ -75,7 +125,7 @@ final class LSPAppKitInputCapture {
             self.monitor = nil
         }
         NSEvent.isMouseCoalescingEnabled = priorMouseCoalescing
-        self.session = nil
+        appKitActive = false
     }
 
     private func handle(_ event: NSEvent) {

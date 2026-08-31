@@ -94,6 +94,15 @@ namespace umbra::lsp {
     /** @brief Queue one allocation-free keyboard or pointer-button edge. */
     [[nodiscard]] clsp_status_t submit_input_edge(const clsp_input_edge_t &edge) noexcept;
 
+    /** @brief Queue one GameController lifecycle/button edge. */
+    [[nodiscard]] clsp_status_t submit_controller_edge(const clsp_controller_edge_t &edge) noexcept;
+
+    /** @brief Queue latest controller triggers and sticks. */
+    [[nodiscard]] clsp_status_t submit_controller_state(const clsp_controller_state_t &state) noexcept;
+
+    /** @brief Queue latest controller gyro or accelerometer state. */
+    [[nodiscard]] clsp_status_t submit_controller_sensor(const clsp_controller_sensor_t &sensor) noexcept;
+
     /** @brief Neutralize and stop the current native input authority. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept;
 

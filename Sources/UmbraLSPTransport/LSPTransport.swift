@@ -202,6 +202,8 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
     case notAuthenticated
     case controlWindowFull
     case timeout
+    case inputPermissionDenied
+    case inputUnavailable
     case unknownStatus(Int32)
 
     public var errorDescription: String? {
@@ -242,6 +244,10 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
             "The bounded LSP control window is full."
         case .timeout:
             "The LSP operation timed out."
+        case .inputPermissionDenied:
+            "macOS denied preferred raw HID input capture."
+        case .inputUnavailable:
+            "Preferred native input capture is unavailable."
         case .unknownStatus(let status):
             "The LSP native core returned unknown status \(status)."
         }
@@ -469,6 +475,14 @@ public final class LSPTransport: @unchecked Sendable {
         try Self.requireSuccess(clsp_core_neutralize_input(core))
     }
 
+    /// Starts preferred public IOHID capture on its dedicated native queue.
+    public func startAppleInputCapture() throws -> LSPAppleInputCapture {
+        var output: OpaquePointer?
+        try Self.requireSuccess(clsp_core_start_apple_input_capture(core, &output))
+        guard let output else { throw LSPTransportError.internalFailure }
+        return LSPAppleInputCapture(handle: output)
+    }
+
     private static func makeNativeConfiguration(
         _ configuration: LSPTransportConfiguration
     ) throws -> clsp_configuration_t {
@@ -565,8 +579,37 @@ public final class LSPTransport: @unchecked Sendable {
             throw LSPTransportError.controlWindowFull
         case CLSP_STATUS_TIMEOUT:
             throw LSPTransportError.timeout
+        case CLSP_STATUS_INPUT_PERMISSION_DENIED:
+            throw LSPTransportError.inputPermissionDenied
+        case CLSP_STATUS_INPUT_UNAVAILABLE:
+            throw LSPTransportError.inputUnavailable
         default:
             throw LSPTransportError.unknownStatus(Int32(status.rawValue))
+        }
+    }
+}
+
+/// Owning Swift boundary for one preferred native Apple capture source.
+public final class LSPAppleInputCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: OpaquePointer?
+
+    fileprivate init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        stop()
+    }
+
+    /// Synchronously quiesces IOHID callbacks before releasing native ownership.
+    public func stop() {
+        let owned = lock.withLock { () -> OpaquePointer? in
+            defer { handle = nil }
+            return handle
+        }
+        if let owned {
+            clsp_apple_input_capture_stop(owned)
         }
     }
 }

@@ -196,6 +196,11 @@ public actor LSPClientSession {
         try transport.neutralizeInput()
     }
 
+    /// Starts preferred IOHID capture without actor work on physical callbacks.
+    public nonisolated func startAppleInputCapture() throws -> LSPAppleInputCapture {
+        try transport.startAppleInputCapture()
+    }
+
     /// Stops and destroys transport authority.
     public func stop() throws {
         guard state == .authenticated || state == .inputActive else { throw LSPTransportError.invalidState }

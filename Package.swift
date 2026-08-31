@@ -102,7 +102,10 @@ let package = Package(
                 .headerSearchPath("."),
                 .unsafeFlags(["-std=c++23", "-fno-exceptions", "-fno-rtti"]),
             ] + lspCoreCXXSettings,
-            linkerSettings: lspCoreLinkerSettings,
+            linkerSettings: lspCoreLinkerSettings + [
+                .linkedFramework("IOKit"),
+                .linkedFramework("GameController"),
+            ],
             plugins: ["CLSPCoreSyncPlugin"]
         ),
         .target(

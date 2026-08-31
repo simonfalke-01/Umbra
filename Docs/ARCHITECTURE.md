@@ -45,9 +45,12 @@ reliable LSPC control, and the input-only START slice. Swift receives
 authenticated control responses, not UDP packets. Pairing, reconnect
 authentication, application browsing, START, the neutral baseline, cumulative
 pointer state, exactly-once keyboard/pointer-button edges, SRTP protection, and
-LSPI retirement are wired into the product. Focused-window AppKit capture is
-the active fallback and restores the prior mouse-coalescing setting at stop.
-IOHID and GameController native adapters remain the next capture upgrade.
+LSPI retirement are wired into the product. Preferred IOHID keyboard/mouse and
+GameController buttons, sticks, triggers, gyro, and accelerometer terminate on
+a dedicated native queue and feed the lock-free native capture ring. Focused-
+window AppKit capture starts only after native capture is quiesced and restores
+the prior mouse-coalescing setting at stop. Controller touch is withheld until
+its public profile-specific adapter is completed against the accepted schema.
 
 ## Session policies
 

@@ -386,6 +386,30 @@ extern "C" clsp_status_t clsp_core_neutralize_input(clsp_core_t *core) {
   return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->neutralize_input();
 }
 
+extern "C" clsp_status_t clsp_core_submit_controller_edge(
+  clsp_core_t *core,
+  const clsp_controller_edge_t *edge
+) {
+  if (core == nullptr || edge == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_edge(*edge);
+}
+
+extern "C" clsp_status_t clsp_core_submit_controller_state(
+  clsp_core_t *core,
+  const clsp_controller_state_t *state
+) {
+  if (core == nullptr || state == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_state(*state);
+}
+
+extern "C" clsp_status_t clsp_core_submit_controller_sensor(
+  clsp_core_t *core,
+  const clsp_controller_sensor_t *sensor
+) {
+  if (core == nullptr || sensor == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_sensor(*sensor);
+}
+
 extern "C" clsp_status_t clsp_core_copy_telemetry(
   const clsp_core_t *core,
   clsp_telemetry_snapshot_t *output
@@ -473,6 +497,10 @@ extern "C" const char *clsp_status_description(const clsp_status_t status) {
       return "LSP control window is full";
     case CLSP_STATUS_TIMEOUT:
       return "LSP operation timed out";
+    case CLSP_STATUS_INPUT_PERMISSION_DENIED:
+      return "macOS denied native LSP input capture";
+    case CLSP_STATUS_INPUT_UNAVAILABLE:
+      return "native LSP input capture is unavailable";
   }
   return "unknown LSP status";
 }

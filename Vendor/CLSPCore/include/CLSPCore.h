@@ -28,6 +28,9 @@ extern "C" {
   /** @brief Opaque retained native byte-buffer handle. */
   typedef struct clsp_buffer clsp_buffer_t;
 
+  /** @brief Opaque preferred Apple native input-capture owner. */
+  typedef struct clsp_apple_input_capture clsp_apple_input_capture_t;
+
   /** @brief Borrowed immutable byte span whose lifetime is defined by the containing call. */
   typedef struct clsp_const_byte_span {
     const uint8_t *data;  ///< First byte, or null only when `length` is zero.
@@ -55,6 +58,8 @@ extern "C" {
     CLSP_STATUS_NOT_AUTHENTICATED = 16,  ///< An operation requires a completed pinned DTLS association.
     CLSP_STATUS_CONTROL_WINDOW_FULL = 17,  ///< The bounded 64-frame control window is full.
     CLSP_STATUS_TIMEOUT = 18,  ///< A bounded handshake or control operation expired.
+    CLSP_STATUS_INPUT_PERMISSION_DENIED = 19,  ///< macOS denied preferred raw HID capture.
+    CLSP_STATUS_INPUT_UNAVAILABLE = 20,  ///< No supported native HID capture source is available.
   } clsp_status_t;
 
   /** @brief Operator-selected congestion-control profile. */
@@ -164,6 +169,41 @@ extern "C" {
     uint8_t kind;  ///< One `clsp_input_edge_kind_t`.
     uint8_t reserved_zero;  ///< Reserved and required to be zero.
   } clsp_input_edge_t;
+
+  /** @brief GameController lifecycle or digital-button edge. */
+  typedef struct clsp_controller_edge {
+    uint64_t sample_time_microseconds;  ///< `lastEventTimestamp` in client monotonic microseconds.
+    uint32_t controller_id;  ///< Stable slot one through sixteen.
+    uint32_t instance_generation;  ///< Nonzero arrival generation.
+    uint16_t control_id;  ///< Profile type for arrival or button bit zero through 31.
+    uint8_t kind;  ///< LSP edge kind five through eight.
+    uint8_t reserved_zero;  ///< Reserved and required to be zero.
+  } clsp_controller_edge_t;
+
+  /** @brief Latest GameController triggers and sticks. */
+  typedef struct clsp_controller_state {
+    uint64_t sample_time_microseconds;  ///< Profile `lastEventTimestamp`.
+    uint32_t controller_id;  ///< Stable slot one through sixteen.
+    uint32_t instance_generation;  ///< Exact active controller generation.
+    uint8_t left_trigger;  ///< Latest normalized trigger zero through 255.
+    uint8_t right_trigger;  ///< Latest normalized trigger zero through 255.
+    int16_t left_stick_x;  ///< Latest normalized signed axis.
+    int16_t left_stick_y;  ///< Latest normalized signed axis.
+    int16_t right_stick_x;  ///< Latest normalized signed axis.
+    int16_t right_stick_y;  ///< Latest normalized signed axis.
+  } clsp_controller_state_t;
+
+  /** @brief Latest GameController gyro or accelerometer vector. */
+  typedef struct clsp_controller_sensor {
+    uint64_t sample_time_microseconds;  ///< Motion callback entry timestamp.
+    uint32_t controller_id;  ///< Stable slot one through sixteen.
+    uint32_t instance_generation;  ///< Exact active controller generation.
+    float x;  ///< X component.
+    float y;  ///< Y component.
+    float z;  ///< Z component.
+    uint8_t sensor_type;  ///< One gyro or two accelerometer.
+    uint8_t reserved_zero[3];  ///< Reserved and required to be zero.
+  } clsp_controller_sensor_t;
 
   /** @brief Low-rate telemetry snapshot copied across the ABI. */
   typedef struct clsp_telemetry_snapshot {
@@ -336,8 +376,31 @@ extern "C" {
     const clsp_input_edge_t *edge
   );
 
+  /** @brief Submit one GameController lifecycle or digital-button edge. */
+  clsp_status_t clsp_core_submit_controller_edge(clsp_core_t *core, const clsp_controller_edge_t *edge);
+
+  /** @brief Submit latest GameController trigger/stick state. */
+  clsp_status_t clsp_core_submit_controller_state(clsp_core_t *core, const clsp_controller_state_t *state);
+
+  /** @brief Submit latest GameController gyro or accelerometer state. */
+  clsp_status_t clsp_core_submit_controller_sensor(clsp_core_t *core, const clsp_controller_sensor_t *sensor);
+
   /** @brief Stop accepting samples and release native capture authority state. */
   clsp_status_t clsp_core_neutralize_input(clsp_core_t *core);
+
+  /**
+   * @brief Start preferred IOHID capture on a dedicated native dispatch queue.
+   *
+   * On failure, callbacks are quiesced before return so AppKit can safely
+   * become the sole fallback owner.
+   */
+  clsp_status_t clsp_core_start_apple_input_capture(
+    clsp_core_t *core,
+    clsp_apple_input_capture_t **output
+  );
+
+  /** @brief Quiesce callbacks, neutralize authority, and release a native capture owner. */
+  void clsp_apple_input_capture_stop(clsp_apple_input_capture_t *capture);
 
   /**
    * @brief Copy a low-rate telemetry snapshot.

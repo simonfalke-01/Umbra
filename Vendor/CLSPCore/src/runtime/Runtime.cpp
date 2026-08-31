@@ -318,6 +318,50 @@ namespace umbra::lsp {
 #endif
     }
 
+    [[nodiscard]] clsp_status_t submit_controller_edge(const clsp_controller_edge_t &edge) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (edge.sample_time_microseconds == 0 || edge.controller_id == 0 || edge.controller_id > 16 ||
+          edge.instance_generation == 0 || edge.kind < 5 || edge.kind > 8 || edge.reserved_zero != 0 ||
+          ((edge.kind == 7 || edge.kind == 8) && edge.control_id > 31)) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      CaptureRecord record {.kind = CaptureKind::controller_edge, .controller_edge = edge};
+      return enqueue_capture(record);
+#else
+      (void)edge;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t submit_controller_state(const clsp_controller_state_t &state) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (state.sample_time_microseconds == 0 || state.controller_id == 0 || state.controller_id > 16 ||
+          state.instance_generation == 0) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      CaptureRecord record {.kind = CaptureKind::controller_state, .controller_state = state};
+      return enqueue_capture(record);
+#else
+      (void)state;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t submit_controller_sensor(const clsp_controller_sensor_t &sensor) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (sensor.sample_time_microseconds == 0 || sensor.controller_id == 0 || sensor.controller_id > 16 ||
+          sensor.instance_generation == 0 || sensor.sensor_type < 1 || sensor.sensor_type > 2 ||
+          sensor.reserved_zero[0] != 0 || sensor.reserved_zero[1] != 0 || sensor.reserved_zero[2] != 0) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      CaptureRecord record {.kind = CaptureKind::controller_sensor, .controller_sensor = sensor};
+      return enqueue_capture(record);
+#else
+      (void)sensor;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
     /** @brief Stop new capture while retaining release edges until acknowledged. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
@@ -345,6 +389,9 @@ namespace umbra::lsp {
       pointer,  ///< Relative pointer sample.
       edge,  ///< Keyboard or pointer-button edge.
       neutralize,  ///< Stop accepting new physical state after queued releases.
+      controller_edge,  ///< Controller lifecycle or digital button edge.
+      controller_state,  ///< Latest controller triggers and sticks.
+      controller_sensor,  ///< Latest gyro or accelerometer sample.
     };
 
     /** @brief One allocation-free record copied from an Apple capture callback. */
@@ -352,6 +399,25 @@ namespace umbra::lsp {
       CaptureKind kind {CaptureKind::neutralize};  ///< Record kind.
       clsp_pointer_sample_t pointer {};  ///< Pointer fields when `kind` is pointer.
       clsp_input_edge_t edge {};  ///< Edge fields when `kind` is edge.
+      clsp_controller_edge_t controller_edge {};  ///< Controller edge fields.
+      clsp_controller_state_t controller_state {};  ///< Controller analog fields.
+      clsp_controller_sensor_t controller_sensor {};  ///< Controller sensor fields.
+    };
+
+    /** @brief Worker-owned latest controller analog state. */
+    struct ControllerLatest {
+      clsp_controller_state_t value {};  ///< Latest captured value.
+      std::uint64_t physical_ordinal {};  ///< Increasing native sample ordinal.
+      std::uint64_t last_sent_us {};  ///< Most recent network submission.
+      bool dirty {};  ///< Whether a newer sample awaits submission.
+    };
+
+    /** @brief Worker-owned latest controller sensor state. */
+    struct ControllerSensorLatest {
+      clsp_controller_sensor_t value {};  ///< Latest captured vector.
+      std::uint64_t physical_ordinal {};  ///< Increasing native sample ordinal.
+      std::uint64_t last_sent_us {};  ///< Most recent network submission.
+      bool dirty {};  ///< Whether a newer vector awaits submission.
     };
 
     /** @brief Increment one C ABI telemetry counter. */
@@ -611,15 +677,12 @@ namespace umbra::lsp {
       }
       for (;;) {
         CaptureRecord record;
-        pthread_mutex_lock(&mutex_);
-        if (capture_count_ == 0) {
-          pthread_mutex_unlock(&mutex_);
+        const auto read = capture_read_.load(std::memory_order_relaxed);
+        if (read == capture_write_.load(std::memory_order_acquire)) {
           return CLSP_STATUS_OK;
         }
-        record = capture_queue_[capture_head_];
-        capture_head_ = (capture_head_ + 1U) % capture_queue_capacity;
-        --capture_count_;
-        pthread_mutex_unlock(&mutex_);
+        record = capture_queue_[read];
+        capture_read_.store((read + 1U) % capture_queue_capacity, std::memory_order_release);
 
         if (record.kind == CaptureKind::neutralize) {
           capture_accepting_ = false;
@@ -694,6 +757,20 @@ namespace umbra::lsp {
       const auto pointer_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.pointer_rate);
       if (pointer_dirty_ && (last_pointer_sent_us_ == 0 || now - last_pointer_sent_us_ >= pointer_interval)) {
         return send_pointer(now);
+      }
+      const auto controller_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.controller_rate);
+      const auto sensor_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.sensor_rate);
+      for (std::size_t index = 0; index < controller_states_.size(); ++index) {
+        auto &state = controller_states_[index];
+        if (state.dirty && (state.last_sent_us == 0 || now - state.last_sent_us >= controller_interval)) {
+          return send_controller_state(index, now);
+        }
+        for (std::size_t sensor_index = 0; sensor_index < 2; ++sensor_index) {
+          auto &sensor = controller_sensors_[index][sensor_index];
+          if (sensor.dirty && (sensor.last_sent_us == 0 || now - sensor.last_sent_us >= sensor_interval)) {
+            return send_controller_sensor(index, sensor_index, now);
+          }
+        }
       }
       return CLSP_STATUS_OK;
     }
@@ -790,6 +867,80 @@ namespace umbra::lsp {
         pointer_composer_.mark_emitted();
         pointer_dirty_ = false;
         last_pointer_sent_us_ = now;
+      }
+      return status;
+    }
+
+    /** @brief Serialize and submit one exact 36-byte controller analog record. */
+    [[nodiscard]] clsp_status_t send_controller_state(const std::size_t index, const std::uint64_t now) noexcept {
+      auto &state = controller_states_[index];
+      std::array<std::uint8_t, 36> payload {};
+      payload[0] = 3;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(2, 2), 1);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(4, 4), state.value.controller_id);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(8, 4), state.value.instance_generation);
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(12, 2), 36);
+      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {payload}.subspan(16, 8), state.physical_ordinal);
+      payload[24] = state.value.left_trigger;
+      payload[25] = state.value.right_trigger;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(28, 2), std::bit_cast<std::uint16_t>(state.value.left_stick_x));
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(30, 2), std::bit_cast<std::uint16_t>(state.value.left_stick_y));
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(32, 2), std::bit_cast<std::uint16_t>(state.value.right_stick_x));
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(34, 2), std::bit_cast<std::uint16_t>(state.value.right_stick_y));
+      const auto sequence = next_state_sequence_;
+      const lumen::lsp::input_plane::common_header header {
+        .input_generation = input_configuration_.input_generation,
+        .kind = lumen::lsp::input_plane::packet_kind::device_state,
+        .state_sequence = sequence,
+        .sample_time_us = state.value.sample_time_microseconds,
+        .object_id = lumen::lsp::input_plane::make_device_object_id(lumen::lsp::input_plane::device_type::controller, state.value.controller_id),
+        .edge_watermark = latest_edge_id_,
+      };
+      bool submitted = false;
+      const auto status = send_input_packet(header, payload, now, submitted);
+      if (status == CLSP_STATUS_OK && submitted) {
+        latest_state_sequence_ = sequence;
+        ++next_state_sequence_;
+        state.last_sent_us = now;
+        state.dirty = false;
+      }
+      return status;
+    }
+
+    /** @brief Serialize and submit one exact 36-byte controller sensor record. */
+    [[nodiscard]] clsp_status_t send_controller_sensor(
+      const std::size_t index,
+      const std::size_t sensor_index,
+      const std::uint64_t now
+    ) noexcept {
+      auto &sensor = controller_sensors_[index][sensor_index];
+      std::array<std::uint8_t, 36> payload {};
+      payload[0] = 3;
+      payload[1] = sensor.value.sensor_type;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(2, 2), 1);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(4, 4), sensor.value.controller_id);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(8, 4), sensor.value.instance_generation);
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(12, 2), 36);
+      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {payload}.subspan(16, 8), sensor.physical_ordinal);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(24, 4), std::bit_cast<std::uint32_t>(sensor.value.x));
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(28, 4), std::bit_cast<std::uint32_t>(sensor.value.y));
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(32, 4), std::bit_cast<std::uint32_t>(sensor.value.z));
+      const auto sequence = next_state_sequence_;
+      const lumen::lsp::input_plane::common_header header {
+        .input_generation = input_configuration_.input_generation,
+        .kind = lumen::lsp::input_plane::packet_kind::sensor_state,
+        .state_sequence = sequence,
+        .sample_time_us = sensor.value.sample_time_microseconds,
+        .object_id = lumen::lsp::input_plane::make_sensor_object_id(sensor.value.controller_id, static_cast<lumen::lsp::input_plane::sensor_type>(sensor.value.sensor_type)),
+        .edge_watermark = latest_edge_id_,
+      };
+      bool submitted = false;
+      const auto status = send_input_packet(header, payload, now, submitted);
+      if (status == CLSP_STATUS_OK && submitted) {
+        latest_state_sequence_ = sequence;
+        ++next_state_sequence_;
+        sensor.last_sent_us = now;
+        sensor.dirty = false;
       }
       return status;
     }
@@ -1054,16 +1205,14 @@ namespace umbra::lsp {
 
     /** @brief Copy one capture record into the bounded native ring. */
     [[nodiscard]] clsp_status_t enqueue_capture(const CaptureRecord &record) noexcept {
-      pthread_mutex_lock(&mutex_);
-      if (capture_count_ == capture_queue_capacity) {
-        pthread_mutex_unlock(&mutex_);
+      const auto write = capture_write_.load(std::memory_order_relaxed);
+      const auto next = (write + 1U) % capture_queue_capacity;
+      if (next == capture_read_.load(std::memory_order_acquire)) {
         increment(RuntimeCounter::dropped);
         return CLSP_STATUS_RESOURCE_EXHAUSTED;
       }
-      capture_queue_[capture_tail_] = record;
-      capture_tail_ = (capture_tail_ + 1U) % capture_queue_capacity;
-      ++capture_count_;
-      pthread_mutex_unlock(&mutex_);
+      capture_queue_[write] = record;
+      capture_write_.store(next, std::memory_order_release);
       wake_worker();
       return CLSP_STATUS_OK;
     }
@@ -1135,14 +1284,15 @@ namespace umbra::lsp {
     clsp_input_configuration_t input_configuration_ {};  ///< Worker-owned active input mapping.
     lumen::lsp::input_plane::pointer_composer pointer_composer_;  ///< Cumulative relative pointer state.
     lumen::lsp::input_plane::edge_sender edge_sender_;  ///< Exactly-once retained edge window.
+    std::array<ControllerLatest, 16> controller_states_ {};  ///< Latest analog state by controller slot.
+    std::array<std::array<ControllerSensorLatest, 2>, 16> controller_sensors_ {};  ///< Latest gyro/accel states.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.
-    std::size_t capture_head_ {};  ///< Next capture record to consume.
-    std::size_t capture_tail_ {};  ///< Next free capture slot.
-    std::size_t capture_count_ {};  ///< Occupied capture slots.
+    std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
+    std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
     std::uint32_t connection_generation_ {};  ///< Zero through CLIENT_HELLO, then host-assigned generation.
     std::uint64_t baseline_id_ {};  ///< Current random neutral-baseline identifier.
@@ -1199,6 +1349,18 @@ namespace umbra::lsp {
 
   clsp_status_t Runtime::submit_input_edge(const clsp_input_edge_t &edge) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_input_edge(edge);
+  }
+
+  clsp_status_t Runtime::submit_controller_edge(const clsp_controller_edge_t &edge) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_controller_edge(edge);
+  }
+
+  clsp_status_t Runtime::submit_controller_state(const clsp_controller_state_t &state) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_controller_state(state);
+  }
+
+  clsp_status_t Runtime::submit_controller_sensor(const clsp_controller_sensor_t &sensor) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_controller_sensor(sensor);
   }
 
   clsp_status_t Runtime::neutralize_input() noexcept {
