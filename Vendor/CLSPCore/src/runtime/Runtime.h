@@ -85,6 +85,18 @@ namespace umbra::lsp {
       std::uint32_t deadline_milliseconds
     ) noexcept;
 
+    /** @brief Install an authenticated input-only START_RESPONSE mapping. */
+    [[nodiscard]] clsp_status_t configure_input(const clsp_input_configuration_t &configuration) noexcept;
+
+    /** @brief Queue one allocation-free relative-pointer capture record. */
+    [[nodiscard]] clsp_status_t submit_pointer(const clsp_pointer_sample_t &sample) noexcept;
+
+    /** @brief Queue one allocation-free keyboard or pointer-button edge. */
+    [[nodiscard]] clsp_status_t submit_input_edge(const clsp_input_edge_t &edge) noexcept;
+
+    /** @brief Neutralize and stop the current native input authority. */
+    [[nodiscard]] clsp_status_t neutralize_input() noexcept;
+
   private:
     class Impl;
     Impl *impl_ {};  ///< Nothrow-allocated platform implementation.

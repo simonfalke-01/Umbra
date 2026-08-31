@@ -206,6 +206,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let maximumConcurrentArtworkRequests: Int
     private let lspProduct: LSPProductClient?
     private let lspDiscovery = LSPDiscovery.makeBonjourBrowser()
+    private let lspInputCapture = LSPAppKitInputCapture()
     private var eventHandler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?
     private var sessionWarningDeliveryState = SessionWarningDeliveryState()
     private var artworkLoadingTasks: [String: Task<Void, Never>] = [:]
@@ -216,6 +217,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lastLegacyHosts: [HostDisplayModel] = []
     private var lastLSPHosts: [HostDisplayModel] = []
     private var discoveredLSPHosts: [UUID: HostDisplayModel] = [:]
+    private var lspApplicationIDs: [HostID: [Int: String]] = [:]
 
     init(
         service: UmbraApplicationService,
@@ -266,6 +268,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     lspDiscovery.stop()
                 }
             }
+        }
+        lspInputCapture.failureHandler = { [weak self] error in
+            self?.eventHandler?(.sessionWarning("Native LSP input stopped: \(error.localizedDescription)"))
         }
     }
 
@@ -338,6 +343,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             try await lspProduct.remove(hostID: hostID)
             lastLSPHosts.removeAll { $0.id == id }
             discoveredLSPHosts.removeValue(forKey: hostID)
+            lspApplicationIDs.removeValue(forKey: id)
             eventHandler?(.hosts(combinedHosts()))
             return
         }
@@ -392,6 +398,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     isDirectLaunch: false
                 ))
             }
+            lspApplicationIDs[id] = wireIDs
             return display
         }
         let catalog = try await applicationsPreservingLastCatalog(
@@ -445,10 +452,17 @@ final class LiveUmbraClientService: UmbraClientServicing {
         resume: Bool,
         activationUptime: TimeInterval
     ) async throws {
-        if lspHostID(hostID) != nil {
-            throw UmbraClientServiceError.unavailable(
-                "LSP application start is unavailable until START media negotiation is enabled. Umbra will not downgrade this authenticated LSP request to GameStream."
+        if let nativeHostID = lspHostID(hostID) {
+            guard let lspProduct, let applicationID = lspApplicationIDs[hostID]?[id.rawValue] else {
+                throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
+            }
+            let session = try await lspProduct.startInput(
+                hostID: nativeHostID,
+                applicationID: applicationID,
+                pointerRate: 1_000
             )
+            lspInputCapture.start(session: session)
+            return
         }
         do {
             let runtimeResolution = preferenceResolver(preferences.settings)
@@ -503,6 +517,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func disconnectSession() async {
+        lspInputCapture.stop()
         _ = try? await service.stopSession(quitHostApplication: false)
     }
 
@@ -1029,6 +1044,7 @@ final class LiveApplicationComposition {
     }
 
     func stopForApplicationTermination() async {
+        await clientService.disconnectSession()
         _ = try? await applicationService.stopSession(quitHostApplication: false)
     }
 

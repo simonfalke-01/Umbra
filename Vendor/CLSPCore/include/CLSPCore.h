@@ -122,6 +122,49 @@ extern "C" {
     clsp_const_byte_span_t payload;  ///< Transient deterministic-CBOR payload.
   } clsp_control_event_t;
 
+  /** @brief Exact input-only START_RESPONSE mapping installed in the native worker. */
+  typedef struct clsp_input_configuration {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_input_configuration_t)`.
+    uint32_t stream_generation;  ///< Nonzero negotiated stream generation.
+    uint32_t input_generation;  ///< Nonzero input authority generation.
+    uint32_t input_ssrc;  ///< Nonzero client input RTP SSRC.
+    uint32_t acknowledgement_ssrc;  ///< Distinct host LSPI SRTCP sender SSRC.
+    uint32_t pointer_rate;  ///< Selected pointer rate in 125 through 16,000 reports/s.
+    uint32_t controller_rate;  ///< Selected controller rate in 125 through 2,000 reports/s.
+    uint32_t sensor_rate;  ///< Selected sensor rate in 125 through 4,000 reports/s.
+    uint32_t reconciliation_rate;  ///< Selected reconciliation rate in 50 through 1,000 reports/s.
+    uint64_t reserved_input_wire_bits_per_second;  ///< Nonzero reserved rate no greater than 32 Mbps.
+    uint8_t input_payload_type;  ///< Dynamic RTP payload type in 96 through 127.
+    uint8_t baseline_required;  ///< Must equal one for a fresh authority.
+    uint16_t reserved_zero;  ///< Reserved and required to be zero.
+  } clsp_input_configuration_t;
+
+  /** @brief Allocation-free relative-pointer capture record. */
+  typedef struct clsp_pointer_sample {
+    uint64_t sample_time_microseconds;  ///< Nonzero client monotonic capture time.
+    int64_t delta_x;  ///< Relative horizontal delta.
+    int64_t delta_y;  ///< Relative vertical delta.
+    int64_t vertical_scroll;  ///< Relative vertical scroll delta.
+    int64_t horizontal_scroll;  ///< Relative horizontal scroll delta.
+  } clsp_pointer_sample_t;
+
+  /** @brief Physical input edge kinds accepted by the native capture boundary. */
+  typedef enum clsp_input_edge_kind {
+    CLSP_INPUT_EDGE_KEY_DOWN = 1,  ///< Keyboard HID usage became pressed.
+    CLSP_INPUT_EDGE_KEY_UP = 2,  ///< Keyboard HID usage became released.
+    CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN = 3,  ///< Pointer button became pressed.
+    CLSP_INPUT_EDGE_POINTER_BUTTON_UP = 4,  ///< Pointer button became released.
+  } clsp_input_edge_kind_t;
+
+  /** @brief Allocation-free keyboard or pointer-button transition. */
+  typedef struct clsp_input_edge {
+    uint64_t sample_time_microseconds;  ///< Nonzero client monotonic capture time.
+    uint16_t control_id;  ///< Keyboard-page HID usage or pointer button one through five.
+    uint8_t kind;  ///< One `clsp_input_edge_kind_t`.
+    uint8_t reserved_zero;  ///< Reserved and required to be zero.
+  } clsp_input_edge_t;
+
   /** @brief Low-rate telemetry snapshot copied across the ABI. */
   typedef struct clsp_telemetry_snapshot {
     uint32_t abi_version;  ///< Snapshot layout version.
@@ -274,6 +317,27 @@ extern "C" {
     clsp_const_byte_span_t payload,
     uint32_t deadline_milliseconds
   );
+
+  /** @brief Install one exact authenticated input-only START_RESPONSE mapping. */
+  clsp_status_t clsp_core_configure_input(
+    clsp_core_t *core,
+    const clsp_input_configuration_t *configuration
+  );
+
+  /** @brief Submit one relative-pointer sample to the native cumulative composer. */
+  clsp_status_t clsp_core_submit_pointer(
+    clsp_core_t *core,
+    const clsp_pointer_sample_t *sample
+  );
+
+  /** @brief Submit one ordered keyboard or pointer-button transition. */
+  clsp_status_t clsp_core_submit_input_edge(
+    clsp_core_t *core,
+    const clsp_input_edge_t *edge
+  );
+
+  /** @brief Stop accepting samples and release native capture authority state. */
+  clsp_status_t clsp_core_neutralize_input(clsp_core_t *core);
 
   /**
    * @brief Copy a low-rate telemetry snapshot.

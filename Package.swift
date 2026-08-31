@@ -99,6 +99,7 @@ let package = Package(
             path: "Vendor/CLSPCore",
             publicHeadersPath: "include",
             cxxSettings: [
+                .headerSearchPath("."),
                 .unsafeFlags(["-std=c++23", "-fno-exceptions", "-fno-rtti"]),
             ] + lspCoreCXXSettings,
             linkerSettings: lspCoreLinkerSettings,

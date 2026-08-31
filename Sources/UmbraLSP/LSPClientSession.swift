@@ -8,6 +8,7 @@ public enum LSPClientSessionState: Equatable, Sendable {
     case idle
     case connecting
     case authenticated
+    case inputActive
     case stopped
     case failed(LSPTransportError)
 }
@@ -139,7 +140,7 @@ public actor LSPClientSession {
 
     /// Lists applications after pairing or reconnect authentication grants browse permission.
     public func listApplications() async throws -> [LSPApplication] {
-        guard state == .authenticated else { throw LSPTransportError.notAuthenticated }
+        guard state == .authenticated || state == .inputActive else { throw LSPTransportError.notAuthenticated }
         let event = try await transport.request(
             messageType: LSPControlMessageType.listApplications.rawValue,
             payload: try LSPControlWire.listApplications()
@@ -147,9 +148,57 @@ public actor LSPClientSession {
         return try LSPControlWire.applications(from: event)
     }
 
+    /// Starts the exact input-only vertical slice and installs its native SRTP mapping.
+    public func startInput(_ request: LSPInputStartRequest) async throws -> LSPInputStartResponse {
+        guard state == .authenticated else { throw LSPTransportError.notAuthenticated }
+        let event = try await transport.request(
+            messageType: LSPControlMessageType.start.rawValue,
+            payload: try LSPControlWire.start(request)
+        )
+        let response = try LSPControlWire.startResponse(from: event)
+        try transport.configureInput(response.nativeConfiguration)
+        state = .inputActive
+        return response
+    }
+
+    /// Sends one AppKit/IOHID relative-pointer record without actor or Task work per sample.
+    public nonisolated func submitPointer(
+        sampleTimeMicroseconds: UInt64,
+        deltaX: Int64,
+        deltaY: Int64,
+        verticalScroll: Int64 = 0,
+        horizontalScroll: Int64 = 0
+    ) throws {
+        try transport.submitPointer(
+            sampleTimeMicroseconds: sampleTimeMicroseconds,
+            deltaX: deltaX,
+            deltaY: deltaY,
+            verticalScroll: verticalScroll,
+            horizontalScroll: horizontalScroll
+        )
+    }
+
+    /// Sends one AppKit/IOHID keyboard or pointer-button edge synchronously.
+    public nonisolated func submitInputEdge(
+        sampleTimeMicroseconds: UInt64,
+        controlID: UInt16,
+        kind: LSPNativeInputEdgeKind
+    ) throws {
+        try transport.submitInputEdge(
+            sampleTimeMicroseconds: sampleTimeMicroseconds,
+            controlID: controlID,
+            kind: kind
+        )
+    }
+
+    /// Stops native capture after caller-submitted release edges.
+    public nonisolated func neutralizeInput() throws {
+        try transport.neutralizeInput()
+    }
+
     /// Stops and destroys transport authority.
     public func stop() throws {
-        guard state == .authenticated else { throw LSPTransportError.invalidState }
+        guard state == .authenticated || state == .inputActive else { throw LSPTransportError.invalidState }
         do {
             try transport.stop()
             hello = nil

@@ -11,6 +11,7 @@ indirect enum DeterministicCBORValue: Equatable {
     case unsigned(UInt64)
     case bytes(Data)
     case text(String)
+    case boolean(Bool)
     case array([DeterministicCBORValue])
     case map([DeterministicCBORPair])
 }
@@ -78,6 +79,8 @@ enum DeterministicCBOR {
             guard bytes.count <= 512 else { throw DeterministicCBORError.resourceLimit }
             appendArgument(UInt64(bytes.count), major: 3, to: &output)
             output.append(bytes)
+        case .boolean(let value):
+            output.append(value ? 0xF5 : 0xF4)
         case .array(let values):
             guard values.count <= 64 else { throw DeterministicCBORError.resourceLimit }
             appendArgument(UInt64(values.count), major: 4, to: &output)
@@ -133,7 +136,13 @@ enum DeterministicCBOR {
         let initial = data[cursor]
         cursor += 1
         let major = initial >> 5
-        let argument = try parseArgument(initial & 0x1F, data: data, cursor: &cursor)
+        let additional = initial & 0x1F
+        if major == 7 {
+            if additional == 20 { return .boolean(false) }
+            if additional == 21 { return .boolean(true) }
+            throw DeterministicCBORError.unsupported
+        }
+        let argument = try parseArgument(additional, data: data, cursor: &cursor)
         switch major {
         case 0:
             return .unsigned(argument)

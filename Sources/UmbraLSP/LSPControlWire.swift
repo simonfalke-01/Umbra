@@ -11,6 +11,8 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case authResponse = 0x0021
     case listApplications = 0x0100
     case applications = 0x0101
+    case start = 0x0200
+    case startResponse = 0x0201
 }
 
 /// Stable status codes in exact LSP control responses.
@@ -55,6 +57,39 @@ public struct LSPApplication: Equatable, Identifiable, Sendable {
     public var id: String
     public var name: String
     public var imagePath: String
+}
+
+/// Requested input-only START rates and aggregate wire budget.
+public struct LSPInputStartRequest: Equatable, Sendable {
+    public var applicationID: String
+    public var pointerRate: UInt32
+    public var controllerRate: UInt32
+    public var sensorRate: UInt32
+    public var reconciliationRate: UInt32
+    public var maximumInputWireBitsPerSecond: UInt64
+
+    public init(
+        applicationID: String,
+        pointerRate: UInt32 = 1_000,
+        controllerRate: UInt32 = 250,
+        sensorRate: UInt32 = 250,
+        reconciliationRate: UInt32 = 250,
+        maximumInputWireBitsPerSecond: UInt64 = 32_000_000
+    ) {
+        self.applicationID = applicationID
+        self.pointerRate = pointerRate
+        self.controllerRate = controllerRate
+        self.sensorRate = sensorRate
+        self.reconciliationRate = reconciliationRate
+        self.maximumInputWireBitsPerSecond = maximumInputWireBitsPerSecond
+    }
+}
+
+/// Exact input-only START_RESPONSE authority and native lane mapping.
+public struct LSPInputStartResponse: Equatable, Sendable {
+    public var sessionID: UUID
+    public var attachToken: Data
+    public var nativeConfiguration: LSPNativeInputConfiguration
 }
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
@@ -197,6 +232,72 @@ public enum LSPControlWire {
             let imagePath = try text(fields[2], maximum: 512, allowEmpty: true)
             return LSPApplication(id: id, name: name, imagePath: imagePath)
         }
+    }
+
+    public static func start(_ request: LSPInputStartRequest) throws -> Data {
+        guard !request.applicationID.isEmpty, request.applicationID.utf8.count <= 128,
+              (125...16_000).contains(request.pointerRate),
+              (125...2_000).contains(request.controllerRate),
+              (125...4_000).contains(request.sensorRate),
+              (50...1_000).contains(request.reconciliationRate),
+              (1...32_000_000).contains(request.maximumInputWireBitsPerSecond)
+        else {
+            throw DeterministicCBORError.malformed
+        }
+        return try encodeMap([
+            .unsigned(1),
+            .text(request.applicationID),
+            .unsigned(UInt64(request.pointerRate)),
+            .unsigned(UInt64(request.controllerRate)),
+            .unsigned(UInt64(request.sensorRate)),
+            .unsigned(UInt64(request.reconciliationRate)),
+            .unsigned(request.maximumInputWireBitsPerSecond),
+        ])
+    }
+
+    public static func startResponse(from event: LSPControlEvent) throws -> LSPInputStartResponse {
+        let values = try responseValues(event, type: .startResponse, count: 15)
+        try requireSuccess(values[1])
+        let sessionID = try uuid(try bytes(values[2], count: 16))
+        let attachToken = try bytes(values[3], count: 32)
+        let streamGeneration = try uint32(values[4], nonzero: true)
+        let inputGeneration = try uint32(values[5], nonzero: true)
+        let inputSSRC = try uint32(values[6], nonzero: true)
+        let acknowledgementSSRC = try uint32(values[7], nonzero: true)
+        let payloadType = try uint32(values[8], nonzero: true)
+        let pointerRate = try uint32(values[9], nonzero: true)
+        let controllerRate = try uint32(values[10], nonzero: true)
+        let sensorRate = try uint32(values[11], nonzero: true)
+        let reconciliationRate = try uint32(values[12], nonzero: true)
+        let reservedBudget = try uint(values[13])
+        guard inputSSRC != acknowledgementSSRC,
+              (96...127).contains(payloadType),
+              (125...16_000).contains(pointerRate),
+              (125...2_000).contains(controllerRate),
+              (125...4_000).contains(sensorRate),
+              (50...1_000).contains(reconciliationRate),
+              (1...32_000_000).contains(reservedBudget),
+              case .boolean(true) = values[14]
+        else {
+            throw DeterministicCBORError.malformed
+        }
+        return LSPInputStartResponse(
+            sessionID: sessionID,
+            attachToken: attachToken,
+            nativeConfiguration: LSPNativeInputConfiguration(
+                streamGeneration: streamGeneration,
+                inputGeneration: inputGeneration,
+                inputSSRC: inputSSRC,
+                acknowledgementSSRC: acknowledgementSSRC,
+                inputPayloadType: UInt8(payloadType),
+                pointerRate: pointerRate,
+                controllerRate: controllerRate,
+                sensorRate: sensorRate,
+                reconciliationRate: reconciliationRate,
+                reservedInputWireBitsPerSecond: reservedBudget,
+                baselineRequired: true
+            )
+        )
     }
 
     private static func responseValues(

@@ -41,10 +41,13 @@ The separate native LSP path owns `_lumen-stream._udp` discovery, strict
 invitation import, a stable owner-private LSP-only Ed25519 identity, fresh LSP
 trust, a nonblocking UDP/kqueue worker, exact-policy wolfSSL 5.9.2 DTLS 1.3,
 SPKI pinning, DTLS-SRTP export, libSRTP 2.8.0 replay/authentication contexts,
-and reliable LSPC control. Swift receives authenticated control responses, not
-UDP packets. Pairing, reconnect authentication, and application browsing are
-wired into the product. Until START installs negotiated native lanes, launch
-fails explicitly and never downgrades to GameStream.
+reliable LSPC control, and the input-only START slice. Swift receives
+authenticated control responses, not UDP packets. Pairing, reconnect
+authentication, application browsing, START, the neutral baseline, cumulative
+pointer state, exactly-once keyboard/pointer-button edges, SRTP protection, and
+LSPI retirement are wired into the product. Focused-window AppKit capture is
+the active fallback and restores the prior mouse-coalescing setting at stop.
+IOHID and GameController native adapters remain the next capture upgrade.
 
 ## Session policies
 

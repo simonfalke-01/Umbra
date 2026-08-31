@@ -1,5 +1,6 @@
 import Foundation
 import UmbraCore
+import UmbraLSPTransport
 
 /// Coarse product owner for LSP persistence, pairing, auth, and application browsing.
 public actor LSPProductClient {
@@ -71,7 +72,7 @@ public actor LSPProductClient {
             throw LSPControlStatus.authenticationFailed
         }
         let session: LSPClientSession
-        if let existing = sessions[hostID], await existing.state == .authenticated {
+        if let existing = sessions[hostID], [.authenticated, .inputActive].contains(await existing.state) {
             session = existing
         } else {
             let created = try await LSPClientSession.persistent(identityStore: identityStore)
@@ -88,9 +89,26 @@ public actor LSPProductClient {
         return try await session.listApplications()
     }
 
+    /// Starts the negotiated input-only session for one authenticated native application.
+    public func startInput(
+        hostID: UUID,
+        applicationID: String,
+        pointerRate: UInt32 = 1_000
+    ) async throws -> LSPClientSession {
+        _ = try await applications(hostID: hostID)
+        guard let session = sessions[hostID], await session.state == .authenticated else {
+            throw LSPTransportError.notAuthenticated
+        }
+        _ = try await session.startInput(LSPInputStartRequest(
+            applicationID: applicationID,
+            pointerRate: pointerRate
+        ))
+        return session
+    }
+
     /// Removes only native LSP host/trust state and stops its session.
     public func remove(hostID: UUID) async throws {
-        if let session = sessions.removeValue(forKey: hostID), await session.state == .authenticated {
+        if let session = sessions.removeValue(forKey: hostID), [.authenticated, .inputActive].contains(await session.state) {
             try await session.stop()
         }
         _ = try await trustStore.update { snapshot in

@@ -7,6 +7,8 @@
 
 #include "SecurityProviders.h"
 #include "../core/control.h"
+#include "../core/rtp.h"
+#include "../input_plane/input_plane.h"
 
 #include <array>
 #include <atomic>
@@ -29,6 +31,8 @@
   #include <sys/socket.h>
   #include <sys/time.h>
   #include <unistd.h>
+  #include <wolfssl/options.h>
+  #include <wolfssl/wolfcrypt/hash.h>
 #endif
 
 namespace umbra::lsp {
@@ -38,6 +42,7 @@ namespace umbra::lsp {
     constexpr std::size_t maximum_control_frame = lumen::lsp::lspc_header_size + maximum_control_payload;
     constexpr std::size_t receive_batch_size = 64;  ///< Initial bounded receive batch.
     constexpr std::size_t control_queue_capacity = 64;  ///< Bounded pre-wire control queue.
+    constexpr std::size_t capture_queue_capacity = 4'096;  ///< Bounded allocation-free Apple capture ring.
 
     /** @brief RFC 7983 first-byte classification. */
     enum class PacketClass : std::uint8_t {
@@ -246,6 +251,86 @@ namespace umbra::lsp {
 #endif
     }
 
+    /** @brief Queue one authenticated START-selected input mapping. */
+    [[nodiscard]] clsp_status_t configure_input(const clsp_input_configuration_t &configuration) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      if (configuration.abi_version != CLSP_CORE_ABI_VERSION ||
+          configuration.structure_size != sizeof(clsp_input_configuration_t) ||
+          configuration.stream_generation == 0 || configuration.input_generation == 0 ||
+          configuration.input_ssrc == 0 || configuration.acknowledgement_ssrc == 0 ||
+          configuration.input_ssrc == configuration.acknowledgement_ssrc ||
+          configuration.input_payload_type < 96U || configuration.input_payload_type > 127U ||
+          configuration.pointer_rate < 125U || configuration.pointer_rate > 16'000U ||
+          configuration.controller_rate < 125U || configuration.controller_rate > 2'000U ||
+          configuration.sensor_rate < 125U || configuration.sensor_rate > 4'000U ||
+          configuration.reconciliation_rate < 50U || configuration.reconciliation_rate > 1'000U ||
+          configuration.reserved_input_wire_bits_per_second == 0 ||
+          configuration.reserved_input_wire_bits_per_second > 32'000'000U ||
+          configuration.baseline_required != 1U || configuration.reserved_zero != 0) {
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
+      pthread_mutex_lock(&mutex_);
+      pending_input_configuration_ = configuration;
+      input_configuration_pending_ = true;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void)configuration;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Queue one bounded relative-pointer record. */
+    [[nodiscard]] clsp_status_t submit_pointer(const clsp_pointer_sample_t &sample) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire) || sample.sample_time_microseconds == 0) {
+        return sample.sample_time_microseconds == 0 ? CLSP_STATUS_INVALID_ARGUMENT : CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      CaptureRecord record {.kind = CaptureKind::pointer, .pointer = sample};
+      return enqueue_capture(record);
+#else
+      (void)sample;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Queue one bounded keyboard or pointer-button edge. */
+    [[nodiscard]] clsp_status_t submit_input_edge(const clsp_input_edge_t &edge) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      const auto known_kind = edge.kind >= CLSP_INPUT_EDGE_KEY_DOWN && edge.kind <= CLSP_INPUT_EDGE_POINTER_BUTTON_UP;
+      const auto pointer = edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN || edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_UP;
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      if (edge.sample_time_microseconds == 0 || !known_kind || edge.reserved_zero != 0 || edge.control_id == 0 ||
+          (pointer && edge.control_id > 5U)) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      CaptureRecord record {.kind = CaptureKind::edge, .edge = edge};
+      return enqueue_capture(record);
+#else
+      (void)edge;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Stop new capture while retaining release edges until acknowledged. */
+    [[nodiscard]] clsp_status_t neutralize_input() noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      CaptureRecord record {.kind = CaptureKind::neutralize};
+      return enqueue_capture(record);
+#else
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
   private:
     /** @brief One bounded deterministic-CBOR request waiting for message-ID assignment. */
     struct ControlCommand {
@@ -253,6 +338,20 @@ namespace umbra::lsp {
       std::uint64_t request_id {};  ///< Caller-generated request ID.
       std::uint64_t deadline_microseconds {};  ///< Absolute retry deadline.
       lumen::lsp::packet_slab<maximum_control_payload> payload {};  ///< Copied deterministic-CBOR payload.
+    };
+
+    /** @brief Capture-record discriminator for the bounded native ring. */
+    enum class CaptureKind : std::uint8_t {
+      pointer,  ///< Relative pointer sample.
+      edge,  ///< Keyboard or pointer-button edge.
+      neutralize,  ///< Stop accepting new physical state after queued releases.
+    };
+
+    /** @brief One allocation-free record copied from an Apple capture callback. */
+    struct CaptureRecord {
+      CaptureKind kind {CaptureKind::neutralize};  ///< Record kind.
+      clsp_pointer_sample_t pointer {};  ///< Pointer fields when `kind` is pointer.
+      clsp_input_edge_t edge {};  ///< Edge fields when `kind` is edge.
     };
 
     /** @brief Increment one C ABI telemetry counter. */
@@ -404,6 +503,21 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        status = process_input_configuration();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = drain_capture_queue();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = transmit_input();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
       }
     }
 
@@ -441,9 +555,9 @@ namespace umbra::lsp {
               break;
             }
             increment(RuntimeCounter::received);
-            // Lane/SSRC registration remains native. Until negotiated, authenticated
-            // packets are deliberately not surfaced to Swift or permitted side effects.
-            increment(RuntimeCounter::dropped);
+            if (!handle_authenticated_realtime(std::span<const std::uint8_t> {packet.data(), packet_length})) {
+              increment(RuntimeCounter::dropped);
+            }
             break;
           }
           case PacketClass::invalid:
@@ -452,6 +566,320 @@ namespace umbra::lsp {
         }
       }
       return CLSP_STATUS_OK;
+    }
+
+    /** @brief Install a pending input authority on the socket-owner thread. */
+    [[nodiscard]] clsp_status_t process_input_configuration() noexcept {
+      clsp_input_configuration_t selected {};
+      pthread_mutex_lock(&mutex_);
+      if (!input_configuration_pending_) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_OK;
+      }
+      selected = pending_input_configuration_;
+      input_configuration_pending_ = false;
+      pthread_mutex_unlock(&mutex_);
+
+      input_configuration_ = selected;
+      if (!pointer_composer_.reset(1, 1) || !edge_sender_.reset(selected.input_generation)) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      input_configured_ = true;
+      capture_accepting_ = true;
+      baseline_acknowledged_ = false;
+      baseline_id_ = (static_cast<std::uint64_t>(arc4random()) << 32U) | arc4random();
+      if (baseline_id_ == 0) {
+        baseline_id_ = 1;
+      }
+      baseline_last_sent_us_ = 0;
+      pointer_dirty_ = false;
+      pointer_ordinal_ = 0;
+      latest_edge_id_ = 0;
+      latest_state_sequence_ = 2;
+      next_state_sequence_ = 2;
+      rtp_sequence_ = static_cast<std::uint16_t>(arc4random());
+      input_tokens_bits_ = selected.reserved_input_wire_bits_per_second / 500U;
+      input_last_credit_us_ = monotonic_microseconds();
+      last_pointer_sent_us_ = 0;
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Move captured records into portable native composers. */
+    [[nodiscard]] clsp_status_t drain_capture_queue() noexcept {
+      if (!input_configured_) {
+        return CLSP_STATUS_OK;
+      }
+      for (;;) {
+        CaptureRecord record;
+        pthread_mutex_lock(&mutex_);
+        if (capture_count_ == 0) {
+          pthread_mutex_unlock(&mutex_);
+          return CLSP_STATUS_OK;
+        }
+        record = capture_queue_[capture_head_];
+        capture_head_ = (capture_head_ + 1U) % capture_queue_capacity;
+        --capture_count_;
+        pthread_mutex_unlock(&mutex_);
+
+        if (record.kind == CaptureKind::neutralize) {
+          capture_accepting_ = false;
+          pointer_dirty_ = false;
+          continue;
+        }
+        if (!capture_accepting_) {
+          continue;
+        }
+        if (record.kind == CaptureKind::pointer) {
+          ++pointer_ordinal_;
+          const auto result = pointer_composer_.add_relative(
+            1,
+            pointer_ordinal_,
+            record.pointer.delta_x,
+            record.pointer.delta_y,
+            record.pointer.vertical_scroll,
+            record.pointer.horizontal_scroll
+          );
+          if (result == lumen::lsp::input_plane::pointer_compose_result::accepted) {
+            pointer_dirty_ = true;
+            pointer_sample_time_us_ = record.pointer.sample_time_microseconds;
+          } else if (result != lumen::lsp::input_plane::pointer_compose_result::batch_full) {
+            return CLSP_STATUS_INTERNAL_FAILURE;
+          }
+          continue;
+        }
+
+        lumen::lsp::input_plane::edge_record edge {
+          .physical_time_us = record.edge.sample_time_microseconds,
+          .kind = static_cast<lumen::lsp::input_plane::edge_kind>(record.edge.kind),
+          .device = record.edge.kind <= CLSP_INPUT_EDGE_KEY_UP ?
+                      lumen::lsp::input_plane::device_type::keyboard :
+                      lumen::lsp::input_plane::device_type::pointer,
+          .control_id = record.edge.control_id,
+          .device_id = 1,
+          .instance_generation = 1,
+        };
+        std::uint64_t assigned_id = 0;
+        const auto result = edge_sender_.enqueue(edge, assigned_id);
+        if (result != lumen::lsp::input_plane::edge_send_result::accepted) {
+          return result == lumen::lsp::input_plane::edge_send_result::window_full ?
+                   CLSP_STATUS_RESOURCE_EXHAUSTED :
+                   CLSP_STATUS_INTERNAL_FAILURE;
+        }
+        latest_edge_id_ = assigned_id;
+      }
+    }
+
+    /** @brief Send baseline, due edge retries, and latest cumulative pointer state. */
+    [[nodiscard]] clsp_status_t transmit_input() noexcept {
+      if (!input_configured_) {
+        return CLSP_STATUS_OK;
+      }
+      const auto now = monotonic_microseconds();
+      replenish_input_credit(now);
+      if (!baseline_acknowledged_) {
+        if (baseline_last_sent_us_ == 0 || now - baseline_last_sent_us_ >= 20'000U) {
+          return send_baseline(now);
+        }
+        return CLSP_STATUS_OK;
+      }
+
+      std::array<lumen::lsp::input_plane::edge_record, 16> edges {};
+      const auto edge_count = edge_sender_.due_batch(now, 20'000U, edges);
+      if (edge_count != 0) {
+        const auto status = send_edges(std::span<const lumen::lsp::input_plane::edge_record> {edges.data(), edge_count}, now);
+        if (status != CLSP_STATUS_OK) {
+          return status;
+        }
+      }
+      const auto pointer_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.pointer_rate);
+      if (pointer_dirty_ && (last_pointer_sent_us_ == 0 || now - last_pointer_sent_us_ >= pointer_interval)) {
+        return send_pointer(now);
+      }
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Serialize and send the exact neutral one-part baseline. */
+    [[nodiscard]] clsp_status_t send_baseline(const std::uint64_t now) noexcept {
+      std::array<std::uint8_t, 16> baseline {'L', 'S', 'P', 'B', 1, 0, 0, 0};
+      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {baseline}.subspan(8, 8), latest_edge_id_);
+      std::array<std::uint8_t, 32> digest {};
+      if (wc_Sha256Hash(baseline.data(), static_cast<word32>(baseline.size()), digest.data()) != 0) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      std::array<std::uint8_t, lumen::lsp::input_plane::baseline_part_header_size + 16> part_bytes {};
+      const lumen::lsp::input_plane::baseline_part part {
+        .part_index = 0,
+        .part_count = 1,
+        .total_length = static_cast<std::uint32_t>(baseline.size()),
+        .part_offset = 0,
+        .part_length = static_cast<std::uint32_t>(baseline.size()),
+        .digest = digest,
+        .bytes = baseline,
+      };
+      if (lumen::lsp::input_plane::serialize_baseline_part(part, part_bytes) != lumen::lsp::input_plane::wire_error::none) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      const lumen::lsp::input_plane::common_header header {
+        .input_generation = input_configuration_.input_generation,
+        .kind = lumen::lsp::input_plane::packet_kind::baseline_part,
+        .state_sequence = 1,
+        .sample_time_us = now,
+        .object_id = baseline_id_,
+        .edge_watermark = latest_edge_id_,
+      };
+      bool submitted = false;
+      const auto status = send_input_packet(header, part_bytes, now, submitted);
+      if (status == CLSP_STATUS_OK && submitted) {
+        baseline_last_sent_us_ = now;
+      }
+      return status;
+    }
+
+    /** @brief Serialize and send one retained-until-ACK edge batch. */
+    [[nodiscard]] clsp_status_t send_edges(
+      const std::span<const lumen::lsp::input_plane::edge_record> edges,
+      const std::uint64_t now
+    ) noexcept {
+      std::array<std::uint8_t, 16U * lumen::lsp::input_plane::edge_record_size> payload {};
+      for (std::size_t index = 0; index < edges.size(); ++index) {
+        if (lumen::lsp::input_plane::serialize_edge_record(
+              edges[index],
+              std::span<std::uint8_t> {payload}.subspan(index * lumen::lsp::input_plane::edge_record_size)
+            ) != lumen::lsp::input_plane::wire_error::none) {
+          return CLSP_STATUS_INTERNAL_FAILURE;
+        }
+      }
+      const lumen::lsp::input_plane::common_header header {
+        .input_generation = input_configuration_.input_generation,
+        .kind = lumen::lsp::input_plane::packet_kind::edge_batch,
+        .state_sequence = latest_state_sequence_,
+        .sample_time_us = edges.back().physical_time_us,
+        .object_id = edges.back().edge_id,
+        .edge_watermark = edges.back().edge_id,
+      };
+      const auto live_payload = std::span<const std::uint8_t> {payload.data(), edges.size() * lumen::lsp::input_plane::edge_record_size};
+      bool submitted = false;
+      const auto status = send_input_packet(header, live_payload, now, submitted);
+      if (status == CLSP_STATUS_OK && submitted && !edge_sender_.mark_sent(edges.front().edge_id, edges.size(), now)) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      return status;
+    }
+
+    /** @brief Serialize and send the newest cumulative relative-pointer sample. */
+    [[nodiscard]] clsp_status_t send_pointer(const std::uint64_t now) noexcept {
+      std::array<std::uint8_t, lumen::lsp::input_plane::pointer_payload_size> payload {};
+      if (lumen::lsp::input_plane::serialize_pointer_payload(pointer_composer_.state(), payload) !=
+          lumen::lsp::input_plane::wire_error::none) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      const auto sequence = next_state_sequence_;
+      const lumen::lsp::input_plane::common_header header {
+        .input_generation = input_configuration_.input_generation,
+        .kind = lumen::lsp::input_plane::packet_kind::pointer_motion,
+        .state_sequence = sequence,
+        .sample_time_us = pointer_sample_time_us_,
+        .object_id = pointer_composer_.pointer_id(),
+        .edge_watermark = latest_edge_id_,
+      };
+      bool submitted = false;
+      const auto status = send_input_packet(header, payload, now, submitted);
+      if (status == CLSP_STATUS_OK && submitted) {
+        latest_state_sequence_ = sequence;
+        ++next_state_sequence_;
+        pointer_composer_.mark_emitted();
+        pointer_dirty_ = false;
+        last_pointer_sent_us_ = now;
+      }
+      return status;
+    }
+
+    /** @brief Wrap one checked input payload in RTP, protect in place, pace, and send. */
+    [[nodiscard]] clsp_status_t send_input_packet(
+      const lumen::lsp::input_plane::common_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now,
+      bool &submitted
+    ) noexcept {
+      submitted = false;
+      std::array<std::uint8_t, maximum_udp_payload> packet {};
+      const lumen::lsp::rtp_fixed_header rtp {
+        .payload_type = input_configuration_.input_payload_type,
+        .sequence_number = rtp_sequence_,
+        .timestamp = static_cast<std::uint32_t>(header.sample_time_us),
+        .ssrc = input_configuration_.input_ssrc,
+      };
+      const auto rtp_result = lumen::lsp::write_rtp_fixed_header(rtp, {}, packet);
+      if (!rtp_result) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      const auto input_destination = std::span<std::uint8_t> {packet}.subspan(rtp_result.bytes_written);
+      if (lumen::lsp::input_plane::serialize_packet(header, payload, input_destination) !=
+          lumen::lsp::input_plane::wire_error::none) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      auto length = rtp_result.bytes_written + lumen::lsp::input_plane::common_header_size + payload.size();
+      const auto charged_bits = static_cast<std::uint64_t>(length + 16U + 28U) * 8U;
+      if (charged_bits > input_tokens_bits_) {
+        return CLSP_STATUS_OK;
+      }
+      const auto status = srtp_.protect(packet, length, false);
+      if (status != CLSP_STATUS_OK) {
+        return status;
+      }
+      const auto sent = ::send(socket_, packet.data(), length, 0);
+      ++rtp_sequence_;
+      if (sent != static_cast<ssize_t>(length)) {
+        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
+      }
+      input_tokens_bits_ -= charged_bits;
+      submitted = true;
+      increment(RuntimeCounter::transmitted);
+      (void)now;
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Refill at most two milliseconds of dedicated input credit. */
+    void replenish_input_credit(const std::uint64_t now) noexcept {
+      if (now < input_last_credit_us_) {
+        input_last_credit_us_ = now;
+        return;
+      }
+      const auto elapsed = now - input_last_credit_us_;
+      const auto earned = elapsed > std::numeric_limits<std::uint64_t>::max() /
+                                      input_configuration_.reserved_input_wire_bits_per_second ?
+                            std::numeric_limits<std::uint64_t>::max() :
+                            elapsed * input_configuration_.reserved_input_wire_bits_per_second / 1'000'000U;
+      const auto capacity = input_configuration_.reserved_input_wire_bits_per_second / 500U;
+      input_tokens_bits_ = earned >= capacity || input_tokens_bits_ >= capacity - earned ?
+                             capacity : input_tokens_bits_ + earned;
+      input_last_credit_us_ = now;
+    }
+
+    /** @brief Parse authenticated SRTCP LSPI and retire baseline/edge state. */
+    [[nodiscard]] bool handle_authenticated_realtime(const std::span<const std::uint8_t> packet) noexcept {
+      if (!input_configured_ || packet.size() < 12U || (packet[0] >> 6U) != 2U || packet[1] != 204U) {
+        return false;
+      }
+      const auto words = lumen::lsp::wire::read_be<std::uint16_t>(packet.subspan(2, 2));
+      if ((static_cast<std::size_t>(words) + 1U) * 4U != packet.size() ||
+          lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != input_configuration_.acknowledgement_ssrc ||
+          !std::equal(lumen::lsp::input_plane::lspi_name.begin(), lumen::lsp::input_plane::lspi_name.end(), packet.begin() + 8)) {
+        return false;
+      }
+      const auto ack = lumen::lsp::input_plane::parse_lspi_ack(packet.subspan(12), input_configuration_.input_generation);
+      if (!ack) {
+        return false;
+      }
+      if (ack.value.accepted_baseline_id == baseline_id_) {
+        baseline_acknowledged_ = true;
+      }
+      edge_sender_.acknowledge(ack.value.contiguous_edge_id, ack.value.edge_reception_bitmap);
+      if ((ack.value.flags & static_cast<std::uint8_t>(lumen::lsp::input_plane::lspi_flag::baseline_requested)) != 0) {
+        baseline_acknowledged_ = false;
+        baseline_last_sent_us_ = 0;
+      }
+      return true;
     }
 
     /** @brief Receive one authenticated DTLS application record from wolfSSL. */
@@ -624,6 +1052,22 @@ namespace umbra::lsp {
       publish_lifecycle(CLSP_LIFECYCLE_FAILED);
     }
 
+    /** @brief Copy one capture record into the bounded native ring. */
+    [[nodiscard]] clsp_status_t enqueue_capture(const CaptureRecord &record) noexcept {
+      pthread_mutex_lock(&mutex_);
+      if (capture_count_ == capture_queue_capacity) {
+        pthread_mutex_unlock(&mutex_);
+        increment(RuntimeCounter::dropped);
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
+      capture_queue_[capture_tail_] = record;
+      capture_tail_ = (capture_tail_ + 1U) % capture_queue_capacity;
+      ++capture_count_;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+    }
+
     /** @brief Trigger the worker's EVFILT_USER wake source. */
     void wake_worker() noexcept {
       if (kqueue_ < 0) {
@@ -686,13 +1130,37 @@ namespace umbra::lsp {
     lumen::lsp::outbound_control_window<maximum_control_frame> outbound_window_;  ///< Byte-identical retry state.
     lumen::lsp::control_rto rto_;  ///< Local-path bounded RTO estimator.
     std::array<ControlCommand, control_queue_capacity> control_queue_ {};  ///< Pre-wire bounded queue.
+    std::array<CaptureRecord, capture_queue_capacity> capture_queue_ {};  ///< Allocation-free captured-input ring.
+    clsp_input_configuration_t pending_input_configuration_ {};  ///< Producer-copied pending input mapping.
+    clsp_input_configuration_t input_configuration_ {};  ///< Worker-owned active input mapping.
+    lumen::lsp::input_plane::pointer_composer pointer_composer_;  ///< Cumulative relative pointer state.
+    lumen::lsp::input_plane::edge_sender edge_sender_;  ///< Exactly-once retained edge window.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.
+    std::size_t capture_head_ {};  ///< Next capture record to consume.
+    std::size_t capture_tail_ {};  ///< Next free capture slot.
+    std::size_t capture_count_ {};  ///< Occupied capture slots.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
     std::uint32_t connection_generation_ {};  ///< Zero through CLIENT_HELLO, then host-assigned generation.
+    std::uint64_t baseline_id_ {};  ///< Current random neutral-baseline identifier.
+    std::uint64_t baseline_last_sent_us_ {};  ///< Most recent baseline submission time.
+    std::uint64_t pointer_ordinal_ {};  ///< Monotonic physical pointer sample ordinal.
+    std::uint64_t pointer_sample_time_us_ {};  ///< Newest captured pointer time.
+    std::uint64_t latest_edge_id_ {};  ///< Newest assigned physical edge identifier.
+    std::uint64_t latest_state_sequence_ {2};  ///< Latest sampled replaceable-state sequence.
+    std::uint64_t next_state_sequence_ {2};  ///< Next replaceable-state sequence.
+    std::uint64_t input_tokens_bits_ {};  ///< Dedicated input-pacer credit.
+    std::uint64_t input_last_credit_us_ {};  ///< Last token refill time.
+    std::uint64_t last_pointer_sent_us_ {};  ///< Last cumulative pointer submission time.
+    std::uint16_t rtp_sequence_ {};  ///< Input RTP sequence with libSRTP rollover tracking.
+    bool input_configuration_pending_ {};  ///< Producer installed a new START mapping.
+    bool input_configured_ {};  ///< Worker has an active input mapping.
+    bool capture_accepting_ {};  ///< New physical capture is authorized.
+    bool baseline_acknowledged_ {};  ///< LSPI accepted the current baseline.
+    bool pointer_dirty_ {};  ///< Cumulative pointer state has unsent reports.
   };
 
   Runtime::Runtime(const clsp_configuration_t &configuration, const RuntimeCallbacks callbacks) noexcept:
@@ -719,5 +1187,21 @@ namespace umbra::lsp {
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
                               impl_->send_control(message_type, request_id, payload, deadline_milliseconds);
+  }
+
+  clsp_status_t Runtime::configure_input(const clsp_input_configuration_t &configuration) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_input(configuration);
+  }
+
+  clsp_status_t Runtime::submit_pointer(const clsp_pointer_sample_t &sample) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_pointer(sample);
+  }
+
+  clsp_status_t Runtime::submit_input_edge(const clsp_input_edge_t &edge) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_input_edge(edge);
+  }
+
+  clsp_status_t Runtime::neutralize_input() noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->neutralize_input();
   }
 }  // namespace umbra::lsp

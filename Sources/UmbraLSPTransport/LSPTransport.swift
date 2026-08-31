@@ -112,6 +112,55 @@ public struct LSPControlEvent: Equatable, Sendable {
     public var payload: Data
 }
 
+/// Exact input-only START_RESPONSE mapping installed in the native packet worker.
+public struct LSPNativeInputConfiguration: Equatable, Sendable {
+    public var streamGeneration: UInt32
+    public var inputGeneration: UInt32
+    public var inputSSRC: UInt32
+    public var acknowledgementSSRC: UInt32
+    public var inputPayloadType: UInt8
+    public var pointerRate: UInt32
+    public var controllerRate: UInt32
+    public var sensorRate: UInt32
+    public var reconciliationRate: UInt32
+    public var reservedInputWireBitsPerSecond: UInt64
+    public var baselineRequired: Bool
+
+    public init(
+        streamGeneration: UInt32,
+        inputGeneration: UInt32,
+        inputSSRC: UInt32,
+        acknowledgementSSRC: UInt32,
+        inputPayloadType: UInt8,
+        pointerRate: UInt32,
+        controllerRate: UInt32,
+        sensorRate: UInt32,
+        reconciliationRate: UInt32,
+        reservedInputWireBitsPerSecond: UInt64,
+        baselineRequired: Bool
+    ) {
+        self.streamGeneration = streamGeneration
+        self.inputGeneration = inputGeneration
+        self.inputSSRC = inputSSRC
+        self.acknowledgementSSRC = acknowledgementSSRC
+        self.inputPayloadType = inputPayloadType
+        self.pointerRate = pointerRate
+        self.controllerRate = controllerRate
+        self.sensorRate = sensorRate
+        self.reconciliationRate = reconciliationRate
+        self.reservedInputWireBitsPerSecond = reservedInputWireBitsPerSecond
+        self.baselineRequired = baselineRequired
+    }
+}
+
+/// Native exactly-once input-edge kind.
+public enum LSPNativeInputEdgeKind: UInt8, Sendable {
+    case keyDown = 1
+    case keyUp = 2
+    case pointerButtonDown = 3
+    case pointerButtonUp = 4
+}
+
 /// Low-rate telemetry copied from the native packet core.
 public struct LSPTelemetrySnapshot: Equatable, Sendable {
     /// Coarse native lifecycle state.
@@ -361,6 +410,63 @@ public final class LSPTransport: @unchecked Sendable {
         _ handler: (@Sendable (LSPControlEvent) -> Void)?
     ) {
         callbackState.setEventHandler(handler)
+    }
+
+    /// Installs the exact authenticated input-only START_RESPONSE mapping.
+    public func configureInput(_ configuration: LSPNativeInputConfiguration) throws {
+        var native = clsp_input_configuration_t()
+        native.abi_version = Self.abiVersion
+        native.structure_size = UInt32(MemoryLayout<clsp_input_configuration_t>.size)
+        native.stream_generation = configuration.streamGeneration
+        native.input_generation = configuration.inputGeneration
+        native.input_ssrc = configuration.inputSSRC
+        native.acknowledgement_ssrc = configuration.acknowledgementSSRC
+        native.pointer_rate = configuration.pointerRate
+        native.controller_rate = configuration.controllerRate
+        native.sensor_rate = configuration.sensorRate
+        native.reconciliation_rate = configuration.reconciliationRate
+        native.reserved_input_wire_bits_per_second = configuration.reservedInputWireBitsPerSecond
+        native.input_payload_type = configuration.inputPayloadType
+        native.baseline_required = configuration.baselineRequired ? 1 : 0
+        try Self.requireSuccess(clsp_core_configure_input(core, &native))
+    }
+
+    /// Submits one relative-pointer sample directly to the native cumulative composer.
+    public func submitPointer(
+        sampleTimeMicroseconds: UInt64,
+        deltaX: Int64,
+        deltaY: Int64,
+        verticalScroll: Int64 = 0,
+        horizontalScroll: Int64 = 0
+    ) throws {
+        var sample = clsp_pointer_sample_t(
+            sample_time_microseconds: sampleTimeMicroseconds,
+            delta_x: deltaX,
+            delta_y: deltaY,
+            vertical_scroll: verticalScroll,
+            horizontal_scroll: horizontalScroll
+        )
+        try Self.requireSuccess(clsp_core_submit_pointer(core, &sample))
+    }
+
+    /// Submits one keyboard HID-usage or pointer-button lifecycle edge.
+    public func submitInputEdge(
+        sampleTimeMicroseconds: UInt64,
+        controlID: UInt16,
+        kind: LSPNativeInputEdgeKind
+    ) throws {
+        var edge = clsp_input_edge_t(
+            sample_time_microseconds: sampleTimeMicroseconds,
+            control_id: controlID,
+            kind: kind.rawValue,
+            reserved_zero: 0
+        )
+        try Self.requireSuccess(clsp_core_submit_input_edge(core, &edge))
+    }
+
+    /// Stops native input capture after queued release edges are retained for LSPI ACK.
+    public func neutralizeInput() throws {
+        try Self.requireSuccess(clsp_core_neutralize_input(core))
     }
 
     private static func makeNativeConfiguration(

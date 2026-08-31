@@ -334,6 +334,58 @@ extern "C" clsp_status_t clsp_core_send_control(
   return core->runtime->send_control(message_type, request_id, payload, deadline_milliseconds);
 }
 
+extern "C" clsp_status_t clsp_core_configure_input(
+  clsp_core_t *core,
+  const clsp_input_configuration_t *configuration
+) {
+  if (core == nullptr || configuration == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (core->callback_active.load(std::memory_order_acquire)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  if (core->runtime == nullptr || core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
+    return CLSP_STATUS_NOT_AUTHENTICATED;
+  }
+  return core->runtime->configure_input(*configuration);
+}
+
+extern "C" clsp_status_t clsp_core_submit_pointer(
+  clsp_core_t *core,
+  const clsp_pointer_sample_t *sample
+) {
+  if (core == nullptr || sample == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (core->callback_active.load(std::memory_order_acquire)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_pointer(*sample);
+}
+
+extern "C" clsp_status_t clsp_core_submit_input_edge(
+  clsp_core_t *core,
+  const clsp_input_edge_t *edge
+) {
+  if (core == nullptr || edge == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (core->callback_active.load(std::memory_order_acquire)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_input_edge(*edge);
+}
+
+extern "C" clsp_status_t clsp_core_neutralize_input(clsp_core_t *core) {
+  if (core == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (core->callback_active.load(std::memory_order_acquire)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->neutralize_input();
+}
+
 extern "C" clsp_status_t clsp_core_copy_telemetry(
   const clsp_core_t *core,
   clsp_telemetry_snapshot_t *output
