@@ -423,6 +423,42 @@ extern "C" clsp_status_t clsp_core_configure_audio(
   return core->runtime->configure_audio(*configuration);
 }
 
+extern "C" clsp_status_t clsp_core_wait_control_response(
+  clsp_core_t *core,
+  const std::uint64_t request_id,
+  const std::uint32_t timeout_milliseconds
+) {
+  if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->wait_control_response(request_id, timeout_milliseconds);
+}
+
+extern "C" clsp_status_t clsp_core_configure_microphone(
+  clsp_core_t *core,
+  const clsp_microphone_configuration_t *configuration
+) {
+  if (core == nullptr || configuration == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->configure_microphone(*configuration);
+}
+
+extern "C" clsp_status_t clsp_core_submit_microphone_packet(
+  clsp_core_t *core,
+  const clsp_const_byte_span_t opus_packet
+) {
+  if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_microphone_packet(opus_packet);
+}
+
+extern "C" clsp_status_t clsp_core_mark_microphone_discontinuity(clsp_core_t *core) {
+  if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->mark_microphone_discontinuity();
+}
+
+extern "C" clsp_status_t clsp_core_stop_microphone(clsp_core_t *core) {
+  if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->stop_microphone();
+}
+
 extern "C" clsp_status_t clsp_core_submit_pointer(
   clsp_core_t *core,
   const clsp_pointer_sample_t *sample

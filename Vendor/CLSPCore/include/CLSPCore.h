@@ -173,6 +173,23 @@ extern "C" {
     uint32_t rtp_timestamp;  ///< Corresponding 48-kHz RTP timestamp.
   } clsp_audio_timing_event_t;
 
+  /** @brief Exact reverse-microphone RTP/SRTP sender mapping. */
+  typedef struct clsp_microphone_configuration {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_microphone_configuration_t)`.
+    uint32_t stream_generation;  ///< Nonzero stream generation.
+    uint32_t microphone_generation;  ///< Nonzero microphone generation.
+    uint32_t microphone_ssrc;  ///< Nonzero client microphone SSRC.
+    uint32_t clock_rate;  ///< Exactly 48,000.
+    uint32_t bitrate;  ///< Selected 6,000 through 128,000 bits/s.
+    uint16_t frame_samples;  ///< Exactly 960.
+    uint16_t udp_payload_size;  ///< Exactly 1,200.
+    uint8_t microphone_payload_type;  ///< Dynamic RTP PT 96 through 127.
+    uint8_t channels;  ///< Exactly one.
+    uint8_t inband_fec;  ///< Boolean Opus in-band FEC selection.
+    uint8_t dtx;  ///< Boolean Opus DTX selection.
+  } clsp_microphone_configuration_t;
+
   /** @brief Exact input-only START_RESPONSE mapping installed in the native worker. */
   typedef struct clsp_input_configuration {
     uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
@@ -443,11 +460,36 @@ extern "C" {
     uint32_t deadline_milliseconds
   );
 
+  /** @brief Wait until one queued semantic response is submitted and cached. */
+  clsp_status_t clsp_core_wait_control_response(
+    clsp_core_t *core,
+    uint64_t request_id,
+    uint32_t timeout_milliseconds
+  );
+
   /** @brief Install exact host-audio SSRC/PT/generation admission before AUDIO_CONFIG_ACK. */
   clsp_status_t clsp_core_configure_audio(
     clsp_core_t *core,
     const clsp_audio_configuration_t *configuration
   );
+
+  /** @brief Install exact reverse-microphone sender mapping before semantic ACK. */
+  clsp_status_t clsp_core_configure_microphone(
+    clsp_core_t *core,
+    const clsp_microphone_configuration_t *configuration
+  );
+
+  /** @brief Queue one complete mono Opus packet into the bounded native mic sender. */
+  clsp_status_t clsp_core_submit_microphone_packet(
+    clsp_core_t *core,
+    clsp_const_byte_span_t opus_packet
+  );
+
+  /** @brief Mark the next microphone RTP packet as a capture discontinuity. */
+  clsp_status_t clsp_core_mark_microphone_discontinuity(clsp_core_t *core);
+
+  /** @brief Stop reverse microphone and discard all queued stale packets. */
+  clsp_status_t clsp_core_stop_microphone(clsp_core_t *core);
 
   /** @brief Install one exact authenticated input-only START_RESPONSE mapping. */
   clsp_status_t clsp_core_configure_input(

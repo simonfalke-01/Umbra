@@ -43,6 +43,8 @@ namespace umbra::lsp {
     constexpr std::size_t receive_batch_size = 64;  ///< Initial bounded receive batch.
     constexpr std::size_t control_queue_capacity = 64;  ///< Bounded pre-wire control queue.
     constexpr std::size_t capture_queue_capacity = 4'096;  ///< Bounded allocation-free Apple capture ring.
+    constexpr std::size_t microphone_queue_capacity = 3;  ///< Two live packets plus one SPSC sentinel slot.
+    constexpr std::size_t maximum_microphone_opus_bytes = 1'172;  ///< 1,200 minus RTP and SRTP tag.
 
     /** @brief RFC 7983 first-byte classification. */
     enum class PacketClass : std::uint8_t {
@@ -197,6 +199,8 @@ namespace umbra::lsp {
       if (!worker_started_) {
         return CLSP_STATUS_INVALID_STATE;
       }
+      microphone_active_.store(false, std::memory_order_release);
+      microphone_prepared_.store(false, std::memory_order_release);
       request_stop();
       join_worker();
       cleanup_platform();
@@ -233,6 +237,7 @@ namespace umbra::lsp {
       command.request_id = request_id;
       command.flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required);
       command.response = false;
+      command.activate_microphone = false;
       command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
       const auto now = monotonic_microseconds();
       const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
@@ -278,6 +283,7 @@ namespace umbra::lsp {
                       static_cast<std::uint8_t>(lumen::lsp::lspc_flag::response) |
                       (error_response ? static_cast<std::uint8_t>(lumen::lsp::lspc_flag::error_response) : 0U);
       command.response = true;
+      command.activate_microphone = message_type == 0x0215U && !error_response;
       command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
       const auto now = monotonic_microseconds();
       const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
@@ -290,6 +296,34 @@ namespace umbra::lsp {
       return CLSP_STATUS_OK;
 #else
       (void)message_type; (void)request_id; (void)payload; (void)error_response; (void)deadline_milliseconds;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t wait_control_response(
+      const std::uint64_t request_id,
+      const std::uint32_t timeout_milliseconds
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (request_id == 0 || timeout_milliseconds == 0 || timeout_milliseconds > 30'000U) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      timespec deadline {};
+      if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      const auto nanoseconds = static_cast<std::uint64_t>(timeout_milliseconds) * 1'000'000U;
+      deadline.tv_sec += static_cast<time_t>(nanoseconds / 1'000'000'000U);
+      deadline.tv_nsec += static_cast<long>(nanoseconds % 1'000'000'000U);
+      if (deadline.tv_nsec >= 1'000'000'000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1'000'000'000L; }
+      pthread_mutex_lock(&mutex_);
+      while (completed_response_request_.load(std::memory_order_acquire) != request_id) {
+        const auto wait = pthread_cond_timedwait(&condition_, &mutex_, &deadline);
+        if (wait == ETIMEDOUT) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_TIMEOUT; }
+        if (wait != 0) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_INTERNAL_FAILURE; }
+      }
+      pthread_mutex_unlock(&mutex_);
+      return CLSP_STATUS_OK;
+#else
+      (void)request_id; (void)timeout_milliseconds;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
     }
@@ -308,6 +342,68 @@ namespace umbra::lsp {
       (void)configuration;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
+    }
+
+    [[nodiscard]] clsp_status_t configure_microphone(const clsp_microphone_configuration_t &configuration) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) return CLSP_STATUS_NOT_AUTHENTICATED;
+      if (!valid_microphone_configuration(configuration)) return CLSP_STATUS_INVALID_CONFIGURATION;
+      if (microphone_prepared_.load(std::memory_order_acquire)) {
+        return same_microphone_configuration(microphone_configuration_, configuration) ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+      }
+      microphone_configuration_ = configuration;
+      microphone_read_.store(0, std::memory_order_release);
+      microphone_write_.store(0, std::memory_order_release);
+      microphone_sequence_ = static_cast<std::uint16_t>(arc4random());
+      microphone_timestamp_ = arc4random();
+      microphone_marker_.store(true, std::memory_order_release);
+      microphone_packet_count_ = 0;
+      microphone_octet_count_ = 0;
+      microphone_last_report_us_ = 0;
+      microphone_last_credit_us_ = monotonic_microseconds();
+      const auto rate = microphone_pacing_rate(configuration);
+      microphone_tokens_bits_ = microphone_credit_capacity(configuration);
+      microphone_prepared_.store(true, std::memory_order_release);
+      return CLSP_STATUS_OK;
+#else
+      (void)configuration;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t submit_microphone_packet(const clsp_const_byte_span_t packet) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!microphone_prepared_.load(std::memory_order_acquire)) return CLSP_STATUS_INVALID_STATE;
+      if (packet.data == nullptr || packet.length == 0 || packet.length > maximum_microphone_opus_bytes) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      const auto write = microphone_write_.load(std::memory_order_relaxed);
+      const auto next = (write + 1U) % microphone_queue_capacity;
+      if (next == microphone_read_.load(std::memory_order_acquire)) {
+        microphone_marker_.store(true, std::memory_order_release);
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
+      microphone_queue_[write].assign(std::span<const std::uint8_t> {packet.data, packet.length});
+      microphone_write_.store(next, std::memory_order_release);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void)packet;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t mark_microphone_discontinuity() noexcept {
+      if (!microphone_active_.load(std::memory_order_acquire)) return CLSP_STATUS_INVALID_STATE;
+      microphone_marker_.store(true, std::memory_order_release);
+      return CLSP_STATUS_OK;
+    }
+
+    [[nodiscard]] clsp_status_t stop_microphone() noexcept {
+      microphone_active_.store(false, std::memory_order_release);
+      microphone_prepared_.store(false, std::memory_order_release);
+      microphone_read_.store(microphone_write_.load(std::memory_order_acquire), std::memory_order_release);
+      return CLSP_STATUS_OK;
     }
 
     /** @brief Queue one authenticated START-selected input mapping. */
@@ -499,6 +595,7 @@ namespace umbra::lsp {
       lumen::lsp::packet_slab<maximum_control_payload> payload {};  ///< Copied deterministic-CBOR payload.
       std::uint8_t flags {};  ///< Exact LSPC request/response/error flags.
       bool response {};  ///< Whether response cache insertion is required.
+      bool activate_microphone {};  ///< Enable prepared microphone only after ACK submission.
     };
 
     /** @brief One retained authenticated host request awaiting a semantic response. */
@@ -597,6 +694,45 @@ namespace umbra::lsp {
              left.mapping_length == right.mapping_length && left.inband_fec == right.inband_fec && left.dtx == right.dtx &&
              left.preroll_packets == right.preroll_packets &&
              std::equal(left.mapping, left.mapping + left.mapping_length, right.mapping);
+    }
+
+    [[nodiscard]] static bool valid_microphone_configuration(
+      const clsp_microphone_configuration_t &value
+    ) noexcept {
+      return value.abi_version == CLSP_CORE_ABI_VERSION &&
+             value.structure_size == sizeof(clsp_microphone_configuration_t) &&
+             value.stream_generation != 0 && value.microphone_generation != 0 && value.microphone_ssrc != 0 &&
+             value.clock_rate == 48'000U && value.bitrate >= 6'000U && value.bitrate <= 128'000U &&
+             value.frame_samples == 960U && value.udp_payload_size == 1'200U &&
+             value.microphone_payload_type >= 96U && value.microphone_payload_type <= 127U &&
+             value.channels == 1U && value.inband_fec <= 1U && value.dtx <= 1U;
+    }
+
+    [[nodiscard]] static bool same_microphone_configuration(
+      const clsp_microphone_configuration_t &left,
+      const clsp_microphone_configuration_t &right
+    ) noexcept {
+      return left.stream_generation == right.stream_generation &&
+             left.microphone_generation == right.microphone_generation &&
+             left.microphone_ssrc == right.microphone_ssrc && left.clock_rate == right.clock_rate &&
+             left.bitrate == right.bitrate && left.frame_samples == right.frame_samples &&
+             left.udp_payload_size == right.udp_payload_size &&
+             left.microphone_payload_type == right.microphone_payload_type && left.channels == right.channels &&
+             left.inband_fec == right.inband_fec && left.dtx == right.dtx;
+    }
+
+    [[nodiscard]] static std::uint64_t microphone_pacing_rate(
+      const clsp_microphone_configuration_t &value
+    ) noexcept {
+      return std::max<std::uint64_t>(64'000U, static_cast<std::uint64_t>(value.bitrate) * 3U / 2U);
+    }
+
+    [[nodiscard]] static std::uint64_t microphone_credit_capacity(
+      const clsp_microphone_configuration_t &value
+    ) noexcept {
+      const auto two_frame_quanta = microphone_pacing_rate(value) / 25U;
+      const auto two_path_packets = static_cast<std::uint64_t>(value.udp_payload_size + 28U) * 8U * 2U;
+      return std::max(two_frame_quanta, two_path_packets);
     }
 
     /** @brief Retain one exact host request until Swift installs and responds. */
@@ -780,6 +916,11 @@ namespace umbra::lsp {
           return;
         }
         status = transmit_input();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = transmit_microphone();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
           return;
@@ -1288,6 +1429,103 @@ namespace umbra::lsp {
       return CLSP_STATUS_OK;
     }
 
+    /** @brief Pace, protect, and submit at most one complete microphone Opus packet. */
+    [[nodiscard]] clsp_status_t transmit_microphone() noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!microphone_active_.load(std::memory_order_acquire)) return CLSP_STATUS_OK;
+      const auto now = monotonic_microseconds();
+      replenish_microphone_credit(now);
+      const auto read = microphone_read_.load(std::memory_order_relaxed);
+      if (read != microphone_write_.load(std::memory_order_acquire)) {
+        const auto opus = microphone_queue_[read].bytes();
+        const auto charged = static_cast<std::uint64_t>(12U + opus.size() + 16U + 28U) * 8U;
+        if (charged <= microphone_tokens_bits_) {
+          std::array<std::uint8_t, maximum_udp_payload> packet {};
+          const lumen::lsp::rtp_fixed_header header {
+            .marker = microphone_marker_.load(std::memory_order_acquire),
+            .payload_type = microphone_configuration_.microphone_payload_type,
+            .sequence_number = microphone_sequence_,
+            .timestamp = microphone_timestamp_,
+            .ssrc = microphone_configuration_.microphone_ssrc,
+          };
+          const auto written = lumen::lsp::write_rtp_fixed_header(header, {}, packet);
+          if (!written || written.bytes_written + opus.size() + 16U > microphone_configuration_.udp_payload_size) {
+            return CLSP_STATUS_INVALID_CONFIGURATION;
+          }
+          std::copy(opus.begin(), opus.end(), packet.begin() + static_cast<std::ptrdiff_t>(written.bytes_written));
+          auto length = written.bytes_written + opus.size();
+          const auto protected_status = srtp_.protect(packet, length, false);
+          if (protected_status != CLSP_STATUS_OK) return protected_status;
+          ++microphone_sequence_;
+          const auto sent = ::send(socket_, packet.data(), length, 0);
+          if (sent == static_cast<ssize_t>(length)) {
+            microphone_tokens_bits_ -= charged;
+            microphone_marker_.store(false, std::memory_order_release);
+            microphone_timestamp_ += 960U;
+            ++microphone_packet_count_;
+            microphone_octet_count_ += static_cast<std::uint32_t>(opus.size());
+            microphone_queue_[read].clear();
+            microphone_read_.store((read + 1U) % microphone_queue_capacity, std::memory_order_release);
+            increment(RuntimeCounter::transmitted);
+          } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return CLSP_STATUS_SOCKET_FAILURE;
+          }
+        }
+      }
+      if (microphone_packet_count_ != 0 &&
+          (microphone_last_report_us_ == 0 || now - microphone_last_report_us_ >= 1'000'000U)) {
+        return send_microphone_report(now);
+      }
+      return CLSP_STATUS_OK;
+#else
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Refill the reverse-microphone pacer below the dedicated input lane. */
+    void replenish_microphone_credit(const std::uint64_t now) noexcept {
+      if (now < microphone_last_credit_us_) { microphone_last_credit_us_ = now; return; }
+      const auto rate = microphone_pacing_rate(microphone_configuration_);
+      const auto elapsed = now - microphone_last_credit_us_;
+      const auto earned = elapsed > std::numeric_limits<std::uint64_t>::max() / rate ?
+                            std::numeric_limits<std::uint64_t>::max() : elapsed * rate / 1'000'000U;
+      const auto capacity = microphone_credit_capacity(microphone_configuration_);
+      microphone_tokens_bits_ = earned >= capacity || microphone_tokens_bits_ >= capacity - earned ?
+                                  capacity : microphone_tokens_bits_ + earned;
+      microphone_last_credit_us_ = now;
+    }
+
+    /** @brief Emit one protected RTCP sender report for the microphone timeline. */
+    [[nodiscard]] clsp_status_t send_microphone_report(const std::uint64_t now) noexcept {
+      std::array<std::uint8_t, 64> packet {};
+      packet[0] = 0x80;
+      packet[1] = 200;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan(2, 2), 6);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(4, 4), microphone_configuration_.microphone_ssrc);
+      timespec realtime {};
+      if (clock_gettime(CLOCK_REALTIME, &realtime) != 0 || realtime.tv_sec < 0 || realtime.tv_nsec < 0) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      constexpr std::uint64_t ntp_epoch_offset = 2'208'988'800ULL;
+      const auto ntp_seconds = static_cast<std::uint64_t>(realtime.tv_sec) + ntp_epoch_offset;
+      const auto ntp_fraction = static_cast<std::uint64_t>(realtime.tv_nsec) * (std::uint64_t {1} << 32U) / 1'000'000'000ULL;
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(8, 4), static_cast<std::uint32_t>(ntp_seconds));
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(12, 4), static_cast<std::uint32_t>(ntp_fraction));
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(16, 4), microphone_timestamp_ - 960U);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(20, 4), microphone_packet_count_);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(24, 4), microphone_octet_count_);
+      auto length = std::size_t {28};
+      const auto status = srtp_.protect(packet, length, true);
+      if (status != CLSP_STATUS_OK) return status;
+      const auto sent = ::send(socket_, packet.data(), length, 0);
+      if (sent != static_cast<ssize_t>(length)) {
+        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
+      }
+      microphone_last_report_us_ = now;
+      increment(RuntimeCounter::transmitted);
+      return CLSP_STATUS_OK;
+    }
+
     /** @brief Refill at most two milliseconds of dedicated input credit. */
     void replenish_input_credit(const std::uint64_t now) noexcept {
       if (now < input_last_credit_us_) {
@@ -1596,6 +1834,16 @@ namespace umbra::lsp {
           pending_request->occupied = false;
           pending_request->frame.clear();
         }
+        if (command.activate_microphone) {
+          if (!microphone_prepared_.load(std::memory_order_acquire)) return CLSP_STATUS_INVALID_STATE;
+          microphone_active_.store(true, std::memory_order_release);
+        }
+        if (command.response) {
+          completed_response_request_.store(command.request_id, std::memory_order_release);
+          pthread_mutex_lock(&mutex_);
+          pthread_cond_broadcast(&condition_);
+          pthread_mutex_unlock(&mutex_);
+        }
       }
       return CLSP_STATUS_OK;
     }
@@ -1726,10 +1974,18 @@ namespace umbra::lsp {
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::atomic<bool> audio_configured_ {false};  ///< Exact host-audio mapping admission gate.
     clsp_audio_configuration_t audio_configuration_ {};  ///< Installed audio generation/SSRC/PT tuple.
+    clsp_microphone_configuration_t microphone_configuration_ {};  ///< Installed reverse microphone tuple.
+    std::array<lumen::lsp::packet_slab<maximum_microphone_opus_bytes>, microphone_queue_capacity> microphone_queue_ {};  ///< Complete Opus SPSC queue.
+    std::atomic<std::size_t> microphone_read_ {0};  ///< Native sender queue read cursor.
+    std::atomic<std::size_t> microphone_write_ {0};  ///< Swift encoder queue write cursor.
+    std::atomic<bool> microphone_active_ {false};  ///< Capture-to-network admission state.
+    std::atomic<bool> microphone_prepared_ {false};  ///< Mapping/queue prepared before semantic ACK.
+    std::atomic<bool> microphone_marker_ {true};  ///< Marker for the next discontinuous packet.
     std::atomic<std::uint64_t> neutralize_requested_ {0};  ///< Latest synchronous neutralize token.
     std::atomic<std::uint64_t> neutralize_completed_ {0};  ///< Worker-completed neutralize token.
     std::atomic<std::uint64_t> input_configuration_requested_ {0};  ///< Latest synchronous mapping token.
     std::atomic<std::uint64_t> input_configuration_completed_ {0};  ///< Worker-installed mapping token.
+    std::atomic<std::uint64_t> completed_response_request_ {0};  ///< Last submitted/cached semantic response ID.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.
@@ -1749,6 +2005,13 @@ namespace umbra::lsp {
     std::uint64_t input_last_credit_us_ {};  ///< Last token refill time.
     std::uint64_t last_pointer_sent_us_ {};  ///< Last cumulative pointer submission time.
     std::uint16_t rtp_sequence_ {};  ///< Input RTP sequence with libSRTP rollover tracking.
+    std::uint16_t microphone_sequence_ {};  ///< Microphone RTP sequence.
+    std::uint32_t microphone_timestamp_ {};  ///< 48-kHz microphone RTP timestamp.
+    std::uint32_t microphone_packet_count_ {};  ///< Sender-report packet count.
+    std::uint32_t microphone_octet_count_ {};  ///< Sender-report Opus octet count.
+    std::uint64_t microphone_tokens_bits_ {};  ///< Reverse microphone pacing credit.
+    std::uint64_t microphone_last_credit_us_ {};  ///< Last microphone token refill.
+    std::uint64_t microphone_last_report_us_ {};  ///< Last microphone RTCP SR submission.
     bool input_configuration_pending_ {};  ///< Producer installed a new START mapping.
     bool input_configured_ {};  ///< Worker has an active input mapping.
     bool capture_accepting_ {};  ///< New physical capture is authorized.
@@ -1801,6 +2064,30 @@ namespace umbra::lsp {
 
   clsp_status_t Runtime::configure_audio(const clsp_audio_configuration_t &configuration) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_audio(configuration);
+  }
+
+  clsp_status_t Runtime::wait_control_response(
+    const std::uint64_t request_id,
+    const std::uint32_t timeout_milliseconds
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->wait_control_response(request_id, timeout_milliseconds);
+  }
+
+  clsp_status_t Runtime::configure_microphone(const clsp_microphone_configuration_t &configuration) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_microphone(configuration);
+  }
+
+  clsp_status_t Runtime::submit_microphone_packet(const clsp_const_byte_span_t opus_packet) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_microphone_packet(opus_packet);
+  }
+
+  clsp_status_t Runtime::mark_microphone_discontinuity() noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->mark_microphone_discontinuity();
+  }
+
+  clsp_status_t Runtime::stop_microphone() noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->stop_microphone();
   }
 
   clsp_status_t Runtime::configure_input(const clsp_input_configuration_t &configuration) noexcept {

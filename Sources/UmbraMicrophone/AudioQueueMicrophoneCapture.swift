@@ -98,6 +98,35 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
         stop()
     }
 
+    /// Probes creation of the real mono 48-kHz AudioQueue input without starting capture.
+    public static func isAvailable() -> Bool {
+        var format = AudioStreamBasicDescription(
+            mSampleRate: Double(ClientMicrophonePCMFrame.sampleRate),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian,
+            mBytesPerPacket: UInt32(MemoryLayout<Float>.size),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(MemoryLayout<Float>.size),
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var queue: AudioQueueRef?
+        let result = AudioQueueNewInput(
+            &format,
+            microphoneAvailabilityProbeCallback,
+            nil,
+            nil,
+            nil,
+            0,
+            &queue
+        )
+        if let queue {
+            AudioQueueDispose(queue, true)
+        }
+        return result == noErr && queue != nil
+    }
+
     public func start(
         frameHandler: @escaping @Sendable (ClientMicrophonePCMFrame) -> Void,
         discontinuityHandler: @escaping @Sendable () -> Void,
@@ -278,6 +307,8 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
         failureHandler = nil
     }
 }
+
+private let microphoneAvailabilityProbeCallback: AudioQueueInputCallback = { _, _, _, _, _, _ in }
 
 protocol AudioQueueInputResource: AnyObject, Sendable {
     func start() throws

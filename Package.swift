@@ -147,7 +147,7 @@ let package = Package(
         ),
         .target(
             name: "UmbraLSP",
-            dependencies: ["UmbraCore", "UmbraNetworking", "UmbraLSPTransport", "UmbraMedia", "UmbraOpus"],
+            dependencies: ["UmbraCore", "UmbraNetworking", "UmbraLSPTransport", "UmbraMedia", "UmbraOpus", "UmbraMicrophone"],
             path: "Sources/UmbraLSP"
         ),
         .target(

@@ -27,6 +27,8 @@ public struct LSPActiveInputAuthority: Equatable, Sendable {
     public var connectionGeneration: UInt32
     public var nativeConfiguration: LSPNativeInputConfiguration
     public var audioConfiguration: LSPNativeAudioConfiguration
+    public var microphoneConfiguration: LSPNativeMicrophoneConfiguration?
+    public var microphoneRequired: Bool
 }
 
 /// Coarse LSP client-session coordinator over the native packet/security core.
@@ -39,8 +41,14 @@ public actor LSPClientSession {
     private var clientNonce: Data?
     private var inputAuthority: LSPActiveInputAuthority?
     private let audioPlayout: LSPAudioPlayout
+    private let microphoneUplink: LSPMicrophoneUplink
     private var pendingAudioConfigurations: [LSPControlEvent] = []
     private var controlHandlerInstalled = false
+    private var pendingMicrophoneConfigurations: [LSPControlEvent] = []
+    private var installedAudioGeneration: UInt32?
+    private var installedMicrophoneGeneration: UInt32?
+    private var microphoneConfigurationTerminal = false
+    private var pendingRetirementPrevious: LSPClientSession?
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -50,6 +58,7 @@ public actor LSPClientSession {
         self.identity = identity
         transportProfile = configuration.profile
         audioPlayout = LSPAudioPlayout()
+        microphoneUplink = LSPMicrophoneUplink()
         transport.setAudioPacketHandler { [audioPlayout] packet in
             audioPlayout.submit(packet)
         }
@@ -193,6 +202,18 @@ public actor LSPClientSession {
             payload: try LSPControlWire.start(resolvedRequest)
         )
         let response = try LSPControlWire.startResponse(from: event)
+        if resolvedRequest.microphoneOffer?.required == true, response.microphoneConfiguration == nil {
+            throw LSPControlStatus.unsupportedMediaTuple
+        }
+        if let selected = response.microphoneConfiguration, let offered = resolvedRequest.microphoneOffer {
+            guard selected.bitrate <= offered.maximumBitrate,
+                  !selected.inbandFEC || offered.inbandFEC,
+                  !selected.dtx || offered.dtx else {
+                throw LSPTransportError.internalFailure
+            }
+        } else if response.microphoneConfiguration != nil {
+            throw LSPTransportError.internalFailure
+        }
         try transport.configureInput(response.nativeConfiguration)
         guard let hello else { throw LSPTransportError.internalFailure }
         inputAuthority = LSPActiveInputAuthority(
@@ -201,10 +222,16 @@ public actor LSPClientSession {
             attachToken: response.attachToken,
             connectionGeneration: hello.connectionGeneration,
             nativeConfiguration: response.nativeConfiguration,
-            audioConfiguration: response.audioConfiguration
+            audioConfiguration: response.audioConfiguration,
+            microphoneConfiguration: response.microphoneConfiguration,
+            microphoneRequired: resolvedRequest.microphoneOffer?.required ?? false
         )
+        installedAudioGeneration = nil
+        installedMicrophoneGeneration = nil
+        microphoneConfigurationTerminal = response.microphoneConfiguration == nil
         state = .inputActive
         await drainPendingAudioConfigurations()
+        await drainPendingMicrophoneConfigurations()
         return response
     }
 
@@ -251,6 +278,7 @@ public actor LSPClientSession {
                   response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.acknowledgementSSRC,
                   response.audioConfiguration.audioGeneration != prior.audioConfiguration.audioGeneration,
                   response.audioConfiguration.audioSSRC != prior.audioConfiguration.audioSSRC,
+                  microphoneAttachSelectionIsValid(response.microphoneConfiguration, prior: prior),
                   response.replacementAttachToken != prior.attachToken
             else {
                 throw LSPTransportError.internalFailure
@@ -262,11 +290,18 @@ public actor LSPClientSession {
                 attachToken: response.replacementAttachToken,
                 connectionGeneration: response.connectionGeneration,
                 nativeConfiguration: response.nativeConfiguration,
-                audioConfiguration: response.audioConfiguration
+                audioConfiguration: response.audioConfiguration,
+                microphoneConfiguration: response.microphoneConfiguration,
+                microphoneRequired: prior.microphoneRequired
             )
+            installedAudioGeneration = nil
+            installedMicrophoneGeneration = nil
+            microphoneConfigurationTerminal = response.microphoneConfiguration == nil
+            pendingRetirementPrevious = previous
             state = .inputActive
             await drainPendingAudioConfigurations()
-            await previous.retireAfterAttach()
+            await drainPendingMicrophoneConfigurations()
+            await completePendingRetirementIfReady()
             return response
         } catch {
             let attachError = error
@@ -341,7 +376,9 @@ public actor LSPClientSession {
             clientNonce = nil
             inputAuthority = nil
             pendingAudioConfigurations.removeAll(keepingCapacity: true)
+            pendingMicrophoneConfigurations.removeAll(keepingCapacity: true)
             audioPlayout.stop()
+            microphoneUplink.stop(transport: transport)
             state = .stopped
         } catch let error as LSPTransportError {
             state = .failed(error)
@@ -353,7 +390,9 @@ public actor LSPClientSession {
         try? transport.stop()
         inputAuthority = nil
         pendingAudioConfigurations.removeAll(keepingCapacity: true)
+        pendingMicrophoneConfigurations.removeAll(keepingCapacity: true)
         audioPlayout.stop()
+        microphoneUplink.stop(transport: transport)
         hello = nil
         clientNonce = nil
         state = .stopped
@@ -371,8 +410,11 @@ public actor LSPClientSession {
         guard !controlHandlerInstalled else { return }
         controlHandlerInstalled = true
         transport.setControlEventHandler { [weak self] event in
-            guard event.messageType == LSPControlMessageType.audioConfig.rawValue else { return }
-            Task { await self?.receiveAudioConfiguration(event) }
+            if event.messageType == LSPControlMessageType.audioConfig.rawValue {
+                Task { await self?.receiveAudioConfiguration(event) }
+            } else if event.messageType == LSPControlMessageType.microphoneConfig.rawValue {
+                Task { await self?.receiveMicrophoneConfiguration(event) }
+            }
         }
     }
 
@@ -415,6 +457,7 @@ public actor LSPClientSession {
                 playoutConfigured = true
                 try transport.configureAudio(request.nativeConfiguration)
                 status = .success
+                installedAudioGeneration = request.nativeConfiguration.audioGeneration
             } catch {
                 if playoutConfigured {
                     audioPlayout.stop()
@@ -442,6 +485,114 @@ public actor LSPClientSession {
             try? transport.stop()
             state = .failed(.internalFailure)
         }
+        await completePendingRetirementIfReady()
+    }
+
+    private func receiveMicrophoneConfiguration(_ event: LSPControlEvent) async {
+        guard inputAuthority != nil else {
+            if pendingMicrophoneConfigurations.count < 4 {
+                pendingMicrophoneConfigurations.append(event)
+            }
+            return
+        }
+        await processMicrophoneConfiguration(event)
+    }
+
+    private func drainPendingMicrophoneConfigurations() async {
+        let pending = pendingMicrophoneConfigurations
+        pendingMicrophoneConfigurations.removeAll(keepingCapacity: true)
+        for event in pending {
+            await processMicrophoneConfiguration(event)
+        }
+    }
+
+    private func processMicrophoneConfiguration(_ event: LSPControlEvent) async {
+        let request: LSPMicrophoneConfigurationRequest
+        do {
+            request = try LSPControlWire.microphoneConfig(from: event)
+        } catch {
+            microphoneUplink.stop(transport: transport)
+            try? transport.stop()
+            state = .failed(.internalFailure)
+            return
+        }
+        let status: LSPControlStatus
+        if let authority = inputAuthority,
+           authority.sessionID == request.sessionID,
+           authority.nativeConfiguration.streamGeneration == request.nativeConfiguration.streamGeneration,
+           authority.microphoneConfiguration == request.nativeConfiguration {
+            do {
+                try microphoneUplink.configure(
+                    request.nativeConfiguration,
+                    transport: transport,
+                    failureHandler: { [weak self] error in
+                        Task { await self?.microphoneCaptureFailed(error) }
+                    }
+                )
+                status = .success
+                installedMicrophoneGeneration = request.nativeConfiguration.microphoneGeneration
+            } catch {
+                microphoneUplink.stop(transport: transport)
+                status = .internalFailure
+            }
+        } else {
+            status = .staleGeneration
+        }
+        do {
+            try transport.sendControlResponse(
+                messageType: LSPControlMessageType.microphoneConfigAck.rawValue,
+                requestID: event.requestID,
+                payload: try LSPControlWire.microphoneConfigAck(
+                    status: status,
+                    sessionID: request.sessionID,
+                    microphoneGeneration: request.nativeConfiguration.microphoneGeneration
+                ),
+                errorResponse: status != .success
+            )
+            microphoneConfigurationTerminal = true
+        } catch {
+            microphoneUplink.stop(transport: transport)
+            try? transport.stop()
+            state = .failed(.internalFailure)
+            return
+        }
+        if status != .success, inputAuthority?.microphoneRequired == true {
+            state = .failed(.internalFailure)
+        }
+        await completePendingRetirementIfReady()
+    }
+
+    private func microphoneCaptureFailed(_ error: Error) {
+        _ = error
+        microphoneUplink.stop(transport: transport)
+        installedMicrophoneGeneration = nil
+        if inputAuthority?.microphoneRequired == true {
+            try? transport.stop()
+            state = .failed(.internalFailure)
+        }
+    }
+
+    private func completePendingRetirementIfReady() async {
+        guard let previous = pendingRetirementPrevious, let authority = inputAuthority else { return }
+        let audioReady = installedAudioGeneration == authority.audioConfiguration.audioGeneration
+        let microphoneReady = authority.microphoneConfiguration == nil || microphoneConfigurationTerminal
+        guard audioReady, microphoneReady else { return }
+        pendingRetirementPrevious = nil
+        await previous.retireAfterAttach()
+    }
+
+    private func microphoneAttachSelectionIsValid(
+        _ replacement: LSPNativeMicrophoneConfiguration?,
+        prior: LSPActiveInputAuthority
+    ) -> Bool {
+        guard let old = prior.microphoneConfiguration else { return replacement == nil }
+        guard let replacement else { return !prior.microphoneRequired }
+        return replacement.streamGeneration == old.streamGeneration &&
+               replacement.microphoneGeneration != old.microphoneGeneration &&
+               replacement.microphoneSSRC != old.microphoneSSRC &&
+               replacement.bitrate == old.bitrate &&
+               replacement.inbandFEC == old.inbandFEC &&
+               replacement.dtx == old.dtx
     }
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {

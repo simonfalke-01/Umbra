@@ -76,6 +76,16 @@ requests receive a byte-identical cached response without rebuilding audio.
 Reconnect uses a fresh audio generation/SSRC and retires the old decoder only
 after successful ATTACH; failed planned rekey leaves old audio functional.
 
+Reverse LSP microphone uses the existing owner-private permission preference,
+AudioQueue microphone capture, and mono 20-ms Opus encoder, but none of the
+legacy LMC1 UDP/AES framing. Complete Opus packets enter a two-packet native
+queue; CLSPCore owns microphone RTP sequence/timestamps, SRTP, pacing below
+input, discontinuity markers, and SRTCP sender reports. Capture and native
+mapping are prepared before the semantic MICROPHONE_CONFIG_ACK, while network
+transmission remains gated until that success ACK is actually submitted.
+Optional permission/capture failure returns a typed negative ACK and continues
+without microphone; required mode fails locally or marks the LSP session failed.
+
 ## Session policies
 
 An immutable effective policy is resolved once per session and passed through

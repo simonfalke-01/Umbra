@@ -219,6 +219,38 @@ public struct LSPAudioTiming: Equatable, Sendable {
     public var rtpTimestamp: UInt32
 }
 
+/// Exact native reverse-microphone RTP/SRTP sender tuple.
+public struct LSPNativeMicrophoneConfiguration: Equatable, Sendable {
+    public var streamGeneration: UInt32
+    public var microphoneGeneration: UInt32
+    public var microphoneSSRC: UInt32
+    public var microphonePayloadType: UInt8
+    public var bitrate: UInt32
+    public var inbandFEC: Bool
+    public var dtx: Bool
+    public var udpPayloadSize: UInt16
+
+    public init(
+        streamGeneration: UInt32,
+        microphoneGeneration: UInt32,
+        microphoneSSRC: UInt32,
+        microphonePayloadType: UInt8,
+        bitrate: UInt32,
+        inbandFEC: Bool,
+        dtx: Bool,
+        udpPayloadSize: UInt16
+    ) {
+        self.streamGeneration = streamGeneration
+        self.microphoneGeneration = microphoneGeneration
+        self.microphoneSSRC = microphoneSSRC
+        self.microphonePayloadType = microphonePayloadType
+        self.bitrate = bitrate
+        self.inbandFEC = inbandFEC
+        self.dtx = dtx
+        self.udpPayloadSize = udpPayloadSize
+    }
+}
+
 /// Native exactly-once input-edge kind.
 public enum LSPNativeInputEdgeKind: UInt8, Sendable {
     case keyDown = 1
@@ -529,6 +561,9 @@ public final class LSPTransport: @unchecked Sendable {
             )
         }
         try Self.requireSuccess(status)
+        try Self.requireSuccess(
+            clsp_core_wait_control_response(core, requestID, milliseconds)
+        )
     }
 
     /// Installs the exact authenticated input-only START_RESPONSE mapping.
@@ -577,6 +612,47 @@ public final class LSPTransport: @unchecked Sendable {
             configuration.mapping.withUnsafeBytes { source in destination.copyBytes(from: source) }
         }
         try Self.requireSuccess(clsp_core_configure_audio(core, &native))
+    }
+
+    /// Prepares the exact native microphone sender before semantic ACK activation.
+    public func configureMicrophone(_ configuration: LSPNativeMicrophoneConfiguration) throws {
+        var native = clsp_microphone_configuration_t()
+        native.abi_version = Self.abiVersion
+        native.structure_size = UInt32(MemoryLayout<clsp_microphone_configuration_t>.size)
+        native.stream_generation = configuration.streamGeneration
+        native.microphone_generation = configuration.microphoneGeneration
+        native.microphone_ssrc = configuration.microphoneSSRC
+        native.clock_rate = 48_000
+        native.bitrate = configuration.bitrate
+        native.frame_samples = 960
+        native.udp_payload_size = configuration.udpPayloadSize
+        native.microphone_payload_type = configuration.microphonePayloadType
+        native.channels = 1
+        native.inband_fec = configuration.inbandFEC ? 1 : 0
+        native.dtx = configuration.dtx ? 1 : 0
+        try Self.requireSuccess(clsp_core_configure_microphone(core, &native))
+    }
+
+    /// Queues one complete Opus packet into the two-packet native microphone sender.
+    public func submitMicrophonePacket(_ packet: Data) throws {
+        let status = packet.withUnsafeBytes { bytes in
+            clsp_core_submit_microphone_packet(
+                core,
+                clsp_const_byte_span_t(
+                    data: bytes.bindMemory(to: UInt8.self).baseAddress,
+                    length: bytes.count
+                )
+            )
+        }
+        try Self.requireSuccess(status)
+    }
+
+    public func markMicrophoneDiscontinuity() throws {
+        try Self.requireSuccess(clsp_core_mark_microphone_discontinuity(core))
+    }
+
+    public func stopMicrophone() throws {
+        try Self.requireSuccess(clsp_core_stop_microphone(core))
     }
 
     /// Submits one relative-pointer sample directly to the native cumulative composer.

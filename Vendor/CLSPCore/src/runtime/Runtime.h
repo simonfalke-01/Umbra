@@ -104,8 +104,26 @@ namespace umbra::lsp {
       std::uint32_t deadline_milliseconds
     ) noexcept;
 
+    /** @brief Wait for actual native submission/cache completion of a semantic response. */
+    [[nodiscard]] clsp_status_t wait_control_response(
+      std::uint64_t request_id,
+      std::uint32_t timeout_milliseconds
+    ) noexcept;
+
     /** @brief Install exact host-audio packet admission before semantic ACK. */
     [[nodiscard]] clsp_status_t configure_audio(const clsp_audio_configuration_t &configuration) noexcept;
+
+    /** @brief Install exact reverse microphone sender mapping. */
+    [[nodiscard]] clsp_status_t configure_microphone(const clsp_microphone_configuration_t &configuration) noexcept;
+
+    /** @brief Queue one complete Opus microphone packet. */
+    [[nodiscard]] clsp_status_t submit_microphone_packet(clsp_const_byte_span_t opus_packet) noexcept;
+
+    /** @brief Mark the next microphone packet as a discontinuity. */
+    [[nodiscard]] clsp_status_t mark_microphone_discontinuity() noexcept;
+
+    /** @brief Stop the microphone sender and discard queued stale packets. */
+    [[nodiscard]] clsp_status_t stop_microphone() noexcept;
 
     /** @brief Install an authenticated input-only START_RESPONSE mapping. */
     [[nodiscard]] clsp_status_t configure_input(const clsp_input_configuration_t &configuration) noexcept;

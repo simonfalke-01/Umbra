@@ -16,6 +16,13 @@ final class MonoOpusEncoderTests: XCTestCase {
         XCTAssertTrue(configuration.dtxEnabled)
     }
 
+    func testLSPSelectionCanDisableFECAndDTXWithoutChangingLegacyDefaults() throws {
+        let encoder = try MonoOpusEncoder(inbandFECEnabled: false, dtxEnabled: false)
+        let configuration = try encoder.configuration()
+        XCTAssertFalse(configuration.inbandFECEnabled)
+        XCTAssertFalse(configuration.dtxEnabled)
+    }
+
     func testEncodesOneTwentyMillisecondMonoFrameWithinProtocolCeiling() throws {
         let encoder = try MonoOpusEncoder()
         let samples = (0..<MonoOpusEncoder.samplesPerFrame).map { sample in

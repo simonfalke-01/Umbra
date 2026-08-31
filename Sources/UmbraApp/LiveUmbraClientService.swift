@@ -456,10 +456,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
             guard let lspProduct, let applicationID = lspApplicationIDs[hostID]?[id.rawValue] else {
                 throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
             }
+            let microphoneOffer = try await lspMicrophoneOffer()
             let session = try await lspProduct.startInput(
                 hostID: nativeHostID,
                 applicationID: applicationID,
-                pointerRate: 1_000
+                pointerRate: 1_000,
+                microphoneOffer: microphoneOffer
             )
             lspInputCapture.start(session: session)
             installLSPReconnectHandler(session: session, hostID: nativeHostID)
@@ -547,6 +549,35 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 }
             }
         }
+    }
+
+    private func lspMicrophoneOffer() async throws -> LSPMicrophoneOffer? {
+        let settings = preferences.settings
+        guard settings.clientMicrophoneEnabled else { return nil }
+        let authorization = SystemClientMicrophoneAuthorization()
+        let status = await authorization.requestAuthorization()
+        guard status.permitsCapture else {
+            if settings.clientMicrophoneRequired {
+                throw UmbraClientServiceError.unavailable(
+                    "Microphone forwarding is required, but macOS microphone access is not available."
+                )
+            }
+            return nil
+        }
+        guard AudioQueueMicrophoneCapture.isAvailable() else {
+            if settings.clientMicrophoneRequired {
+                throw UmbraClientServiceError.unavailable(
+                    "Microphone forwarding is required, but no usable AudioQueue input is available."
+                )
+            }
+            return nil
+        }
+        return LSPMicrophoneOffer(
+            maximumBitrate: 64_000,
+            inbandFEC: true,
+            dtx: true,
+            required: settings.clientMicrophoneRequired
+        )
     }
 
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws {

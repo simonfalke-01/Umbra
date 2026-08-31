@@ -46,7 +46,9 @@ public final class MonoOpusEncoder: @unchecked Sendable {
 
     public init(
         bitrate: Int32 = defaultBitrate,
-        packetLossPercentage: Int32 = defaultPacketLossPercentage
+        packetLossPercentage: Int32 = defaultPacketLossPercentage,
+        inbandFECEnabled: Bool = true,
+        dtxEnabled: Bool = true
     ) throws {
         var result = Int32(OPUS_OK)
         guard let encoder = opus_encoder_create(
@@ -61,9 +63,9 @@ public final class MonoOpusEncoder: @unchecked Sendable {
 
         let controls = [
             Int32(umbra_opus_encoder_set_bitrate(encoder, bitrate)),
-            Int32(umbra_opus_encoder_set_inband_fec(encoder, 1)),
+            Int32(umbra_opus_encoder_set_inband_fec(encoder, inbandFECEnabled ? 1 : 0)),
             Int32(umbra_opus_encoder_set_packet_loss_percentage(encoder, packetLossPercentage)),
-            Int32(umbra_opus_encoder_set_dtx(encoder, 1)),
+            Int32(umbra_opus_encoder_set_dtx(encoder, dtxEnabled ? 1 : 0)),
         ]
         if let failure = controls.first(where: { $0 != OPUS_OK }) {
             opus_encoder_destroy(encoder)

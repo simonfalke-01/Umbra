@@ -93,7 +93,8 @@ public actor LSPProductClient {
     public func startInput(
         hostID: UUID,
         applicationID: String,
-        pointerRate: UInt32 = 1_000
+        pointerRate: UInt32 = 1_000,
+        microphoneOffer: LSPMicrophoneOffer? = nil
     ) async throws -> LSPClientSession {
         _ = try await applications(hostID: hostID)
         guard let session = sessions[hostID], await session.state == .authenticated else {
@@ -101,7 +102,8 @@ public actor LSPProductClient {
         }
         _ = try await session.startInput(LSPInputStartRequest(
             applicationID: applicationID,
-            pointerRate: pointerRate
+            pointerRate: pointerRate,
+            microphoneOffer: microphoneOffer
         ))
         return session
     }
