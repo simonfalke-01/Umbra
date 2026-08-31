@@ -40,6 +40,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
     public let rtpTimestamp: UInt32
     public let isHDR: Bool
     public let colorSpace: UInt8
+    public let isFullRange: Bool
     public let hostCaptureTimeMicroseconds: UInt64
     public let appliedInputStateSequence: UInt64
     public let appliedInputEdgeID: UInt64
@@ -58,6 +59,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
         rtpTimestamp: UInt32 = 0,
         isHDR: Bool = false,
         colorSpace: UInt8 = 1,
+        isFullRange: Bool = true,
         hostCaptureTimeMicroseconds: UInt64 = 0,
         appliedInputStateSequence: UInt64 = 0,
         appliedInputEdgeID: UInt64 = 0,
@@ -75,6 +77,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
         self.rtpTimestamp = rtpTimestamp
         self.isHDR = isHDR
         self.colorSpace = colorSpace
+        self.isFullRange = isFullRange
         self.hostCaptureTimeMicroseconds = hostCaptureTimeMicroseconds
         self.appliedInputStateSequence = appliedInputStateSequence
         self.appliedInputEdgeID = appliedInputEdgeID
@@ -85,6 +88,7 @@ public struct CompressedVideoFrame: Sendable, Equatable {
 public enum VideoFrameDisposition: Int32, Sendable {
     case accepted = 0
     case requestKeyFrame = -1
+    case capacityDropped = 1
 }
 
 /// Synchronous, thread-safe boundary used by the streaming callback bridge.
@@ -771,6 +775,8 @@ public protocol MetalVideoRendering: AnyObject, Sendable {
     /// Installs a lifecycle-scoped signal fired after the first Metal command-buffer commit.
     /// This is a software presentation proxy, not physical scanout evidence.
     func installFirstPresentationProxyHandler(_ handler: @escaping @Sendable (Int) -> Void)
+    func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void)
+    func setMailboxDropNewest(_ enabled: Bool)
     func installTelemetryProfile(_ profile: StreamingTelemetryProfile)
     func installTelemetryClient(_ client: StreamingTelemetryClient)
 }
@@ -779,6 +785,9 @@ public extension MetalVideoRendering {
     func installFirstPresentationProxyHandler(_ handler: @escaping @Sendable (Int) -> Void) {
         _ = handler
     }
+
+    func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) { _ = handler }
+    func setMailboxDropNewest(_ enabled: Bool) { _ = enabled }
 
     func installTelemetryProfile(_ profile: StreamingTelemetryProfile) {
         _ = profile

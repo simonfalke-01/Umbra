@@ -191,6 +191,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         var latencyGeneration = MetalLatencyGenerationGate()
         var reportedFirstMetalCommit = false
         var lastError: MetalRendererError?
+        var dropsNewestWhenMailboxFull = false
     }
 
     private let layer: CAMetalLayer
@@ -210,6 +211,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     private var displayLink: CAMetalDisplayLink?
     private var displayLinkGeneration: UInt64?
     private var firstMetalCommitHandler: @Sendable (Int) -> Void = { _ in }
+    private var commandCommitHandler: @Sendable (Int) -> Void = { _ in }
     private var nominalFramesPerSecond: Double
     private var displayRefreshRate: Double
     #if DEBUG
@@ -481,6 +483,11 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             state.layerConfigurationGeneration &+= 1
         }
         if state.frames.count == maximumQueuedFrames {
+            if state.dropsNewestWhenMailboxFull {
+                state.statistics.record(.dropped(.queueOverflow), at: now)
+                lock.unlock()
+                return
+            }
             state.frames.removeFirst()
             state.statistics.record(.dropped(.queueOverflow), at: now)
         }
@@ -503,6 +510,14 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         lock.lock()
         firstMetalCommitHandler = handler
         lock.unlock()
+    }
+
+    public func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) {
+        lock.withLock { commandCommitHandler = handler }
+    }
+
+    public func setMailboxDropNewest(_ enabled: Bool) {
+        lock.withLock { state.dropsNewestWhenMailboxFull = enabled }
     }
 
     public func installTelemetryProfile(_ profile: StreamingTelemetryProfile) {
@@ -789,7 +804,9 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         let shouldReportFirstMetalCommit = !state.reportedFirstMetalCommit
         state.reportedFirstMetalCommit = true
         let firstMetalCommitHandler = self.firstMetalCommitHandler
+        let commandCommitHandler = self.commandCommitHandler
         lock.unlock()
+        commandCommitHandler(frame.frameNumber)
         if shouldReportFirstMetalCommit {
             firstMetalCommitHandler(frame.frameNumber)
         }

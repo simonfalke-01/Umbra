@@ -569,6 +569,41 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         )
     }
 
+    /// Prepares the existing Metal window/router for native LSP without manufacturing legacy state.
+    func prepareLSPVideo(applicationName: String, preferences: StreamingPreferences) async throws {
+        if let stopRequestTask { await stopRequestTask.value; self.stopRequestTask = nil }
+        presentationFinishTask = nil
+        windowModeCoordinator.setWindowActivationSuppressed(true)
+        fullscreenTeardown = StreamWindowTeardownStateMachine()
+        isSessionActive = true
+        isStopRequested = false
+        quitHostApplication = false
+        presentationRevealed = false
+        activeSessionID = UUID()
+        activePreferences = preferences
+        activeEffectivePolicy = .resolve(for: preferences)
+        window.title = applicationName
+        contentView.videoSize = CGSize(width: preferences.width, height: preferences.height)
+        contentView.directTouchMode = preferences.absoluteTouchMode
+        let targetScreen = resolvedScreen(for: preferences, currentScreen: nil, uiScreen: NSApp.keyWindow?.screen)
+        let generation = videoRenderer.prepareSession(mode: .metal)
+        activeRendererGeneration = generation
+        videoRenderer.setSessionPresentationProxyHandler { [weak self] generation, frameNumber in
+            Task { @MainActor [weak self] in
+                self?.revealPreparedPresentation(rendererGeneration: generation, frameNumber: frameNumber)
+            }
+        }
+        updateDisplayConfiguration(for: targetScreen, preferences: preferences, policy: .resolve(for: preferences))
+        await renderer?.awaitPresentationQuiescence()
+        await videoRenderer.awaitPreparedBackendReset()
+        guard videoRenderer.activatePreparedSession(generation: generation) else {
+            throw UmbraIntegrationError.mediaConfigurationFailed("LSP renderer activation was superseded.")
+        }
+        keepAwake.setActive(preferences.keepAwake, reason: "Umbra is streaming \(applicationName)")
+        controllers.start()
+        positionWindow(on: targetScreen, videoSize: contentView.videoSize)
+    }
+
     func updatePreparedSession(for bootstrap: StreamBootstrap) {
         guard isSessionActive, activeSessionID == bootstrap.sessionID else { return }
         activePreferences = bootstrap.preferences
@@ -1842,6 +1877,7 @@ final class NativeVideoRendererRouter: UmbraMedia.MetalVideoRendering, @unchecke
     private var videoSizeHandler: (@MainActor @Sendable (CGSize) -> Void)?
     private var firstPresentationProxyHandler: @Sendable (Int) -> Void = { _ in }
     private var sessionPresentationProxyHandler: @Sendable (UInt64, Int) -> Void = { _, _ in }
+    private var commandCommitHandler: @Sendable (Int) -> Void = { _ in }
 
     init(metal: MetalVideoRenderer?, sampleBuffer: SampleBufferVideoRenderer) {
         self.metal = metal
@@ -1938,6 +1974,14 @@ final class NativeVideoRendererRouter: UmbraMedia.MetalVideoRendering, @unchecke
         lock.withLock { firstPresentationProxyHandler = handler }
     }
 
+    func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) {
+        lock.withLock { commandCommitHandler = handler }
+    }
+
+    func setMailboxDropNewest(_ enabled: Bool) {
+        metal?.setMailboxDropNewest(enabled)
+    }
+
     func setSessionPresentationProxyHandler(
         _ handler: @escaping @Sendable (UInt64, Int) -> Void
     ) {
@@ -2023,6 +2067,11 @@ final class NativeVideoRendererRouter: UmbraMedia.MetalVideoRendering, @unchecke
     private func installBackendPresentationProxyDispatchers() {
         metal?.installFirstPresentationProxyHandler { [weak self] frameNumber in
             self?.handlePresentationProxy(frameNumber: frameNumber, source: .metal)
+        }
+        metal?.installCommandCommitHandler { [weak self] frameNumber in
+            guard let self else { return }
+            let handler = lock.withLock { commandCommitHandler }
+            handler(frameNumber)
         }
         sampleBuffer.installFirstPresentationProxyHandler { [weak self] frameNumber in
             self?.handlePresentationProxy(frameNumber: frameNumber, source: .sampleBuffer)

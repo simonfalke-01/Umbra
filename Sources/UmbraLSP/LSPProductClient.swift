@@ -1,6 +1,7 @@
 import Foundation
 import UmbraCore
 import UmbraLSPTransport
+import UmbraMedia
 
 /// Coarse product owner for LSP persistence, pairing, auth, and application browsing.
 public actor LSPProductClient {
@@ -8,24 +9,28 @@ public actor LSPProductClient {
     private let hostStore: JSONFileStore<LSPHostSnapshot>
     private let identityStore: JSONFileStore<LSPClientIdentitySnapshot>
     private var sessions: [UUID: LSPClientSession] = [:]
+    private let videoRenderer: (any MetalVideoRendering)?
 
     public init(
         trustStore: JSONFileStore<LSPTrustSnapshot>,
         hostStore: JSONFileStore<LSPHostSnapshot>,
-        identityStore: JSONFileStore<LSPClientIdentitySnapshot>
+        identityStore: JSONFileStore<LSPClientIdentitySnapshot>,
+        videoRenderer: (any MetalVideoRendering)? = nil
     ) {
         self.trustStore = trustStore
         self.hostStore = hostStore
         self.identityStore = identityStore
+        self.videoRenderer = videoRenderer
     }
 
     /// Creates a product client using Umbra's normal owner-private Application Support files.
-    public static func applicationSupport() throws -> LSPProductClient {
+    public static func applicationSupport(videoRenderer: (any MetalVideoRendering)? = nil) throws -> LSPProductClient {
         let stores = try LSPPersistence.applicationSupportStores()
         return LSPProductClient(
             trustStore: stores.trust,
             hostStore: stores.hosts,
-            identityStore: stores.identity
+            identityStore: stores.identity,
+            videoRenderer: videoRenderer
         )
     }
 
@@ -37,7 +42,7 @@ public actor LSPProductClient {
     /// Imports a single-use invitation, performs real pairing, and persists fresh LSP trust.
     public func pair(invitationURI: String) async throws -> LSPHostRecord {
         let invitation = try LSPPairingInvitation.decode(uri: invitationURI)
-        let session = try await LSPClientSession.persistent(identityStore: identityStore)
+        let session = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
         let trust = try await session.pair(invitation: invitation)
         let host = LSPHostRecord(
             hostID: invitation.hostID,
@@ -75,7 +80,7 @@ public actor LSPProductClient {
         if let existing = sessions[hostID], [.authenticated, .inputActive].contains(await existing.state) {
             session = existing
         } else {
-            let created = try await LSPClientSession.persistent(identityStore: identityStore)
+            let created = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
             let updatedTrust = try await created.authenticate(host: host, trust: trust)
             _ = try await trustStore.update { snapshot in
                 var snapshot = snapshot
@@ -94,7 +99,11 @@ public actor LSPProductClient {
         hostID: UUID,
         applicationID: String,
         pointerRate: UInt32 = 1_000,
-        microphoneOffer: LSPMicrophoneOffer? = nil
+        microphoneOffer: LSPMicrophoneOffer? = nil,
+        videoOffers: [LSPVideoOffer],
+        receiveBatchCapacity: UInt8 = 64,
+        decoderSurfaces: UInt8 = 3,
+        maximumCaptureToPresentMicroseconds: UInt32 = 50_000
     ) async throws -> LSPClientSession {
         _ = try await applications(hostID: hostID)
         guard let session = sessions[hostID], await session.state == .authenticated else {
@@ -103,7 +112,11 @@ public actor LSPProductClient {
         _ = try await session.startInput(LSPInputStartRequest(
             applicationID: applicationID,
             pointerRate: pointerRate,
-            microphoneOffer: microphoneOffer
+            microphoneOffer: microphoneOffer,
+            videoOffers: videoOffers,
+            receiveBatchCapacity: receiveBatchCapacity,
+            decoderSurfaces: decoderSurfaces,
+            maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds
         ))
         return session
     }
@@ -123,7 +136,7 @@ public actor LSPProductClient {
         else {
             throw LSPControlStatus.authenticationFailed
         }
-        let replacement = try await LSPClientSession.persistent(identityStore: identityStore)
+        let replacement = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
         let updatedTrust = try await replacement.authenticate(host: host, trust: trust)
         _ = try await trustStore.update { snapshot in
             var snapshot = snapshot
@@ -139,6 +152,11 @@ public actor LSPProductClient {
     /// Planned rekey is the same fresh-DTLS ATTACH path as reconnect.
     public func rekeyInput(hostID: UUID) async throws -> LSPClientSession {
         try await reconnectInput(hostID: hostID, reason: .plannedRekey)
+    }
+
+    public func stop(hostID: UUID) async {
+        guard let session = sessions[hostID], [.authenticated, .inputActive].contains(await session.state) else { return }
+        try? await session.stop()
     }
 
     /// Removes only native LSP host/trust state and stops its session.

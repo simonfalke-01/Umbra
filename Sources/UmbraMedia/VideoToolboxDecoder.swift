@@ -18,6 +18,11 @@ public enum VideoDecodeCapacityPolicy: Sendable, Equatable {
     case dropNewestWhenFull
 }
 
+public enum VideoDecodeCapacityOverflowBehavior: Sendable, Equatable {
+    case requestRecovery
+    case dropWithoutRecovery
+}
+
 public enum VideoDecoderError: Error, Sendable, Equatable, CustomStringConvertible {
     case unsupportedCodecMask(Int32)
     case unsupportedHardwareCodec(VideoCodec)
@@ -183,7 +188,7 @@ private final class DecodingFrameContext: @unchecked Sendable {
         self.recoveryEpochAtSubmission = recoveryEpochAtSubmission
         color = VideoColorMetadata(
             colorSpace: isHDR ? .rec2020 : VideoColorSpace(bridgeValue: frame.colorSpace),
-            range: .full,
+            range: frame.isFullRange ? .full : .video,
             transferFunction: isHDR ? (hdrStaticMetadata?.transferFunction ?? .pq) : .sdr,
             hdrStaticMetadata: isHDR ? hdrStaticMetadata : nil
         )
@@ -402,6 +407,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
     private let renderer: (any MetalVideoRendering)?
     private let policy: VideoDecoderPolicy
     private let capacityPolicy: VideoDecodeCapacityPolicy
+    private let capacityOverflowBehavior: VideoDecodeCapacityOverflowBehavior
     private let inFlightLimiter: VideoDecodeInFlightLimiter
     private let errorHandler: @Sendable (VideoDecoderError) -> Void
     private let firstFrameHandler: @Sendable (Int) -> Void
@@ -418,6 +424,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         policy: VideoDecoderPolicy = .automatic,
         maximumOutstandingFrames: Int = 5,
         capacityPolicy: VideoDecodeCapacityPolicy = .waitWhenFull,
+        capacityOverflowBehavior: VideoDecodeCapacityOverflowBehavior = .requestRecovery,
         telemetryProfile: StreamingTelemetryProfile = .unspecified,
         telemetryClient: StreamingTelemetryClient = .unspecified,
         errorHandler: @escaping @Sendable (VideoDecoderError) -> Void = { _ in },
@@ -427,6 +434,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         self.renderer = renderer
         self.policy = policy
         self.capacityPolicy = capacityPolicy
+        self.capacityOverflowBehavior = capacityOverflowBehavior
         self.inFlightLimiter = VideoDecodeInFlightLimiter(maximumCount: maximumOutstandingFrames)
         self.errorHandler = errorHandler
         self.firstFrameHandler = firstFrameHandler
@@ -448,6 +456,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         renderer: (any MetalVideoRendering)? = nil,
         policy: VideoDecoderPolicy = .automatic,
         capacityPolicy: VideoDecodeCapacityPolicy = .waitWhenFull,
+        capacityOverflowBehavior: VideoDecodeCapacityOverflowBehavior = .requestRecovery,
         telemetryProfile: StreamingTelemetryProfile = .unspecified,
         telemetryClient: StreamingTelemetryClient = .unspecified,
         errorHandler: @escaping @Sendable (VideoDecoderError) -> Void = { _ in },
@@ -459,6 +468,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         self.renderer = renderer
         self.policy = policy
         self.capacityPolicy = capacityPolicy
+        self.capacityOverflowBehavior = capacityOverflowBehavior
         self.inFlightLimiter = inFlightLimiter
         self.errorHandler = errorHandler
         self.firstFrameHandler = firstFrameHandler
@@ -824,14 +834,16 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             return .accepted
         }
         state.lastError = .queueFull
-        state.recovery.requireRecovery()
+        if capacityOverflowBehavior == .requestRecovery {
+            state.recovery.requireRecovery()
+        }
         state.statistics.record(.submitted, at: time)
         state.statistics.record(.dropped(.queueOverflow), at: time)
         state.statistics.record(.decoderError, at: time)
         state.statistics.record(.queueDepth(depth), at: time)
         lock.unlock()
         errorHandler(.queueFull)
-        return .requestKeyFrame
+        return capacityOverflowBehavior == .requestRecovery ? .requestKeyFrame : .capacityDropped
     }
 
     private func decode(

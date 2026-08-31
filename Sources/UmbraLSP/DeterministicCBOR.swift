@@ -72,7 +72,7 @@ enum DeterministicCBOR {
         case .unsigned(let integer):
             appendArgument(integer, major: 0, to: &output)
         case .bytes(let bytes):
-            guard bytes.count <= 64 else { throw DeterministicCBORError.resourceLimit }
+            guard bytes.count <= 1_024 else { throw DeterministicCBORError.resourceLimit }
             appendArgument(UInt64(bytes.count), major: 2, to: &output)
             output.append(bytes)
         case .text(let text):
@@ -91,7 +91,7 @@ enum DeterministicCBOR {
                 try append(value, to: &output, depth: depth + 1)
             }
         case .map(let pairs):
-            guard pairs.count <= 16 else { throw DeterministicCBORError.resourceLimit }
+            guard pairs.count <= 32 else { throw DeterministicCBORError.resourceLimit }
             for index in pairs.indices where index > 0 && pairs[index - 1].key >= pairs[index].key {
                 throw DeterministicCBORError.nonCanonical
             }
@@ -151,7 +151,7 @@ enum DeterministicCBOR {
         case 0:
             return .unsigned(argument)
         case 2:
-            let bytes = try slice(data, cursor: &cursor, count: argument, maximum: 64)
+            let bytes = try slice(data, cursor: &cursor, count: argument, maximum: 1_024)
             return .bytes(bytes)
         case 3:
             let bytes = try slice(data, cursor: &cursor, count: argument, maximum: 512)
@@ -168,7 +168,7 @@ enum DeterministicCBOR {
             }
             return .array(values)
         case 5:
-            guard argument <= 16 else { throw DeterministicCBORError.resourceLimit }
+            guard argument <= 32 else { throw DeterministicCBORError.resourceLimit }
             var pairs: [DeterministicCBORPair] = []
             pairs.reserveCapacity(Int(argument))
             for _ in 0..<argument {

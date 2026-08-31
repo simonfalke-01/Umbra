@@ -207,6 +207,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let lspProduct: LSPProductClient?
     private let lspDiscovery = LSPDiscovery.makeBonjourBrowser()
     private let lspInputCapture = LSPAppKitInputCapture()
+    private weak var streamWindow: StreamWindowController?
+    private let lspMediaCapabilities: AppleStreamingCapabilities
+    private var activeLSPHostID: UUID?
     private var eventHandler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?
     private var sessionWarningDeliveryState = SessionWarningDeliveryState()
     private var artworkLoadingTasks: [String: Task<Void, Never>] = [:]
@@ -229,7 +232,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
         configurationWarningEvaluator: any StreamingConfigurationWarningEvaluating = StreamingConfigurationWarningEvaluator(),
         artworkCache: ApplicationArtworkCache = ApplicationArtworkCache(),
         maximumConcurrentArtworkRequests: Int = 4,
-        lspProduct: LSPProductClient? = nil
+        lspProduct: LSPProductClient? = nil,
+        streamWindow: StreamWindowController? = nil,
+        lspMediaCapabilities: AppleStreamingCapabilities = .probe()
     ) {
         self.service = service
         self.preferences = preferences
@@ -239,6 +244,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.artworkCache = artworkCache
         self.maximumConcurrentArtworkRequests = max(1, maximumConcurrentArtworkRequests)
         self.lspProduct = lspProduct
+        self.streamWindow = streamWindow
+        self.lspMediaCapabilities = lspMediaCapabilities
         let (events, continuation) = AsyncStream<HostServiceEvent>.makeStream()
         handlerInstallationTask = Task { [service, continuation] in
             await service.setEventHandler { event in
@@ -457,12 +464,35 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
             }
             let microphoneOffer = try await lspMicrophoneOffer()
+            guard lspMediaCapabilities.hasMetalDevice,
+                  let frameRate = preferenceResolver(preferences.settings).preferences.normalizedFrameRate
+            else { throw UmbraClientServiceError.unavailable("Native LSP requires Metal and a valid refresh rate.") }
+            let resolved = preferenceResolver(preferences.settings).preferences
+            let bitrate = UInt64(resolved.bitrateKbps) * 1_000
+            var videoOffers: [LSPVideoOffer] = []
+            if lspMediaCapabilities.supportsHardwareHEVC {
+                videoOffers.append(.init(codec: 2, profile: 2, width: UInt32(resolved.width), height: UInt32(resolved.height), refreshNumerator: frameRate.numerator, refreshDenominator: frameRate.denominator, preferredBitsPerSecond: bitrate, maximumBitsPerSecond: bitrate))
+            }
+            if lspMediaCapabilities.supportsHardwareH264 {
+                videoOffers.append(.init(codec: 1, profile: 1, width: UInt32(resolved.width), height: UInt32(resolved.height), refreshNumerator: frameRate.numerator, refreshDenominator: frameRate.denominator, preferredBitsPerSecond: bitrate, maximumBitsPerSecond: bitrate))
+            }
+            guard !videoOffers.isEmpty, let streamWindow else {
+                throw UmbraClientServiceError.unavailable("Native LSP hardware video is unavailable.")
+            }
+            try await streamWindow.prepareLSPVideo(applicationName: applicationID, preferences: resolved)
+            var started = false
+            defer { if !started { Task { @MainActor in await streamWindow.finish() } } }
             let session = try await lspProduct.startInput(
                 hostID: nativeHostID,
                 applicationID: applicationID,
                 pointerRate: 1_000,
-                microphoneOffer: microphoneOffer
+                microphoneOffer: microphoneOffer,
+                videoOffers: videoOffers,
+                decoderSurfaces: 3,
+                maximumCaptureToPresentMicroseconds: UInt32(max(10_000, Int(2_000_000 * Double(frameRate.denominator) / Double(frameRate.numerator))))
             )
+            started = true
+            activeLSPHostID = nativeHostID
             lspInputCapture.start(session: session)
             installLSPReconnectHandler(session: session, hostID: nativeHostID)
             return
@@ -521,6 +551,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     func disconnectSession() async {
         lspInputCapture.stop()
+        if let hostID = activeLSPHostID {
+            await lspProduct?.stop(hostID: hostID)
+            activeLSPHostID = nil
+            await streamWindow?.finish()
+        }
         _ = try? await service.stopSession(quitHostApplication: false)
     }
 
@@ -965,7 +1000,6 @@ final class LiveApplicationComposition {
 
     init() throws {
         let persistence: JSONFileStore<UmbraSnapshot> = try .applicationSupport()
-        let lspProduct = try LSPProductClient.applicationSupport()
         preferences = PreferencesStore(snapshotStore: persistence)
         let supportLogger = Self.makeSupportLog()
         supportLog = supportLogger
@@ -980,6 +1014,7 @@ final class LiveApplicationComposition {
                 supportLogger?.record(source: "Window", level: .info, message: message)
             }
         )
+        let lspProduct = try LSPProductClient.applicationSupport(videoRenderer: streamWindow.videoRenderer)
 
         let securePorts = SecurePortRegistry()
         let compatibilityUpdater = NVIDIAServerCompatibilityUpdater()
@@ -1092,7 +1127,9 @@ final class LiveApplicationComposition {
             configurationWarningEvaluator: StreamingConfigurationWarningEvaluator(
                 capabilities: mediaCapabilities
             ),
-            lspProduct: lspProduct
+            lspProduct: lspProduct,
+            streamWindow: streamWindow,
+            lspMediaCapabilities: mediaCapabilities
         )
         streamWindow.onStopRequested = { [applicationService] quitHostApplication in
             _ = try? await applicationService.stopSession(

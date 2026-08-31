@@ -209,6 +209,30 @@ final class MediaHardwareTests: XCTestCase {
         decoder.stop()
     }
 
+    func testLSPCapacityOverflowDropsWithoutRequestingRecovery() throws {
+        let decoder = VideoToolboxDecoder(
+            policy: .softwareOnly,
+            capacityPolicy: .dropNewestWhenFull,
+            capacityOverflowBehavior: .dropWithoutRecovery
+        )
+        XCTAssertTrue(decoder.configure(format: VideoStreamFormat(
+            codecMask: 0x0001,
+            width: 1_280,
+            height: 720,
+            redrawRate: 60
+        )))
+        decoder.start()
+        XCTAssertEqual(
+            decoder.recordCapacityOverflow(
+                depth: 2,
+                generation: decoder.currentDecodeGeneration,
+                at: 1
+            ),
+            .capacityDropped
+        )
+        decoder.stop()
+    }
+
     func testStopBetweenAdmissionAndEnqueueCancelsOldGenerationBeforeReopen() throws {
         let reachedBoundary = DispatchSemaphore(value: 0)
         let resumeSubmission = DispatchSemaphore(value: 0)

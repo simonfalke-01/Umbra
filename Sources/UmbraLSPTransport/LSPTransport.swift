@@ -251,6 +251,81 @@ public struct LSPNativeMicrophoneConfiguration: Equatable, Sendable {
     }
 }
 
+/// Exact authenticated native SDR video admission tuple.
+public struct LSPNativeVideoConfiguration: Equatable, Sendable {
+    public var streamGeneration: UInt32
+    public var videoGeneration: UInt32
+    public var primarySSRC: UInt32
+    public var primaryPayloadType: UInt8
+    public var codec: UInt8
+    public var profile: UInt8
+    public var width: UInt32
+    public var height: UInt32
+    public var refreshNumerator: UInt32
+    public var refreshDenominator: UInt32
+    public var bitrate: UInt32
+    public var maximumAccessUnitBytes: UInt32
+    public var maximumFrameAgeMicroseconds: UInt32
+    public var frameIDOrigin: UInt64
+    public var recoveryEpoch: UInt32
+    public var decoderSurfaces: UInt8
+    public var udpPayloadSize: UInt16
+    public var frameMarkingExtension: UInt8
+    public var absoluteCaptureExtension: UInt8
+    public var frameIDExtension: UInt8
+    public var inputWatermarkExtension: UInt8
+    public var encoderTimingExtension: UInt8
+
+    public init(
+        streamGeneration: UInt32, videoGeneration: UInt32, primarySSRC: UInt32,
+        primaryPayloadType: UInt8, codec: UInt8, profile: UInt8, width: UInt32,
+        height: UInt32, refreshNumerator: UInt32, refreshDenominator: UInt32,
+        bitrate: UInt32, maximumAccessUnitBytes: UInt32,
+        maximumFrameAgeMicroseconds: UInt32, frameIDOrigin: UInt64,
+        recoveryEpoch: UInt32, decoderSurfaces: UInt8, udpPayloadSize: UInt16,
+        frameMarkingExtension: UInt8, absoluteCaptureExtension: UInt8,
+        frameIDExtension: UInt8, inputWatermarkExtension: UInt8,
+        encoderTimingExtension: UInt8
+    ) {
+        self.streamGeneration = streamGeneration; self.videoGeneration = videoGeneration
+        self.primarySSRC = primarySSRC; self.primaryPayloadType = primaryPayloadType
+        self.codec = codec; self.profile = profile; self.width = width; self.height = height
+        self.refreshNumerator = refreshNumerator; self.refreshDenominator = refreshDenominator
+        self.bitrate = bitrate; self.maximumAccessUnitBytes = maximumAccessUnitBytes
+        self.maximumFrameAgeMicroseconds = maximumFrameAgeMicroseconds
+        self.frameIDOrigin = frameIDOrigin; self.recoveryEpoch = recoveryEpoch
+        self.decoderSurfaces = decoderSurfaces; self.udpPayloadSize = udpPayloadSize
+        self.frameMarkingExtension = frameMarkingExtension
+        self.absoluteCaptureExtension = absoluteCaptureExtension
+        self.frameIDExtension = frameIDExtension
+        self.inputWatermarkExtension = inputWatermarkExtension
+        self.encoderTimingExtension = encoderTimingExtension
+    }
+}
+
+/// One native-owned complete Annex-B access unit transferred without copying.
+public struct LSPVideoFrame: @unchecked Sendable {
+    public var videoGeneration: UInt32
+    public var rtpTimestamp: UInt32
+    public var frameID: UInt64
+    public var receiveTimeMicroseconds: UInt64
+    public var captureTimeMicroseconds: UInt64
+    public var inputStateSequence: UInt64
+    public var inputEdgeID: UInt64
+    public var recoveryEpoch: UInt32
+    public var independent: Bool
+    public var codec: UInt8
+    public var annexBAccessUnit: Data
+}
+
+/// Typed terminal video outcome sent in protected LSPV feedback.
+public enum LSPVideoDecodeStatus: UInt8, Sendable {
+    case ready = 0
+    case surfaceExhausted = 1
+    case recoverableError = 2
+    case unrecoverableError = 3
+}
+
 /// Native exactly-once input-edge kind.
 public enum LSPNativeInputEdgeKind: UInt8, Sendable {
     case keyDown = 1
@@ -397,6 +472,7 @@ public final class LSPTransport: @unchecked Sendable {
         nativeCallbacks.control = lspControlCallback
         nativeCallbacks.audio_packet = lspAudioPacketCallback
         nativeCallbacks.audio_timing = lspAudioTimingCallback
+        nativeCallbacks.video_frame = lspVideoFrameCallback
         var output: OpaquePointer?
         let status = clsp_core_create(&nativeConfiguration, &nativeCallbacks, &output)
         try Self.requireSuccess(status)
@@ -536,6 +612,76 @@ public final class LSPTransport: @unchecked Sendable {
         _ handler: (@Sendable (LSPAudioTiming) -> Void)?
     ) {
         callbackState.setAudioTimingHandler(handler)
+    }
+
+    /// Installs the complete-frame handler; native RTP packets never cross this boundary.
+    public func setVideoFrameHandler(_ handler: (@Sendable (LSPVideoFrame) -> Void)?) {
+        callbackState.setVideoHandler(handler)
+    }
+
+    /// Installs the exact authenticated native video mapping before semantic ACK.
+    public func configureVideo(_ configuration: LSPNativeVideoConfiguration) throws {
+        var native = clsp_video_configuration_t()
+        native.abi_version = Self.abiVersion
+        native.structure_size = UInt32(MemoryLayout<clsp_video_configuration_t>.size)
+        native.stream_generation = configuration.streamGeneration
+        native.video_generation = configuration.videoGeneration
+        native.primary_ssrc = configuration.primarySSRC
+        native.clock_rate = 90_000
+        native.width = configuration.width
+        native.height = configuration.height
+        native.refresh_numerator = configuration.refreshNumerator
+        native.refresh_denominator = configuration.refreshDenominator
+        native.bitrate = configuration.bitrate
+        native.maximum_access_unit_bytes = configuration.maximumAccessUnitBytes
+        native.maximum_frame_age_microseconds = configuration.maximumFrameAgeMicroseconds
+        native.frame_id_origin = configuration.frameIDOrigin
+        native.recovery_epoch = configuration.recoveryEpoch
+        native.udp_payload_size = configuration.udpPayloadSize
+        native.primary_payload_type = configuration.primaryPayloadType
+        native.codec = configuration.codec
+        native.profile = configuration.profile
+        native.decoder_surfaces = configuration.decoderSurfaces
+        native.frame_marking_extension = configuration.frameMarkingExtension
+        native.absolute_capture_extension = configuration.absoluteCaptureExtension
+        native.frame_id_extension = configuration.frameIDExtension
+        native.input_watermark_extension = configuration.inputWatermarkExtension
+        native.encoder_timing_extension = configuration.encoderTimingExtension
+        try Self.requireSuccess(clsp_core_configure_video(core, &native))
+    }
+
+    /// Reports one terminal decoder outcome and current bounded capacities.
+    public func reportVideoDecode(
+        videoGeneration: UInt32,
+        frameID: UInt64,
+        recoveryEpoch: UInt32,
+        status: LSPVideoDecodeStatus,
+        availableCredit: UInt8,
+        mailboxOccupancy: UInt8
+    ) throws {
+        try Self.requireSuccess(clsp_core_report_video_decode(
+            core,
+            videoGeneration,
+            frameID,
+            recoveryEpoch,
+            status.rawValue,
+            availableCredit,
+            mailboxOccupancy
+        ))
+    }
+
+    /// Reports one actual Metal command-buffer commit.
+    public func reportVideoCommit(
+        videoGeneration: UInt32,
+        frameID: UInt64,
+        mailboxOccupancy: UInt8
+    ) throws {
+        try Self.requireSuccess(clsp_core_report_video_commit(
+            core,
+            videoGeneration,
+            frameID,
+            mailboxOccupancy
+        ))
     }
 
     /// Sends one semantic response to an authenticated host control request.
@@ -841,6 +987,7 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
     private var lifecycleHandler: (@Sendable (LSPTransportLifecycle) -> Void)?
     private var audioHandler: (@Sendable (LSPAudioPacket) -> Void)?
     private var audioTimingHandler: (@Sendable (LSPAudioTiming) -> Void)?
+    private var videoHandler: (@Sendable (LSPVideoFrame) -> Void)?
 
     func reserveRequestID() -> UInt64 {
         lock.withLock {
@@ -910,6 +1057,15 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
 
     func setAudioTimingHandler(_ handler: (@Sendable (LSPAudioTiming) -> Void)?) {
         lock.withLock { audioTimingHandler = handler }
+    }
+
+    func receiveVideo(_ frame: LSPVideoFrame) {
+        let handler = lock.withLock { videoHandler }
+        handler?(frame)
+    }
+
+    func setVideoHandler(_ handler: (@Sendable (LSPVideoFrame) -> Void)?) {
+        lock.withLock { videoHandler = handler }
     }
 }
 
@@ -999,4 +1155,49 @@ private let lspAudioTimingCallback: @convention(c) (
             rtpTimestamp: native.rtp_timestamp
         )
     )
+}
+
+private let lspVideoFrameCallback: @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<clsp_video_frame_event_t>?
+) -> Void = { context, nativeEvent in
+    guard let nativeEvent else { return }
+    let native = nativeEvent.pointee
+    guard let handle = native.frame else { return }
+    guard let context,
+          native.abi_version == LSPTransport.abiVersion,
+          native.structure_size == MemoryLayout<clsp_video_frame_event_t>.size,
+          native.video_generation != 0,
+          native.frame_id != 0
+    else {
+        clsp_buffer_release(handle)
+        return
+    }
+    var span = clsp_const_byte_span_t()
+    guard clsp_buffer_bytes(handle, &span) == CLSP_STATUS_OK,
+          span.length > 0,
+          let bytes = span.data
+    else {
+        clsp_buffer_release(handle)
+        return
+    }
+    let storage = NSData(
+        bytesNoCopy: UnsafeMutableRawPointer(mutating: bytes),
+        length: span.length,
+        deallocator: { _, _ in clsp_buffer_release(handle) }
+    )
+    let frame = LSPVideoFrame(
+        videoGeneration: native.video_generation,
+        rtpTimestamp: native.rtp_timestamp,
+        frameID: native.frame_id,
+        receiveTimeMicroseconds: native.receive_time_microseconds,
+        captureTimeMicroseconds: native.capture_time_microseconds,
+        inputStateSequence: native.input_state_sequence,
+        inputEdgeID: native.input_edge_id,
+        recoveryEpoch: native.recovery_epoch,
+        independent: native.independent != 0,
+        codec: native.codec,
+        annexBAccessUnit: Data(referencing: storage)
+    )
+    Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receiveVideo(frame)
 }

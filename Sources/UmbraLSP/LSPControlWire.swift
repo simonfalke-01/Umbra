@@ -15,6 +15,10 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case startResponse = 0x0201
     case attach = 0x0202
     case attachResponse = 0x0203
+    case stop = 0x0204
+    case stopResponse = 0x0205
+    case videoConfig = 0x0210
+    case videoConfigAck = 0x0211
     case audioConfig = 0x0212
     case audioConfigAck = 0x0213
     case microphoneConfig = 0x0214
@@ -78,6 +82,11 @@ public struct LSPInputStartRequest: Equatable, Sendable {
     public var audioOffers: [LSPAudioOffer]
     public var offeredMaximumUDPPayload: UInt16
     public var microphoneOffer: LSPMicrophoneOffer?
+    public var networkProfile: UInt8
+    public var videoOffers: [LSPVideoOffer]
+    public var receiveBatchCapacity: UInt8
+    public var decoderSurfaces: UInt8
+    public var maximumCaptureToPresentMicroseconds: UInt32
 
     public init(
         applicationID: String,
@@ -88,7 +97,12 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         maximumInputWireBitsPerSecond: UInt64 = 32_000_000,
         audioOffers: [LSPAudioOffer] = [],
         offeredMaximumUDPPayload: UInt16 = 1_472,
-        microphoneOffer: LSPMicrophoneOffer? = nil
+        microphoneOffer: LSPMicrophoneOffer? = nil,
+        networkProfile: UInt8 = 0,
+        videoOffers: [LSPVideoOffer] = [],
+        receiveBatchCapacity: UInt8 = 64,
+        decoderSurfaces: UInt8 = 3,
+        maximumCaptureToPresentMicroseconds: UInt32 = 50_000
     ) {
         self.applicationID = applicationID
         self.pointerRate = pointerRate
@@ -99,7 +113,40 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         self.audioOffers = audioOffers
         self.offeredMaximumUDPPayload = offeredMaximumUDPPayload
         self.microphoneOffer = microphoneOffer
+        self.networkProfile = networkProfile
+        self.videoOffers = videoOffers
+        self.receiveBatchCapacity = receiveBatchCapacity
+        self.decoderSurfaces = decoderSurfaces
+        self.maximumCaptureToPresentMicroseconds = maximumCaptureToPresentMicroseconds
     }
+}
+
+/// Exact hardware-only SDR video offer in START key twelve.
+public struct LSPVideoOffer: Equatable, Sendable {
+    public var codec: UInt8
+    public var profile: UInt8
+    public var width: UInt32
+    public var height: UInt32
+    public var refreshNumerator: UInt32
+    public var refreshDenominator: UInt32
+    public var preferredBitsPerSecond: UInt64
+    public var maximumBitsPerSecond: UInt64
+
+    public init(
+        codec: UInt8, profile: UInt8, width: UInt32, height: UInt32,
+        refreshNumerator: UInt32, refreshDenominator: UInt32,
+        preferredBitsPerSecond: UInt64, maximumBitsPerSecond: UInt64
+    ) {
+        self.codec = codec; self.profile = profile; self.width = width; self.height = height
+        self.refreshNumerator = refreshNumerator; self.refreshDenominator = refreshDenominator
+        self.preferredBitsPerSecond = preferredBitsPerSecond
+        self.maximumBitsPerSecond = maximumBitsPerSecond
+    }
+}
+
+/// Exact selected 28-key SDR video tuple.
+public struct LSPVideoSelection: Equatable, Sendable {
+    public var nativeConfiguration: LSPNativeVideoConfiguration
 }
 
 /// Optional mono 20-ms reverse-microphone START offer.
@@ -154,6 +201,7 @@ public struct LSPInputStartResponse: Equatable, Sendable {
     public var nativeConfiguration: LSPNativeInputConfiguration
     public var audioConfiguration: LSPNativeAudioConfiguration
     public var microphoneConfiguration: LSPNativeMicrophoneConfiguration?
+    public var videoSelection: LSPVideoSelection
 }
 
 /// Exact ATTACH request ownership values retained from the prior authority.
@@ -171,6 +219,7 @@ public struct LSPAttachResponse: Equatable, Sendable {
     public var nativeConfiguration: LSPNativeInputConfiguration
     public var audioConfiguration: LSPNativeAudioConfiguration
     public var microphoneConfiguration: LSPNativeMicrophoneConfiguration?
+    public var videoSelection: LSPVideoSelection
 }
 
 /// Exact authenticated AUDIO_CONFIG request.
@@ -183,6 +232,13 @@ public struct LSPAudioConfigurationRequest: Equatable, Sendable {
 public struct LSPMicrophoneConfigurationRequest: Equatable, Sendable {
     public var sessionID: UUID
     public var nativeConfiguration: LSPNativeMicrophoneConfiguration
+}
+
+/// Exact authenticated VIDEO_CONFIG request.
+public struct LSPVideoConfigurationRequest: Equatable, Sendable {
+    public var sessionID: UUID
+    public var nativeConfiguration: LSPNativeVideoConfiguration
+    public var parameterSets: [Data]
 }
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
@@ -335,7 +391,12 @@ public enum LSPControlWire {
               (50...1_000).contains(request.reconciliationRate),
               (1...32_000_000).contains(request.maximumInputWireBitsPerSecond),
               (1...12).contains(request.audioOffers.count),
-              (1_200...1_472).contains(request.offeredMaximumUDPPayload)
+              (1_200...1_472).contains(request.offeredMaximumUDPPayload),
+              request.networkProfile <= 1,
+              (1...8).contains(request.videoOffers.count),
+              (1...64).contains(request.receiveBatchCapacity),
+              (2...4).contains(request.decoderSurfaces),
+              request.maximumCaptureToPresentMicroseconds > 0
         else {
             throw DeterministicCBORError.malformed
         }
@@ -368,6 +429,29 @@ public enum LSPControlWire {
         } else {
             microphone = .null
         }
+        let videoOffers = try request.videoOffers.map { offer -> DeterministicCBORValue in
+            guard ((offer.codec == 2 && offer.profile == 2) || (offer.codec == 1 && offer.profile == 1)),
+                  offer.width > 0, offer.height > 0,
+                  offer.refreshNumerator > 0, offer.refreshDenominator > 0,
+                  offer.preferredBitsPerSecond > 0,
+                  offer.preferredBitsPerSecond <= offer.maximumBitsPerSecond,
+                  offer.maximumBitsPerSecond <= 1_000_000_000
+            else { throw DeterministicCBORError.malformed }
+            return .map([
+                .init(key: 1, value: .unsigned(UInt64(offer.codec))),
+                .init(key: 2, value: .unsigned(UInt64(offer.profile))),
+                .init(key: 3, value: .unsigned(UInt64(offer.width))),
+                .init(key: 4, value: .unsigned(UInt64(offer.height))),
+                .init(key: 5, value: .unsigned(UInt64(offer.refreshNumerator))),
+                .init(key: 6, value: .unsigned(UInt64(offer.refreshDenominator))),
+                .init(key: 7, value: .unsigned(offer.preferredBitsPerSecond)),
+                .init(key: 8, value: .unsigned(offer.maximumBitsPerSecond)),
+                .init(key: 9, value: .unsigned(1)),
+                .init(key: 10, value: .unsigned(1)),
+                .init(key: 11, value: .boolean(false)),
+                .init(key: 12, value: .boolean(false)),
+            ])
+        }
         return try encodeMap([
             .unsigned(1),
             .text(request.applicationID),
@@ -379,11 +463,17 @@ public enum LSPControlWire {
             .array(offers),
             .unsigned(UInt64(request.offeredMaximumUDPPayload)),
             microphone,
+            .unsigned(UInt64(request.networkProfile)),
+            .array(videoOffers),
+            .unsigned(UInt64(request.receiveBatchCapacity)),
+            .unsigned(UInt64(request.decoderSurfaces)),
+            .unsigned(1),
+            .unsigned(UInt64(request.maximumCaptureToPresentMicroseconds)),
         ])
     }
 
     public static func startResponse(from event: LSPControlEvent) throws -> LSPInputStartResponse {
-        let values = try responseValues(event, type: .startResponse, count: 30)
+        let values = try responseValues(event, type: .startResponse, count: 31)
         try requireSuccess(values[1])
         let sessionID = try uuid(try bytes(values[2], count: 16))
         let attachToken = try bytes(values[3], count: 32)
@@ -410,6 +500,7 @@ public enum LSPControlWire {
         }
         let audio = try audioConfiguration(values: values, offset: 15, streamGeneration: streamGeneration)
         let microphone = try microphoneConfiguration(value: values[29], streamGeneration: streamGeneration)
+        let video = try videoSelection(value: values[30], streamGeneration: streamGeneration)
         return LSPInputStartResponse(
             sessionID: sessionID,
             attachToken: attachToken,
@@ -427,7 +518,8 @@ public enum LSPControlWire {
                 baselineRequired: true
             ),
             audioConfiguration: audio,
-            microphoneConfiguration: microphone
+            microphoneConfiguration: microphone,
+            videoSelection: video
         )
     }
 
@@ -442,7 +534,7 @@ public enum LSPControlWire {
     }
 
     public static func attachResponse(from event: LSPControlEvent) throws -> LSPAttachResponse {
-        let values = try responseValues(event, type: .attachResponse, count: 31)
+        let values = try responseValues(event, type: .attachResponse, count: 32)
         try requireSuccess(values[1])
         let sessionID = try uuid(try bytes(values[2], count: 16))
         let replacement = try bytes(values[3], count: 32)
@@ -470,6 +562,7 @@ public enum LSPControlWire {
         }
         let audio = try audioConfiguration(values: values, offset: 16, streamGeneration: streamGeneration)
         let microphone = try microphoneConfiguration(value: values[30], streamGeneration: streamGeneration)
+        let video = try videoSelection(value: values[31], streamGeneration: streamGeneration)
         return LSPAttachResponse(
             sessionID: sessionID,
             replacementAttachToken: replacement,
@@ -488,8 +581,71 @@ public enum LSPControlWire {
                 baselineRequired: true
             ),
             audioConfiguration: audio,
-            microphoneConfiguration: microphone
+            microphoneConfiguration: microphone,
+            videoSelection: video
         )
+    }
+
+    public static func videoConfig(from event: LSPControlEvent) throws -> LSPVideoConfigurationRequest {
+        guard event.messageType == LSPControlMessageType.videoConfig.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 8)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        let sessionID = try uuid(try bytes(values[1], count: 16))
+        let streamGeneration = try uint32(values[2], nonzero: true)
+        let selection = try videoSelection(value: values[3], streamGeneration: streamGeneration)
+        guard case .array(let encodedSets) = values[4], encodedSets.count == (selection.nativeConfiguration.codec == 1 ? 2 : 3) else {
+            throw DeterministicCBORError.malformed
+        }
+        let sets = try encodedSets.map { value -> Data in
+            guard case .bytes(let bytes) = value, !bytes.isEmpty, bytes.count <= 4_096 else {
+                throw DeterministicCBORError.malformed
+            }
+            return bytes
+        }
+        let validTypes: [UInt8] = if selection.nativeConfiguration.codec == 1 {
+            sets.map { $0[0] & 0x1f }
+        } else {
+            sets.map { ($0[0] >> 1) & 0x3f }
+        }
+        guard validTypes == (selection.nativeConfiguration.codec == 1 ? [7, 8] : [32, 33, 34]),
+              sets.allSatisfy({ bytes in
+                  !(bytes.count >= 3 && bytes[0] == 0 && bytes[1] == 0 &&
+                    (bytes[2] == 1 || (bytes.count >= 4 && bytes[2] == 0 && bytes[3] == 1)))
+              })
+        else { throw DeterministicCBORError.malformed }
+        var native = selection.nativeConfiguration
+        native.frameIDOrigin = try uint(values[5])
+        native.recoveryEpoch = try uint32(values[6], nonzero: true)
+        native.maximumAccessUnitBytes = try uint32(values[7], nonzero: true)
+        guard native.frameIDOrigin != 0, native.maximumAccessUnitBytes <= 16 * 1_024 * 1_024 else {
+            throw DeterministicCBORError.malformed
+        }
+        return LSPVideoConfigurationRequest(sessionID: sessionID, nativeConfiguration: native, parameterSets: sets)
+    }
+
+    public static func videoConfigAck(
+        status: LSPControlStatus,
+        sessionID: UUID,
+        videoGeneration: UInt32,
+        decoderCredit: UInt8
+    ) throws -> Data {
+        guard videoGeneration != 0, (2...4).contains(decoderCredit) else { throw DeterministicCBORError.malformed }
+        return try encodeMap([
+            .unsigned(1), .unsigned(UInt64(status.rawValue)), .bytes(uuidBytes(sessionID)),
+            .unsigned(UInt64(videoGeneration)), .unsigned(UInt64(decoderCredit)),
+        ])
+    }
+
+    public static func stop(sessionID: UUID) throws -> Data {
+        try encodeMap([.unsigned(1), .bytes(uuidBytes(sessionID))])
+    }
+
+    public static func requireStopResponse(_ event: LSPControlEvent) throws {
+        let values = try responseValues(event, type: .stopResponse, count: 2)
+        try requireSuccess(values[1])
     }
 
     public static func audioConfig(from event: LSPControlEvent) throws -> LSPAudioConfigurationRequest {
@@ -657,6 +813,60 @@ public enum LSPControlWire {
             dtx: dtx,
             udpPayloadSize: UInt16(udp)
         )
+    }
+
+    private static func videoSelection(
+        value: DeterministicCBORValue,
+        streamGeneration: UInt32
+    ) throws -> LSPVideoSelection {
+        let values = try DeterministicCBOR.exactMap(value, count: 28)
+        let generation = try uint32(values[0], nonzero: true)
+        let ssrc = try uint32(values[1], nonzero: true)
+        let payloadType = try uint32(values[2], nonzero: true)
+        let clock = try uint32(values[3], nonzero: true)
+        let codec = try uint32(values[4], nonzero: true)
+        let profile = try uint32(values[5], nonzero: true)
+        let width = try uint32(values[6], nonzero: true)
+        let height = try uint32(values[7], nonzero: true)
+        let refreshNumerator = try uint32(values[8], nonzero: true)
+        let refreshDenominator = try uint32(values[9], nonzero: true)
+        let bitrate = try uint32(values[10], nonzero: true)
+        let extensionIDs = try (20...24).map { try uint(values[$0]) }
+        guard try uint(values[11]) == 1, try uint(values[12]) == 1,
+              try uint(values[13]) == 1, try uint(values[14]) == 1,
+              case .boolean(false) = values[15], try uint(values[16]) == 1_200,
+              (2...4).contains(try uint(values[17])), try uint(values[18]) == 1,
+              try uint(values[19]) == 1,
+              extensionIDs.allSatisfy({ (1...14).contains($0) }), Set(extensionIDs).count == 5,
+              case .boolean(false) = values[25], case .boolean(false) = values[26],
+              ((codec == 1 && profile == 1) || (codec == 2 && profile == 2)),
+              (96...127).contains(payloadType), clock == 90_000
+        else { throw DeterministicCBORError.malformed }
+        let maximumFrameAge = try uint32(values[27], nonzero: true)
+        return LSPVideoSelection(nativeConfiguration: LSPNativeVideoConfiguration(
+            streamGeneration: streamGeneration,
+            videoGeneration: generation,
+            primarySSRC: ssrc,
+            primaryPayloadType: UInt8(payloadType),
+            codec: UInt8(codec),
+            profile: UInt8(profile),
+            width: width,
+            height: height,
+            refreshNumerator: refreshNumerator,
+            refreshDenominator: refreshDenominator,
+            bitrate: bitrate,
+            maximumAccessUnitBytes: 0,
+            maximumFrameAgeMicroseconds: maximumFrameAge,
+            frameIDOrigin: 0,
+            recoveryEpoch: 0,
+            decoderSurfaces: UInt8(try uint(values[17])),
+            udpPayloadSize: 1_200,
+            frameMarkingExtension: UInt8(extensionIDs[0]),
+            absoluteCaptureExtension: UInt8(extensionIDs[1]),
+            frameIDExtension: UInt8(extensionIDs[2]),
+            inputWatermarkExtension: UInt8(extensionIDs[3]),
+            encoderTimingExtension: UInt8(extensionIDs[4])
+        ))
     }
 
     private static func requireSuccess(_ value: DeterministicCBORValue) throws {
