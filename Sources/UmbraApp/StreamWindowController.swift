@@ -69,10 +69,8 @@ enum StreamStatisticsPresenter {
     static func make(
         renderer: MediaPipelineStatistics?,
         decoder: MediaPipelineStatistics?,
-        transport: StreamTransportStatistics?,
-        protocolV3: ProtocolV3SessionStatistics? = nil
+        transport: StreamTransportStatistics?
     ) -> StreamStatisticsPresentation {
-        let decoder = decoder ?? protocolV3?.media.videoPipeline
         let videoRate: String
         if let renderer, renderer.presentedFrames > 0 {
             videoRate = String(format: "%.1f FPS", renderer.presentationFramesPerSecond)
@@ -92,13 +90,6 @@ enum StreamStatisticsPresenter {
             } else {
                 rtt = "\(milliseconds) ms"
             }
-        } else if let smoothed = protocolV3?.transport.smoothedRTTMicroseconds,
-                  let minimum = protocolV3?.transport.minimumRTTMicroseconds,
-                  let variation = protocolV3?.transport.rttVariationMicroseconds {
-            rtt = protocolV3RTT(smoothed: smoothed, minimum: minimum, variation: variation)
-        } else if let protocolV3 {
-            rtt = "Unavailable, QUIC cap \(protocolV3.transport.usableDatagramPayloadBytes) B, "
-                + "path changes \(protocolV3.transport.pathChangeCount)"
         } else {
             rtt = "Unavailable"
         }
@@ -111,9 +102,7 @@ enum StreamStatisticsPresenter {
             .hostProcessingLatency: percentiles(
                 decoder?.latencyStatistics?.hostProcessing
             ),
-            .inputToDecodeProxyLatency: percentiles(
-                protocolV3?.media.inputToDecodeProxy
-            ),
+            .inputToDecodeProxyLatency: "Unavailable",
             .receiveToSubmitLatency: percentiles(
                 decoder?.latencyStatistics?.receiveToVideoToolboxSubmit
             ),
@@ -136,19 +125,14 @@ enum StreamStatisticsPresenter {
             .renderQueue: renderer.map { frameCount($0.queueDepth) } ?? "Unavailable",
             .networkRTT: rtt,
             .videoQueue: transport.map { frameCount(Int($0.pendingVideoFrames)) }
-                ?? protocolV3?.media.videoPipeline.map { frameCount($0.queueDepth) }
                 ?? "Unavailable",
             .audioQueue: transport.map { $0.pendingAudioDurationMilliseconds >= 0
                 ? "\($0.pendingAudioDurationMilliseconds) ms"
                 : "Unavailable"
-            } ?? protocolV3?.media.audioRenderer.map {
-                String(format: "%.1f ms", $0.queuedDurationMilliseconds)
             } ?? "Unavailable",
             .videoPackets: transport.map { String($0.videoPackets) }
-                ?? protocolV3.map { String($0.media.videoFragmentsReceived) }
                 ?? "Unavailable",
             .audioPackets: transport.map { String($0.audioPackets) }
-                ?? protocolV3.map { String($0.media.audioPacketsReceived) }
                 ?? "Unavailable",
         ])
     }
@@ -156,15 +140,6 @@ enum StreamStatisticsPresenter {
     private static func frameCount(_ count: Int) -> String {
         guard count >= 0 else { return "Unavailable" }
         return "\(count) \(count == 1 ? "frame" : "frames")"
-    }
-
-    static func protocolV3RTT(smoothed: UInt32, minimum: UInt32, variation: UInt32) -> String {
-        String(
-            format: "%.2f ms, variation %.2f ms, min %.2f ms",
-            Double(smoothed) / 1_000,
-            Double(variation) / 1_000,
-            Double(minimum) / 1_000
-        )
     }
 
     private static func percentiles(_ summary: LatencyPercentileSummary?) -> String {
@@ -281,7 +256,6 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private var showsStatistics = false
     private var streamStatistics: StreamTransportStatistics?
     private var videoPipelineStatistics: MediaPipelineStatistics?
-    private var protocolV3Statistics: ProtocolV3SessionStatistics?
     private var activePreferences: StreamingPreferences?
     private var activeEffectivePolicy: EffectiveStreamingPolicy?
     private var activeSystemShortcutCaptureMode: SystemShortcutCaptureMode = .off
@@ -695,7 +669,6 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         statisticsTimer = nil
         streamStatistics = nil
         videoPipelineStatistics = nil
-        protocolV3Statistics = nil
         setStatisticsVisible(false)
         setPointerCapture(false)
         pointerCapture.handle(.focusChanged(false))
@@ -996,8 +969,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             visible ? StreamStatisticsPresenter.make(
                 renderer: nil,
                 decoder: nil,
-                transport: nil,
-                protocolV3: nil
+                transport: nil
             ) : nil
         )
         statisticsTimer?.invalidate()
@@ -1015,8 +987,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         contentView.setStatisticsPresentation(StreamStatisticsPresenter.make(
             renderer: nil,
             decoder: videoPipelineStatistics,
-            transport: streamStatistics,
-            protocolV3: protocolV3Statistics
+            transport: streamStatistics
         ))
     }
 
@@ -1026,10 +997,6 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     func updateVideoPipelineStatistics(_ statistics: MediaPipelineStatistics) {
         videoPipelineStatistics = statistics
-    }
-
-    func updateProtocolV3Statistics(_ statistics: ProtocolV3SessionStatistics) {
-        protocolV3Statistics = statistics
     }
 
     private func setPointerCapture(_ active: Bool) {

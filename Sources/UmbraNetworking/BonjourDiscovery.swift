@@ -60,7 +60,6 @@ protocol BonjourBrowsing: AnyObject, Sendable {
 
 enum BonjourServiceKind: Hashable, Sendable {
     case legacyGameStream
-    case modernLumenV3
 }
 
 protocol BonjourBrowserCreating: Sendable {
@@ -108,9 +107,6 @@ private final class NWBonjourBrowser: BonjourBrowsing, @unchecked Sendable {
         case .legacyGameStream:
             parameters = .tcp
             descriptor = .bonjour(type: "_nvstream._tcp", domain: "local.")
-        case .modernLumenV3:
-            parameters = .udp
-            descriptor = .bonjourWithTXTRecord(type: "_lumen-v3._udp", domain: "local.")
         }
         parameters.includePeerToPeer = true
         browser = NWBrowser(for: descriptor, using: parameters)

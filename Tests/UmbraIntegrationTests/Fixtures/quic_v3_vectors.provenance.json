@@ -1,6 +1,0 @@
-{
-  "upstream_repository": "Lumen",
-  "upstream_commit": "82dba7c25b6976eb7f5aeac62c471c8a70826eb4",
-  "upstream_path": "docs/protocols/vectors/quic_v3_vectors.json",
-  "sha256": "621487791559995b2ce6f234d196de9d2fc3c2c3758b55d916c3d8e4e27dc874"
-}

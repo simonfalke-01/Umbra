@@ -77,9 +77,7 @@ class PackageAppQualifyingTests(unittest.TestCase):
             key = sys.argv[sys.argv.index("-extract") + 1]
             values = {
                 "CFBundleIdentifier": "app.umbra.Umbra",
-                "CFBundleURLTypes.0.CFBundleURLSchemes.0": "umbra",
                 "NSBonjourServices.0": "_nvstream._tcp",
-                "NSBonjourServices.1": "_lumen-v3._udp",
                 "CFBundleDisplayName": "Umbra",
                 "NSLocalNetworkUsageDescription": "network",
                 "NSInputMonitoringUsageDescription": "input",

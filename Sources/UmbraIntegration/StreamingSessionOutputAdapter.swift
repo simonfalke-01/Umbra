@@ -8,14 +8,12 @@ public typealias StreamTransportStatistics = UmbraStreaming.StreamingStatistics
 public protocol StreamingEventOutputHandling: Sendable {
     func handle(_ event: StreamingEvent)
     func handleVideoStatistics(_ statistics: MediaPipelineStatistics)
-    func handleProtocolV3Statistics(_ statistics: ProtocolV3SessionStatistics)
     func beginSession() async
     func endSession() async
 }
 
 public extension StreamingEventOutputHandling {
     func handleVideoStatistics(_ statistics: MediaPipelineStatistics) {}
-    func handleProtocolV3Statistics(_ statistics: ProtocolV3SessionStatistics) {}
     func beginSession() async {}
     func endSession() async {}
 }
@@ -58,7 +56,6 @@ public final class StreamingSessionOutputAdapter: StreamingEventOutputHandling, 
     public typealias HDRHandler = @MainActor @Sendable (Bool, StreamingHDRMetadata?) -> Void
     public typealias StatisticsHandler = @MainActor @Sendable (StreamingStatistics) -> Void
     public typealias VideoStatisticsHandler = @MainActor @Sendable (MediaPipelineStatistics) -> Void
-    public typealias ProtocolV3StatisticsHandler = @MainActor @Sendable (ProtocolV3SessionStatistics) -> Void
 
     private let controllers: any ControllerOutputServicing
     private let motionEnabler: (any ControllerMotionEnabling)?
@@ -67,7 +64,6 @@ public final class StreamingSessionOutputAdapter: StreamingEventOutputHandling, 
     private let hdrHandler: HDRHandler
     private let statisticsHandler: StatisticsHandler
     private let videoStatisticsHandler: VideoStatisticsHandler
-    private let protocolV3StatisticsHandler: ProtocolV3StatisticsHandler
     private let sessionState = StreamingOutputSessionState()
     private let callbackLock = NSLock()
     private var callbackTail: Task<Void, Never>?
@@ -79,8 +75,7 @@ public final class StreamingSessionOutputAdapter: StreamingEventOutputHandling, 
         motionPolicy: ControllerMotionPolicy = ControllerMotionPolicy(),
         hdrHandler: @escaping HDRHandler = { _, _ in },
         statisticsHandler: @escaping StatisticsHandler = { _ in },
-        videoStatisticsHandler: @escaping VideoStatisticsHandler = { _ in },
-        protocolV3StatisticsHandler: @escaping ProtocolV3StatisticsHandler = { _ in }
+        videoStatisticsHandler: @escaping VideoStatisticsHandler = { _ in }
     ) {
         self.controllers = controllers
         self.motionEnabler = motionEnabler
@@ -90,20 +85,12 @@ public final class StreamingSessionOutputAdapter: StreamingEventOutputHandling, 
         self.hdrHandler = hdrHandler
         self.statisticsHandler = statisticsHandler
         self.videoStatisticsHandler = videoStatisticsHandler
-        self.protocolV3StatisticsHandler = protocolV3StatisticsHandler
     }
 
     public func handleVideoStatistics(_ statistics: MediaPipelineStatistics) {
         enqueueCallback { [videoStatisticsHandler, sessionState] in
             guard sessionState.isActive else { return }
             videoStatisticsHandler(statistics)
-        }
-    }
-
-    public func handleProtocolV3Statistics(_ statistics: ProtocolV3SessionStatistics) {
-        enqueueCallback { [protocolV3StatisticsHandler, sessionState] in
-            guard sessionState.isActive else { return }
-            protocolV3StatisticsHandler(statistics)
         }
     }
 

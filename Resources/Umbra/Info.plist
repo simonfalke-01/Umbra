@@ -20,19 +20,6 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>CFBundleURLName</key>
-            <string>app.umbra.Umbra.secure-pairing</string>
-            <key>CFBundleURLSchemes</key>
-            <array>
-                <string>umbra</string>
-            </array>
-        </dict>
-    </array>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSApplicationCategoryType</key>
@@ -48,7 +35,6 @@
     <key>NSBonjourServices</key>
     <array>
         <string>_nvstream._tcp</string>
-        <string>_lumen-v3._udp</string>
     </array>
     <key>GCSupportsControllerUserInteraction</key>
     <true/>

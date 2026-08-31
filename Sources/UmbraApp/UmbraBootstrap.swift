@@ -18,6 +18,12 @@ enum UmbraBootstrap {
         let arguments = normalizedProcessArguments(CommandLine.arguments)
         var parser = UmbraCLIParser()
         var parseResult = parser.parseProcessArguments(arguments)
+        if let recoveryResult = storageRecoveryResult(for: parseResult) {
+            writeStandardOutput(recoveryResult.standardOutput)
+            writeStandardError(recoveryResult.standardError)
+            exit(recoveryResult.exitCode)
+        }
+        try? ObsoleteStreamingStateCleanup.performDefaultIfNeeded()
         if case .ready(command: .stream, warnings: _) = parseResult,
            let store: JSONFileStore<UmbraSnapshot> = try? .applicationSupport(),
            let snapshot = runAsyncAndWait({ try? await store.load() }) {
@@ -32,12 +38,6 @@ enum UmbraBootstrap {
             writeStandardError(result.standardError)
             exit(result.exitCode)
         }
-        if let recoveryResult = storageRecoveryResult(for: parseResult) {
-            writeStandardOutput(recoveryResult.standardOutput)
-            writeStandardError(recoveryResult.standardError)
-            exit(recoveryResult.exitCode)
-        }
-
         do {
             let service = try makeHeadlessService()
             let output = CLIOutputSink(

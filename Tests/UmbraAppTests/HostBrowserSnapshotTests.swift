@@ -484,7 +484,6 @@ private final class HostSnapshotService: UmbraClientServicing {
         return hosts
     }
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw unavailable() }
-    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel { throw unavailable() }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
         guard suspendsPairing else { throw unavailable() }
         try await Task.sleep(for: .seconds(60))

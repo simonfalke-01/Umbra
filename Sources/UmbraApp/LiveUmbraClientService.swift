@@ -9,7 +9,6 @@ import UmbraMedia
 import UmbraMicrophone
 import UmbraNetworking
 import UmbraPairing
-import UmbraQUICTransport
 import UmbraServices
 
 final class SecurePortRegistry: @unchecked Sendable {
@@ -200,7 +199,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let service: UmbraApplicationService
     private let preferences: PreferencesStore
     private let securePorts: SecurePortRegistry
-    private let protocolV3: ModernLumenV3Manager?
     private let preferenceResolver: (StreamingPreferences) -> RuntimeStreamingResolution
     private let configurationWarningEvaluator: any StreamingConfigurationWarningEvaluating
     private let artworkCache: ApplicationArtworkCache
@@ -212,14 +210,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let handlerInstallationTask: Task<Void, Never>
     private var serviceEventTask: Task<Void, Never>?
     private var discoveryPreferenceTask: Task<Void, Never>?
-    private var legacyDiscoveryBootstrapTask: Task<Void, Never>?
     private var lastLegacyHosts: [HostDisplayModel] = []
 
     init(
         service: UmbraApplicationService,
         preferences: PreferencesStore,
         securePorts: SecurePortRegistry,
-        protocolV3: ModernLumenV3Manager? = nil,
         preferenceResolver: @escaping (StreamingPreferences) -> RuntimeStreamingResolution = {
             RuntimeStreamingResolution(preferences: $0)
         },
@@ -230,7 +226,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.service = service
         self.preferences = preferences
         self.securePorts = securePorts
-        self.protocolV3 = protocolV3
         self.preferenceResolver = preferenceResolver
         self.configurationWarningEvaluator = configurationWarningEvaluator
         self.artworkCache = artworkCache
@@ -247,34 +242,13 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 self.handle(event)
             }
         }
-        discoveryPreferenceTask = Task { @MainActor [weak self, preferences, service] in
+        discoveryPreferenceTask = Task { @MainActor [preferences, service] in
             var lastEnabledValue: Bool?
             for await settings in preferences.$settings.values {
-                guard let self, !Task.isCancelled else { return }
+                guard !Task.isCancelled else { return }
                 guard settings.enableMDNS != lastEnabledValue else { continue }
                 lastEnabledValue = settings.enableMDNS
                 await service.setDiscoveryEnabled(settings.enableMDNS)
-                if settings.enableMDNS {
-                    self.protocolV3?.startDiscovery()
-                } else {
-                    self.protocolV3?.stopDiscovery()
-                }
-            }
-        }
-        protocolV3?.setCatalogEventHandler { [weak self] _ in
-            guard let self else { return }
-            self.eventHandler?(.hosts(self.combinedHosts()))
-        }
-        protocolV3?.setSessionEventHandler { [weak self] event in
-            guard let self else { return }
-            self.eventHandler?(event)
-            switch event {
-            case .sessionFailed:
-                self.onSessionTerminated?(false)
-            case .sessionEnded:
-                self.onSessionTerminated?(true)
-            default:
-                break
             }
         }
     }
@@ -283,8 +257,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         handlerInstallationTask.cancel()
         serviceEventTask?.cancel()
         discoveryPreferenceTask?.cancel()
-        legacyDiscoveryBootstrapTask?.cancel()
-        protocolV3?.stopDiscovery()
         for task in artworkLoadingTasks.values { task.cancel() }
     }
 
@@ -297,69 +269,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func discoverHosts() async throws -> [HostDisplayModel] {
-        if preferences.settings.enableMDNS {
-            protocolV3?.startDiscovery()
-        }
-        var modernHosts = try protocolV3?.displayHosts() ?? []
-        if !modernHosts.isEmpty {
-            if let protocolV3 {
-                let mode = Self.quicMode(preferences.settings.optimizationMode)
-                for host in modernHosts {
-                    _ = try? await protocolV3.reconnect(hostID: host.id, mode: mode)
-                }
-                modernHosts = try protocolV3.displayHosts()
-            }
-            startLegacyDiscoveryBootstrap()
-            return lastLegacyHosts + modernHosts
-        }
-        do {
-            let initial = try await service.startMonitoring()
-            let hosts = initial.isEmpty ? initial : try await service.refreshHosts()
-            lastLegacyHosts = hosts.map(displayHost)
-            return combinedHosts()
-        } catch {
-            let modernHosts = try protocolV3?.displayHosts() ?? []
-            guard !modernHosts.isEmpty else { throw error }
-            return modernHosts
-        }
-    }
-
-    private func startLegacyDiscoveryBootstrap() {
-        legacyDiscoveryBootstrapTask?.cancel()
-        let service = self.service
-        legacyDiscoveryBootstrapTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let initial = try await service.startMonitoring()
-                let hosts = initial.isEmpty ? initial : try await service.refreshHosts()
-                try Task.checkCancellation()
-                self.lastLegacyHosts = hosts.map(self.displayHost)
-                self.eventHandler?(.hosts(self.combinedHosts()))
-            } catch {
-                // Persisted v3 hosts remain authoritative and usable even when
-                // legacy discovery is unavailable or slow.
-            }
-            self.legacyDiscoveryBootstrapTask = nil
-        }
+        let initial = try await service.startMonitoring()
+        let hosts = initial.isEmpty ? initial : try await service.refreshHosts()
+        lastLegacyHosts = hosts.map(displayHost)
+        return lastLegacyHosts
     }
 
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel {
         let port = endpoint.port.flatMap(UInt16.init(exactly:))
         return displayHost(try await service.addHost(address: endpoint.address, port: port))
-    }
-
-    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel {
-        guard let protocolV3 else {
-            throw UmbraClientServiceError.unavailable(
-                "Secure Lumen pairing is unavailable because Umbra's protocol-v3 services did not start."
-            )
-        }
-        return try await protocolV3.pairInvitation(
-            invitationURI,
-            requestedPermissions: ModernLumenV3Manager.requestedPermissions(
-                for: preferences.settings
-            )
-        )
     }
 
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
@@ -371,17 +289,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel {
-        if let protocolV3, protocolV3.owns(id) {
-            return try protocolV3.renameHost(id: id, name: name)
-        }
         return displayHost(try await service.renameHost(id: id.rawValue, name: name))
     }
 
     func deleteHost(id: HostID) async throws {
-        if let protocolV3, protocolV3.owns(id) {
-            try protocolV3.removeHost(id: id)
-            return
-        }
         try await service.removeHost(id: id.rawValue)
         artworkLoadingTasks[id.rawValue]?.cancel()
         artworkLoadingTasks[id.rawValue] = nil
@@ -390,22 +301,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func wakeHost(id: HostID) async throws -> HostDisplayModel {
-        if protocolV3?.owns(id) == true {
-            throw UmbraClientServiceError.unavailable(
-                "Wake-on-LAN is not available for secure protocol-v3 hosts. Legacy fallback was not attempted."
-            )
-        }
         return displayHost(try await service.wakeHost(id: id.rawValue))
     }
 
     func testNetwork(for id: HostID) async throws -> NetworkTestOutcome {
-        if let protocolV3, protocolV3.owns(id) {
-            _ = try await protocolV3.reconnect(
-                hostID: id,
-                mode: Self.quicMode(preferences.settings.optimizationMode)
-            )
-            return .clear
-        }
         _ = try await service.details(hostID: id.rawValue)
         switch await service.testConnectivity() {
         case .clear:
@@ -418,39 +317,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func applications(for id: HostID, includeHidden: Bool) async throws -> [ApplicationDisplayModel] {
-        if let protocolV3, protocolV3.owns(id) {
-            let previousArtworkHashes = try? protocolV3.artworkHashes(hostID: id)
-            var applications = try await protocolV3.refreshApplications(
-                hostID: id,
-                mode: Self.quicMode(preferences.settings.optimizationMode)
-            )
-            let refreshedArtworkHashes = try protocolV3.artworkHashes(hostID: id)
-            if let previousArtworkHashes,
-               previousArtworkHashes != refreshedArtworkHashes {
-                await artworkCache.removeHost(id.rawValue)
-            }
-            let artworkURLs = await artworkCache.cachedArtworkURLs(
-                hostID: id.rawValue,
-                applicationIDs: applications.map(\.id.rawValue)
-            )
-            for index in applications.indices {
-                applications[index].artworkURL = artworkURLs[applications[index].id.rawValue]
-            }
-            let mode = Self.quicMode(preferences.settings.optimizationMode)
-            startArtworkLoading(
-                hostID: id,
-                applicationIDs: applications.map(\.id.rawValue),
-                displayApplications: applications,
-                loader: { [protocolV3] applicationID in
-                    try await protocolV3.applicationArtwork(
-                        hostID: id,
-                        applicationID: ApplicationID(applicationID),
-                        mode: mode
-                    )
-                }
-            )
-            return includeHidden ? applications : applications.filter { !$0.isHidden }
-        }
         let catalog = try await applicationsPreservingLastCatalog(
             hostID: id.rawValue,
             includeHidden: includeHidden
@@ -502,17 +368,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         resume: Bool,
         activationUptime: TimeInterval
     ) async throws {
-        if let protocolV3, protocolV3.owns(hostID) {
-            let runtimeResolution = preferenceResolver(preferences.settings)
-            try await protocolV3.launchApplication(
-                id: id,
-                hostID: hostID,
-                resume: resume,
-                preferences: runtimeResolution.preferences,
-                activationUptime: activationUptime
-            )
-            return
-        }
         do {
             let runtimeResolution = preferenceResolver(preferences.settings)
             let resolvedPreferences = runtimeResolution.preferences
@@ -566,21 +421,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func disconnectSession() async {
-        do {
-            try await protocolV3?.stopSession(quitApplication: false)
-        } catch {
-            eventHandler?(.sessionWarning(
-                "Secure stream teardown closed the connection after STOP failed: \(error.localizedDescription)"
-            ))
-        }
         _ = try? await service.stopSession(quitHostApplication: false)
     }
 
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws {
-        if let protocolV3, protocolV3.owns(hostID) {
-            try await protocolV3.stopSession(quitApplication: true)
-            return
-        }
         _ = try await service.cancelHostApplication(
             hostID: hostID.rawValue,
             applicationID: id.rawValue
@@ -588,10 +432,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func setApplicationHidden(id: ApplicationID, on hostID: HostID, hidden: Bool) async throws {
-        if let protocolV3, protocolV3.owns(hostID) {
-            try protocolV3.setApplicationHidden(id: id, hostID: hostID, hidden: hidden)
-            return
-        }
         try await service.setApplicationHidden(
             hostID: hostID.rawValue,
             applicationID: id.rawValue,
@@ -600,10 +440,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func setDirectLaunch(id: ApplicationID, on hostID: HostID, enabled: Bool) async throws {
-        if let protocolV3, protocolV3.owns(hostID) {
-            try protocolV3.setDirectLaunch(id: id, hostID: hostID, enabled: enabled)
-            return
-        }
         try await service.setDirectLaunch(
             hostID: hostID.rawValue,
             applicationID: id.rawValue,
@@ -857,15 +693,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     private func combinedHosts() -> [HostDisplayModel] {
-        let modernHosts = (try? protocolV3?.displayHosts()) ?? []
-        return lastLegacyHosts + modernHosts
-    }
-
-    private static func quicMode(_ mode: StreamOptimizationMode) -> QUICOptimizationMode {
-        switch mode {
-        case .latency: .latency
-        case .quality: .quality
-        }
+        lastLegacyHosts
     }
 }
 
@@ -877,7 +705,6 @@ final class LiveApplicationComposition {
     let streamWindow: StreamWindowController
     let runtimePreferenceResolver: RuntimeStreamingPreferencesResolver
     let supportLog: SupportLog?
-    let protocolV3: ModernLumenV3Manager
 
     init() throws {
         let persistence: JSONFileStore<UmbraSnapshot> = try .applicationSupport()
@@ -961,9 +788,6 @@ final class LiveApplicationComposition {
             },
             videoStatisticsHandler: { [weak streamWindow] statistics in
                 streamWindow?.updateVideoPipelineStatistics(statistics)
-            },
-            protocolV3StatisticsHandler: { [weak streamWindow] statistics in
-                streamWindow?.updateProtocolV3Statistics(statistics)
             }
         )
         let appLifecycle = AppStreamLifecycleCoordinator(
@@ -974,16 +798,6 @@ final class LiveApplicationComposition {
             appLifecycle,
             DiscordRichPresenceLifecycleCoordinator(),
         ])
-        protocolV3 = ModernLumenV3Manager(
-            mediaCapabilities: mediaCapabilities,
-            mediaProvider: mediaProvider,
-            output: output,
-            motionPolicy: motionPolicy,
-            inputInstaller: streamWindow,
-            lifecycle: lifecycle,
-            startupTelemetry: startupTelemetry,
-            log: supportLogger
-        )
         let streamDriver = NativeStreamSessionDriver(
             mediaProvider: mediaProvider,
             output: output,
@@ -1011,7 +825,6 @@ final class LiveApplicationComposition {
             service: applicationService,
             preferences: preferences,
             securePorts: securePorts,
-            protocolV3: protocolV3,
             preferenceResolver: { [runtimePreferenceResolver] preferences in
                 runtimePreferenceResolver.resolveForStreaming(
                     preferences,
@@ -1022,42 +835,7 @@ final class LiveApplicationComposition {
                 capabilities: mediaCapabilities
             )
         )
-        streamWindow.onStopRequested = { [applicationService, protocolV3] quitHostApplication in
-            supportLogger?.record(
-                source: "Lumen v3",
-                level: .info,
-                message: "Window-requested STOP started; awaiting STOP response and SESSION_ENDED."
-            )
-            do {
-                try await protocolV3.stopSession(quitApplication: quitHostApplication)
-                supportLogger?.record(
-                    source: "Lumen v3",
-                    level: .info,
-                    message: "Window-requested STOP completed after terminal confirmation."
-                )
-            } catch {
-                supportLogger?.record(
-                    source: "Lumen v3",
-                    level: .error,
-                    message: "Window-requested STOP failed: \(error)."
-                )
-                if quitHostApplication {
-                    do {
-                        try await protocolV3.stopSession(quitApplication: false)
-                        supportLogger?.record(
-                            source: "Lumen v3",
-                            level: .warning,
-                            message: "The host did not grant remote app quit; Umbra detached the stream and left the app running."
-                        )
-                    } catch {
-                        supportLogger?.record(
-                            source: "Lumen v3",
-                            level: .error,
-                            message: "Fallback stream detach also failed: \(error)."
-                        )
-                    }
-                }
-            }
+        streamWindow.onStopRequested = { [applicationService] quitHostApplication in
             _ = try? await applicationService.stopSession(
                 quitHostApplication: quitHostApplication
             )
@@ -1066,7 +844,6 @@ final class LiveApplicationComposition {
     }
 
     func stopForApplicationTermination() async {
-        await protocolV3.stopAll()
         _ = try? await applicationService.stopSession(quitHostApplication: false)
     }
 

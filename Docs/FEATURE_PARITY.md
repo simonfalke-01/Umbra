@@ -90,12 +90,7 @@ commit `d2f6990b`. The checkout is intentionally not part of the Umbra source tr
 
 The remaining unchecked composites require direct evidence: exact live HDR/EDR
 and YUV 4:4:4 tuples, complete human-reviewed localization catalogs, and direct
-VoiceOver and contrast traversal. Experimental protocol-v2, QUIC, lossless,
-and Lumen VDD work does not change the status of these legacy-client checks.
+VoiceOver and contrast traversal. Experimental protocol-v2, lossless, and
+Lumen VDD work does not change the status of these legacy-client checks.
 Umbra must not expose a capability as proven when only parser, fixture, or
 portable test coverage exists.
-
-Protocol-v3 input state format 2 fits at most 15 simultaneous 64-byte controller
-records. Authenticated hosts can advertise compact state format 3, which carries
-all 16 controller records within the same 1,108-byte payload; older hosts report
-an explicit nonterminal degradation instead of sending an oversized datagram.

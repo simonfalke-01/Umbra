@@ -113,12 +113,8 @@ validate_packaged_app() {
     [[ "$app_identifier" == "$expected_app_identifier" ]] || {
         fail "Umbra's bundle identifier must remain $expected_app_identifier for macOS privacy permissions."
     }
-    [[ "$(plutil -extract CFBundleURLTypes.0.CFBundleURLSchemes.0 raw "$info_plist")" == "umbra" ]] || {
-        fail "Umbra's secure-pairing URL scheme is missing from the packaged app."
-    }
-    [[ "$(plutil -extract NSBonjourServices.0 raw "$info_plist")" == "_nvstream._tcp"
-        && "$(plutil -extract NSBonjourServices.1 raw "$info_plist")" == "_lumen-v3._udp" ]] || {
-        fail "Umbra's legacy and secure protocol-v3 Bonjour declarations are incomplete."
+    [[ "$(plutil -extract NSBonjourServices.0 raw "$info_plist")" == "_nvstream._tcp" ]] || {
+        fail "Umbra's legacy GameStream Bonjour declaration is missing."
     }
 
     local packaged_resource_bundle="$resource_directory/Umbra_UmbraApp.bundle"
@@ -269,13 +265,8 @@ cp "$repository_root/Resources/Umbra/Info.plist" "$app_root/Contents/Info.plist"
 app_identifier="$(plutil -extract CFBundleIdentifier raw "$app_root/Contents/Info.plist")"
 [[ "$app_identifier" == "$expected_app_identifier" ]] || fail \
     "Umbra's bundle identifier must remain $expected_app_identifier for macOS privacy permissions."
-[[ "$(plutil -extract CFBundleURLTypes.0.CFBundleURLSchemes.0 raw "$app_root/Contents/Info.plist")" == "umbra" ]] || {
-    echo "Umbra's secure-pairing URL scheme is missing from the packaged app." >&2
-    exit 1
-}
-[[ "$(plutil -extract NSBonjourServices.0 raw "$app_root/Contents/Info.plist")" == "_nvstream._tcp"
-    && "$(plutil -extract NSBonjourServices.1 raw "$app_root/Contents/Info.plist")" == "_lumen-v3._udp" ]] || {
-    echo "Umbra's legacy and secure protocol-v3 Bonjour declarations are incomplete." >&2
+[[ "$(plutil -extract NSBonjourServices.0 raw "$app_root/Contents/Info.plist")" == "_nvstream._tcp" ]] || {
+    echo "Umbra's legacy GameStream Bonjour declaration is missing." >&2
     exit 1
 }
 cp "$repository_root/LICENSE" "$app_root/Contents/Resources/LICENSE"

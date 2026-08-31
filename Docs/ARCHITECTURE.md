@@ -60,19 +60,6 @@ encoder tuple is not proven. Even when accepted, it does not prove RGB-to-YUV,
 chroma, bit-depth conversion, color management, transport, or display scanout
 lossless.
 
-## Modern protocol
-
-`UmbraProtocolV3` and `UmbraQUICTransport` are production-linked targets. The
-packaged application owns QR invitation handling, persistent trust, host
-browsing, session control, media, input, microphone, reconnect, and teardown.
-This source integration is not a live interoperability or latency claim until
-the full Windows build and real cross-machine stream gate pass. A host with
-modern trust state must never silently downgrade to legacy pairing.
-
-The modern QUIC design uses one authenticated connection for Umbra-specific
-control and media. Vanilla Moonlight clients cannot use that transport and
-still require the legacy GameStream listeners on Lumen.
-
 Client microphone forwarding is optional by default. Umbra resolves paired-host
 permission, current macOS authorization, and the host's selected endpoint before
 advertising an active microphone path; unavailable optional capture is reported
@@ -92,10 +79,6 @@ the microphone, which makes the same preflight fail closed before streaming.
 - Merged player-one metadata stays stable while the virtual controller is active,
   avoiding heterogeneous hot-plug rebind races. A full disconnect/rearrival
   advances the generation, and stale feedback is rejected.
-- Compact input state format 3 is enabled only by an authenticated server
-  capability. It preserves the 1,108-byte QUIC payload cap with 16 controllers;
-  format-2 hosts retain their original wire shape and degrade explicitly above
-  their 15-controller operational ceiling.
 
 ## Trust and identity
 
@@ -105,9 +88,7 @@ be described as brute-force resistant.
 
 Umbra stores the legacy RSA identity in its private Application Support
 directory with mode `0600`; it does not use the login Keychain. Paired host
-certificates are pinned. The experimental modern flow uses QR-delivered
-high-entropy trust material and separate protocol records; it is not yet the
-production pairing path.
+certificates are pinned.
 
 ## Measurement boundaries
 

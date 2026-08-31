@@ -136,10 +136,6 @@ struct UmbraApp: App {
     var body: some Scene {
         WindowGroup("Umbra") {
             RootView(store: store)
-                .onOpenURL { url in
-                    guard url.scheme == "umbra", url.host == "pair", url.path == "/v3" else { return }
-                    store.showSecurePairing(invitationURI: url.absoluteString)
-                }
         }
         .defaultSize(width: 1_040, height: 720)
         .commands {

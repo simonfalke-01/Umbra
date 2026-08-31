@@ -978,7 +978,6 @@ private final class FinalVisualEvidenceService: UmbraClientServicing {
 
     func discoverHosts() async throws -> [HostDisplayModel] { [host] }
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw unavailable() }
-    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel { throw unavailable() }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel { throw unavailable() }
     func cancelPairing(hostID: HostID) async {}
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw unavailable() }

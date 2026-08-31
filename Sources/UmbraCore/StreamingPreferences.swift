@@ -757,7 +757,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         return Double(frameRateNumerator) / Double(frameRateDenominator)
     }
 
-    /// The reduced, wire-representable refresh fraction used by protocol v3.
+    /// The reduced refresh fraction used by streaming transports.
     public var normalizedFrameRate: (numerator: UInt32, denominator: UInt32)? {
         guard let numerator = UInt64(exactly: frameRateNumerator),
               let denominator = UInt64(exactly: frameRateDenominator),

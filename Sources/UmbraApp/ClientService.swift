@@ -31,7 +31,6 @@ protocol UmbraClientServicing: AnyObject {
     func setEventHandler(_ handler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?)
     func discoverHosts() async throws -> [HostDisplayModel]
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel
-    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel
     func cancelPairing(hostID: HostID) async
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel
@@ -76,7 +75,6 @@ final class UnavailableUmbraClientService: UmbraClientServicing {
     func setEventHandler(_ handler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?) {}
     func discoverHosts() async throws -> [HostDisplayModel] { throw error }
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw error }
-    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel { throw error }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel { throw error }
     func cancelPairing(hostID: HostID) async {}
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw error }

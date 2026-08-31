@@ -136,15 +136,6 @@ let package = Package(
             swiftSettings: releaseSwiftSettings
         ),
         .target(
-            name: "UmbraQUICTransport",
-            path: "Sources/UmbraQUICTransport"
-        ),
-        .target(
-            name: "UmbraProtocolV3",
-            dependencies: ["UmbraQUICTransport"],
-            path: "Sources/UmbraProtocolV3",
-        ),
-        .target(
             name: "UmbraIntegration",
             dependencies: [
                 "UmbraCore",
@@ -156,8 +147,6 @@ let package = Package(
                 "UmbraMedia",
                 "UmbraOpus",
                 "UmbraMicrophone",
-                "UmbraProtocolV3",
-                "UmbraQUICTransport",
             ],
             path: "Sources/UmbraIntegration"
         ),
@@ -181,8 +170,6 @@ let package = Package(
                 "UmbraCLIExecution",
                 "UmbraDiagnostics",
                 "UmbraMicrophone",
-                "UmbraProtocolV3",
-                "UmbraQUICTransport",
             ],
             path: "Sources/UmbraApp",
             exclude: [
@@ -246,16 +233,6 @@ let package = Package(
             swiftSettings: releaseSwiftSettings
         ),
         .testTarget(
-            name: "UmbraQUICTransportTests",
-            dependencies: ["UmbraQUICTransport"],
-            path: "Tests/UmbraQUICTransportTests"
-        ),
-        .testTarget(
-            name: "UmbraProtocolV3Tests",
-            dependencies: ["UmbraProtocolV3", "UmbraQUICTransport"],
-            path: "Tests/UmbraProtocolV3Tests",
-        ),
-        .testTarget(
             name: "UmbraIntegrationTests",
             dependencies: [
                 "UmbraIntegration",
@@ -268,11 +245,8 @@ let package = Package(
                 "UmbraMedia",
                 "UmbraOpus",
                 "UmbraMicrophone",
-                "UmbraProtocolV3",
-                "UmbraQUICTransport",
             ],
-            path: "Tests/UmbraIntegrationTests",
-            resources: [.process("Fixtures")]
+            path: "Tests/UmbraIntegrationTests"
         ),
         .testTarget(
             name: "UmbraCLIExecutionTests",
@@ -286,9 +260,8 @@ let package = Package(
         ),
         .testTarget(
             name: "UmbraAppTests",
-            dependencies: ["UmbraApp", "UmbraCore", "UmbraMedia", "UmbraProtocolV3"],
-            path: "Tests/UmbraAppTests",
-            resources: [.process("Fixtures")]
+            dependencies: ["UmbraApp", "UmbraCore", "UmbraMedia"],
+            path: "Tests/UmbraAppTests"
         ),
     ]
 )

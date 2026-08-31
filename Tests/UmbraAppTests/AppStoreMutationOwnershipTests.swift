@@ -321,7 +321,6 @@ private final class ApplicationMutationServiceSpy: UmbraClientServicing {
     }
 
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw unused() }
-    func pairSecureHost(invitationURI: String) async throws -> HostDisplayModel { throw unused() }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel { throw unused() }
     func cancelPairing(hostID: HostID) async {}
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw unused() }

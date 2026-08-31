@@ -20,11 +20,8 @@ Quality mode is not a lossless-stream claim. The separate
 the exact codec tuple; it preserves samples only after the encoder-input
 conversion boundary.
 
-Full builds include the production-linked Umbra/Lumen v3 stack over one QUIC
-connection. Legacy GameStream remains available for existing Moonlight hosts
-and clients. The v3 source and package gates are implemented, but the current
-release remains unqualified until the full Windows artifact and a real
-cross-machine QR-paired stream pass the installed-system gate. See
+The current baseline uses the legacy GameStream path for Sunshine, Lumen, and
+other Moonlight-compatible hosts. See
 [Architecture](Docs/ARCHITECTURE.md) and [Compatibility and validation
 status](Docs/FEATURE_PARITY.md).
 
