@@ -432,7 +432,8 @@ public actor LSPClientSession {
                     status: status,
                     sessionID: request.sessionID,
                     audioGeneration: request.nativeConfiguration.audioGeneration
-                )
+                ),
+                errorResponse: status != .success
             )
         } catch {
             if status == .success {
