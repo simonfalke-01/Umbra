@@ -397,8 +397,22 @@ namespace umbra::lsp {
       if (!authenticated_.load(std::memory_order_acquire)) {
         return CLSP_STATUS_NOT_AUTHENTICATED;
       }
-      CaptureRecord record {.kind = CaptureKind::neutralize};
-      return enqueue_capture(record);
+      const auto token = neutralize_requested_.fetch_add(1, std::memory_order_acq_rel) + 1U;
+      CaptureRecord record {.kind = CaptureKind::neutralize, .neutralize_token = token};
+      const auto queued = enqueue_capture(record);
+      if (queued != CLSP_STATUS_OK) return queued;
+      timespec deadline {};
+      if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      deadline.tv_nsec += 100'000'000L;
+      if (deadline.tv_nsec >= 1'000'000'000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1'000'000'000L; }
+      pthread_mutex_lock(&mutex_);
+      while (neutralize_completed_.load(std::memory_order_acquire) < token) {
+        const auto wait = pthread_cond_timedwait(&condition_, &mutex_, &deadline);
+        if (wait == ETIMEDOUT) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_TIMEOUT; }
+        if (wait != 0) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_INTERNAL_FAILURE; }
+      }
+      pthread_mutex_unlock(&mutex_);
+      return CLSP_STATUS_OK;
 #else
       return CLSP_STATUS_UNSUPPORTED;
 #endif
@@ -435,6 +449,7 @@ namespace umbra::lsp {
       clsp_controller_sensor_t controller_sensor {};  ///< Controller sensor fields.
       clsp_controller_touch_edge_t touch_edge {};  ///< Touch lifecycle fields.
       clsp_controller_touch_state_t touch_state {};  ///< Touch coordinate fields.
+      std::uint64_t neutralize_token {};  ///< Synchronous quiesce completion token.
     };
 
     /** @brief Worker-owned latest controller analog state. */
@@ -728,6 +743,10 @@ namespace umbra::lsp {
         if (record.kind == CaptureKind::neutralize) {
           capture_accepting_ = false;
           pointer_dirty_ = false;
+          neutralize_completed_.store(record.neutralize_token, std::memory_order_release);
+          pthread_mutex_lock(&mutex_);
+          pthread_cond_broadcast(&condition_);
+          pthread_mutex_unlock(&mutex_);
           continue;
         }
         if (!capture_accepting_) {
@@ -1465,6 +1484,8 @@ namespace umbra::lsp {
     std::array<TouchLatest, 16> touch_states_ {};  ///< Latest controller touch contacts.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
+    std::atomic<std::uint64_t> neutralize_requested_ {0};  ///< Latest synchronous neutralize token.
+    std::atomic<std::uint64_t> neutralize_completed_ {0};  ///< Worker-completed neutralize token.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.

@@ -13,6 +13,8 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case applications = 0x0101
     case start = 0x0200
     case startResponse = 0x0201
+    case attach = 0x0202
+    case attachResponse = 0x0203
 }
 
 /// Stable status codes in exact LSP control responses.
@@ -89,6 +91,21 @@ public struct LSPInputStartRequest: Equatable, Sendable {
 public struct LSPInputStartResponse: Equatable, Sendable {
     public var sessionID: UUID
     public var attachToken: Data
+    public var nativeConfiguration: LSPNativeInputConfiguration
+}
+
+/// Exact ATTACH request ownership values retained from the prior authority.
+public struct LSPAttachRequest: Equatable, Sendable {
+    public var sessionID: UUID
+    public var attachToken: Data
+    public var intentID: UUID
+}
+
+/// Authenticated ATTACH_RESPONSE with rotated ownership and input mapping.
+public struct LSPAttachResponse: Equatable, Sendable {
+    public var sessionID: UUID
+    public var replacementAttachToken: Data
+    public var connectionGeneration: UInt32
     public var nativeConfiguration: LSPNativeInputConfiguration
 }
 
@@ -295,6 +312,63 @@ public enum LSPControlWire {
                 sensorRate: sensorRate,
                 reconciliationRate: reconciliationRate,
                 reservedInputWireBitsPerSecond: reservedBudget,
+                baselineRequired: true
+            )
+        )
+    }
+
+    public static func attach(_ request: LSPAttachRequest) throws -> Data {
+        try fixed(request.attachToken, count: 32)
+        return try encodeMap([
+            .unsigned(1),
+            .bytes(uuidBytes(request.sessionID)),
+            .bytes(request.attachToken),
+            .bytes(uuidBytes(request.intentID)),
+        ])
+    }
+
+    public static func attachResponse(from event: LSPControlEvent) throws -> LSPAttachResponse {
+        let values = try responseValues(event, type: .attachResponse, count: 16)
+        try requireSuccess(values[1])
+        let sessionID = try uuid(try bytes(values[2], count: 16))
+        let replacement = try bytes(values[3], count: 32)
+        let connectionGeneration = try uint32(values[4], nonzero: true)
+        let streamGeneration = try uint32(values[5], nonzero: true)
+        let inputGeneration = try uint32(values[6], nonzero: true)
+        let inputSSRC = try uint32(values[7], nonzero: true)
+        let acknowledgementSSRC = try uint32(values[8], nonzero: true)
+        let payloadType = try uint32(values[9], nonzero: true)
+        let pointerRate = try uint32(values[10], nonzero: true)
+        let controllerRate = try uint32(values[11], nonzero: true)
+        let sensorRate = try uint32(values[12], nonzero: true)
+        let reconciliationRate = try uint32(values[13], nonzero: true)
+        let budget = try uint(values[14])
+        guard inputSSRC != acknowledgementSSRC,
+              (96...127).contains(payloadType),
+              (125...16_000).contains(pointerRate),
+              (125...2_000).contains(controllerRate),
+              (125...4_000).contains(sensorRate),
+              (50...1_000).contains(reconciliationRate),
+              (1...32_000_000).contains(budget),
+              case .boolean(true) = values[15]
+        else {
+            throw DeterministicCBORError.malformed
+        }
+        return LSPAttachResponse(
+            sessionID: sessionID,
+            replacementAttachToken: replacement,
+            connectionGeneration: connectionGeneration,
+            nativeConfiguration: LSPNativeInputConfiguration(
+                streamGeneration: streamGeneration,
+                inputGeneration: inputGeneration,
+                inputSSRC: inputSSRC,
+                acknowledgementSSRC: acknowledgementSSRC,
+                inputPayloadType: UInt8(payloadType),
+                pointerRate: pointerRate,
+                controllerRate: controllerRate,
+                sensorRate: sensorRate,
+                reconciliationRate: reconciliationRate,
+                reservedInputWireBitsPerSecond: budget,
                 baselineRequired: true
             )
         )

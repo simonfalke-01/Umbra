@@ -55,6 +55,14 @@ applies LED, reusable CoreHaptics intensity, DualSense adaptive triggers,
 motion-sensor state, and player slot on the native controller queue; unsupported
 primitives return an explicit retry-safe terminal ACK.
 
+Transport loss and planned rekey share one product reconnect path. Umbra first
+establishes and authenticates a fresh UDP/DTLS association, synchronously
+quiesces the old native input producer, sends the current single-use attach
+token with a fresh intent ID, then accepts only a matching authenticated
+ATTACH_RESPONSE. Success rotates the token, retires the old association,
+installs fresh SRTP contexts/SSRCs and advanced generations, and requires a new
+atomic neutral baseline. An authenticated failure never selects GameStream.
+
 ## Session policies
 
 An immutable effective policy is resolved once per session and passed through

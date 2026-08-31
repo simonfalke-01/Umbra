@@ -418,6 +418,13 @@ public final class LSPTransport: @unchecked Sendable {
         callbackState.setEventHandler(handler)
     }
 
+    /// Installs a coarse native lifecycle handler; never called per packet or input sample.
+    public func setLifecycleHandler(
+        _ handler: (@Sendable (LSPTransportLifecycle) -> Void)?
+    ) {
+        callbackState.setLifecycleHandler(handler)
+    }
+
     /// Installs the exact authenticated input-only START_RESPONSE mapping.
     public func configureInput(_ configuration: LSPNativeInputConfiguration) throws {
         var native = clsp_input_configuration_t()
@@ -620,6 +627,7 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
     private let lock = NSLock()
     private var completions: [UInt64: Completion] = [:]
     private var eventHandler: (@Sendable (LSPControlEvent) -> Void)?
+    private var lifecycleHandler: (@Sendable (LSPTransportLifecycle) -> Void)?
 
     func reserveRequestID() -> UInt64 {
         lock.withLock {
@@ -661,6 +669,15 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
             eventHandler = handler
         }
     }
+
+    func receiveLifecycle(_ lifecycle: LSPTransportLifecycle) {
+        let handler = lock.withLock { lifecycleHandler }
+        handler?(lifecycle)
+    }
+
+    func setLifecycleHandler(_ handler: (@Sendable (LSPTransportLifecycle) -> Void)?) {
+        lock.withLock { lifecycleHandler = handler }
+    }
 }
 
 private let lspRetainCallbackContext: @convention(c) (UnsafeMutableRawPointer?) -> Void = { context in
@@ -676,8 +693,11 @@ private let lspReleaseCallbackContext: @convention(c) (UnsafeMutableRawPointer?)
 private let lspLifecycleCallback: @convention(c) (
     UnsafeMutableRawPointer?,
     UnsafePointer<clsp_lifecycle_event_t>?
-) -> Void = { _, _ in
-    // Start waits for authenticated completion and telemetry exposes lifecycle.
+) -> Void = { context, event in
+    guard let context, let event,
+          let lifecycle = LSPTransportLifecycle(rawValue: event.pointee.state)
+    else { return }
+    Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receiveLifecycle(lifecycle)
 }
 
 private let lspControlCallback: @convention(c) (

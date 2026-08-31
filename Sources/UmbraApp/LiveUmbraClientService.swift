@@ -462,6 +462,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 pointerRate: 1_000
             )
             lspInputCapture.start(session: session)
+            installLSPReconnectHandler(session: session, hostID: nativeHostID)
             return
         }
         do {
@@ -519,6 +520,33 @@ final class LiveUmbraClientService: UmbraClientServicing {
     func disconnectSession() async {
         lspInputCapture.stop()
         _ = try? await service.stopSession(quitHostApplication: false)
+    }
+
+    /// Executes the product reconnect/rekey boundary without legacy fallback.
+    func reconnectLSPInput(
+        hostID: UUID,
+        reason: LSPReconnectReason
+    ) async throws {
+        guard let lspProduct else { throw UmbraClientServiceError.unavailable("Native LSP is unavailable.") }
+        let replacement = try await lspProduct.reconnectInput(hostID: hostID, reason: reason)
+        lspInputCapture.start(session: replacement)
+        installLSPReconnectHandler(session: replacement, hostID: hostID)
+    }
+
+    private func installLSPReconnectHandler(session: LSPClientSession, hostID: UUID) {
+        session.setTransportLifecycleHandler { [weak self, weak session] lifecycle in
+            guard lifecycle == .failed, session != nil else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.reconnectLSPInput(hostID: hostID, reason: .transportLoss)
+                    self.eventHandler?(.sessionWarning("Native LSP input reconnected with fresh security keys."))
+                } catch {
+                    self.lspInputCapture.stop()
+                    self.eventHandler?(.sessionWarning("Native LSP reconnect failed: \(error.localizedDescription)"))
+                }
+            }
+        }
     }
 
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws {

@@ -106,6 +106,39 @@ public actor LSPProductClient {
         return session
     }
 
+    /// Reconnects or rekeys through a fresh DTLS association and authenticated ATTACH.
+    public func reconnectInput(
+        hostID: UUID,
+        reason: LSPReconnectReason
+    ) async throws -> LSPClientSession {
+        guard let previous = sessions[hostID] else {
+            throw LSPTransportError.invalidState
+        }
+        let hosts = try await hostStore.load().records
+        let trusts = try await trustStore.load().records
+        guard let host = hosts.first(where: { $0.hostID == hostID }),
+              let trust = trusts.first(where: { $0.hostID == hostID })
+        else {
+            throw LSPControlStatus.authenticationFailed
+        }
+        let replacement = try await LSPClientSession.persistent(identityStore: identityStore)
+        let updatedTrust = try await replacement.authenticate(host: host, trust: trust)
+        _ = try await trustStore.update { snapshot in
+            var snapshot = snapshot
+            snapshot.records.removeAll { $0.hostID == hostID }
+            snapshot.records.append(updatedTrust)
+            return snapshot
+        }
+        _ = try await replacement.attach(previous: previous, reason: reason)
+        sessions[hostID] = replacement
+        return replacement
+    }
+
+    /// Planned rekey is the same fresh-DTLS ATTACH path as reconnect.
+    public func rekeyInput(hostID: UUID) async throws -> LSPClientSession {
+        try await reconnectInput(hostID: hostID, reason: .plannedRekey)
+    }
+
     /// Removes only native LSP host/trust state and stops its session.
     public func remove(hostID: UUID) async throws {
         if let session = sessions.removeValue(forKey: hostID), [.authenticated, .inputActive].contains(await session.state) {
