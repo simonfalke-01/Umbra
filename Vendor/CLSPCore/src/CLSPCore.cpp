@@ -38,6 +38,7 @@ struct clsp_core {
   std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
   std::atomic<std::uint32_t> state {CLSP_LIFECYCLE_CREATED};  ///< Coarse lifecycle state.
   std::atomic<bool> callback_active {false};  ///< Rejects reentrant ABI operations.
+  std::atomic<bool> audio_callback_active {false};  ///< Prevents recursive complete-audio delivery.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
   clsp_apple_input_capture_t *apple_capture {};  ///< Active native controller-output owner.
   umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
@@ -145,6 +146,30 @@ namespace {
   /** @brief Receive one native authenticated LSPC frame. */
   void runtime_control(void *context, const clsp_control_event_t &event) noexcept {
     publish_control(static_cast<clsp_core_t *>(context), event);
+  }
+
+  /** @brief Publish one authenticated complete Opus packet. */
+  void runtime_audio_packet(void *context, const clsp_audio_packet_event_t &event) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    if (core->callbacks.audio_packet == nullptr) return;
+    auto expected = false;
+    if (!core->audio_callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    clsp_core_retain(core);
+    core->callbacks.audio_packet(core->callbacks.context, &event);
+    core->audio_callback_active.store(false, std::memory_order_release);
+    clsp_core_release(core);
+  }
+
+  /** @brief Publish one authenticated audio sender-report timeline. */
+  void runtime_audio_timing(void *context, const clsp_audio_timing_event_t &event) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    if (core->callbacks.audio_timing == nullptr) return;
+    auto expected = false;
+    if (!core->audio_callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    clsp_core_retain(core);
+    core->callbacks.audio_timing(core->callbacks.context, &event);
+    core->audio_callback_active.store(false, std::memory_order_release);
+    clsp_core_release(core);
   }
 
   /** @brief Accumulate one native runtime telemetry counter. */
@@ -301,6 +326,8 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
       .control = runtime_control,
       .counter = runtime_counter,
       .controller_output = runtime_controller_output,
+      .audio_packet = runtime_audio_packet,
+      .audio_timing = runtime_audio_timing,
     },
   };
   if (runtime == nullptr) {
@@ -365,6 +392,35 @@ extern "C" clsp_status_t clsp_core_configure_input(
     return CLSP_STATUS_NOT_AUTHENTICATED;
   }
   return core->runtime->configure_input(*configuration);
+}
+
+extern "C" clsp_status_t clsp_core_send_control_response(
+  clsp_core_t *core,
+  const std::uint16_t message_type,
+  const std::uint64_t request_id,
+  const clsp_const_byte_span_t payload,
+  const std::uint8_t error_response,
+  const std::uint32_t deadline_milliseconds
+) {
+  if (core == nullptr || error_response > 1U) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (core->callback_active.load(std::memory_order_acquire)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (core->runtime == nullptr) return CLSP_STATUS_NOT_AUTHENTICATED;
+  return core->runtime->send_control_response(
+    message_type,
+    request_id,
+    payload,
+    error_response != 0,
+    deadline_milliseconds
+  );
+}
+
+extern "C" clsp_status_t clsp_core_configure_audio(
+  clsp_core_t *core,
+  const clsp_audio_configuration_t *configuration
+) {
+  if (core == nullptr || configuration == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (core->runtime == nullptr) return CLSP_STATUS_NOT_AUTHENTICATED;
+  return core->runtime->configure_audio(*configuration);
 }
 
 extern "C" clsp_status_t clsp_core_submit_pointer(

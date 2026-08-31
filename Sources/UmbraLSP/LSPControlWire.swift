@@ -15,6 +15,8 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case startResponse = 0x0201
     case attach = 0x0202
     case attachResponse = 0x0203
+    case audioConfig = 0x0212
+    case audioConfigAck = 0x0213
 }
 
 /// Stable status codes in exact LSP control responses.
@@ -25,8 +27,10 @@ public enum LSPControlStatus: UInt8, Error, Sendable {
     case authenticationFailed = 3
     case permissionDenied = 4
     case busy = 5
+    case unsupportedMediaTuple = 6
     case staleGeneration = 7
     case timeout = 8
+    case pathCapacityInsufficient = 9
     case internalFailure = 10
 }
 
@@ -69,6 +73,8 @@ public struct LSPInputStartRequest: Equatable, Sendable {
     public var sensorRate: UInt32
     public var reconciliationRate: UInt32
     public var maximumInputWireBitsPerSecond: UInt64
+    public var audioOffers: [LSPAudioOffer]
+    public var offeredMaximumUDPPayload: UInt16
 
     public init(
         applicationID: String,
@@ -76,7 +82,9 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         controllerRate: UInt32 = 250,
         sensorRate: UInt32 = 250,
         reconciliationRate: UInt32 = 250,
-        maximumInputWireBitsPerSecond: UInt64 = 32_000_000
+        maximumInputWireBitsPerSecond: UInt64 = 32_000_000,
+        audioOffers: [LSPAudioOffer] = [],
+        offeredMaximumUDPPayload: UInt16 = 1_472
     ) {
         self.applicationID = applicationID
         self.pointerRate = pointerRate
@@ -84,7 +92,34 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         self.sensorRate = sensorRate
         self.reconciliationRate = reconciliationRate
         self.maximumInputWireBitsPerSecond = maximumInputWireBitsPerSecond
+        self.audioOffers = audioOffers
+        self.offeredMaximumUDPPayload = offeredMaximumUDPPayload
     }
+}
+
+/// One ordered Opus capability in START.
+public struct LSPAudioOffer: Equatable, Sendable {
+    public var channels: UInt8
+    public var frameSamples: UInt16
+    public var maximumBitrate: UInt32
+    public var inbandFEC: Bool
+    public var dtx: Bool
+
+    public static let adaptiveDefaults: [Self] = [
+        .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
+        .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
+        .init(channels: 6, frameSamples: 480, maximumBitrate: 768_000, inbandFEC: false, dtx: true),
+        .init(channels: 8, frameSamples: 480, maximumBitrate: 1_024_000, inbandFEC: false, dtx: true),
+        .init(channels: 2, frameSamples: 960, maximumBitrate: 256_000, inbandFEC: true, dtx: true),
+    ]
+
+    public static let competitionDefaults: [Self] = [
+        .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
+        .init(channels: 2, frameSamples: 120, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
+        .init(channels: 6, frameSamples: 240, maximumBitrate: 768_000, inbandFEC: false, dtx: true),
+        .init(channels: 8, frameSamples: 240, maximumBitrate: 1_024_000, inbandFEC: false, dtx: true),
+        .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
+    ]
 }
 
 /// Exact input-only START_RESPONSE authority and native lane mapping.
@@ -92,6 +127,7 @@ public struct LSPInputStartResponse: Equatable, Sendable {
     public var sessionID: UUID
     public var attachToken: Data
     public var nativeConfiguration: LSPNativeInputConfiguration
+    public var audioConfiguration: LSPNativeAudioConfiguration
 }
 
 /// Exact ATTACH request ownership values retained from the prior authority.
@@ -107,6 +143,13 @@ public struct LSPAttachResponse: Equatable, Sendable {
     public var replacementAttachToken: Data
     public var connectionGeneration: UInt32
     public var nativeConfiguration: LSPNativeInputConfiguration
+    public var audioConfiguration: LSPNativeAudioConfiguration
+}
+
+/// Exact authenticated AUDIO_CONFIG request.
+public struct LSPAudioConfigurationRequest: Equatable, Sendable {
+    public var sessionID: UUID
+    public var nativeConfiguration: LSPNativeAudioConfiguration
 }
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
@@ -257,9 +300,24 @@ public enum LSPControlWire {
               (125...2_000).contains(request.controllerRate),
               (125...4_000).contains(request.sensorRate),
               (50...1_000).contains(request.reconciliationRate),
-              (1...32_000_000).contains(request.maximumInputWireBitsPerSecond)
+              (1...32_000_000).contains(request.maximumInputWireBitsPerSecond),
+              (1...12).contains(request.audioOffers.count),
+              (1_200...1_472).contains(request.offeredMaximumUDPPayload)
         else {
             throw DeterministicCBORError.malformed
+        }
+        let offers = try request.audioOffers.map { offer -> DeterministicCBORValue in
+            guard [2, 6, 8].contains(offer.channels), [120, 240, 480, 960].contains(offer.frameSamples),
+                  (6_000...2_048_000).contains(offer.maximumBitrate) else {
+                throw DeterministicCBORError.malformed
+            }
+            return .map([
+                .init(key: 1, value: .unsigned(UInt64(offer.channels))),
+                .init(key: 2, value: .unsigned(UInt64(offer.frameSamples))),
+                .init(key: 3, value: .unsigned(UInt64(offer.maximumBitrate))),
+                .init(key: 4, value: .boolean(offer.inbandFEC)),
+                .init(key: 5, value: .boolean(offer.dtx)),
+            ])
         }
         return try encodeMap([
             .unsigned(1),
@@ -269,11 +327,13 @@ public enum LSPControlWire {
             .unsigned(UInt64(request.sensorRate)),
             .unsigned(UInt64(request.reconciliationRate)),
             .unsigned(request.maximumInputWireBitsPerSecond),
+            .array(offers),
+            .unsigned(UInt64(request.offeredMaximumUDPPayload)),
         ])
     }
 
     public static func startResponse(from event: LSPControlEvent) throws -> LSPInputStartResponse {
-        let values = try responseValues(event, type: .startResponse, count: 15)
+        let values = try responseValues(event, type: .startResponse, count: 29)
         try requireSuccess(values[1])
         let sessionID = try uuid(try bytes(values[2], count: 16))
         let attachToken = try bytes(values[3], count: 32)
@@ -298,6 +358,7 @@ public enum LSPControlWire {
         else {
             throw DeterministicCBORError.malformed
         }
+        let audio = try audioConfiguration(values: values, offset: 15, streamGeneration: streamGeneration)
         return LSPInputStartResponse(
             sessionID: sessionID,
             attachToken: attachToken,
@@ -313,7 +374,8 @@ public enum LSPControlWire {
                 reconciliationRate: reconciliationRate,
                 reservedInputWireBitsPerSecond: reservedBudget,
                 baselineRequired: true
-            )
+            ),
+            audioConfiguration: audio
         )
     }
 
@@ -328,7 +390,7 @@ public enum LSPControlWire {
     }
 
     public static func attachResponse(from event: LSPControlEvent) throws -> LSPAttachResponse {
-        let values = try responseValues(event, type: .attachResponse, count: 16)
+        let values = try responseValues(event, type: .attachResponse, count: 30)
         try requireSuccess(values[1])
         let sessionID = try uuid(try bytes(values[2], count: 16))
         let replacement = try bytes(values[3], count: 32)
@@ -354,6 +416,7 @@ public enum LSPControlWire {
         else {
             throw DeterministicCBORError.malformed
         }
+        let audio = try audioConfiguration(values: values, offset: 16, streamGeneration: streamGeneration)
         return LSPAttachResponse(
             sessionID: sessionID,
             replacementAttachToken: replacement,
@@ -370,8 +433,36 @@ public enum LSPControlWire {
                 reconciliationRate: reconciliationRate,
                 reservedInputWireBitsPerSecond: budget,
                 baselineRequired: true
-            )
+            ),
+            audioConfiguration: audio
         )
+    }
+
+    public static func audioConfig(from event: LSPControlEvent) throws -> LSPAudioConfigurationRequest {
+        guard event.messageType == LSPControlMessageType.audioConfig.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 17)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        let sessionID = try uuid(try bytes(values[1], count: 16))
+        let streamGeneration = try uint32(values[2], nonzero: true)
+        let configuration = try audioConfiguration(values: values, offset: 3, streamGeneration: streamGeneration)
+        return LSPAudioConfigurationRequest(sessionID: sessionID, nativeConfiguration: configuration)
+    }
+
+    public static func audioConfigAck(
+        status: LSPControlStatus,
+        sessionID: UUID,
+        audioGeneration: UInt32
+    ) throws -> Data {
+        guard audioGeneration != 0 else { throw DeterministicCBORError.malformed }
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(UInt64(status.rawValue)),
+            .bytes(uuidBytes(sessionID)),
+            .unsigned(UInt64(audioGeneration)),
+        ])
     }
 
     private static func responseValues(
@@ -395,6 +486,54 @@ public enum LSPControlWire {
         let values = try DeterministicCBOR.exactMap(value, count: count)
         guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
         return values
+    }
+
+    private static func audioConfiguration(
+        values: [DeterministicCBORValue],
+        offset: Int,
+        streamGeneration: UInt32
+    ) throws -> LSPNativeAudioConfiguration {
+        guard values.count >= offset + 14 else { throw DeterministicCBORError.malformed }
+        let generation = try uint32(values[offset], nonzero: true)
+        let ssrc = try uint32(values[offset + 1], nonzero: true)
+        let payloadType = try uint32(values[offset + 2], nonzero: true)
+        let clock = try uint32(values[offset + 3], nonzero: true)
+        let channels = try uint32(values[offset + 4], nonzero: true)
+        let streams = try uint32(values[offset + 5], nonzero: true)
+        let coupled = try uint32(values[offset + 6], nonzero: false)
+        guard case .bytes(let mapping) = values[offset + 7] else { throw DeterministicCBORError.malformed }
+        let frameSamples = try uint32(values[offset + 8], nonzero: true)
+        let bitrate = try uint32(values[offset + 9], nonzero: true)
+        guard case .boolean(let fec) = values[offset + 10],
+              case .boolean(let dtx) = values[offset + 11]
+        else { throw DeterministicCBORError.malformed }
+        let udpPayload = try uint32(values[offset + 12], nonzero: true)
+        let preroll = try uint32(values[offset + 13], nonzero: true)
+        guard (96...127).contains(payloadType), clock == 48_000,
+              [2, 6, 8].contains(channels), streams > 0, coupled <= streams,
+              streams + coupled == channels, mapping.count == Int(channels),
+              mapping.allSatisfy({ UInt32($0) < channels }),
+              [120, 240, 480, 960].contains(frameSamples),
+              (6_000...2_048_000).contains(bitrate),
+              (1_200...1_472).contains(udpPayload), preroll == 1
+        else {
+            throw DeterministicCBORError.malformed
+        }
+        return LSPNativeAudioConfiguration(
+            streamGeneration: streamGeneration,
+            audioGeneration: generation,
+            audioSSRC: ssrc,
+            audioPayloadType: UInt8(payloadType),
+            channels: UInt8(channels),
+            streams: UInt8(streams),
+            coupledStreams: UInt8(coupled),
+            mapping: Array(mapping),
+            frameSamples: UInt16(frameSamples),
+            bitrate: bitrate,
+            inbandFEC: fec,
+            dtx: dtx,
+            udpPayloadSize: UInt16(udpPayload)
+        )
     }
 
     private static func requireSuccess(_ value: DeterministicCBORValue) throws {

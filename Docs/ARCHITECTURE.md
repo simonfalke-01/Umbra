@@ -63,6 +63,19 @@ ATTACH_RESPONSE. Success rotates the token, retires the old association,
 installs fresh SRTP contexts/SSRCs and advanced generations, and requires a new
 atomic neutral baseline. An authenticated failure never selects GameStream.
 
+Host audio is negotiated in START and installed only after an exact
+authenticated AUDIO_CONFIG. CLSPCore admits only the selected audio
+generation/SSRC/PT, decrypts SRTP in place, and crosses the C ABI once per
+complete Opus packet. Swift configures the existing multistream Opus decoder
+and production AudioQueue renderer with one selected packet of initial preroll
+before returning the semantic AUDIO_CONFIG_ACK. A depth-one reorder owner drops
+duplicates/late packets, uses a one-frame deadline, and invokes Opus PLC for one
+proven isolated gap. Authenticated RTCP sender reports retain the NTP-to-48-kHz
+clock relation without crossing into the Opus callback. Duplicate configuration
+requests receive a byte-identical cached response without rebuilding audio.
+Reconnect uses a fresh audio generation/SSRC and retires the old decoder only
+after successful ATTACH; failed planned rekey leaves old audio functional.
+
 ## Session policies
 
 An immutable effective policy is resolved once per session and passed through

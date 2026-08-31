@@ -24,11 +24,17 @@ namespace umbra::lsp {
     /** @brief Apply one authenticated LSPG payload and return a terminal command status. */
     using ControllerOutput = std::uint8_t (*)(void *context, clsp_const_byte_span_t payload) noexcept;
 
+    /** @brief Deliver one authenticated complete Opus RTP payload. */
+    using AudioPacket = void (*)(void *context, const clsp_audio_packet_event_t &event) noexcept;
+    using AudioTiming = void (*)(void *context, const clsp_audio_timing_event_t &event) noexcept;
+
     void *context {};  ///< Opaque C ABI owner.
     Lifecycle lifecycle {};  ///< Required lifecycle callback.
     Control control {};  ///< Optional authenticated-control callback.
     Counter counter {};  ///< Required telemetry callback.
     ControllerOutput controller_output {};  ///< Optional generation-checked GameController output callback.
+    AudioPacket audio_packet {};  ///< Optional complete Opus packet callback.
+    AudioTiming audio_timing {};  ///< Optional authenticated sender-report callback.
   };
 
   /** @brief Runtime telemetry counter identifiers. */
@@ -88,6 +94,18 @@ namespace umbra::lsp {
       clsp_const_byte_span_t payload,
       std::uint32_t deadline_milliseconds
     ) noexcept;
+
+    /** @brief Queue one semantic LSPC response for a retained authenticated request. */
+    [[nodiscard]] clsp_status_t send_control_response(
+      std::uint16_t message_type,
+      std::uint64_t request_id,
+      clsp_const_byte_span_t payload,
+      bool error_response,
+      std::uint32_t deadline_milliseconds
+    ) noexcept;
+
+    /** @brief Install exact host-audio packet admission before semantic ACK. */
+    [[nodiscard]] clsp_status_t configure_audio(const clsp_audio_configuration_t &configuration) noexcept;
 
     /** @brief Install an authenticated input-only START_RESPONSE mapping. */
     [[nodiscard]] clsp_status_t configure_input(const clsp_input_configuration_t &configuration) noexcept;

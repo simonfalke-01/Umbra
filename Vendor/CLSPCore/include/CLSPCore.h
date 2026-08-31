@@ -127,6 +127,52 @@ extern "C" {
     clsp_const_byte_span_t payload;  ///< Transient deterministic-CBOR payload.
   } clsp_control_event_t;
 
+  /** @brief Exact authenticated host-audio configuration installed before semantic ACK. */
+  typedef struct clsp_audio_configuration {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_audio_configuration_t)`.
+    uint32_t stream_generation;  ///< Nonzero retained stream generation.
+    uint32_t audio_generation;  ///< Nonzero audio generation.
+    uint32_t audio_ssrc;  ///< Nonzero host audio RTP SSRC.
+    uint32_t clock_rate;  ///< Exactly 48,000.
+    uint32_t bitrate;  ///< Selected Opus bitrate.
+    uint16_t frame_samples;  ///< 120, 240, 480, or 960.
+    uint16_t udp_payload_size;  ///< Authenticated path payload size.
+    uint8_t audio_payload_type;  ///< Dynamic RTP PT 96 through 127.
+    uint8_t channels;  ///< Two, six, or eight.
+    uint8_t streams;  ///< Nonzero Opus stream count.
+    uint8_t coupled_streams;  ///< Opus coupled stream count.
+    uint8_t mapping[8];  ///< Leading `mapping_length` Opus channel mapping bytes.
+    uint8_t mapping_length;  ///< Exactly `channels`.
+    uint8_t inband_fec;  ///< Boolean.
+    uint8_t dtx;  ///< Boolean.
+    uint8_t preroll_packets;  ///< Exactly one.
+  } clsp_audio_configuration_t;
+
+  /** @brief One authenticated complete Opus RTP payload delivered at packet frequency. */
+  typedef struct clsp_audio_packet_event {
+    uint32_t abi_version;  ///< Event ABI version.
+    uint32_t structure_size;  ///< Size of this event.
+    uint32_t audio_generation;  ///< Exact installed audio generation.
+    uint32_t ssrc;  ///< Exact installed audio SSRC.
+    uint32_t timestamp;  ///< 48-kHz RTP timestamp.
+    uint16_t sequence_number;  ///< RTP sequence number.
+    uint8_t marker;  ///< RTP marker bit.
+    uint8_t reserved_zero;  ///< Reserved and zero.
+    clsp_const_byte_span_t opus_packet;  ///< Transient complete Opus packet.
+  } clsp_audio_packet_event_t;
+
+  /** @brief Authenticated RTCP sender-report audio clock relation. */
+  typedef struct clsp_audio_timing_event {
+    uint32_t abi_version;  ///< Event ABI version.
+    uint32_t structure_size;  ///< Size of this event.
+    uint32_t audio_generation;  ///< Installed audio generation.
+    uint32_t ssrc;  ///< Installed audio SSRC.
+    uint32_t ntp_seconds;  ///< NTP seconds field.
+    uint32_t ntp_fraction;  ///< NTP fractional field.
+    uint32_t rtp_timestamp;  ///< Corresponding 48-kHz RTP timestamp.
+  } clsp_audio_timing_event_t;
+
   /** @brief Exact input-only START_RESPONSE mapping installed in the native worker. */
   typedef struct clsp_input_configuration {
     uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
@@ -262,6 +308,12 @@ extern "C" {
    */
   typedef void (*clsp_control_callback_t)(void *context, const clsp_control_event_t *event);
 
+  /** @brief Complete authenticated Opus packet callback; no UDP fragment crosses the ABI. */
+  typedef void (*clsp_audio_packet_callback_t)(void *context, const clsp_audio_packet_event_t *event);
+
+  /** @brief Authenticated low-rate audio sender-report callback. */
+  typedef void (*clsp_audio_timing_callback_t)(void *context, const clsp_audio_timing_event_t *event);
+
   /**
    * @brief Retain an explicitly owned callback context.
    *
@@ -289,6 +341,8 @@ extern "C" {
     clsp_context_release_t release_context;  ///< Required release operation for nonnull context.
     clsp_lifecycle_callback_t lifecycle;  ///< Optional coarse lifecycle callback.
     clsp_control_callback_t control;  ///< Optional authenticated control-frame callback.
+    clsp_audio_packet_callback_t audio_packet;  ///< Optional complete Opus packet callback.
+    clsp_audio_timing_callback_t audio_timing;  ///< Optional authenticated sender-report callback.
   } clsp_callbacks_t;
 
   /**
@@ -377,6 +431,22 @@ extern "C" {
     uint64_t request_id,
     clsp_const_byte_span_t payload,
     uint32_t deadline_milliseconds
+  );
+
+  /** @brief Queue one semantic response correlated to an authenticated host request. */
+  clsp_status_t clsp_core_send_control_response(
+    clsp_core_t *core,
+    uint16_t message_type,
+    uint64_t request_id,
+    clsp_const_byte_span_t payload,
+    uint8_t error_response,
+    uint32_t deadline_milliseconds
+  );
+
+  /** @brief Install exact host-audio SSRC/PT/generation admission before AUDIO_CONFIG_ACK. */
+  clsp_status_t clsp_core_configure_audio(
+    clsp_core_t *core,
+    const clsp_audio_configuration_t *configuration
   );
 
   /** @brief Install one exact authenticated input-only START_RESPONSE mapping. */

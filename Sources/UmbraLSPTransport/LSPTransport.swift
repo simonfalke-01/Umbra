@@ -153,6 +153,72 @@ public struct LSPNativeInputConfiguration: Equatable, Sendable {
     }
 }
 
+/// Exact native host-audio SSRC/PT/generation admission tuple.
+public struct LSPNativeAudioConfiguration: Equatable, Sendable {
+    public var streamGeneration: UInt32
+    public var audioGeneration: UInt32
+    public var audioSSRC: UInt32
+    public var audioPayloadType: UInt8
+    public var channels: UInt8
+    public var streams: UInt8
+    public var coupledStreams: UInt8
+    public var mapping: [UInt8]
+    public var frameSamples: UInt16
+    public var bitrate: UInt32
+    public var inbandFEC: Bool
+    public var dtx: Bool
+    public var udpPayloadSize: UInt16
+
+    public init(
+        streamGeneration: UInt32,
+        audioGeneration: UInt32,
+        audioSSRC: UInt32,
+        audioPayloadType: UInt8,
+        channels: UInt8,
+        streams: UInt8,
+        coupledStreams: UInt8,
+        mapping: [UInt8],
+        frameSamples: UInt16,
+        bitrate: UInt32,
+        inbandFEC: Bool,
+        dtx: Bool,
+        udpPayloadSize: UInt16
+    ) {
+        self.streamGeneration = streamGeneration
+        self.audioGeneration = audioGeneration
+        self.audioSSRC = audioSSRC
+        self.audioPayloadType = audioPayloadType
+        self.channels = channels
+        self.streams = streams
+        self.coupledStreams = coupledStreams
+        self.mapping = mapping
+        self.frameSamples = frameSamples
+        self.bitrate = bitrate
+        self.inbandFEC = inbandFEC
+        self.dtx = dtx
+        self.udpPayloadSize = udpPayloadSize
+    }
+}
+
+/// One native-authenticated complete Opus packet.
+public struct LSPAudioPacket: Equatable, Sendable {
+    public var audioGeneration: UInt32
+    public var ssrc: UInt32
+    public var sequenceNumber: UInt16
+    public var timestamp: UInt32
+    public var marker: Bool
+    public var opusPacket: Data
+}
+
+/// Authenticated RTCP sender-report relation for the 48-kHz audio clock.
+public struct LSPAudioTiming: Equatable, Sendable {
+    public var audioGeneration: UInt32
+    public var ssrc: UInt32
+    public var ntpSeconds: UInt32
+    public var ntpFraction: UInt32
+    public var rtpTimestamp: UInt32
+}
+
 /// Native exactly-once input-edge kind.
 public enum LSPNativeInputEdgeKind: UInt8, Sendable {
     case keyDown = 1
@@ -297,6 +363,8 @@ public final class LSPTransport: @unchecked Sendable {
         nativeCallbacks.release_context = lspReleaseCallbackContext
         nativeCallbacks.lifecycle = lspLifecycleCallback
         nativeCallbacks.control = lspControlCallback
+        nativeCallbacks.audio_packet = lspAudioPacketCallback
+        nativeCallbacks.audio_timing = lspAudioTimingCallback
         var output: OpaquePointer?
         let status = clsp_core_create(&nativeConfiguration, &nativeCallbacks, &output)
         try Self.requireSuccess(status)
@@ -425,6 +493,44 @@ public final class LSPTransport: @unchecked Sendable {
         callbackState.setLifecycleHandler(handler)
     }
 
+    /// Installs the complete-Opus packet handler; no UDP fragment crosses this boundary.
+    public func setAudioPacketHandler(
+        _ handler: (@Sendable (LSPAudioPacket) -> Void)?
+    ) {
+        callbackState.setAudioHandler(handler)
+    }
+
+    public func setAudioTimingHandler(
+        _ handler: (@Sendable (LSPAudioTiming) -> Void)?
+    ) {
+        callbackState.setAudioTimingHandler(handler)
+    }
+
+    /// Sends one semantic response to an authenticated host control request.
+    public func sendControlResponse(
+        messageType: UInt16,
+        requestID: UInt64,
+        payload: Data,
+        errorResponse: Bool = false,
+        timeout: Duration = .seconds(1)
+    ) throws {
+        let milliseconds = try Self.milliseconds(timeout, minimum: 20, maximum: 30_000)
+        let status = payload.withUnsafeBytes { bytes in
+            clsp_core_send_control_response(
+                core,
+                messageType,
+                requestID,
+                clsp_const_byte_span_t(
+                    data: bytes.bindMemory(to: UInt8.self).baseAddress,
+                    length: bytes.count
+                ),
+                errorResponse ? 1 : 0,
+                milliseconds
+            )
+        }
+        try Self.requireSuccess(status)
+    }
+
     /// Installs the exact authenticated input-only START_RESPONSE mapping.
     public func configureInput(_ configuration: LSPNativeInputConfiguration) throws {
         var native = clsp_input_configuration_t()
@@ -442,6 +548,35 @@ public final class LSPTransport: @unchecked Sendable {
         native.input_payload_type = configuration.inputPayloadType
         native.baseline_required = configuration.baselineRequired ? 1 : 0
         try Self.requireSuccess(clsp_core_configure_input(core, &native))
+    }
+
+    /// Installs exact native host-audio admission before AUDIO_CONFIG_ACK.
+    public func configureAudio(_ configuration: LSPNativeAudioConfiguration) throws {
+        guard configuration.mapping.count == Int(configuration.channels), configuration.mapping.count <= 8 else {
+            throw LSPTransportError.invalidConfiguration
+        }
+        var native = clsp_audio_configuration_t()
+        native.abi_version = Self.abiVersion
+        native.structure_size = UInt32(MemoryLayout<clsp_audio_configuration_t>.size)
+        native.stream_generation = configuration.streamGeneration
+        native.audio_generation = configuration.audioGeneration
+        native.audio_ssrc = configuration.audioSSRC
+        native.clock_rate = 48_000
+        native.bitrate = configuration.bitrate
+        native.frame_samples = configuration.frameSamples
+        native.udp_payload_size = configuration.udpPayloadSize
+        native.audio_payload_type = configuration.audioPayloadType
+        native.channels = configuration.channels
+        native.streams = configuration.streams
+        native.coupled_streams = configuration.coupledStreams
+        native.mapping_length = UInt8(configuration.mapping.count)
+        native.inband_fec = configuration.inbandFEC ? 1 : 0
+        native.dtx = configuration.dtx ? 1 : 0
+        native.preroll_packets = 1
+        withUnsafeMutableBytes(of: &native.mapping) { destination in
+            configuration.mapping.withUnsafeBytes { source in destination.copyBytes(from: source) }
+        }
+        try Self.requireSuccess(clsp_core_configure_audio(core, &native))
     }
 
     /// Submits one relative-pointer sample directly to the native cumulative composer.
@@ -628,6 +763,8 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
     private var completions: [UInt64: Completion] = [:]
     private var eventHandler: (@Sendable (LSPControlEvent) -> Void)?
     private var lifecycleHandler: (@Sendable (LSPTransportLifecycle) -> Void)?
+    private var audioHandler: (@Sendable (LSPAudioPacket) -> Void)?
+    private var audioTimingHandler: (@Sendable (LSPAudioTiming) -> Void)?
 
     func reserveRequestID() -> UInt64 {
         lock.withLock {
@@ -647,7 +784,9 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
 
     func receive(_ event: LSPControlEvent) {
         let delivery: Completion? = lock.withLock {
-            event.requestID == 0 ? nil : completions.removeValue(forKey: event.requestID)
+            event.requestID == 0 || !event.flags.contains(.response)
+                ? nil
+                : completions.removeValue(forKey: event.requestID)
         }
         if let delivery {
             delivery(.success(event))
@@ -677,6 +816,24 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
 
     func setLifecycleHandler(_ handler: (@Sendable (LSPTransportLifecycle) -> Void)?) {
         lock.withLock { lifecycleHandler = handler }
+    }
+
+    func receiveAudio(_ packet: LSPAudioPacket) {
+        let handler = lock.withLock { audioHandler }
+        handler?(packet)
+    }
+
+    func setAudioHandler(_ handler: (@Sendable (LSPAudioPacket) -> Void)?) {
+        lock.withLock { audioHandler = handler }
+    }
+
+    func receiveAudioTiming(_ timing: LSPAudioTiming) {
+        let handler = lock.withLock { audioTimingHandler }
+        handler?(timing)
+    }
+
+    func setAudioTimingHandler(_ handler: (@Sendable (LSPAudioTiming) -> Void)?) {
+        lock.withLock { audioTimingHandler = handler }
     }
 }
 
@@ -723,4 +880,47 @@ private let lspControlCallback: @convention(c) (
         payload: payload
     )
     Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receive(event)
+}
+
+private let lspAudioPacketCallback: @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<clsp_audio_packet_event_t>?
+) -> Void = { context, nativeEvent in
+    guard let context, let nativeEvent else { return }
+    let native = nativeEvent.pointee
+    let data: Data
+    if native.opus_packet.length == 0 {
+        return
+    } else if let bytes = native.opus_packet.data {
+        data = Data(bytes: bytes, count: native.opus_packet.length)
+    } else {
+        return
+    }
+    Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receiveAudio(
+        LSPAudioPacket(
+            audioGeneration: native.audio_generation,
+            ssrc: native.ssrc,
+            sequenceNumber: native.sequence_number,
+            timestamp: native.timestamp,
+            marker: native.marker != 0,
+            opusPacket: data
+        )
+    )
+}
+
+private let lspAudioTimingCallback: @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<clsp_audio_timing_event_t>?
+) -> Void = { context, nativeEvent in
+    guard let context, let nativeEvent else { return }
+    let native = nativeEvent.pointee
+    Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receiveAudioTiming(
+        LSPAudioTiming(
+            audioGeneration: native.audio_generation,
+            ssrc: native.ssrc,
+            ntpSeconds: native.ntp_seconds,
+            ntpFraction: native.ntp_fraction,
+            rtpTimestamp: native.rtp_timestamp
+        )
+    )
 }

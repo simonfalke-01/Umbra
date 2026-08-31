@@ -231,6 +231,8 @@ namespace umbra::lsp {
       auto &command = control_queue_[control_queue_tail_];
       command.message_type = message_type;
       command.request_id = request_id;
+      command.flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required);
+      command.response = false;
       command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
       const auto now = monotonic_microseconds();
       const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
@@ -247,6 +249,63 @@ namespace umbra::lsp {
       (void)request_id;
       (void)payload;
       (void)deadline_milliseconds;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t send_control_response(
+      const std::uint16_t message_type,
+      const std::uint64_t request_id,
+      const clsp_const_byte_span_t payload,
+      const bool error_response,
+      const std::uint32_t deadline_milliseconds
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) return CLSP_STATUS_NOT_AUTHENTICATED;
+      if (message_type == 0 || request_id == 0 || deadline_milliseconds < 20U || deadline_milliseconds > 30'000U ||
+          payload.length > maximum_control_payload || (payload.data == nullptr && payload.length != 0)) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      pthread_mutex_lock(&mutex_);
+      if (queued_control_count_ == control_queue_capacity) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_CONTROL_WINDOW_FULL;
+      }
+      auto &command = control_queue_[control_queue_tail_];
+      command.message_type = message_type;
+      command.request_id = request_id;
+      command.flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required) |
+                      static_cast<std::uint8_t>(lumen::lsp::lspc_flag::response) |
+                      (error_response ? static_cast<std::uint8_t>(lumen::lsp::lspc_flag::error_response) : 0U);
+      command.response = true;
+      command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
+      const auto now = monotonic_microseconds();
+      const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
+      command.deadline_microseconds = now > std::numeric_limits<std::uint64_t>::max() - duration ?
+                                         std::numeric_limits<std::uint64_t>::max() : now + duration;
+      control_queue_tail_ = (control_queue_tail_ + 1U) % control_queue_capacity;
+      ++queued_control_count_;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void)message_type; (void)request_id; (void)payload; (void)error_response; (void)deadline_milliseconds;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t configure_audio(const clsp_audio_configuration_t &configuration) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) return CLSP_STATUS_NOT_AUTHENTICATED;
+      if (!valid_audio_configuration(configuration)) return CLSP_STATUS_INVALID_CONFIGURATION;
+      if (audio_configured_.load(std::memory_order_acquire)) {
+        return same_audio_configuration(audio_configuration_, configuration) ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+      }
+      audio_configuration_ = configuration;
+      audio_configured_.store(true, std::memory_order_release);
+      return CLSP_STATUS_OK;
+#else
+      (void)configuration;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
     }
@@ -438,6 +497,15 @@ namespace umbra::lsp {
       std::uint64_t request_id {};  ///< Caller-generated request ID.
       std::uint64_t deadline_microseconds {};  ///< Absolute retry deadline.
       lumen::lsp::packet_slab<maximum_control_payload> payload {};  ///< Copied deterministic-CBOR payload.
+      std::uint8_t flags {};  ///< Exact LSPC request/response/error flags.
+      bool response {};  ///< Whether response cache insertion is required.
+    };
+
+    /** @brief One retained authenticated host request awaiting a semantic response. */
+    struct PendingInboundRequest {
+      std::uint64_t request_id {};  ///< Nonzero host request ID.
+      lumen::lsp::packet_slab<maximum_control_frame> frame {};  ///< Exact original LSPC bytes.
+      bool occupied {};  ///< Whether this slot is live.
     };
 
     /** @brief Capture-record discriminator for the bounded native ring. */
@@ -494,6 +562,69 @@ namespace umbra::lsp {
       if (callbacks_.counter != nullptr) {
         callbacks_.counter(callbacks_.context, static_cast<std::uint32_t>(counter), amount);
       }
+    }
+
+    /** @brief Validate one exact host-audio tuple before native admission. */
+    [[nodiscard]] static bool valid_audio_configuration(const clsp_audio_configuration_t &value) noexcept {
+      if (value.abi_version != CLSP_CORE_ABI_VERSION || value.structure_size != sizeof(clsp_audio_configuration_t) ||
+          value.stream_generation == 0 || value.audio_generation == 0 || value.audio_ssrc == 0 ||
+          value.clock_rate != 48'000U || value.audio_payload_type < 96U || value.audio_payload_type > 127U ||
+          (value.channels != 2U && value.channels != 6U && value.channels != 8U) || value.mapping_length != value.channels ||
+          value.streams == 0 || value.coupled_streams > value.streams ||
+          static_cast<unsigned>(value.streams) + value.coupled_streams != value.channels ||
+          (value.frame_samples != 120U && value.frame_samples != 240U && value.frame_samples != 480U && value.frame_samples != 960U) ||
+          value.bitrate < 6'000U || value.bitrate > 2'048'000U || value.inband_fec > 1U || value.dtx > 1U ||
+          value.udp_payload_size < 1'200U || value.udp_payload_size > maximum_udp_payload || value.preroll_packets != 1U) {
+        return false;
+      }
+      const auto coded_channels = static_cast<unsigned>(value.streams) + value.coupled_streams;
+      for (std::size_t index = 0; index < value.mapping_length; ++index) {
+        if (value.mapping[index] >= coded_channels) return false;
+      }
+      return true;
+    }
+
+    /** @brief Compare every wire-significant native audio mapping field. */
+    [[nodiscard]] static bool same_audio_configuration(
+      const clsp_audio_configuration_t &left,
+      const clsp_audio_configuration_t &right
+    ) noexcept {
+      return left.stream_generation == right.stream_generation && left.audio_generation == right.audio_generation &&
+             left.audio_ssrc == right.audio_ssrc && left.clock_rate == right.clock_rate && left.bitrate == right.bitrate &&
+             left.frame_samples == right.frame_samples && left.udp_payload_size == right.udp_payload_size &&
+             left.audio_payload_type == right.audio_payload_type && left.channels == right.channels &&
+             left.streams == right.streams && left.coupled_streams == right.coupled_streams &&
+             left.mapping_length == right.mapping_length && left.inband_fec == right.inband_fec && left.dtx == right.dtx &&
+             left.preroll_packets == right.preroll_packets &&
+             std::equal(left.mapping, left.mapping + left.mapping_length, right.mapping);
+    }
+
+    /** @brief Retain one exact host request until Swift installs and responds. */
+    [[nodiscard]] bool retain_inbound_request(
+      const std::uint64_t request_id,
+      const std::span<const std::uint8_t> frame
+    ) noexcept {
+      PendingInboundRequest *free_slot = nullptr;
+      for (auto &entry : pending_inbound_requests_) {
+        if (entry.occupied && entry.request_id == request_id) {
+          return entry.frame.bytes().size() == frame.size() &&
+                 std::equal(entry.frame.bytes().begin(), entry.frame.bytes().end(), frame.begin());
+        }
+        if (!entry.occupied && free_slot == nullptr) free_slot = &entry;
+      }
+      if (free_slot == nullptr) return false;
+      free_slot->request_id = request_id;
+      free_slot->frame.assign(frame);
+      free_slot->occupied = true;
+      return true;
+    }
+
+    /** @brief Find one retained exact host request by request ID. */
+    [[nodiscard]] PendingInboundRequest *pending_inbound_request(const std::uint64_t request_id) noexcept {
+      for (auto &entry : pending_inbound_requests_) {
+        if (entry.occupied && entry.request_id == request_id) return &entry;
+      }
+      return nullptr;
     }
 
     /** @brief Publish one coarse lifecycle transition. */
@@ -684,13 +815,14 @@ namespace umbra::lsp {
               break;
             }
             auto packet_length = datagram.size();
-            const auto status = srtp_.unprotect(packet, packet_length, is_rtcp(datagram));
+            const auto rtcp = is_rtcp(datagram);
+            const auto status = srtp_.unprotect(packet, packet_length, rtcp);
             if (status != CLSP_STATUS_OK) {
               increment(RuntimeCounter::authentication_failure);
               break;
             }
             increment(RuntimeCounter::received);
-            if (!handle_authenticated_realtime(std::span<const std::uint8_t> {packet.data(), packet_length})) {
+            if (!handle_authenticated_realtime(std::span<const std::uint8_t> {packet.data(), packet_length}, rtcp)) {
               increment(RuntimeCounter::dropped);
             }
             break;
@@ -1174,10 +1306,61 @@ namespace umbra::lsp {
     }
 
     /** @brief Parse authenticated SRTCP LSPI and retire baseline/edge state. */
-    [[nodiscard]] bool handle_authenticated_realtime(const std::span<const std::uint8_t> packet) noexcept {
-      if (!input_configured_ || packet.size() < 12U || (packet[0] >> 6U) != 2U || packet[1] != 204U) {
+    [[nodiscard]] bool handle_authenticated_realtime(
+      const std::span<const std::uint8_t> packet,
+      const bool rtcp
+    ) noexcept {
+      if (packet.size() < 12U || (packet[0] >> 6U) != 2U) {
         return false;
       }
+      if (!rtcp) {
+        if (!audio_configured_.load(std::memory_order_acquire)) return false;
+        const auto audio = audio_configuration_;
+        const auto rtp = lumen::lsp::parse_rtp_fixed_header(packet);
+        if (!rtp || rtp.header.padding || rtp.header.extension || rtp.header.csrc_count != 0 ||
+            rtp.header.ssrc != audio.audio_ssrc || rtp.header.payload_type != audio.audio_payload_type ||
+            packet.size() > audio.udp_payload_size || packet.size() <= rtp.bytes_consumed || callbacks_.audio_packet == nullptr) {
+          return false;
+        }
+        const auto opus = packet.subspan(rtp.bytes_consumed);
+        const clsp_audio_packet_event_t event {
+          .abi_version = CLSP_CORE_ABI_VERSION,
+          .structure_size = sizeof(clsp_audio_packet_event_t),
+          .audio_generation = audio.audio_generation,
+          .ssrc = audio.audio_ssrc,
+          .timestamp = rtp.header.timestamp,
+          .sequence_number = rtp.header.sequence_number,
+          .marker = static_cast<std::uint8_t>(rtp.header.marker),
+          .reserved_zero = 0,
+          .opus_packet = {.data = opus.data(), .length = opus.size()},
+        };
+        callbacks_.audio_packet(callbacks_.context, event);
+        return true;
+      }
+      if (packet[1] == 200U) {
+        if (!audio_configured_.load(std::memory_order_acquire) || packet.size() < 28U || callbacks_.audio_timing == nullptr) {
+          return false;
+        }
+        const auto audio = audio_configuration_;
+        const auto words = lumen::lsp::wire::read_be<std::uint16_t>(packet.subspan(2, 2));
+        if ((static_cast<std::size_t>(words) + 1U) * 4U != packet.size() ||
+            lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != audio.audio_ssrc) {
+          return false;
+        }
+        const clsp_audio_timing_event_t timing {
+          .abi_version = CLSP_CORE_ABI_VERSION,
+          .structure_size = sizeof(clsp_audio_timing_event_t),
+          .audio_generation = audio.audio_generation,
+          .ssrc = audio.audio_ssrc,
+          .ntp_seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4)),
+          .ntp_fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4)),
+          .rtp_timestamp = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(16, 4)),
+        };
+        callbacks_.audio_timing(callbacks_.context, timing);
+        return true;
+      }
+      if (packet[1] != 204U) return false;
+      if (!input_configured_) return false;
       const auto words = lumen::lsp::wire::read_be<std::uint16_t>(packet.subspan(2, 2));
       if ((static_cast<std::size_t>(words) + 1U) * 4U != packet.size() ||
           lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != input_configuration_.acknowledgement_ssrc) {
@@ -1287,10 +1470,26 @@ namespace umbra::lsp {
           return false;
         }
       }
-      if (observed == lumen::lsp::receive_id_result::duplicate ||
-          lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::acknowledgement_only)) {
+      const auto semantic_request = !lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::response) &&
+                                    !lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::acknowledgement_only) &&
+                                    parsed.header.request_id != 0;
+      if (observed == lumen::lsp::receive_id_result::duplicate) {
+        if (semantic_request) {
+          const auto cached = inbound_response_cache_.lookup(parsed.header.request_id, plaintext);
+          if (cached.result == lumen::lsp::response_cache_result::hit) {
+            const auto status = dtls_.send_application_data(cached.response);
+            if (status != CLSP_STATUS_OK) return false;
+            increment(RuntimeCounter::transmitted);
+          } else if (cached.result == lumen::lsp::response_cache_result::conflicting_request) {
+            return false;
+          }
+        }
         return true;
       }
+      if (lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::acknowledgement_only)) {
+        return true;
+      }
+      if (semantic_request && !retain_inbound_request(parsed.header.request_id, plaintext)) return false;
       if (parsed.header.message_type == 0x0002U && parsed.header.connection_generation != 0) {
         connection_generation_ = parsed.header.connection_generation;
       }
@@ -1353,7 +1552,7 @@ namespace umbra::lsp {
         std::array<std::uint8_t, maximum_control_frame> frame {};
         const auto message_id = next_message_id_++;
         const lumen::lsp::lspc_header header {
-          .flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required),
+          .flags = command.flags,
           .message_type = command.message_type,
           .connection_generation = command.message_type == 0x0001U ? 0U : connection_generation_,
           .payload_length = static_cast<std::uint32_t>(command.payload.size()),
@@ -1367,6 +1566,15 @@ namespace umbra::lsp {
           return CLSP_STATUS_INTERNAL_FAILURE;
         }
         const auto encoded = std::span<const std::uint8_t> {frame.data(), serialized.bytes_written};
+        PendingInboundRequest *pending_request = nullptr;
+        if (command.response) {
+          pending_request = pending_inbound_request(command.request_id);
+          if (pending_request == nullptr) return CLSP_STATUS_INVALID_STATE;
+          const auto cached = inbound_response_cache_.insert(command.request_id, pending_request->frame.bytes(), encoded);
+          if (cached != lumen::lsp::response_cache_result::stored && cached != lumen::lsp::response_cache_result::hit) {
+            return CLSP_STATUS_INTERNAL_FAILURE;
+          }
+        }
         const auto status = dtls_.send_application_data(encoded);
         if (status != CLSP_STATUS_OK) {
           return status;
@@ -1383,6 +1591,10 @@ namespace umbra::lsp {
           return stored == lumen::lsp::outbound_store_result::window_full ?
                    CLSP_STATUS_CONTROL_WINDOW_FULL :
                    CLSP_STATUS_INTERNAL_FAILURE;
+        }
+        if (pending_request != nullptr) {
+          pending_request->occupied = false;
+          pending_request->frame.clear();
         }
       }
       return CLSP_STATUS_OK;
@@ -1498,8 +1710,10 @@ namespace umbra::lsp {
     SrtpSession srtp_;  ///< Directional AEAD AES-128-GCM contexts.
     lumen::lsp::selective_ack_window receive_window_;  ///< Peer logical-frame receive/ACK state.
     lumen::lsp::outbound_control_window<maximum_control_frame> outbound_window_;  ///< Byte-identical retry state.
+    lumen::lsp::response_cache<maximum_control_frame, maximum_control_frame> inbound_response_cache_;  ///< Host request response replay.
     lumen::lsp::control_rto rto_;  ///< Local-path bounded RTO estimator.
     std::array<ControlCommand, control_queue_capacity> control_queue_ {};  ///< Pre-wire bounded queue.
+    std::array<PendingInboundRequest, 64> pending_inbound_requests_ {};  ///< Authenticated requests awaiting semantic response.
     std::array<CaptureRecord, capture_queue_capacity> capture_queue_ {};  ///< Allocation-free captured-input ring.
     clsp_input_configuration_t pending_input_configuration_ {};  ///< Producer-copied pending input mapping.
     clsp_input_configuration_t input_configuration_ {};  ///< Worker-owned active input mapping.
@@ -1510,6 +1724,8 @@ namespace umbra::lsp {
     std::array<TouchLatest, 16> touch_states_ {};  ///< Latest controller touch contacts.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
+    std::atomic<bool> audio_configured_ {false};  ///< Exact host-audio mapping admission gate.
+    clsp_audio_configuration_t audio_configuration_ {};  ///< Installed audio generation/SSRC/PT tuple.
     std::atomic<std::uint64_t> neutralize_requested_ {0};  ///< Latest synchronous neutralize token.
     std::atomic<std::uint64_t> neutralize_completed_ {0};  ///< Worker-completed neutralize token.
     std::atomic<std::uint64_t> input_configuration_requested_ {0};  ///< Latest synchronous mapping token.
@@ -1564,6 +1780,27 @@ namespace umbra::lsp {
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
                               impl_->send_control(message_type, request_id, payload, deadline_milliseconds);
+  }
+
+  clsp_status_t Runtime::send_control_response(
+    const std::uint16_t message_type,
+    const std::uint64_t request_id,
+    const clsp_const_byte_span_t payload,
+    const bool error_response,
+    const std::uint32_t deadline_milliseconds
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->send_control_response(
+                                message_type,
+                                request_id,
+                                payload,
+                                error_response,
+                                deadline_milliseconds
+                              );
+  }
+
+  clsp_status_t Runtime::configure_audio(const clsp_audio_configuration_t &configuration) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_audio(configuration);
   }
 
   clsp_status_t Runtime::configure_input(const clsp_input_configuration_t &configuration) noexcept {

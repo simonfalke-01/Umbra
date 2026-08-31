@@ -26,6 +26,7 @@ public struct LSPActiveInputAuthority: Equatable, Sendable {
     public var attachToken: Data
     public var connectionGeneration: UInt32
     public var nativeConfiguration: LSPNativeInputConfiguration
+    public var audioConfiguration: LSPNativeAudioConfiguration
 }
 
 /// Coarse LSP client-session coordinator over the native packet/security core.
@@ -33,9 +34,13 @@ public actor LSPClientSession {
     public private(set) var state: LSPClientSessionState = .idle
     private let transport: LSPTransport
     private let identity: LSPClientIdentity
+    private let transportProfile: LSPTransportProfile
     private var hello: LSPServerHello?
     private var clientNonce: Data?
     private var inputAuthority: LSPActiveInputAuthority?
+    private let audioPlayout: LSPAudioPlayout
+    private var pendingAudioConfigurations: [LSPControlEvent] = []
+    private var controlHandlerInstalled = false
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -43,6 +48,14 @@ public actor LSPClientSession {
     ) throws {
         transport = try LSPTransport(configuration: configuration)
         self.identity = identity
+        transportProfile = configuration.profile
+        audioPlayout = LSPAudioPlayout()
+        transport.setAudioPacketHandler { [audioPlayout] packet in
+            audioPlayout.submit(packet)
+        }
+        transport.setAudioTimingHandler { [audioPlayout] timing in
+            audioPlayout.receiveTiming(timing)
+        }
     }
 
     /// Creates a product session from the stable owner-private LSP-only identity store.
@@ -167,21 +180,31 @@ public actor LSPClientSession {
     /// Starts the exact input-only vertical slice and installs its native SRTP mapping.
     public func startInput(_ request: LSPInputStartRequest) async throws -> LSPInputStartResponse {
         guard state == .authenticated else { throw LSPTransportError.notAuthenticated }
+        installControlHandlerIfNeeded()
+        var resolvedRequest = request
+        if resolvedRequest.audioOffers.isEmpty {
+            resolvedRequest.audioOffers = switch transportProfile {
+            case .adaptiveLowLatency: LSPAudioOffer.adaptiveDefaults
+            case .competitionLAN: LSPAudioOffer.competitionDefaults
+            }
+        }
         let event = try await transport.request(
             messageType: LSPControlMessageType.start.rawValue,
-            payload: try LSPControlWire.start(request)
+            payload: try LSPControlWire.start(resolvedRequest)
         )
         let response = try LSPControlWire.startResponse(from: event)
         try transport.configureInput(response.nativeConfiguration)
         guard let hello else { throw LSPTransportError.internalFailure }
         inputAuthority = LSPActiveInputAuthority(
-            applicationID: request.applicationID,
+            applicationID: resolvedRequest.applicationID,
             sessionID: response.sessionID,
             attachToken: response.attachToken,
             connectionGeneration: hello.connectionGeneration,
-            nativeConfiguration: response.nativeConfiguration
+            nativeConfiguration: response.nativeConfiguration,
+            audioConfiguration: response.audioConfiguration
         )
         state = .inputActive
+        await drainPendingAudioConfigurations()
         return response
     }
 
@@ -191,6 +214,7 @@ public actor LSPClientSession {
         reason: LSPReconnectReason
     ) async throws -> LSPAttachResponse {
         guard state == .authenticated, let hello else { throw LSPTransportError.notAuthenticated }
+        installControlHandlerIfNeeded()
         let prior = try await previous.activeInputAuthority()
         var neutralizationAttempted = false
         do {
@@ -225,6 +249,8 @@ public actor LSPClientSession {
                   response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.acknowledgementSSRC,
                   response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.inputSSRC,
                   response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.acknowledgementSSRC,
+                  response.audioConfiguration.audioGeneration != prior.audioConfiguration.audioGeneration,
+                  response.audioConfiguration.audioSSRC != prior.audioConfiguration.audioSSRC,
                   response.replacementAttachToken != prior.attachToken
             else {
                 throw LSPTransportError.internalFailure
@@ -235,9 +261,11 @@ public actor LSPClientSession {
                 sessionID: response.sessionID,
                 attachToken: response.replacementAttachToken,
                 connectionGeneration: response.connectionGeneration,
-                nativeConfiguration: response.nativeConfiguration
+                nativeConfiguration: response.nativeConfiguration,
+                audioConfiguration: response.audioConfiguration
             )
             state = .inputActive
+            await drainPendingAudioConfigurations()
             await previous.retireAfterAttach()
             return response
         } catch {
@@ -312,6 +340,8 @@ public actor LSPClientSession {
             hello = nil
             clientNonce = nil
             inputAuthority = nil
+            pendingAudioConfigurations.removeAll(keepingCapacity: true)
+            audioPlayout.stop()
             state = .stopped
         } catch let error as LSPTransportError {
             state = .failed(error)
@@ -322,6 +352,8 @@ public actor LSPClientSession {
     private func retireAfterAttach() {
         try? transport.stop()
         inputAuthority = nil
+        pendingAudioConfigurations.removeAll(keepingCapacity: true)
+        audioPlayout.stop()
         hello = nil
         clientNonce = nil
         state = .stopped
@@ -333,6 +365,82 @@ public actor LSPClientSession {
             throw LSPTransportError.invalidState
         }
         try transport.configureInput(authority.nativeConfiguration)
+    }
+
+    private func installControlHandlerIfNeeded() {
+        guard !controlHandlerInstalled else { return }
+        controlHandlerInstalled = true
+        transport.setControlEventHandler { [weak self] event in
+            guard event.messageType == LSPControlMessageType.audioConfig.rawValue else { return }
+            Task { await self?.receiveAudioConfiguration(event) }
+        }
+    }
+
+    private func receiveAudioConfiguration(_ event: LSPControlEvent) async {
+        guard inputAuthority != nil else {
+            if pendingAudioConfigurations.count < 4 {
+                pendingAudioConfigurations.append(event)
+            }
+            return
+        }
+        await processAudioConfiguration(event)
+    }
+
+    private func drainPendingAudioConfigurations() async {
+        let pending = pendingAudioConfigurations
+        pendingAudioConfigurations.removeAll(keepingCapacity: true)
+        for event in pending {
+            await processAudioConfiguration(event)
+        }
+    }
+
+    private func processAudioConfiguration(_ event: LSPControlEvent) async {
+        let request: LSPAudioConfigurationRequest
+        do {
+            request = try LSPControlWire.audioConfig(from: event)
+        } catch {
+            audioPlayout.stop()
+            try? transport.stop()
+            state = .failed(.internalFailure)
+            return
+        }
+        let status: LSPControlStatus
+        if let authority = inputAuthority,
+           authority.sessionID == request.sessionID,
+           authority.nativeConfiguration.streamGeneration == request.nativeConfiguration.streamGeneration,
+           authority.audioConfiguration == request.nativeConfiguration {
+            var playoutConfigured = false
+            do {
+                try audioPlayout.configure(request.nativeConfiguration)
+                playoutConfigured = true
+                try transport.configureAudio(request.nativeConfiguration)
+                status = .success
+            } catch {
+                if playoutConfigured {
+                    audioPlayout.stop()
+                }
+                status = .internalFailure
+            }
+        } else {
+            status = .staleGeneration
+        }
+        do {
+            try transport.sendControlResponse(
+                messageType: LSPControlMessageType.audioConfigAck.rawValue,
+                requestID: event.requestID,
+                payload: try LSPControlWire.audioConfigAck(
+                    status: status,
+                    sessionID: request.sessionID,
+                    audioGeneration: request.nativeConfiguration.audioGeneration
+                )
+            )
+        } catch {
+            if status == .success {
+                audioPlayout.stop()
+            }
+            try? transport.stop()
+            state = .failed(.internalFailure)
+        }
     }
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {
