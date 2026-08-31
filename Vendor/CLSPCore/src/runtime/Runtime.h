@@ -21,10 +21,14 @@ namespace umbra::lsp {
     /** @brief Increment one thread-owned telemetry counter at snapshot frequency. */
     using Counter = void (*)(void *context, std::uint32_t counter, std::uint64_t amount) noexcept;
 
+    /** @brief Apply one authenticated LSPG payload and return a terminal command status. */
+    using ControllerOutput = std::uint8_t (*)(void *context, clsp_const_byte_span_t payload) noexcept;
+
     void *context {};  ///< Opaque C ABI owner.
     Lifecycle lifecycle {};  ///< Required lifecycle callback.
     Control control {};  ///< Optional authenticated-control callback.
     Counter counter {};  ///< Required telemetry callback.
+    ControllerOutput controller_output {};  ///< Optional generation-checked GameController output callback.
   };
 
   /** @brief Runtime telemetry counter identifiers. */
@@ -102,6 +106,12 @@ namespace umbra::lsp {
 
     /** @brief Queue latest controller gyro or accelerometer state. */
     [[nodiscard]] clsp_status_t submit_controller_sensor(const clsp_controller_sensor_t &sensor) noexcept;
+
+    /** @brief Queue one controller touch lifecycle edge. */
+    [[nodiscard]] clsp_status_t submit_controller_touch_edge(const clsp_controller_touch_edge_t &edge) noexcept;
+
+    /** @brief Queue latest controller touch coordinates. */
+    [[nodiscard]] clsp_status_t submit_controller_touch_state(const clsp_controller_touch_state_t &state) noexcept;
 
     /** @brief Neutralize and stop the current native input authority. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept;

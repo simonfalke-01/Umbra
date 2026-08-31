@@ -105,6 +105,7 @@ let package = Package(
             linkerSettings: lspCoreLinkerSettings + [
                 .linkedFramework("IOKit"),
                 .linkedFramework("GameController"),
+                .linkedFramework("CoreHaptics"),
             ],
             plugins: ["CLSPCoreSyncPlugin"]
         ),

@@ -12,6 +12,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <mutex>
+
+extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
+  clsp_apple_input_capture_t *capture,
+  clsp_const_byte_span_t payload
+);
 
 #ifndef CLSP_CORE_HAS_WOLFSSL
   #define CLSP_CORE_HAS_WOLFSSL 0
@@ -32,6 +38,8 @@ struct clsp_core {
   std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
   std::atomic<std::uint32_t> state {CLSP_LIFECYCLE_CREATED};  ///< Coarse lifecycle state.
   std::atomic<bool> callback_active {false};  ///< Rejects reentrant ABI operations.
+  std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
+  clsp_apple_input_capture_t *apple_capture {};  ///< Active native controller-output owner.
   umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
   clsp_configuration_t configuration {};  ///< Caller configuration copied at creation.
   clsp_callbacks_t callbacks {};  ///< Callback table copied at creation.
@@ -162,6 +170,14 @@ namespace {
     }
   }
 
+  /** @brief Apply authenticated LSPG through the currently active Apple capture owner. */
+  std::uint8_t runtime_controller_output(void *context, const clsp_const_byte_span_t payload) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    std::lock_guard lock(core->apple_capture_mutex);
+    auto *capture = core->apple_capture;
+    return capture == nullptr ? 1U : clsp_apple_input_capture_apply_lspg(capture, payload);
+  }
+
   /** @brief Validate an exact remote endpoint and nonzero 32-byte pin. */
   [[nodiscard]] bool valid_endpoint(const clsp_endpoint_t &endpoint) noexcept {
     if (endpoint.abi_version != CLSP_CORE_ABI_VERSION || endpoint.structure_size != sizeof(clsp_endpoint_t) ||
@@ -284,6 +300,7 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
       .lifecycle = runtime_lifecycle,
       .control = runtime_control,
       .counter = runtime_counter,
+      .controller_output = runtime_controller_output,
     },
   };
   if (runtime == nullptr) {
@@ -408,6 +425,42 @@ extern "C" clsp_status_t clsp_core_submit_controller_sensor(
 ) {
   if (core == nullptr || sensor == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
   return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_sensor(*sensor);
+}
+
+extern "C" clsp_status_t clsp_core_submit_controller_touch_edge(
+  clsp_core_t *core,
+  const clsp_controller_touch_edge_t *edge
+) {
+  if (core == nullptr || edge == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_touch_edge(*edge);
+}
+
+extern "C" clsp_status_t clsp_core_submit_controller_touch_state(
+  clsp_core_t *core,
+  const clsp_controller_touch_state_t *state
+) {
+  if (core == nullptr || state == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_touch_state(*state);
+}
+
+extern "C" bool clsp_core_register_apple_capture(
+  clsp_core_t *core,
+  clsp_apple_input_capture_t *capture
+) {
+  if (core == nullptr || capture == nullptr) return false;
+  std::lock_guard lock(core->apple_capture_mutex);
+  if (core->apple_capture != nullptr) return false;
+  core->apple_capture = capture;
+  return true;
+}
+
+extern "C" void clsp_core_unregister_apple_capture(
+  clsp_core_t *core,
+  clsp_apple_input_capture_t *capture
+) {
+  if (core == nullptr || capture == nullptr) return;
+  std::lock_guard lock(core->apple_capture_mutex);
+  if (core->apple_capture == capture) core->apple_capture = nullptr;
 }
 
 extern "C" clsp_status_t clsp_core_copy_telemetry(

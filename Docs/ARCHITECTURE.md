@@ -49,8 +49,11 @@ LSPI retirement are wired into the product. Preferred IOHID keyboard/mouse and
 GameController buttons, sticks, triggers, gyro, and accelerometer terminate on
 a dedicated native queue and feed the lock-free native capture ring. Focused-
 window AppKit capture starts only after native capture is quiesced and restores
-the prior mouse-coalescing setting at stop. Controller touch is withheld until
-its public profile-specific adapter is completed against the accepted schema.
+the prior mouse-coalescing setting at stop. Public `GCControllerTouchpad`
+lifecycle/coordinates use the same controller generation. Authenticated LSPG
+applies LED, reusable CoreHaptics intensity, DualSense adaptive triggers,
+motion-sensor state, and player slot on the native controller queue; unsupported
+primitives return an explicit retry-safe terminal ACK.
 
 ## Session policies
 

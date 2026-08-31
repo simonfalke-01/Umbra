@@ -205,6 +205,27 @@ extern "C" {
     uint8_t reserved_zero[3];  ///< Reserved and required to be zero.
   } clsp_controller_sensor_t;
 
+  /** @brief Controller touchpad lifecycle edge for one contact. */
+  typedef struct clsp_controller_touch_edge {
+    uint64_t sample_time_microseconds;  ///< Profile last-event timestamp.
+    uint32_t controller_id;  ///< Owning controller one through sixteen.
+    uint32_t contact_id;  ///< Contact one through sixteen.
+    uint32_t instance_generation;  ///< Owning controller generation.
+    uint8_t kind;  ///< Touch begin, end, or cancel kind nine through eleven.
+    uint8_t reserved_zero[3];  ///< Reserved and required to be zero.
+  } clsp_controller_touch_edge_t;
+
+  /** @brief Latest controller touchpad contact coordinates. */
+  typedef struct clsp_controller_touch_state {
+    uint64_t sample_time_microseconds;  ///< Profile last-event timestamp.
+    uint32_t controller_id;  ///< Owning controller one through sixteen.
+    uint32_t contact_id;  ///< Contact one through sixteen.
+    uint32_t instance_generation;  ///< Owning controller generation.
+    uint32_t x;  ///< Absolute X in Q0.32.
+    uint32_t y;  ///< Absolute Y in Q0.32.
+    uint32_t pressure;  ///< Normalized pressure in Q0.32.
+  } clsp_controller_touch_state_t;
+
   /** @brief Low-rate telemetry snapshot copied across the ABI. */
   typedef struct clsp_telemetry_snapshot {
     uint32_t abi_version;  ///< Snapshot layout version.
@@ -384,6 +405,12 @@ extern "C" {
 
   /** @brief Submit latest GameController gyro or accelerometer state. */
   clsp_status_t clsp_core_submit_controller_sensor(clsp_core_t *core, const clsp_controller_sensor_t *sensor);
+
+  /** @brief Submit a controller touchpad begin/end/cancel edge. */
+  clsp_status_t clsp_core_submit_controller_touch_edge(clsp_core_t *core, const clsp_controller_touch_edge_t *edge);
+
+  /** @brief Submit latest controller touchpad coordinates. */
+  clsp_status_t clsp_core_submit_controller_touch_state(clsp_core_t *core, const clsp_controller_touch_state_t *state);
 
   /** @brief Stop accepting samples and release native capture authority state. */
   clsp_status_t clsp_core_neutralize_input(clsp_core_t *core);

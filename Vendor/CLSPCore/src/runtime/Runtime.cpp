@@ -362,6 +362,35 @@ namespace umbra::lsp {
 #endif
     }
 
+    [[nodiscard]] clsp_status_t submit_controller_touch_edge(const clsp_controller_touch_edge_t &edge) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (edge.sample_time_microseconds == 0 || edge.controller_id == 0 || edge.controller_id > 16 ||
+          edge.contact_id == 0 || edge.contact_id > 16 || edge.instance_generation == 0 ||
+          edge.kind < 9 || edge.kind > 11 || edge.reserved_zero[0] != 0 || edge.reserved_zero[1] != 0 || edge.reserved_zero[2] != 0) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      CaptureRecord record {.kind = CaptureKind::touch_edge, .touch_edge = edge};
+      return enqueue_capture(record);
+#else
+      (void)edge;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t submit_controller_touch_state(const clsp_controller_touch_state_t &state) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (state.sample_time_microseconds == 0 || state.controller_id == 0 || state.controller_id > 16 ||
+          state.contact_id == 0 || state.contact_id > 16 || state.instance_generation == 0) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      CaptureRecord record {.kind = CaptureKind::touch_state, .touch_state = state};
+      return enqueue_capture(record);
+#else
+      (void)state;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
     /** @brief Stop new capture while retaining release edges until acknowledged. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
@@ -392,6 +421,8 @@ namespace umbra::lsp {
       controller_edge,  ///< Controller lifecycle or digital button edge.
       controller_state,  ///< Latest controller triggers and sticks.
       controller_sensor,  ///< Latest gyro or accelerometer sample.
+      touch_edge,  ///< Controller touchpad lifecycle edge.
+      touch_state,  ///< Latest controller touch coordinates.
     };
 
     /** @brief One allocation-free record copied from an Apple capture callback. */
@@ -402,6 +433,8 @@ namespace umbra::lsp {
       clsp_controller_edge_t controller_edge {};  ///< Controller edge fields.
       clsp_controller_state_t controller_state {};  ///< Controller analog fields.
       clsp_controller_sensor_t controller_sensor {};  ///< Controller sensor fields.
+      clsp_controller_touch_edge_t touch_edge {};  ///< Touch lifecycle fields.
+      clsp_controller_touch_state_t touch_state {};  ///< Touch coordinate fields.
     };
 
     /** @brief Worker-owned latest controller analog state. */
@@ -418,6 +451,14 @@ namespace umbra::lsp {
       std::uint64_t physical_ordinal {};  ///< Increasing native sample ordinal.
       std::uint64_t last_sent_us {};  ///< Most recent network submission.
       bool dirty {};  ///< Whether a newer vector awaits submission.
+    };
+
+    /** @brief Worker-owned latest controller touch coordinates. */
+    struct TouchLatest {
+      clsp_controller_touch_state_t value {};  ///< Latest captured contact.
+      std::uint64_t physical_ordinal {};  ///< Increasing contact sample ordinal.
+      std::uint64_t last_sent_us {};  ///< Most recent network submission.
+      bool dirty {};  ///< Whether newer coordinates await submission.
     };
 
     /** @brief Increment one C ABI telemetry counter. */
@@ -711,6 +752,46 @@ namespace umbra::lsp {
           continue;
         }
 
+        if (record.kind == CaptureKind::controller_state) {
+          auto &state = controller_states_[record.controller_state.controller_id - 1U];
+          state.value = record.controller_state;
+          ++state.physical_ordinal;
+          state.dirty = true;
+          continue;
+        }
+        if (record.kind == CaptureKind::controller_sensor) {
+          auto &sensor = controller_sensors_[record.controller_sensor.controller_id - 1U]
+                                            [record.controller_sensor.sensor_type - 1U];
+          sensor.value = record.controller_sensor;
+          ++sensor.physical_ordinal;
+          sensor.dirty = true;
+          continue;
+        }
+        if (record.kind == CaptureKind::controller_edge || record.kind == CaptureKind::touch_edge) {
+          const auto controller = record.kind == CaptureKind::controller_edge;
+          lumen::lsp::input_plane::edge_record edge {
+            .physical_time_us = controller ? record.controller_edge.sample_time_microseconds : record.touch_edge.sample_time_microseconds,
+            .kind = static_cast<lumen::lsp::input_plane::edge_kind>(controller ? record.controller_edge.kind : record.touch_edge.kind),
+            .device = controller ? lumen::lsp::input_plane::device_type::controller : lumen::lsp::input_plane::device_type::touch,
+            .control_id = controller ? record.controller_edge.control_id : static_cast<std::uint16_t>(record.touch_edge.controller_id),
+            .device_id = controller ? record.controller_edge.controller_id : record.touch_edge.contact_id,
+            .instance_generation = controller ? record.controller_edge.instance_generation : record.touch_edge.instance_generation,
+          };
+          std::uint64_t assigned_id = 0;
+          if (edge_sender_.enqueue(edge, assigned_id) != lumen::lsp::input_plane::edge_send_result::accepted) {
+            return CLSP_STATUS_RESOURCE_EXHAUSTED;
+          }
+          latest_edge_id_ = assigned_id;
+          continue;
+        }
+        if (record.kind == CaptureKind::touch_state) {
+          auto &touch = touch_states_[record.touch_state.contact_id - 1U];
+          touch.value = record.touch_state;
+          ++touch.physical_ordinal;
+          touch.dirty = true;
+          continue;
+        }
+
         lumen::lsp::input_plane::edge_record edge {
           .physical_time_us = record.edge.sample_time_microseconds,
           .kind = static_cast<lumen::lsp::input_plane::edge_kind>(record.edge.kind),
@@ -770,6 +851,12 @@ namespace umbra::lsp {
           if (sensor.dirty && (sensor.last_sent_us == 0 || now - sensor.last_sent_us >= sensor_interval)) {
             return send_controller_sensor(index, sensor_index, now);
           }
+        }
+      }
+      for (std::size_t index = 0; index < touch_states_.size(); ++index) {
+        auto &touch = touch_states_[index];
+        if (touch.dirty && (touch.last_sent_us == 0 || now - touch.last_sent_us >= controller_interval)) {
+          return send_touch_state(index, now);
         }
       }
       return CLSP_STATUS_OK;
@@ -945,6 +1032,40 @@ namespace umbra::lsp {
       return status;
     }
 
+    /** @brief Serialize and submit one exact 40-byte controller touch record. */
+    [[nodiscard]] clsp_status_t send_touch_state(const std::size_t index, const std::uint64_t now) noexcept {
+      auto &touch = touch_states_[index];
+      std::array<std::uint8_t, 40> payload {};
+      payload[0] = 4;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(2, 2), 1);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(4, 4), touch.value.contact_id);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(8, 4), touch.value.instance_generation);
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(12, 2), 40);
+      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {payload}.subspan(16, 8), touch.physical_ordinal);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(24, 4), touch.value.controller_id);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(28, 4), touch.value.x);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(32, 4), touch.value.y);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(36, 4), touch.value.pressure);
+      const auto sequence = next_state_sequence_;
+      const lumen::lsp::input_plane::common_header header {
+        .input_generation = input_configuration_.input_generation,
+        .kind = lumen::lsp::input_plane::packet_kind::device_state,
+        .state_sequence = sequence,
+        .sample_time_us = touch.value.sample_time_microseconds,
+        .object_id = lumen::lsp::input_plane::make_device_object_id(lumen::lsp::input_plane::device_type::touch, touch.value.contact_id),
+        .edge_watermark = latest_edge_id_,
+      };
+      bool submitted = false;
+      const auto status = send_input_packet(header, payload, now, submitted);
+      if (status == CLSP_STATUS_OK && submitted) {
+        latest_state_sequence_ = sequence;
+        ++next_state_sequence_;
+        touch.last_sent_us = now;
+        touch.dirty = false;
+      }
+      return status;
+    }
+
     /** @brief Wrap one checked input payload in RTP, protect in place, pace, and send. */
     [[nodiscard]] clsp_status_t send_input_packet(
       const lumen::lsp::input_plane::common_header &header,
@@ -1014,8 +1135,24 @@ namespace umbra::lsp {
       }
       const auto words = lumen::lsp::wire::read_be<std::uint16_t>(packet.subspan(2, 2));
       if ((static_cast<std::size_t>(words) + 1U) * 4U != packet.size() ||
-          lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != input_configuration_.acknowledgement_ssrc ||
-          !std::equal(lumen::lsp::input_plane::lspi_name.begin(), lumen::lsp::input_plane::lspi_name.end(), packet.begin() + 8)) {
+          lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != input_configuration_.acknowledgement_ssrc) {
+        return false;
+      }
+      if (std::equal(lumen::lsp::input_plane::lspg_name.begin(), lumen::lsp::input_plane::lspg_name.end(), packet.begin() + 8)) {
+        const auto parsed = lumen::lsp::input_plane::parse_lspg(packet.subspan(12));
+        if (!parsed || parsed.input_generation != input_configuration_.input_generation || callbacks_.controller_output == nullptr) {
+          return false;
+        }
+        const auto status = callbacks_.controller_output(
+          callbacks_.context,
+          {.data = packet.data() + 12, .length = packet.size() - 12U}
+        );
+        if (parsed.subtype == lumen::lsp::input_plane::lspg_subtype::command) {
+          return send_controller_ack(parsed, static_cast<lumen::lsp::input_plane::controller_command_status>(status)) == CLSP_STATUS_OK;
+        }
+        return true;
+      }
+      if (!std::equal(lumen::lsp::input_plane::lspi_name.begin(), lumen::lsp::input_plane::lspi_name.end(), packet.begin() + 8)) {
         return false;
       }
       const auto ack = lumen::lsp::input_plane::parse_lspi_ack(packet.subspan(12), input_configuration_.input_generation);
@@ -1031,6 +1168,45 @@ namespace umbra::lsp {
         baseline_last_sent_us_ = 0;
       }
       return true;
+    }
+
+    /** @brief Protect and send one terminal client-to-host LSPG command ACK. */
+    [[nodiscard]] clsp_status_t send_controller_ack(
+      const lumen::lsp::input_plane::parsed_lspg &command,
+      const lumen::lsp::input_plane::controller_command_status status
+    ) noexcept {
+      if (!lumen::lsp::input_plane::valid_controller_command_status(status)) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      std::array<std::uint8_t, maximum_udp_payload> packet {};
+      packet[0] = 0x80;
+      packet[1] = 204;
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(4, 4), input_configuration_.input_ssrc);
+      std::copy(lumen::lsp::input_plane::lspg_name.begin(), lumen::lsp::input_plane::lspg_name.end(), packet.begin() + 8);
+      const lumen::lsp::input_plane::controller_command_ack ack {
+        .input_generation = command.input_generation,
+        .controller_id = command.controller_id,
+        .instance_generation = command.instance_generation,
+        .sequence = command.sequence,
+        .status = status,
+      };
+      if (lumen::lsp::input_plane::serialize_controller_ack(ack, std::span<std::uint8_t> {packet}.subspan(12)) !=
+          lumen::lsp::input_plane::lspg_error::none) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      auto length = 12U + lumen::lsp::input_plane::lspg_header_size + 4U;
+      lumen::lsp::wire::write_be<std::uint16_t>(
+        std::span<std::uint8_t> {packet}.subspan(2, 2),
+        static_cast<std::uint16_t>(length / 4U - 1U)
+      );
+      const auto protected_status = srtp_.protect(packet, length, true);
+      if (protected_status != CLSP_STATUS_OK) return protected_status;
+      const auto sent = ::send(socket_, packet.data(), length, 0);
+      if (sent != static_cast<ssize_t>(length)) {
+        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
+      }
+      increment(RuntimeCounter::transmitted);
+      return CLSP_STATUS_OK;
     }
 
     /** @brief Receive one authenticated DTLS application record from wolfSSL. */
@@ -1286,6 +1462,7 @@ namespace umbra::lsp {
     lumen::lsp::input_plane::edge_sender edge_sender_;  ///< Exactly-once retained edge window.
     std::array<ControllerLatest, 16> controller_states_ {};  ///< Latest analog state by controller slot.
     std::array<std::array<ControllerSensorLatest, 2>, 16> controller_sensors_ {};  ///< Latest gyro/accel states.
+    std::array<TouchLatest, 16> touch_states_ {};  ///< Latest controller touch contacts.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
@@ -1361,6 +1538,14 @@ namespace umbra::lsp {
 
   clsp_status_t Runtime::submit_controller_sensor(const clsp_controller_sensor_t &sensor) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_controller_sensor(sensor);
+  }
+
+  clsp_status_t Runtime::submit_controller_touch_edge(const clsp_controller_touch_edge_t &edge) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_controller_touch_edge(edge);
+  }
+
+  clsp_status_t Runtime::submit_controller_touch_state(const clsp_controller_touch_state_t &state) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_controller_touch_state(state);
   }
 
   clsp_status_t Runtime::neutralize_input() noexcept {
