@@ -212,6 +212,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     private var displayLinkGeneration: UInt64?
     private var firstMetalCommitHandler: @Sendable (Int) -> Void = { _ in }
     private var commandCommitHandler: @Sendable (Int) -> Void = { _ in }
+    private var frameDropHandler: @Sendable (Int, MetalFrameDropReason) -> Void = { _, _ in }
     private var nominalFramesPerSecond: Double
     private var displayRefreshRate: Double
     #if DEBUG
@@ -468,10 +469,13 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             seconds: CACurrentMediaTime(),
             clockDomain: .clientMediaTime
         ))
+        var evictedFrameNumber: Int?
         lock.lock()
         guard state.isPresentationActive else {
             state.statistics.record(.dropped(.rendererUnavailable), at: now)
+            let handler = frameDropHandler
             lock.unlock()
+            handler(timedFrame.frameNumber, .rendererUnavailable)
             return
         }
         let desiredLayerConfiguration = LayerConfiguration(
@@ -485,10 +489,12 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         if state.frames.count == maximumQueuedFrames {
             if state.dropsNewestWhenMailboxFull {
                 state.statistics.record(.dropped(.queueOverflow), at: now)
+                let handler = frameDropHandler
                 lock.unlock()
+                handler(timedFrame.frameNumber, .mailboxRejectedNewest)
                 return
             }
-            state.frames.removeFirst()
+            evictedFrameNumber = state.frames.removeFirst().frame.frameNumber
             state.statistics.record(.dropped(.queueOverflow), at: now)
         }
         state.frames.append(QueuedMetalFrame(
@@ -499,8 +505,10 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         ))
         state.statistics.record(.queueDepth(state.frames.count), at: now)
         let shouldDrain = armDrainIfNeededLocked()
+        let dropHandler = frameDropHandler
         lock.signal()
         lock.unlock()
+        if let evictedFrameNumber { dropHandler(evictedFrameNumber, .mailboxEviction) }
         if shouldDrain {
             scheduleDrain()
         }
@@ -514,6 +522,12 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
 
     public func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) {
         lock.withLock { commandCommitHandler = handler }
+    }
+
+    public func installFrameDropHandler(
+        _ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void
+    ) {
+        lock.withLock { frameDropHandler = handler }
     }
 
     public func setMailboxDropNewest(_ enabled: Bool) {

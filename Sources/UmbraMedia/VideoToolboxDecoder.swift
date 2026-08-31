@@ -38,6 +38,7 @@ public enum VideoDecoderError: Error, Sendable, Equatable, CustomStringConvertib
     case notConfigured
     case notRunning
     case queueFull
+    case decodedFormatMismatch
 
     public var description: String {
         switch self {
@@ -55,6 +56,7 @@ public enum VideoDecoderError: Error, Sendable, Equatable, CustomStringConvertib
         case .notConfigured: "The decoder is not configured"
         case .notRunning: "The decoder is not running"
         case .queueFull: "The bounded decoder queue is full"
+        case .decodedFormatMismatch: "Decoded pixel or color metadata conflicts with the authenticated stream tuple"
         }
     }
 }
@@ -169,9 +171,15 @@ private final class DecodingFrameContext: @unchecked Sendable {
     let color: VideoColorMetadata
     let submittedAt: TimeInterval
     let latencyMetadata: VideoFrameLatencyMetadata
+    let expectedCodecMask: Int32
+    let requiresExactDecodedFormat: Bool
+    let colorPrimariesCode: UInt8?
+    let transferCharacteristicsCode: UInt8?
+    let matrixCoefficientsCode: UInt8?
 
     init(
         frame: CompressedVideoFrame,
+        format: VideoStreamFormat,
         decodeGeneration: UInt64,
         sessionGeneration: UInt64,
         recoveryEpochAtSubmission: UInt64,
@@ -194,6 +202,11 @@ private final class DecodingFrameContext: @unchecked Sendable {
         )
         self.submittedAt = submittedAt
         self.latencyMetadata = latencyMetadata
+        expectedCodecMask = format.codecMask
+        requiresExactDecodedFormat = format.requiresExactDecodedFormat
+        colorPrimariesCode = format.colorPrimariesCode
+        transferCharacteristicsCode = format.transferCharacteristicsCode
+        matrixCoefficientsCode = format.matrixCoefficientsCode
     }
 }
 
@@ -624,7 +637,11 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                     guard payloadFormat == .av1LowOverheadOBU else {
                         throw VideoDecoderError.invalidAccessUnit
                     }
-                    let accessUnit = try AV1AccessUnit(data: data, profile: profile)
+                    let accessUnit = try AV1AccessUnit(
+                        data: data,
+                        profile: profile,
+                        expectedColor: AV1ExpectedColor(format: format)
+                    )
                     description = try makeAV1FormatDescription(
                         format: format,
                         codecConfigurationRecord: accessUnit.codecConfigurationRecord
@@ -926,7 +943,11 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                 let accessUnit: AV1AccessUnit?
                 if !hasSession || frame.isKeyFrame {
                     do {
-                        accessUnit = try AV1AccessUnit(data: frame.data, profile: profile)
+                        accessUnit = try AV1AccessUnit(
+                            data: frame.data,
+                            profile: profile,
+                            expectedColor: AV1ExpectedColor(format: format)
+                        )
                     } catch VideoDecoderError.missingParameterSets where hasSession {
                         // A key frame may reuse the active sequence header. Malformed
                         // headers still propagate as errors instead of using stale state.
@@ -1093,6 +1114,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         )
         let context = Unmanaged.passRetained(DecodingFrameContext(
             frame: frame,
+            format: format,
             decodeGeneration: generation,
             sessionGeneration: sessionGeneration,
             recoveryEpochAtSubmission: recoveryEpochAtSubmission,
@@ -1137,11 +1159,15 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             }
         }
         let pixelFormat: OSType
-        switch (profile.isTenBit, profile.isYUV444) {
-        case (false, false): pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        case (true, false): pixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
-        case (false, true): pixelFormat = kCVPixelFormatType_444YpCbCr8BiPlanarFullRange
-        case (true, true): pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+        switch (profile.isTenBit, profile.isYUV444, format.colorRange) {
+        case (false, false, .video): pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        case (false, false, .full): pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        case (true, false, .video): pixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        case (true, false, .full): pixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        case (false, true, .video): pixelFormat = kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange
+        case (false, true, .full): pixelFormat = kCVPixelFormatType_444YpCbCr8BiPlanarFullRange
+        case (true, true, .video): pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
+        case (true, true, .full): pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
         }
         let imageAttributes: [CFString: Any] = [
             kCVPixelBufferMetalCompatibilityKey: true,
@@ -1239,6 +1265,17 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             )
             return
         }
+        guard let imageBuffer else { return }
+        if context.requiresExactDecodedFormat,
+           !decodedFormatMatches(context: context, imageBuffer: imageBuffer) {
+            recordAsynchronousDecodeFailure(
+                .decodedFormatMismatch,
+                generation: context.decodeGeneration,
+                frameNumber: context.frameNumber,
+                at: now
+            )
+            return
+        }
         guard let outstandingDepth = inFlightLimiter.release(
             generation: context.decodeGeneration
         ) else { return }
@@ -1289,7 +1326,6 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         state.reportedFirstDecodedFrame = true
         lock.unlock()
 
-        guard let imageBuffer else { return }
         let resolvedColor = resolvedColorMetadata(
             fallback: context.color,
             imageBuffer: imageBuffer
@@ -1721,13 +1757,31 @@ func makeAV1FormatDescription(
     return description
 }
 
+struct AV1ExpectedColor {
+    let primaries: UInt8
+    let transfer: UInt8
+    let matrix: UInt8
+    let fullRange: Bool
+
+    init?(format: VideoStreamFormat) {
+        guard format.requiresExactDecodedFormat,
+              let primaries = format.colorPrimariesCode,
+              let transfer = format.transferCharacteristicsCode,
+              let matrix = format.matrixCoefficientsCode else { return nil }
+        self.primaries = primaries
+        self.transfer = transfer
+        self.matrix = matrix
+        fullRange = format.colorRange == .full
+    }
+}
+
 struct AV1AccessUnit {
     let sequenceHeaderOBU: Data
     let codecConfigurationRecord: Data
 
-    init(data: Data, profile: VideoCodecProfile) throws {
+    init(data: Data, profile: VideoCodecProfile, expectedColor: AV1ExpectedColor? = nil) throws {
         let parsed = try data.withUnsafeBytes { bytes in
-            try Self.parse(bytes: bytes, profile: profile)
+            try Self.parse(bytes: bytes, profile: profile, expectedColor: expectedColor)
         }
         sequenceHeaderOBU = parsed.sequenceHeaderOBU
         codecConfigurationRecord = parsed.codecConfigurationRecord
@@ -1735,7 +1789,8 @@ struct AV1AccessUnit {
 
     private static func parse(
         bytes: UnsafeRawBufferPointer,
-        profile: VideoCodecProfile
+        profile: VideoCodecProfile,
+        expectedColor: AV1ExpectedColor?
     ) throws -> (sequenceHeaderOBU: Data, codecConfigurationRecord: Data) {
         var index = 0
         var sequenceHeaderRange: Range<Int>?
@@ -1825,10 +1880,93 @@ struct AV1AccessUnit {
             tier = firstTier
         }
 
+        let frameWidthBits = Int(try bits.readBits(4)) + 1
+        let frameHeightBits = Int(try bits.readBits(4)) + 1
+        try bits.skip(frameWidthBits + frameHeightBits)
+        if !reducedStillPictureHeader {
+            let frameIDsPresent = try bits.readBit()
+            if frameIDsPresent { try bits.skip(7) }
+        }
+        try bits.skip(3) // use_128x128_superblock, filter_intra, intra_edge_filter
+        if !reducedStillPictureHeader {
+            try bits.skip(4) // interintra, masked compound, warped motion, dual filter
+            let enableOrderHint = try bits.readBit()
+            if enableOrderHint { try bits.skip(2) }
+            let chooseScreenContentTools = try bits.readBit()
+            let forceScreenContentTools = chooseScreenContentTools ? 2 : Int(try bits.readBits(1))
+            if forceScreenContentTools > 0 {
+                let chooseIntegerMV = try bits.readBit()
+                if !chooseIntegerMV { try bits.skip(1) }
+            }
+            if enableOrderHint { try bits.skip(3) }
+        }
+        try bits.skip(3) // superres, CDEF, restoration
+
+        let highBitDepth = try bits.readBit()
+        let twelveBit = parsedProfile == 2 && highBitDepth ? try bits.readBit() : false
+        let bitDepth = twelveBit ? 12 : highBitDepth ? 10 : 8
+        let monochrome = parsedProfile == 1 ? false : try bits.readBit()
+        let colorDescriptionPresent = try bits.readBit()
+        let colorPrimaries = colorDescriptionPresent ? UInt8(try bits.readBits(8)) : 2
+        let transferCharacteristics = colorDescriptionPresent ? UInt8(try bits.readBits(8)) : 2
+        let matrixCoefficients = colorDescriptionPresent ? UInt8(try bits.readBits(8)) : 2
+        let fullRange: Bool
+        let subsamplingX: Bool
+        let subsamplingY: Bool
+        let chromaSamplePosition: UInt8
+        if monochrome {
+            fullRange = try bits.readBit()
+            subsamplingX = true
+            subsamplingY = true
+            chromaSamplePosition = 0
+            try bits.skip(1) // separate_uv_delta_q
+        } else if colorPrimaries == 1 && transferCharacteristics == 13 && matrixCoefficients == 0 {
+            fullRange = true
+            subsamplingX = false
+            subsamplingY = false
+            chromaSamplePosition = 0
+            try bits.skip(1)
+        } else {
+            fullRange = try bits.readBit()
+            if parsedProfile == 0 {
+                subsamplingX = true
+                subsamplingY = true
+            } else if parsedProfile == 1 {
+                subsamplingX = false
+                subsamplingY = false
+            } else if bitDepth == 12 {
+                subsamplingX = try bits.readBit()
+                subsamplingY = subsamplingX ? try bits.readBit() : false
+            } else {
+                subsamplingX = true
+                subsamplingY = false
+            }
+            chromaSamplePosition = subsamplingX && subsamplingY ? UInt8(try bits.readBits(2)) : 0
+            try bits.skip(1)
+        }
+        guard !monochrome,
+              bitDepth == (profile.isTenBit ? 10 : 8),
+              subsamplingX == !profile.isYUV444,
+              subsamplingY == !profile.isYUV444 else {
+            throw VideoDecoderError.invalidAccessUnit
+        }
+        if let expectedColor {
+            guard colorPrimaries == expectedColor.primaries,
+                  transferCharacteristics == expectedColor.transfer,
+                  matrixCoefficients == expectedColor.matrix,
+                  fullRange == expectedColor.fullRange else {
+                throw VideoDecoderError.invalidAccessUnit
+            }
+        }
+
         let profileAndLevel = UInt8(parsedProfile << 5) | level
         let chromaAndDepth = (tier << 7) |
-            (profile.isTenBit ? 1 << 6 : 0) |
-            (profile.isYUV444 ? 0 : (1 << 3) | (1 << 2))
+            (highBitDepth ? 1 << 6 : 0) |
+            (twelveBit ? 1 << 5 : 0) |
+            (monochrome ? 1 << 4 : 0) |
+            (subsamplingX ? 1 << 3 : 0) |
+            (subsamplingY ? 1 << 2 : 0) |
+            (chromaSamplePosition & 0x03)
         var record = Data([0x81, profileAndLevel, chromaAndDepth, 0])
         let sequenceHeader = Data(bytes[sequenceHeaderRange])
         record.append(sequenceHeader)
@@ -1967,6 +2105,7 @@ func resolvedColorMetadata(
             maximumLuminanceNits: hdrMetadata?.maximumLuminanceNits,
             maximumContentLightLevelNits: hdrMetadata?.maximumContentLightLevelNits,
             maximumFrameAverageLightLevelNits: hdrMetadata?.maximumFrameAverageLightLevelNits,
+            maximumFullFrameLuminanceNits: hdrMetadata?.maximumFullFrameLuminanceNits,
             masteringDisplayColorVolume: mastering ?? hdrMetadata?.masteringDisplayColorVolume,
             contentLightLevelInfo: contentLight ?? hdrMetadata?.contentLightLevelInfo
         )
@@ -1977,6 +2116,60 @@ func resolvedColorMetadata(
         transferFunction: transferFunction,
         hdrStaticMetadata: hdrMetadata
     )
+}
+
+private func decodedFormatMatches(
+    context: DecodingFrameContext,
+    imageBuffer: CVImageBuffer
+) -> Bool {
+    guard let profile = try? VideoCodecProfile(codecMask: context.expectedCodecMask) else { return false }
+    let pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
+    let actual: (tenBit: Bool, yuv444: Bool, range: VideoColorRange)? = switch pixelFormat {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: (false, false, .video)
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: (false, false, .full)
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: (true, false, .video)
+    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange: (true, false, .full)
+    case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange: (false, true, .video)
+    case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange: (false, true, .full)
+    case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange: (true, true, .video)
+    case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange: (true, true, .full)
+    default: nil
+    }
+    guard let actual,
+          actual.tenBit == profile.isTenBit,
+          actual.yuv444 == profile.isYUV444,
+          actual.range == context.color.range,
+          attachmentMatchesOrIsAbsent(
+              imageBuffer,
+              key: kCVImageBufferColorPrimariesKey,
+              expected: context.colorPrimariesCode == 9 ? kCVImageBufferColorPrimaries_ITU_R_2020 :
+                  kCVImageBufferColorPrimaries_ITU_R_709_2
+          ),
+          attachmentMatchesOrIsAbsent(
+              imageBuffer,
+              key: kCVImageBufferTransferFunctionKey,
+              expected: context.transferCharacteristicsCode == 16 ? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ :
+                  context.transferCharacteristicsCode == 18 ? kCVImageBufferTransferFunction_ITU_R_2100_HLG :
+                  kCVImageBufferTransferFunction_ITU_R_709_2
+          ),
+          attachmentMatchesOrIsAbsent(
+              imageBuffer,
+              key: kCVImageBufferYCbCrMatrixKey,
+              expected: context.matrixCoefficientsCode == 9 ? kCVImageBufferYCbCrMatrix_ITU_R_2020 :
+                  kCVImageBufferYCbCrMatrix_ITU_R_709_2
+          )
+    else { return false }
+    return [context.colorPrimariesCode, context.transferCharacteristicsCode, context.matrixCoefficientsCode]
+        .allSatisfy { $0 != nil }
+}
+
+private func attachmentMatchesOrIsAbsent(
+    _ imageBuffer: CVImageBuffer,
+    key: CFString,
+    expected: CFString
+) -> Bool {
+    guard let value = CVBufferCopyAttachment(imageBuffer, key, nil) else { return true }
+    return CFEqual(value, expected)
 }
 
 private func attachment(

@@ -468,15 +468,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                   let frameRate = preferenceResolver(preferences.settings).preferences.normalizedFrameRate
             else { throw UmbraClientServiceError.unavailable("Native LSP requires Metal and a valid refresh rate.") }
             let resolved = preferenceResolver(preferences.settings).preferences
-            let bitrate = UInt64(resolved.bitrateKbps) * 1_000
-            var videoOffers: [LSPVideoOffer] = []
-            if lspMediaCapabilities.supportsHardwareHEVC {
-                videoOffers.append(.init(codec: 2, profile: 2, width: UInt32(resolved.width), height: UInt32(resolved.height), refreshNumerator: frameRate.numerator, refreshDenominator: frameRate.denominator, preferredBitsPerSecond: bitrate, maximumBitsPerSecond: bitrate))
-            }
-            if lspMediaCapabilities.supportsHardwareH264 {
-                videoOffers.append(.init(codec: 1, profile: 1, width: UInt32(resolved.width), height: UInt32(resolved.height), refreshNumerator: frameRate.numerator, refreshDenominator: frameRate.denominator, preferredBitsPerSecond: bitrate, maximumBitsPerSecond: bitrate))
-            }
-            guard !videoOffers.isEmpty, let streamWindow else {
+            guard let streamWindow else {
                 throw UmbraClientServiceError.unavailable("Native LSP hardware video is unavailable.")
             }
             try await streamWindow.prepareLSPVideo(applicationName: applicationID, preferences: resolved)
@@ -487,7 +479,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 applicationID: applicationID,
                 pointerRate: 1_000,
                 microphoneOffer: microphoneOffer,
-                videoOffers: videoOffers,
+                capabilities: lspMediaCapabilities,
+                preferences: resolved,
+                refreshNumerator: frameRate.numerator,
+                refreshDenominator: frameRate.denominator,
                 decoderSurfaces: 3,
                 maximumCaptureToPresentMicroseconds: UInt32(max(10_000, Int(2_000_000 * Double(frameRate.denominator) / Double(frameRate.numerator))))
             )
@@ -571,6 +566,23 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     private func installLSPReconnectHandler(session: LSPClientSession, hostID: UUID) {
+        session.setTerminationHandler { [weak self, weak session] termination in
+            guard session != nil else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.lspInputCapture.stop()
+                self.activeLSPHostID = nil
+                await self.streamWindow?.finish()
+                switch termination {
+                case .streamEnded:
+                    self.eventHandler?(.sessionEnded)
+                    self.onSessionTerminated?(true)
+                case .failed(let error):
+                    self.eventHandler?(.sessionWarning("Native LSP stream failed: \(error.localizedDescription)"))
+                    self.onSessionTerminated?(false)
+                }
+            }
+        }
         session.setTransportLifecycleHandler { [weak self, weak session] lifecycle in
             guard lifecycle == .failed, session != nil else { return }
             Task { @MainActor [weak self] in

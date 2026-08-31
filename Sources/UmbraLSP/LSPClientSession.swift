@@ -20,6 +20,42 @@ public enum LSPReconnectReason: Equatable, Sendable {
     case plannedRekey
 }
 
+/// Terminal product event emitted once after authenticated stream end or local failure.
+public enum LSPClientSessionTermination: Equatable, Sendable {
+    case streamEnded(reason: UInt8)
+    case failed(LSPTransportError)
+}
+
+final class LSPTerminationObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable (LSPClientSessionTermination) -> Void)?
+    private var terminalEvent: LSPClientSessionTermination?
+
+    func set(_ handler: (@Sendable (LSPClientSessionTermination) -> Void)?) {
+        let latched = lock.withLock { () -> LSPClientSessionTermination? in
+            self.handler = handler
+            return handler == nil ? nil : terminalEvent
+        }
+        if let handler, let latched { handler(latched) }
+    }
+
+    @discardableResult
+    func emit(_ event: LSPClientSessionTermination) -> Bool {
+        let result = lock.withLock { () -> (Bool, (@Sendable (LSPClientSessionTermination) -> Void)?) in
+            guard terminalEvent == nil else { return (false, nil) }
+            terminalEvent = event
+            return (true, handler)
+        }
+        guard result.0 else { return false }
+        result.1?(event)
+        return result.0
+    }
+
+    var hasTerminalEvent: Bool {
+        lock.withLock { terminalEvent != nil }
+    }
+}
+
 /// Current single-use session ownership required for ATTACH.
 public struct LSPActiveInputAuthority: Equatable, Sendable {
     public var applicationID: String
@@ -54,6 +90,8 @@ public actor LSPClientSession {
     private var microphoneConfigurationTerminal = false
     private var installedVideoGeneration: UInt32?
     private var pendingRetirementPrevious: LSPClientSession?
+    private var configurationFailure: LSPTransportError?
+    private let terminationObserver = LSPTerminationObserver()
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -76,6 +114,9 @@ public actor LSPClientSession {
         }
         transport.setAudioTimingHandler { [audioPlayout] timing in
             audioPlayout.receiveTiming(timing)
+        }
+        videoPipeline?.setFailureHandler { [weak self] error in
+            Task { await self?.videoGenerationFailed(error) }
         }
     }
 
@@ -222,6 +263,12 @@ public actor LSPClientSession {
         guard videoSelection(response.videoSelection, matches: resolvedRequest) else {
             throw LSPControlStatus.unsupportedMediaTuple
         }
+        guard laneIdentifiersAreGloballyUnique(
+            input: response.nativeConfiguration,
+            audio: response.audioConfiguration,
+            microphone: response.microphoneConfiguration,
+            video: response.videoSelection.nativeConfiguration
+        ) else { throw LSPControlStatus.unsupportedMediaTuple }
         if resolvedRequest.microphoneOffer?.required == true, response.microphoneConfiguration == nil {
             throw LSPControlStatus.unsupportedMediaTuple
         }
@@ -250,11 +297,18 @@ public actor LSPClientSession {
         installedAudioGeneration = nil
         installedMicrophoneGeneration = nil
         installedVideoGeneration = nil
+        configurationFailure = nil
         microphoneConfigurationTerminal = response.microphoneConfiguration == nil
-        state = .inputActive
         await drainPendingAudioConfigurations()
         await drainPendingMicrophoneConfigurations()
         await drainPendingVideoConfigurations()
+        do {
+            try await waitForTerminalConfiguration(authority: inputAuthority!)
+        } catch let error as LSPTransportError {
+            failSession(error)
+            throw error
+        }
+        state = .inputActive
         return response
     }
 
@@ -305,6 +359,12 @@ public actor LSPClientSession {
                   response.videoSelection.nativeConfiguration.videoGeneration != prior.videoSelection.nativeConfiguration.videoGeneration,
                   response.videoSelection.nativeConfiguration.primarySSRC != prior.videoSelection.nativeConfiguration.primarySSRC,
                   attachedVideoSelection(response.videoSelection, retains: prior.videoSelection),
+                  laneIdentifiersAreGloballyUnique(
+                      input: response.nativeConfiguration,
+                      audio: response.audioConfiguration,
+                      microphone: response.microphoneConfiguration,
+                      video: response.videoSelection.nativeConfiguration
+                  ),
                   response.replacementAttachToken != prior.attachToken
             else {
                 throw LSPTransportError.internalFailure
@@ -324,16 +384,19 @@ public actor LSPClientSession {
             installedAudioGeneration = nil
             installedMicrophoneGeneration = nil
             installedVideoGeneration = nil
+            configurationFailure = nil
             microphoneConfigurationTerminal = response.microphoneConfiguration == nil
             pendingRetirementPrevious = previous
-            state = .inputActive
             await drainPendingAudioConfigurations()
             await drainPendingMicrophoneConfigurations()
             await drainPendingVideoConfigurations()
+            try await waitForTerminalConfiguration(authority: inputAuthority!)
+            state = .inputActive
             await completePendingRetirementIfReady()
             return response
         } catch {
             let attachError = error
+            failSession((error as? LSPTransportError) ?? .internalFailure)
             if reason == .plannedRekey, neutralizationAttempted {
                 try await previous.restoreInputAuthority(prior)
             }
@@ -354,6 +417,13 @@ public actor LSPClientSession {
         _ handler: (@Sendable (LSPTransportLifecycle) -> Void)?
     ) {
         transport.setLifecycleHandler(handler)
+    }
+
+    /// Installs the coarse terminal stream observer used by the product/UI owner.
+    public nonisolated func setTerminationHandler(
+        _ handler: (@Sendable (LSPClientSessionTermination) -> Void)?
+    ) {
+        terminationObserver.set(handler)
     }
 
     /// Sends one AppKit/IOHID relative-pointer record without actor or Task work per sample.
@@ -471,6 +541,8 @@ public actor LSPClientSession {
                 Task { await self?.receiveVideoConfiguration(event) }
             } else if event.messageType == LSPControlMessageType.pathProbe.rawValue {
                 Task { await self?.receivePathProbeIntent(event) }
+            } else if event.messageType == LSPControlMessageType.streamEnded.rawValue {
+                Task { await self?.receiveStreamEnded(event) }
             }
         }
         transport.setPathProbeHandler { [weak self] event in
@@ -494,8 +566,7 @@ public actor LSPClientSession {
 
     private func processVideoConfiguration(_ event: LSPControlEvent) async {
         guard let request = try? LSPControlWire.videoConfig(from: event) else {
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession(.internalFailure)
             return
         }
         var status = LSPControlStatus.staleGeneration
@@ -504,11 +575,13 @@ public actor LSPClientSession {
             var expected = authority.videoSelection.nativeConfiguration
             expected.frameIDOrigin = request.nativeConfiguration.frameIDOrigin
             expected.recoveryEpoch = request.nativeConfiguration.recoveryEpoch
-            expected.maximumAccessUnitBytes = request.nativeConfiguration.maximumAccessUnitBytes
             if expected == request.nativeConfiguration {
                 do {
                     _ = try videoPipeline.configure(request)
                     status = .success
+                } catch is VideoDecoderError {
+                    videoPipeline.abortConfiguration()
+                    status = .unsupportedMediaTuple
                 } catch {
                     videoPipeline.abortConfiguration()
                     status = .internalFailure
@@ -534,11 +607,12 @@ public actor LSPClientSession {
                 }
                 try videoPipeline?.activate()
                 try transport.startPathDiscovery()
+            } else {
+                configurationFailure = status == .unsupportedMediaTuple ? .unsupported : .internalFailure
             }
         } catch {
             if status == .success { videoPipeline?.abortConfiguration() }
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession((error as? LSPTransportError) ?? .internalFailure)
             return
         }
         await completePendingRetirementIfReady()
@@ -621,8 +695,7 @@ public actor LSPClientSession {
             request = try LSPControlWire.audioConfig(from: event)
         } catch {
             audioPlayout.stop()
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession(.internalFailure)
             return
         }
         let status: LSPControlStatus
@@ -661,9 +734,10 @@ public actor LSPClientSession {
             if status == .success {
                 audioPlayout.stop()
             }
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession((error as? LSPTransportError) ?? .internalFailure)
+            return
         }
+        if status != .success { configurationFailure = .internalFailure }
         await completePendingRetirementIfReady()
     }
 
@@ -691,8 +765,7 @@ public actor LSPClientSession {
             request = try LSPControlWire.microphoneConfig(from: event)
         } catch {
             microphoneUplink.stop(transport: transport)
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession(.internalFailure)
             return
         }
         let status: LSPControlStatus
@@ -731,12 +804,11 @@ public actor LSPClientSession {
             microphoneConfigurationTerminal = true
         } catch {
             microphoneUplink.stop(transport: transport)
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession((error as? LSPTransportError) ?? .internalFailure)
             return
         }
         if status != .success, inputAuthority?.microphoneRequired == true {
-            state = .failed(.internalFailure)
+            configurationFailure = .internalFailure
         }
         await completePendingRetirementIfReady()
     }
@@ -746,8 +818,7 @@ public actor LSPClientSession {
         microphoneUplink.stop(transport: transport)
         installedMicrophoneGeneration = nil
         if inputAuthority?.microphoneRequired == true {
-            try? transport.stop()
-            state = .failed(.internalFailure)
+            failSession(.internalFailure)
         }
     }
 
@@ -786,12 +857,21 @@ public actor LSPClientSession {
               video.maximumFrameAgeMicroseconds > 0,
               video.maximumFrameAgeMicroseconds <= request.maximumCaptureToPresentMicroseconds else { return false }
         return request.videoOffers.contains { offer in
-            offer.codec == video.codec && offer.profile == video.profile &&
+            offer.codec.rawValue == video.codec && offer.profile.rawValue == video.profile &&
+            offer.pixelFormat.rawValue == video.pixelFormat &&
+            offer.color.colorPrimaries == video.colorPrimaries &&
+            offer.color.transferCharacteristics == video.transferCharacteristics &&
+            offer.color.matrixCoefficients == video.matrixCoefficients &&
+            offer.color.fullRange == video.fullRange &&
+            offer.delivery.rawValue == video.delivery &&
             offer.width == video.width && offer.height == video.height &&
             offer.refreshNumerator == video.refreshNumerator &&
             offer.refreshDenominator == video.refreshDenominator &&
             video.bitrate > 0 &&
-            UInt64(video.bitrate) <= offer.maximumBitsPerSecond
+            UInt64(video.bitrate) <= offer.maximumBitsPerSecond &&
+            video.maximumAccessUnitBytes <= offer.maximumAccessUnitBytes &&
+            (video.flexFECSSRC == 0 || offer.supportsFlexFEC) &&
+            (video.rtxSSRC == 0 || offer.supportsRTX)
         }
     }
 
@@ -801,7 +881,12 @@ public actor LSPClientSession {
         return new.streamGeneration == old.streamGeneration &&
             new.videoGeneration != old.videoGeneration && new.primarySSRC != old.primarySSRC &&
             new.primaryPayloadType == old.primaryPayloadType && new.codec == old.codec &&
-            new.profile == old.profile && new.width == old.width && new.height == old.height &&
+            new.profile == old.profile && new.pixelFormat == old.pixelFormat &&
+            new.colorPrimaries == old.colorPrimaries &&
+            new.transferCharacteristics == old.transferCharacteristics &&
+            new.matrixCoefficients == old.matrixCoefficients && new.fullRange == old.fullRange &&
+            new.delivery == old.delivery && new.payloadFormat == old.payloadFormat &&
+            new.width == old.width && new.height == old.height &&
             new.refreshNumerator == old.refreshNumerator && new.refreshDenominator == old.refreshDenominator &&
             new.bitrate == old.bitrate && new.maximumAccessUnitBytes == old.maximumAccessUnitBytes &&
             new.maximumFrameAgeMicroseconds == old.maximumFrameAgeMicroseconds &&
@@ -811,7 +896,102 @@ public actor LSPClientSession {
             new.absoluteCaptureExtension == old.absoluteCaptureExtension &&
             new.frameIDExtension == old.frameIDExtension &&
             new.inputWatermarkExtension == old.inputWatermarkExtension &&
-            new.encoderTimingExtension == old.encoderTimingExtension
+            new.encoderTimingExtension == old.encoderTimingExtension &&
+            ((old.flexFECSSRC == 0 && new.flexFECSSRC == 0) ||
+             (old.flexFECSSRC != 0 && new.flexFECSSRC != 0 && new.flexFECSSRC != old.flexFECSSRC)) &&
+            new.flexFECPayloadType == old.flexFECPayloadType &&
+            new.flexFECRepairWindowMicroseconds == old.flexFECRepairWindowMicroseconds &&
+            new.flexFECMaximumGroupPackets == old.flexFECMaximumGroupPackets &&
+            ((old.rtxSSRC == 0 && new.rtxSSRC == 0) ||
+             (old.rtxSSRC != 0 && new.rtxSSRC != 0 && new.rtxSSRC != old.rtxSSRC)) &&
+            new.rtxPayloadType == old.rtxPayloadType &&
+            new.rtxAssociatedPayloadType == old.rtxAssociatedPayloadType
+    }
+
+    private func waitForTerminalConfiguration(authority: LSPActiveInputAuthority) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while true {
+            if case .failed(let error) = state { throw error }
+            if let configurationFailure { throw configurationFailure }
+            let audioReady = installedAudioGeneration == authority.audioConfiguration.audioGeneration
+            let videoReady = installedVideoGeneration == authority.videoSelection.nativeConfiguration.videoGeneration
+            let microphoneReady: Bool
+            if let microphone = authority.microphoneConfiguration {
+                microphoneReady = microphoneConfigurationTerminal &&
+                    (!authority.microphoneRequired || installedMicrophoneGeneration == microphone.microphoneGeneration)
+            } else {
+                microphoneReady = true
+            }
+            if audioReady, videoReady, microphoneReady { return }
+            guard clock.now < deadline else { throw LSPTransportError.timeout }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    private func laneIdentifiersAreGloballyUnique(
+        input: LSPNativeInputConfiguration,
+        audio: LSPNativeAudioConfiguration,
+        microphone: LSPNativeMicrophoneConfiguration?,
+        video: LSPNativeVideoConfiguration
+    ) -> Bool {
+        var ssrcs = [
+            input.inputSSRC,
+            input.acknowledgementSSRC,
+            audio.audioSSRC,
+            video.primarySSRC,
+        ]
+        var payloadTypes = [
+            input.inputPayloadType,
+            audio.audioPayloadType,
+            video.primaryPayloadType,
+        ]
+        if let microphone {
+            ssrcs.append(microphone.microphoneSSRC)
+            payloadTypes.append(microphone.microphonePayloadType)
+        }
+        if video.flexFECSSRC != 0 {
+            ssrcs.append(video.flexFECSSRC)
+            payloadTypes.append(video.flexFECPayloadType)
+        }
+        if video.rtxSSRC != 0 {
+            ssrcs.append(video.rtxSSRC)
+            payloadTypes.append(video.rtxPayloadType)
+        }
+        return Set(ssrcs).count == ssrcs.count && Set(payloadTypes).count == payloadTypes.count
+    }
+
+    private func receiveStreamEnded(_ event: LSPControlEvent) {
+        guard !terminationObserver.hasTerminalEvent else { return }
+        guard let ended = try? LSPControlWire.streamEnded(from: event),
+              ended.sessionID == inputAuthority?.sessionID else {
+            failSession(.internalFailure)
+            return
+        }
+        videoPipeline?.disablePublication()
+        try? transport.stop()
+        videoPipeline?.stop()
+        audioPlayout.stop()
+        microphoneUplink.stop(transport: transport)
+        inputAuthority = nil
+        state = .stopped
+        terminationObserver.emit(.streamEnded(reason: ended.reason))
+    }
+
+    private func videoGenerationFailed(_ error: LSPTransportError) {
+        failSession(error)
+    }
+
+    private func failSession(_ error: LSPTransportError) {
+        if terminationObserver.hasTerminalEvent || state == .stopped { return }
+        if case .failed = state { return }
+        videoPipeline?.disablePublication()
+        try? transport.stop()
+        videoPipeline?.stop()
+        audioPlayout.stop()
+        microphoneUplink.stop(transport: transport)
+        state = .failed(error)
+        terminationObserver.emit(.failed(error))
     }
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {

@@ -58,6 +58,18 @@ public struct AppleStreamingCapabilities: Sendable, Equatable {
         return formats
     }
 
+    /// Exact hardware decoder tuples which may be offered by a native protocol.
+    /// Family availability never promotes an unproven 10-bit or 4:4:4 tuple.
+    public var supportedHardwareVideoFormats: [MoonlightVideoFormat] {
+        let mask = supportedVideoFormatMask
+        return MoonlightVideoFormat.allCases.filter { mask & $0.rawValue != 0 }
+    }
+
+    /// Returns whether the active machine has direct evidence for one exact tuple.
+    public func supportsHardwareVideoFormat(_ format: MoonlightVideoFormat) -> Bool {
+        supportedVideoFormatMask & format.rawValue != 0
+    }
+
     /// Queries the active system. It never infers decoder or output support from the CPU name.
     public static func probe() -> AppleStreamingCapabilities {
         let metalDevice = MTLCreateSystemDefaultDevice()
@@ -75,32 +87,14 @@ public struct AppleStreamingCapabilities: Sendable, Equatable {
             // Querying a routed virtual device's stream configuration can activate it.
             // Keep this unknown until the audio backend opens at Moonlight audio init.
             audioOutputChannelCount: 0,
-            supportsHardwareHEVCMain10: supportsHEVCMain10(
-                codecAvailable: supportsHEVC,
-                metalDevice: metalDevice
-            ),
-            // AV1 Main profile includes both 8-bit and 10-bit decoding.
-            supportsHardwareAV1Main10: supportsAV1,
+            supportsHardwareHEVCMain10: hardwareTupleProofs.supports(.hevcMain10),
+            supportsHardwareAV1Main10: hardwareTupleProofs.supports(.av1Main10),
             supportedHardwareYUV444FormatMask: hardwareTupleProofs.yuv444Mask
         )
     }
 
     static func recordHardwareYUV444Proof(formatMask: Int32) {
         hardwareTupleProofs.record(formatMask & VideoCodecProfile.yuv444Mask)
-    }
-
-    private static func supportsHEVCMain10(
-        codecAvailable: Bool,
-        metalDevice: (any MTLDevice)?
-    ) -> Bool {
-        guard codecAvailable, let metalDevice else { return false }
-#if arch(arm64)
-        return metalDevice.supportsFamily(.mac2)
-#else
-        // VideoToolbox exposes no profile-specific query. Avoid model-name
-        // heuristics on Intel/AMD Macs; an exact stream can still be tested at runtime.
-        return false
-#endif
     }
 
     private static func defaultAudioOutputDevice() -> AudioDeviceID? {
@@ -126,7 +120,7 @@ public struct AppleStreamingCapabilities: Sendable, Equatable {
 
 private final class HardwareVideoTupleProofs: @unchecked Sendable {
     private let lock = NSLock()
-    private var storedYUV444Mask: Int32 = 0
+    private var storedExactMask: Int32 = 0
     private var performedColdProbe = false
 
     var yuv444Mask: Int32 {
@@ -137,14 +131,19 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
         }
         if shouldProbe {
             let proven = Self.probeExactHardwareTuples()
-            lock.withLock { storedYUV444Mask |= proven }
+            lock.withLock { storedExactMask |= proven }
         }
-        return lock.withLock { storedYUV444Mask }
+        return lock.withLock { storedExactMask & VideoCodecProfile.yuv444Mask }
+    }
+
+    func supports(_ format: MoonlightVideoFormat) -> Bool {
+        _ = yuv444Mask
+        return lock.withLock { storedExactMask & format.rawValue != 0 }
     }
 
     func record(_ formatMask: Int32) {
         guard formatMask != 0 else { return }
-        lock.withLock { storedYUV444Mask |= formatMask }
+        lock.withLock { storedExactMask |= formatMask }
     }
 
     private struct Probe {
@@ -156,6 +155,29 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
 
     private static func probeExactHardwareTuples() -> Int32 {
         let probes: [Probe] = [
+            Probe(
+                formatMask: MoonlightVideoFormat.hevcMain10.rawValue,
+                codecType: kCMVideoCodecType_HEVC,
+                initialization: Data([
+                    0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x02, 0x20,
+                    0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
+                    0x1e, 0x95, 0x94, 0x09, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x02,
+                    0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+                    0x00, 0x1e, 0xa0, 0x20, 0x81, 0x04, 0xd9, 0x65, 0x65, 0x4a, 0x4c, 0x2f,
+                    0x01, 0x68, 0x08, 0x00, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x00,
+                    0x08, 0x40, 0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0xc0, 0x73, 0xc0, 0x89,
+                ]),
+                payloadFormat: .annexB
+            ),
+            Probe(
+                formatMask: MoonlightVideoFormat.av1Main10.rawValue,
+                codecType: kCMVideoCodecType_AV1,
+                initialization: Data([
+                    0x12, 0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00,
+                    0x02, 0xaf, 0xff, 0x89, 0x5f, 0x28, 0x08,
+                ]),
+                payloadFormat: .av1LowOverheadOBU
+            ),
             Probe(
                 formatMask: MoonlightVideoFormat.h264High8YUV444.rawValue,
                 codecType: kCMVideoCodecType_H264,
@@ -232,6 +254,6 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
             mask |= probe.formatMask
             decoder.cleanUp()
         }
-        return mask & VideoCodecProfile.yuv444Mask
+        return mask
     }
 }

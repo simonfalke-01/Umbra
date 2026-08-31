@@ -6,6 +6,35 @@ import XCTest
 @testable import UmbraMedia
 
 final class MediaFormatTests: XCTestCase {
+    func testAV1ConfigurationUsesParsedDepthSubsamplingAndRejectsColorMismatch() throws {
+        let profile = try VideoCodecProfile(codecMask: MoonlightVideoFormat.av1Main10.rawValue)
+        let sequence = Data([
+            0x12, 0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00,
+            0x02, 0xaf, 0xff, 0x89, 0x5f, 0x28, 0x08,
+        ])
+        let parsed = try AV1AccessUnit(data: sequence, profile: profile)
+        XCTAssertEqual(parsed.codecConfigurationRecord[0], 0x81)
+        XCTAssertNotEqual(parsed.codecConfigurationRecord[2] & 0x40, 0)
+        XCTAssertNotEqual(parsed.codecConfigurationRecord[2] & 0x0c, 0)
+
+        let exactFormat = VideoStreamFormat(
+            codecMask: MoonlightVideoFormat.av1Main10.rawValue,
+            width: 64,
+            height: 64,
+            redrawRate: 60,
+            colorRange: .video,
+            requiresExactDecodedFormat: true,
+            colorPrimariesCode: 1,
+            transferCharacteristicsCode: 1,
+            matrixCoefficientsCode: 1
+        )
+        XCTAssertThrowsError(try AV1AccessUnit(
+            data: sequence,
+            profile: profile,
+            expectedColor: try XCTUnwrap(AV1ExpectedColor(format: exactFormat))
+        ))
+    }
+
     func testMoonlightCodecMasksMapToCodecDepthAndChroma() throws {
         XCTAssertEqual(try VideoCodecProfile(codecMask: 0x0001).codec, .h264)
         XCTAssertFalse(try VideoCodecProfile(codecMask: 0x0001).isTenBit)

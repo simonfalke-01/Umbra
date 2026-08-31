@@ -100,6 +100,50 @@ public actor LSPProductClient {
         applicationID: String,
         pointerRate: UInt32 = 1_000,
         microphoneOffer: LSPMicrophoneOffer? = nil,
+        capabilities: AppleStreamingCapabilities,
+        preferences: StreamingPreferences,
+        refreshNumerator: UInt32,
+        refreshDenominator: UInt32,
+        receiveBatchCapacity: UInt8 = 64,
+        decoderSurfaces: UInt8 = 3,
+        maximumCaptureToPresentMicroseconds: UInt32 = 50_000
+    ) async throws -> LSPClientSession {
+        guard preferences.videoDecoderPreference != .software,
+              preferences.rendererPreference == .automatic || preferences.rendererPreference == .metal
+        else { throw LSPControlStatus.unsupportedMediaTuple }
+        let bitrate = UInt64(preferences.bitrateKbps) * 1_000
+        let offers = LSPVideoOffer.hardwareOffers(
+            capabilities: capabilities,
+            width: UInt32(preferences.width),
+            height: UInt32(preferences.height),
+            refreshNumerator: refreshNumerator,
+            refreshDenominator: refreshDenominator,
+            preferredBitsPerSecond: bitrate,
+            maximumBitsPerSecond: bitrate,
+            codecPreference: preferences.videoCodecPreference,
+            enableHDR: preferences.enableHDR,
+            hdrTransferPreference: preferences.hdrTransferPreference,
+            enableYUV444: preferences.enableYUV444
+        )
+        guard !offers.isEmpty else { throw LSPControlStatus.unsupportedMediaTuple }
+        return try await startInput(
+            hostID: hostID,
+            applicationID: applicationID,
+            pointerRate: pointerRate,
+            microphoneOffer: microphoneOffer,
+            videoOffers: offers,
+            receiveBatchCapacity: receiveBatchCapacity,
+            decoderSurfaces: decoderSurfaces,
+            maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds
+        )
+    }
+
+    /// Starts with already proven exact offers, primarily for controlled integration callers.
+    func startInput(
+        hostID: UUID,
+        applicationID: String,
+        pointerRate: UInt32 = 1_000,
+        microphoneOffer: LSPMicrophoneOffer? = nil,
         videoOffers: [LSPVideoOffer],
         receiveBatchCapacity: UInt8 = 64,
         decoderSurfaces: UInt8 = 3,

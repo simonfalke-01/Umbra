@@ -111,6 +111,7 @@ public struct HDRStaticMetadata: Sendable, Equatable {
     public var maximumLuminanceNits: Float?
     public var maximumContentLightLevelNits: Float?
     public var maximumFrameAverageLightLevelNits: Float?
+    public var maximumFullFrameLuminanceNits: Float?
     public var masteringDisplayColorVolume: Data?
     public var contentLightLevelInfo: Data?
 
@@ -119,6 +120,7 @@ public struct HDRStaticMetadata: Sendable, Equatable {
         maximumLuminanceNits: Float? = nil,
         maximumContentLightLevelNits: Float? = nil,
         maximumFrameAverageLightLevelNits: Float? = nil,
+        maximumFullFrameLuminanceNits: Float? = nil,
         masteringDisplayColorVolume: Data? = nil,
         contentLightLevelInfo: Data? = nil,
         transferFunction: VideoTransferFunction? = nil
@@ -127,6 +129,7 @@ public struct HDRStaticMetadata: Sendable, Equatable {
         self.maximumLuminanceNits = maximumLuminanceNits
         self.maximumContentLightLevelNits = maximumContentLightLevelNits
         self.maximumFrameAverageLightLevelNits = maximumFrameAverageLightLevelNits
+        self.maximumFullFrameLuminanceNits = maximumFullFrameLuminanceNits
         self.masteringDisplayColorVolume = masteringDisplayColorVolume
         self.contentLightLevelInfo = contentLightLevelInfo
         self.transferFunction = transferFunction

@@ -10,6 +10,7 @@
 #include "../input_plane/input_plane.h"
 #include "../media/media.h"
 #include "../transport/congestion.h"
+#include "../transport/repair.h"
 #include "../transport/rtcp.h"
 #include "BufferInternal.h"
 #include "SecurityProviders.h"
@@ -18,12 +19,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
@@ -56,6 +59,25 @@ namespace umbra::lsp {
       4;  ///< Maximum negotiated hardware submissions.
     constexpr std::size_t maximum_depacketized_video_bytes =
       4'096;  ///< Worst-case small-NAL aggregation expansion.
+    constexpr std::size_t authenticated_video_source_capacity =
+      128;  ///< Shared source replay-window retention bound.
+    constexpr std::size_t pending_flexfec_repair_capacity =
+      16;  ///< Bounded authenticated repair packets awaiting a deterministic decode.
+    constexpr std::size_t maximum_video_gap_count =
+      256;  ///< Bounded unresolved primary sequences and one-shot NACK entries.
+    constexpr std::uint64_t competition_reorder_delay_microseconds =
+      100;  ///< Maximum validated competition-path reordering wait.
+    constexpr std::uint64_t adaptive_reorder_delay_microseconds =
+      1'000;  ///< Conservative adaptive-path reordering wait.
+    constexpr std::uint64_t authenticated_repair_abuse_window_microseconds =
+      10'000'000;  ///< Rolling malformed authenticated repair window.
+    constexpr std::uint16_t authenticated_repair_abuse_limit =
+      32;  ///< Fail only after bounded repeated authenticated repair abuse.
+    constexpr std::uint8_t maximum_video_nack_attempts = 3;  ///< Initial Generic NACK plus two repeats.
+    constexpr std::uint64_t competition_nack_repeat_microseconds = 500;  ///< Competition repeat floor.
+    constexpr std::uint64_t adaptive_nack_repeat_microseconds = 2'000;  ///< Adaptive repeat floor.
+    constexpr std::size_t minimum_retained_video_payload_bytes = 512;  ///< Abuse-resistant slab sizing floor.
+    constexpr std::size_t maximum_video_receive_slabs = 65'536;  ///< Per-association receive-slab ceiling.
     constexpr std::uint64_t path_probe_timer_microseconds = 15'000'000U;  ///< RFC 8899 conservative PROBE_TIMER.
     constexpr std::uint64_t path_probe_intent_retention_microseconds = 60'000'000U;  ///< Authenticated intent lifetime.
     constexpr std::uint64_t path_probe_smoothed_rtt_microseconds = 20'000U;  ///< Local-path initial SRTT estimate.
@@ -76,6 +98,36 @@ namespace umbra::lsp {
       dtls,  ///< DTLS record, first byte 20 through 63.
       srtp_or_srtcp,  ///< RTP/RTCP packet, first byte 128 through 191.
       invalid,  ///< Reserved or invalid LSP/1 datagram.
+    };
+
+    /** @brief Authenticated negotiated host-to-client video RTP lane. */
+    enum class VideoRtpLane : std::uint8_t {
+      none,  ///< SSRC is not part of the active video registry.
+      primary,  ///< Primary codec RTP source.
+      flexfec,  ///< RFC 8627 repair RTP source.
+      rtx,  ///< RFC 4588 retransmission RTP source.
+    };
+
+    /** @brief Trust origin for one plaintext primary video packet. */
+    enum class VideoSourceOrigin : std::uint8_t {
+      primary_srtp,  ///< Authenticated directly by the primary SRTP policy.
+      flexfec,  ///< Reconstructed from authenticated repair and source inputs.
+      rtx,  ///< Reconstructed from an authenticated RFC 4588 RTX packet.
+    };
+
+    /** @brief Deterministic FlexFEC decode disposition for one authenticated repair. */
+    enum class FlexFecAttempt : std::uint8_t {
+      waiting,  ///< More authenticated source packets are required.
+      recovered,  ///< Exactly one source was reconstructed and admitted.
+      redundant,  ///< Every protected source was already admitted.
+      invalid,  ///< Authenticated repair or reconstruction violated negotiation.
+    };
+
+    /** @brief Shared primary replay/gap admission disposition. */
+    enum class VideoSourceAdmission : std::uint8_t {
+      accepted,  ///< New original or recovered source was admitted.
+      duplicate,  ///< Already-admitted or too-old source was harmlessly suppressed.
+      rejected,  ///< Bounded repair or registry state rejected the source.
     };
 
     /** @brief Result of classifying authenticated SRTCP as an LSPP probe. */
@@ -297,6 +349,374 @@ namespace umbra::lsp {
       VideoExtensions extensions{};           ///< Validated negotiated extensions.
       std::span<const std::uint8_t>
         payload{};  ///< Exact codec RTP payload without padding.
+    };
+
+    /** @brief Borrowed generic RTP payload after bounded CSRC, extension, and padding parsing. */
+    struct RtpPayloadView {
+      lumen::lsp::rtp_fixed_header header {};  ///< Validated visible fixed RTP fields.
+      std::span<const std::uint8_t> header_bytes {};  ///< Header and extension bytes before payload.
+      std::span<const std::uint8_t> payload {};  ///< Exact payload excluding RTP padding.
+    };
+
+    /** @brief Parse generic RTP payload bounds without interpreting codec extensions. */
+    [[nodiscard]] constexpr std::optional<RtpPayloadView> parse_rtp_payload(
+      const std::span<const std::uint8_t> packet
+    ) noexcept {
+      const auto parsed = lumen::lsp::parse_rtp_fixed_header(packet);
+      if (!parsed) {
+        return std::nullopt;
+      }
+      auto payload_offset = parsed.bytes_consumed;
+      if (parsed.header.extension) {
+        if (packet.size() < payload_offset + 4U) {
+          return std::nullopt;
+        }
+        const auto extension_words = lumen::lsp::wire::read_be<std::uint16_t>(
+          packet.subspan(payload_offset + 2U, 2)
+        );
+        const auto extension_bytes = static_cast<std::size_t>(extension_words) * 4U;
+        if (extension_bytes > packet.size() - payload_offset - 4U) {
+          return std::nullopt;
+        }
+        payload_offset += 4U + extension_bytes;
+      }
+      auto payload_end = packet.size();
+      if (parsed.header.padding) {
+        if (payload_end <= payload_offset) {
+          return std::nullopt;
+        }
+        const auto padding = static_cast<std::size_t>(packet.back());
+        if (padding == 0 || padding > payload_end - payload_offset) {
+          return std::nullopt;
+        }
+        payload_end -= padding;
+      }
+      if (payload_end <= payload_offset) {
+        return std::nullopt;
+      }
+      return RtpPayloadView {
+        .header = parsed.header,
+        .header_bytes = packet.first(payload_offset),
+        .payload = packet.subspan(payload_offset, payload_end - payload_offset),
+      };
+    }
+
+    /** @brief Typed result of reconstructing one RFC 4588 primary RTP packet. */
+    struct RtxReconstructionResult {
+      std::size_t bytes_written {};  ///< Complete reconstructed primary plaintext bytes.
+      std::uint16_t original_sequence_number {};  ///< RFC 4588 OSN extracted from RTX payload.
+
+      /** @brief Return whether a complete primary packet was reconstructed. */
+      [[nodiscard]] constexpr explicit operator bool() const noexcept {
+        return bytes_written != 0;
+      }
+    };
+
+    /**
+     * @brief Reconstruct one primary RTP packet from an authenticated RFC 4588 packet.
+     *
+     * @param packet Complete authenticated/decrypted RTX RTP packet.
+     * @param rtx_ssrc Negotiated RTX SSRC.
+     * @param rtx_payload_type Negotiated RTX payload type.
+     * @param primary_ssrc Associated primary SSRC.
+     * @param primary_payload_type Associated primary payload type.
+     * @param destination Fixed caller storage for reconstructed plaintext.
+     * @return Exact reconstructed byte count and OSN, or an empty result.
+     */
+    [[nodiscard]] constexpr RtxReconstructionResult reconstruct_rtx_source(
+      const std::span<const std::uint8_t> packet,
+      const std::uint32_t rtx_ssrc,
+      const std::uint8_t rtx_payload_type,
+      const std::uint32_t primary_ssrc,
+      const std::uint8_t primary_payload_type,
+      const std::span<std::uint8_t> destination
+    ) noexcept {
+      const auto parsed = parse_rtp_payload(packet);
+      if (!parsed || parsed->header.padding || parsed->header.csrc_count != 0 ||
+          parsed->header.ssrc != rtx_ssrc || parsed->header.payload_type != rtx_payload_type ||
+          parsed->payload.size() <= 2U) {
+        return {};
+      }
+      const auto required = parsed->header_bytes.size() + parsed->payload.size() - 2U;
+      if (destination.size() < required) {
+        return {};
+      }
+      const auto original_sequence = lumen::lsp::wire::read_be<std::uint16_t>(parsed->payload.first(2));
+      std::copy(parsed->header_bytes.begin(), parsed->header_bytes.end(), destination.begin());
+      std::copy(
+        parsed->payload.begin() + 2,
+        parsed->payload.end(),
+        destination.begin() + static_cast<std::ptrdiff_t>(parsed->header_bytes.size())
+      );
+      auto reconstructed = destination.first(required);
+      reconstructed[1] = static_cast<std::uint8_t>((reconstructed[1] & 0x80U) | primary_payload_type);
+      lumen::lsp::wire::write_be<std::uint16_t>(reconstructed.subspan(2, 2), original_sequence);
+      lumen::lsp::wire::write_be<std::uint32_t>(reconstructed.subspan(8, 4), primary_ssrc);
+      return {
+        .bytes_written = required,
+        .original_sequence_number = original_sequence,
+      };
+    }
+
+    /** @brief Compile-time RFC 4588 OSN/header reconstruction regression check. */
+    [[nodiscard]] constexpr bool rtx_reconstruction_contract() noexcept {
+      std::array<std::uint8_t, 16> rtx {
+        0x80, 0xe2, 0x00, 0x09, 0x00, 0x00, 0x00, 0x07,
+        0x11, 0x22, 0x33, 0x44, 0x12, 0x34, 0xaa, 0xbb,
+      };
+      std::array<std::uint8_t, 16> primary {};
+      const auto result = reconstruct_rtx_source(
+        rtx,
+        0x1122'3344U,
+        98U,
+        0x5566'7788U,
+        97U,
+        primary
+      );
+      return result && result.bytes_written == 14U && result.original_sequence_number == 0x1234U &&
+             primary[1] == 0xe1U && primary[2] == 0x12U && primary[3] == 0x34U &&
+             primary[8] == 0x55U && primary[9] == 0x66U && primary[10] == 0x77U &&
+             primary[11] == 0x88U && primary[12] == 0xaaU && primary[13] == 0xbbU;
+    }
+
+    static_assert(rtx_reconstruction_contract());
+
+    /** @brief Return whether one RFC 8627 mask represents a source sequence. */
+    [[nodiscard]] constexpr bool flexfec_mask_contains_sequence(
+      const std::uint16_t base_sequence_number,
+      const std::uint64_t source_mask,
+      const std::uint16_t sequence_number
+    ) noexcept {
+      const auto offset = static_cast<std::uint16_t>(sequence_number - base_sequence_number);
+      return offset < lumen::lsp::transport::maximum_flexfec_group_packets &&
+             (source_mask & (std::uint64_t {1} << offset)) != 0;
+    }
+
+    static_assert(flexfec_mask_contains_sequence(65'534U, 0b111U, 0U));
+    static_assert(!flexfec_mask_contains_sequence(65'534U, 0b011U, 0U));
+
+    /** @brief Decide whether pending parity belongs to an advancing recovery frame. */
+    [[nodiscard]] constexpr bool flexfec_repair_matches_advancing_frame(
+      const bool frame_bound,
+      const std::uint32_t bound_rtp_timestamp,
+      const std::uint64_t bound_frame_id,
+      const std::uint32_t bound_recovery_epoch,
+      const std::uint32_t repair_timestamp,
+      const std::uint16_t base_sequence_number,
+      const std::uint64_t source_mask,
+      const std::uint16_t boundary_sequence_number,
+      const std::uint32_t advancing_rtp_timestamp,
+      const std::uint64_t advancing_frame_id,
+      const std::uint32_t advancing_recovery_epoch
+    ) noexcept {
+      if (!frame_bound) {
+        return repair_timestamp == advancing_rtp_timestamp ||
+               flexfec_mask_contains_sequence(
+                 base_sequence_number,
+                 source_mask,
+                 boundary_sequence_number
+               );
+      }
+      return bound_rtp_timestamp == advancing_rtp_timestamp &&
+             (bound_frame_id == 0 || bound_frame_id == advancing_frame_id) &&
+             (bound_recovery_epoch == 0 || bound_recovery_epoch == advancing_recovery_epoch);
+    }
+
+    static_assert(flexfec_repair_matches_advancing_frame(
+      false, 0, 0, 0, 6, 99, 0b11U, 100, 7, 8, 2
+    ));
+    static_assert(flexfec_repair_matches_advancing_frame(
+      false, 0, 0, 0, 7, 400, 0b11U, 100, 7, 8, 2
+    ));
+    static_assert(!flexfec_repair_matches_advancing_frame(
+      false, 0, 0, 0, 6, 400, 0b11U, 100, 7, 8, 2
+    ));
+    static_assert(flexfec_repair_matches_advancing_frame(
+      true, 7, 8, 2, 999, 0, 0, 0, 7, 8, 2
+    ));
+    static_assert(!flexfec_repair_matches_advancing_frame(
+      true, 7, 8, 1, 7, 0, 0, 0, 7, 8, 2
+    ));
+
+    /** @brief One fixed-size reference-counted UDP receive slab. */
+    struct VideoReceiveSlab {
+      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< In-place recv/SRTP/plaintext storage.
+      std::uint32_t generation {};  ///< Nonzero token incarnation.
+      std::uint32_t references {};  ///< Worker-owned live references.
+    };
+
+    /** @brief Configuration-time fixed receive pool with generation-safe tokens. */
+    class VideoReceivePool {
+    public:
+      /** @brief Allocate a bounded slab/free-index arena. */
+      [[nodiscard]] bool configure(const std::size_t count) noexcept {
+        if (count == 0 || count > maximum_video_receive_slabs || slabs_) {
+          return false;
+        }
+        auto slabs = std::unique_ptr<VideoReceiveSlab[]> {new (std::nothrow) VideoReceiveSlab[count]};
+        auto free_indices = std::unique_ptr<std::uint32_t[]> {new (std::nothrow) std::uint32_t[count]};
+        if (!slabs || !free_indices) {
+          return false;
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+          free_indices[index] = static_cast<std::uint32_t>(count - index - 1U);
+        }
+        slabs_ = std::move(slabs);
+        free_indices_ = std::move(free_indices);
+        capacity_ = count;
+        free_count_ = count;
+        return true;
+      }
+
+      /** @brief Acquire one root receive reference and mutable capacity. */
+      [[nodiscard]] bool acquire(std::uint64_t &token, std::span<std::uint8_t> &bytes) noexcept {
+        token = 0;
+        bytes = {};
+        if (!slabs_ || free_count_ == 0) {
+          return false;
+        }
+        const auto index = free_indices_[--free_count_];
+        auto &slab = slabs_[index];
+        ++slab.generation;
+        if (slab.generation == 0) {
+          ++slab.generation;
+        }
+        slab.references = 1;
+        token = (static_cast<std::uint64_t>(slab.generation) << 32U) |
+                (static_cast<std::uint64_t>(index) + 1U);
+        bytes = slab.bytes;
+        return true;
+      }
+
+      /** @brief Retain one live slab token. */
+      [[nodiscard]] bool retain(const std::uint64_t token) noexcept {
+        auto *slab = find(token);
+        if (slab == nullptr || slab->references == std::numeric_limits<std::uint32_t>::max()) {
+          return false;
+        }
+        ++slab->references;
+        return true;
+      }
+
+      /** @brief Release one live token and recycle its slab at zero. */
+      [[nodiscard]] bool release(const std::uint64_t token) noexcept {
+        auto *slab = find(token);
+        if (slab == nullptr) {
+          return false;
+        }
+        if (--slab->references == 0) {
+          const auto index = static_cast<std::uint32_t>((token & 0xffff'ffffU) - 1U);
+          free_indices_[free_count_++] = index;
+        }
+        return true;
+      }
+
+      /** @brief Borrow complete mutable slab storage for one live token. */
+      [[nodiscard]] std::span<std::uint8_t> mutable_bytes(const std::uint64_t token) noexcept {
+        auto *slab = find(token);
+        return slab == nullptr ? std::span<std::uint8_t> {} : std::span<std::uint8_t> {slab->bytes};
+      }
+
+      /** @brief Borrow complete immutable slab storage for one live token. */
+      [[nodiscard]] std::span<const std::uint8_t> bytes(const std::uint64_t token) const noexcept {
+        const auto *slab = find(token);
+        return slab == nullptr ? std::span<const std::uint8_t> {} : std::span<const std::uint8_t> {slab->bytes};
+      }
+
+      /** @brief Return whether configuration storage exists. */
+      [[nodiscard]] bool ready() const noexcept {
+        return slabs_ != nullptr;
+      }
+
+      /** @brief Release storage only after every slab reference was returned. */
+      [[nodiscard]] bool clear() noexcept {
+        if (slabs_ && free_count_ != capacity_) {
+          return false;
+        }
+        slabs_.reset();
+        free_indices_.reset();
+        capacity_ = 0;
+        free_count_ = 0;
+        return true;
+      }
+
+    private:
+      /** @brief Resolve one mutable generation-safe token. */
+      [[nodiscard]] VideoReceiveSlab *find(const std::uint64_t token) noexcept {
+        const auto index_plus_one = static_cast<std::uint32_t>(token);
+        const auto generation = static_cast<std::uint32_t>(token >> 32U);
+        if (!slabs_ || index_plus_one == 0 || index_plus_one > capacity_) {
+          return nullptr;
+        }
+        auto &slab = slabs_[index_plus_one - 1U];
+        return generation != 0 && slab.generation == generation && slab.references != 0 ? &slab : nullptr;
+      }
+
+      /** @brief Resolve one immutable generation-safe token. */
+      [[nodiscard]] const VideoReceiveSlab *find(const std::uint64_t token) const noexcept {
+        const auto index_plus_one = static_cast<std::uint32_t>(token);
+        const auto generation = static_cast<std::uint32_t>(token >> 32U);
+        if (!slabs_ || index_plus_one == 0 || index_plus_one > capacity_) {
+          return nullptr;
+        }
+        const auto &slab = slabs_[index_plus_one - 1U];
+        return generation != 0 && slab.generation == generation && slab.references != 0 ? &slab : nullptr;
+      }
+
+      std::unique_ptr<VideoReceiveSlab[]> slabs_ {};  ///< Fixed packet storage.
+      std::unique_ptr<std::uint32_t[]> free_indices_ {};  ///< O(1) free stack.
+      std::size_t capacity_ {};  ///< Allocated slab count.
+      std::size_t free_count_ {};  ///< Free-stack depth.
+    };
+
+    /** @brief Scope-owned root receive-slab reference. */
+    class VideoReceiveLease {
+    public:
+      /** @brief Construct an empty lease. */
+      VideoReceiveLease() noexcept = default;
+
+      /** @brief Release the root reference at scope exit. */
+      ~VideoReceiveLease() {
+        reset();
+      }
+
+      VideoReceiveLease(const VideoReceiveLease &) = delete;
+      VideoReceiveLease &operator=(const VideoReceiveLease &) = delete;
+
+      /** @brief Acquire from one configured pool. */
+      [[nodiscard]] bool acquire(VideoReceivePool &pool) noexcept {
+        reset();
+        if (!pool.acquire(token_, bytes_)) {
+          return false;
+        }
+        pool_ = &pool;
+        return true;
+      }
+
+      /** @brief Return the live slab token. */
+      [[nodiscard]] std::uint64_t token() const noexcept {
+        return token_;
+      }
+
+      /** @brief Return mutable receive capacity. */
+      [[nodiscard]] std::span<std::uint8_t> bytes() const noexcept {
+        return bytes_;
+      }
+
+      /** @brief Release any current root reference. */
+      void reset() noexcept {
+        if (pool_ != nullptr) {
+          (void)pool_->release(token_);
+        }
+        pool_ = nullptr;
+        token_ = 0;
+        bytes_ = {};
+      }
+
+    private:
+      VideoReceivePool *pool_ {};  ///< Owning pool while live.
+      std::uint64_t token_ {};  ///< Generation-safe root token.
+      std::span<std::uint8_t> bytes_ {};  ///< Mutable slab capacity.
     };
 
     /** @brief Convert one unsigned 64-bit NTP fixed-point value to saturated
@@ -594,6 +1014,80 @@ namespace umbra::lsp {
       }
       return output.append(payload.subspan(3));
     }
+
+    /** @brief Validate one H.264 RTP payload without copying codec bytes. */
+    [[nodiscard]] bool valid_h264_payload(const std::span<const std::uint8_t> payload) noexcept {
+      if (payload.empty() || (payload[0] & 0x80U) != 0) {
+        return false;
+      }
+      const auto type = static_cast<std::uint8_t>(payload[0] & 0x1fU);
+      if (type >= 1U && type <= 23U) {
+        return true;
+      }
+      if (type == lumen::lsp::media::h264_stap_a_type) {
+        std::size_t offset = 1;
+        std::size_t units = 0;
+        while (offset < payload.size()) {
+          if (payload.size() - offset < 2U) {
+            return false;
+          }
+          const auto length = static_cast<std::size_t>(
+            lumen::lsp::wire::read_be<std::uint16_t>(payload.subspan(offset, 2))
+          );
+          offset += 2U;
+          if (length == 0 || length > payload.size() - offset ||
+              !valid_h264_nal(payload.subspan(offset, length))) {
+            return false;
+          }
+          offset += length;
+          ++units;
+        }
+        return units != 0;
+      }
+      if (type != lumen::lsp::media::h264_fu_a_type || payload.size() < 3U) {
+        return false;
+      }
+      const auto fu = payload[1];
+      const auto original_type = static_cast<std::uint8_t>(fu & 0x1fU);
+      return (fu & 0x20U) == 0 && (fu & 0xc0U) != 0xc0U && original_type != 0 &&
+             original_type <= 23U;
+    }
+
+    /** @brief Validate one HEVC RTP payload without copying codec bytes. */
+    [[nodiscard]] bool valid_hevc_payload(const std::span<const std::uint8_t> payload) noexcept {
+      if (payload.size() < 2U || (payload[0] & 0x80U) != 0 || (payload[1] & 0x07U) == 0) {
+        return false;
+      }
+      const auto type = static_cast<std::uint8_t>((payload[0] >> 1U) & 0x3fU);
+      if (type <= 47U) {
+        return true;
+      }
+      if (type == lumen::lsp::media::hevc_ap_type) {
+        std::size_t offset = 2;
+        std::size_t units = 0;
+        while (offset < payload.size()) {
+          if (payload.size() - offset < 2U) {
+            return false;
+          }
+          const auto length = static_cast<std::size_t>(
+            lumen::lsp::wire::read_be<std::uint16_t>(payload.subspan(offset, 2))
+          );
+          offset += 2U;
+          if (length == 0 || length > payload.size() - offset ||
+              !valid_hevc_nal(payload.subspan(offset, length))) {
+            return false;
+          }
+          offset += length;
+          ++units;
+        }
+        return units != 0;
+      }
+      if (type != lumen::lsp::media::hevc_fu_type || payload.size() < 4U) {
+        return false;
+      }
+      const auto fu = payload[2];
+      return (fu & 0xc0U) != 0xc0U && static_cast<std::uint8_t>(fu & 0x3fU) <= 47U;
+    }
   }  // namespace
 
   class Runtime::Impl {
@@ -647,6 +1141,7 @@ namespace umbra::lsp {
       }
 
       stop_requested_.store(false, std::memory_order_release);
+      terminal_failed_.store(false, std::memory_order_release);
       startup_complete_ = false;
       startup_status_ = CLSP_STATUS_TIMEOUT;
       publish_lifecycle(CLSP_LIFECYCLE_CONNECTING);
@@ -687,6 +1182,7 @@ namespace umbra::lsp {
       pthread_mutex_unlock(&mutex_);
 
       if (status != CLSP_STATUS_OK) {
+        terminal_failed_.store(true, std::memory_order_release);
         request_stop();
         join_worker();
         cleanup_platform();
@@ -707,11 +1203,14 @@ namespace umbra::lsp {
       }
       microphone_active_.store(false, std::memory_order_release);
       microphone_prepared_.store(false, std::memory_order_release);
+      const auto preserve_failed = terminal_failed_.load(std::memory_order_acquire);
       request_stop();
       join_worker();
       release_video_state();
       cleanup_platform();
-      publish_lifecycle(CLSP_LIFECYCLE_STOPPED);
+      if (!preserve_failed) {
+        publish_lifecycle(CLSP_LIFECYCLE_STOPPED);
+      }
       return CLSP_STATUS_OK;
 #else
       return CLSP_STATUS_UNSUPPORTED;
@@ -849,8 +1348,30 @@ namespace umbra::lsp {
       if (!valid_audio_configuration(configuration)) {
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
+      pthread_mutex_lock(&mutex_);
       if (audio_configured_.load(std::memory_order_acquire)) {
-        return same_audio_configuration(audio_configuration_, configuration) ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+        const auto status = same_audio_configuration(audio_configuration_, configuration) ?
+                              CLSP_STATUS_OK :
+                              CLSP_STATUS_INVALID_STATE;
+        pthread_mutex_unlock(&mutex_);
+        return status;
+      }
+      const std::array<std::uint32_t, 1> ssrcs {configuration.audio_ssrc};
+      const std::array<std::uint8_t, 1> payload_types {configuration.audio_payload_type};
+      if (!reserve_media_identifiers_locked(ssrcs, payload_types)) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
+      pthread_mutex_unlock(&mutex_);
+      const std::array<InboundSecurityStream, 1> security_streams {
+        InboundSecurityStream {.ssrc = configuration.audio_ssrc},
+      };
+      const auto security_status = install_inbound_security_streams(security_streams);
+      pthread_mutex_lock(&mutex_);
+      if (security_status != CLSP_STATUS_OK) {
+        rollback_media_identifiers_locked(ssrcs.size(), payload_types.size());
+        pthread_mutex_unlock(&mutex_);
+        return security_status;
       }
       audio_configuration_ = configuration;
       audio_feedback_.reset(monotonic_microseconds());
@@ -859,6 +1380,7 @@ namespace umbra::lsp {
       audio_feedback_largest_extended_sequence_ = 0;
       authenticated_audio_fingerprints_ = {};
       audio_configured_.store(true, std::memory_order_release);
+      pthread_mutex_unlock(&mutex_);
       return CLSP_STATUS_OK;
 #else
       (void) configuration;
@@ -870,8 +1392,19 @@ namespace umbra::lsp {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (!authenticated_.load(std::memory_order_acquire)) return CLSP_STATUS_NOT_AUTHENTICATED;
       if (!valid_microphone_configuration(configuration)) return CLSP_STATUS_INVALID_CONFIGURATION;
+      pthread_mutex_lock(&mutex_);
       if (microphone_prepared_.load(std::memory_order_acquire)) {
-        return same_microphone_configuration(microphone_configuration_, configuration) ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+        const auto status = same_microphone_configuration(microphone_configuration_, configuration) ?
+                              CLSP_STATUS_OK :
+                              CLSP_STATUS_INVALID_STATE;
+        pthread_mutex_unlock(&mutex_);
+        return status;
+      }
+      const std::array<std::uint32_t, 1> ssrcs {configuration.microphone_ssrc};
+      const std::array<std::uint8_t, 1> payload_types {configuration.microphone_payload_type};
+      if (!reserve_media_identifiers_locked(ssrcs, payload_types)) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_CONFIGURATION;
       }
       microphone_configuration_ = configuration;
       microphone_read_.store(0, std::memory_order_release);
@@ -883,9 +1416,9 @@ namespace umbra::lsp {
       microphone_octet_count_ = 0;
       microphone_last_report_us_ = 0;
       microphone_last_credit_us_ = monotonic_microseconds();
-      const auto rate = microphone_pacing_rate(configuration);
       microphone_tokens_bits_ = microphone_credit_capacity(configuration);
       microphone_prepared_.store(true, std::memory_order_release);
+      pthread_mutex_unlock(&mutex_);
       return CLSP_STATUS_OK;
 #else
       (void)configuration;
@@ -928,8 +1461,7 @@ namespace umbra::lsp {
       return CLSP_STATUS_OK;
     }
 
-    /** @brief Install one immutable video generation and all bounded
-     * complete-frame storage. */
+    /** @brief Install one immutable schema-v3 video/repair generation and bounded AU storage. */
     [[nodiscard]] clsp_status_t
     configure_video(const clsp_video_configuration_t &configuration) noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
@@ -949,18 +1481,77 @@ namespace umbra::lsp {
         pthread_mutex_unlock(&mutex_);
         return same ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
       }
+      std::array<std::uint32_t, 3> ssrcs {configuration.primary_ssrc};
+      std::array<std::uint8_t, 3> payload_types {configuration.primary_payload_type};
+      std::size_t ssrc_count = 1;
+      std::size_t payload_type_count = 1;
+      if (configuration.flexfec_ssrc != 0) {
+        ssrcs[ssrc_count++] = configuration.flexfec_ssrc;
+        payload_types[payload_type_count++] = configuration.flexfec_payload_type;
+      }
+      if (configuration.rtx_ssrc != 0) {
+        ssrcs[ssrc_count++] = configuration.rtx_ssrc;
+        payload_types[payload_type_count++] = configuration.rtx_payload_type;
+      }
+      const auto selected_ssrcs = std::span<const std::uint32_t> {ssrcs}.first(ssrc_count);
+      const auto selected_payload_types = std::span<const std::uint8_t> {payload_types}.first(payload_type_count);
+      if (!reserve_media_identifiers_locked(selected_ssrcs, selected_payload_types)) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
       auto *pool = create_retained_frame_pool(
         configuration.maximum_access_unit_bytes,
         static_cast<std::size_t>(configuration.decoder_surfaces) + 2U
       );
       if (pool == nullptr) {
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_RESOURCE_EXHAUSTED;
       }
-      video_reassembler_.emplace(configuration.maximum_access_unit_bytes);
+      auto reassembly_capacity = static_cast<std::size_t>(configuration.maximum_access_unit_bytes);
+      constexpr auto maximum_transport_overhead =
+        lumen::lsp::media::maximum_fragments_per_frame * 6U;
+      const auto available = lumen::lsp::media::absolute_frame_size_limit - reassembly_capacity;
+      reassembly_capacity += std::min<std::size_t>(available, maximum_transport_overhead);
+      const auto frame_slabs = (reassembly_capacity + minimum_retained_video_payload_bytes - 1U) /
+                               minimum_retained_video_payload_bytes;
+      const auto requested_slabs = frame_slabs > (maximum_video_receive_slabs - 256U) / 2U ?
+                                     maximum_video_receive_slabs :
+                                     frame_slabs * 2U + 256U;
+      if (!video_receive_pool_.configure(requested_slabs)) {
+        release_retained_frame_pool(pool);
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
+      const auto maximum_fragments = std::min<std::size_t>(
+        lumen::lsp::media::maximum_fragments_per_frame,
+        frame_slabs + 64U
+      );
+      video_reassembly_slices_.reset(
+        new (std::nothrow) lumen::lsp::media::token_frame_slice[maximum_fragments * 2U]
+      );
+      if (!video_reassembly_slices_) {
+        (void)video_receive_pool_.clear();
+        release_retained_frame_pool(pool);
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
+      video_reassembler_.emplace(
+        std::span<lumen::lsp::media::token_frame_slice> {
+          video_reassembly_slices_.get(),
+          maximum_fragments * 2U,
+        },
+        reassembly_capacity,
+        maximum_fragments
+      );
       if (!video_reassembler_->ready()) {
         video_reassembler_.reset();
+        video_reassembly_slices_.reset();
+        (void)video_receive_pool_.clear();
         release_retained_frame_pool(pool);
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_RESOURCE_EXHAUSTED;
       }
@@ -969,19 +1560,45 @@ namespace umbra::lsp {
         configuration.input_watermark_extension,
         configuration.encoder_timing_extension,
       };
-      const auto security_status = srtp_.configure_video_inbound(
-        configuration.primary_ssrc,
-        encrypted_extensions
+      std::array<InboundSecurityStream, 3> security_streams {};
+      std::size_t security_stream_count = 0;
+      security_streams[security_stream_count++] = {
+        .encrypted_extensions = encrypted_extensions,
+        .ssrc = configuration.primary_ssrc,
+        .encrypted_extension_count = encrypted_extensions.size(),
+      };
+      if (configuration.flexfec_ssrc != 0) {
+        security_streams[security_stream_count++] = {
+          .ssrc = configuration.flexfec_ssrc,
+        };
+      }
+      if (configuration.rtx_ssrc != 0) {
+        security_streams[security_stream_count++] = {
+          .encrypted_extensions = encrypted_extensions,
+          .ssrc = configuration.rtx_ssrc,
+          .encrypted_extension_count = encrypted_extensions.size(),
+        };
+      }
+      pthread_mutex_unlock(&mutex_);
+      const auto security_status = install_inbound_security_streams(
+        std::span<const InboundSecurityStream> {security_streams}.first(security_stream_count)
       );
+      pthread_mutex_lock(&mutex_);
       if (security_status != CLSP_STATUS_OK) {
         video_reassembler_.reset();
+        video_reassembly_slices_.reset();
+        (void)video_receive_pool_.clear();
         release_retained_frame_pool(pool);
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
         pthread_mutex_unlock(&mutex_);
         return security_status;
       }
       if (!video_decoder_credit_.configure(configuration.decoder_surfaces)) {
         video_reassembler_.reset();
+        video_reassembly_slices_.reset();
+        (void)video_receive_pool_.clear();
         release_retained_frame_pool(pool);
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
@@ -992,6 +1609,29 @@ namespace umbra::lsp {
       delivered_video_frames_ = {};
       video_retired_frames_ = {};
       authenticated_video_fingerprints_ = {};
+      authenticated_flexfec_fingerprints_ = {};
+      authenticated_rtx_fingerprints_ = {};
+      authenticated_video_sources_ = {};
+      pending_flexfec_repairs_ = {};
+      pending_video_nack_ = {};
+      video_nack_retries_ = {};
+      if (!video_source_replay_.reset(configuration.primary_ssrc, configuration.video_generation) ||
+          !video_gap_tracker_.reset(
+            configuration.primary_ssrc,
+            configuration.video_generation,
+            configuration_.profile == CLSP_PROFILE_COMPETITION_LAN ?
+              competition_reorder_delay_microseconds :
+              adaptive_reorder_delay_microseconds
+          )) {
+        video_reassembler_.reset();
+        video_reassembly_slices_.reset();
+        (void)video_receive_pool_.clear();
+        video_frame_pool_ = nullptr;
+        release_retained_frame_pool(pool);
+        rollback_media_identifiers_locked(ssrc_count, payload_type_count);
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
       video_sequence_initialized_ = false;
       video_timestamp_initialized_ = false;
       video_largest_extended_sequence_ = 0;
@@ -1006,11 +1646,21 @@ namespace umbra::lsp {
       video_recovery_feedback_pending_ = false;
       video_recovery_evidence_watermark_ = 0;
       last_recovery_lspv_microseconds_ = 0;
+      authenticated_repair_abuse_window_start_ = 0;
+      authenticated_repair_abuse_count_ = 0;
       video_delivery_active_.store(false, std::memory_order_release);
       video_feedback_.reset(monotonic_microseconds());
+      flexfec_feedback_.reset(monotonic_microseconds());
+      rtx_feedback_.reset(monotonic_microseconds());
       video_reception_.reset();
+      flexfec_reception_.reset();
+      rtx_reception_.reset();
       feedback_sequence_initialized_ = false;
       feedback_largest_extended_sequence_ = 0;
+      flexfec_feedback_sequence_initialized_ = false;
+      flexfec_feedback_largest_extended_sequence_ = 0;
+      rtx_feedback_sequence_initialized_ = false;
+      rtx_feedback_largest_extended_sequence_ = 0;
       compound_rtcp_sent_ = false;
       last_compound_rtcp_microseconds_ = 0;
       pending_rtcp_ = {};
@@ -1355,6 +2005,37 @@ namespace umbra::lsp {
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
       pthread_mutex_lock(&mutex_);
+      if (input_configured_) {
+        const auto status = same_input_configuration(input_configuration_, configuration) ?
+                              CLSP_STATUS_OK :
+                              CLSP_STATUS_INVALID_STATE;
+        pthread_mutex_unlock(&mutex_);
+        return status;
+      }
+      if (input_configuration_pending_) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      const std::array<std::uint32_t, 2> ssrcs {
+        configuration.input_ssrc,
+        configuration.acknowledgement_ssrc,
+      };
+      const std::array<std::uint8_t, 1> payload_types {configuration.input_payload_type};
+      if (!reserve_media_identifiers_locked(ssrcs, payload_types)) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
+      pthread_mutex_unlock(&mutex_);
+      const std::array<InboundSecurityStream, 1> security_streams {
+        InboundSecurityStream {.ssrc = configuration.acknowledgement_ssrc},
+      };
+      const auto security_status = install_inbound_security_streams(security_streams);
+      pthread_mutex_lock(&mutex_);
+      if (security_status != CLSP_STATUS_OK) {
+        rollback_media_identifiers_locked(ssrcs.size(), payload_types.size());
+        pthread_mutex_unlock(&mutex_);
+        return security_status;
+      }
       pending_input_configuration_ = configuration;
       const auto token = input_configuration_requested_.fetch_add(1, std::memory_order_acq_rel) + 1U;
       pending_input_configuration_token_ = token;
@@ -1535,6 +2216,23 @@ namespace umbra::lsp {
       bool occupied {};  ///< Whether this slot is live.
     };
 
+    /** @brief One exact inbound libSRTP stream install descriptor. */
+    struct InboundSecurityStream {
+      std::array<int, 3> encrypted_extensions {};  ///< Optional RFC 6904 extension IDs.
+      std::uint32_t ssrc {};  ///< Nonzero negotiated inbound SSRC.
+      std::size_t encrypted_extension_count {};  ///< Populated encrypted-extension IDs.
+    };
+
+    /** @brief One synchronous provider mutation owned by the socket thread. */
+    struct PendingInboundSecurityInstall {
+      std::array<InboundSecurityStream, 3> streams {};  ///< One audio/ACK or three video streams.
+      std::uint64_t token {};  ///< Monotonic synchronous request identity.
+      clsp_status_t result {CLSP_STATUS_TIMEOUT};  ///< Worker-completed provider result.
+      std::size_t stream_count {};  ///< Populated stream descriptors.
+      bool pending {};  ///< Whether the socket owner must execute the request.
+      bool awaiting_result {};  ///< Whether the synchronous caller still owns the result.
+    };
+
     /** @brief Capture-record discriminator for the bounded native ring. */
     enum class CaptureKind : std::uint8_t {
       pointer,  ///< Relative pointer sample.
@@ -1595,9 +2293,11 @@ namespace umbra::lsp {
       std::uint64_t capture_time_microseconds {};  ///< Repeated absolute capture time when observed.
       std::uint64_t input_state_sequence {};  ///< Repeated applied state watermark.
       std::uint64_t input_edge_id {};  ///< Repeated applied edge watermark.
+      std::uint16_t start_sequence_number {};  ///< RTP sequence carrying authenticated frame start.
       bool has_capture_time {};  ///< Whether capture time has been bound.
       bool has_input_watermark {};  ///< Whether the input watermark has been bound.
       bool has_independent_marking {};  ///< Whether independence metadata has been bound.
+      bool has_start_sequence {};  ///< Whether the authenticated start sequence is bound.
       bool independent {};  ///< Whether any repeated frame marking says independent.
     };
 
@@ -1659,6 +2359,8 @@ namespace umbra::lsp {
       } kind {Kind::none};  ///< Retained packet semantic.
       std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Exact protected bytes.
       native_feedback_write_result video_feedback {};  ///< Video commit watermark for CCFB.
+      native_feedback_write_result flexfec_feedback {};  ///< FlexFEC commit watermark for CCFB.
+      native_feedback_write_result rtx_feedback {};  ///< RTX commit watermark for CCFB.
       native_feedback_write_result audio_feedback {};  ///< Audio commit watermark for CCFB.
       std::size_t length {};  ///< Exact protected datagram length.
       std::uint64_t created_microseconds {};  ///< Report timestamp and successful commit time.
@@ -1667,6 +2369,30 @@ namespace umbra::lsp {
       [[nodiscard]] explicit operator bool() const noexcept {
         return kind != Kind::none && length != 0;
       }
+    };
+
+    /** @brief One urgent protected Generic NACK retained across socket backpressure. */
+    struct PendingProtectedNack {
+      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Exact protected reduced-size RTCP.
+      std::array<std::uint16_t, maximum_video_gap_count> sequences {};  ///< Missing primary sequences named by the packet.
+      std::array<std::uint64_t, maximum_video_gap_count> frame_deadlines {};  ///< Per-sequence strict RTX deadlines.
+      std::size_t length {};  ///< Complete protected datagram length.
+      std::size_t sequence_count {};  ///< Populated sequence identifiers.
+      bool initial {};  ///< Whether gap tracker one-shot state is not yet committed.
+
+      /** @brief Return whether one protected NACK awaits kernel submission. */
+      [[nodiscard]] explicit operator bool() const noexcept {
+        return length != 0 && sequence_count != 0;
+      }
+    };
+
+    /** @brief One successfully submitted NACK eligible for bounded fresh-index repeats. */
+    struct VideoNackRetry {
+      std::uint64_t frame_deadline_microseconds {};  ///< Strict RTX arrival deadline.
+      std::uint64_t next_retry_microseconds {};  ///< Earliest fresh SRTCP retry.
+      std::uint16_t sequence_number {};  ///< Missing primary OSN.
+      std::uint8_t attempts {};  ///< Successful NACK submissions, at most three.
+      bool occupied {};  ///< Whether another retry may be useful.
     };
 
     /** @brief One exact protected controller command ACK retained across backpressure. */
@@ -1689,6 +2415,97 @@ namespace umbra::lsp {
       bool occupied {};  ///< Whether this ring slot is authenticated.
     };
 
+    /** @brief One fixed-slot authenticated primary plaintext retained for FlexFEC decode. */
+    struct AuthenticatedVideoSourcePacket {
+      std::uint64_t frame_deadline_microseconds {};  ///< Protected frame repair deadline.
+      std::uint64_t frame_id {};  ///< Bound frame identifier, or zero before repeated metadata.
+      std::uint64_t slab_token {};  ///< Retained receive-pool slab token.
+      std::uint32_t video_generation {};  ///< Active generation that authenticated the source.
+      std::uint32_t rtp_timestamp {};  ///< Frame-local RTP timestamp.
+      std::uint32_t recovery_epoch {};  ///< Bound source epoch, or zero before repeated metadata.
+      std::size_t length {};  ///< Populated plaintext byte count.
+      std::uint16_t sequence_number {};  ///< Primary RTP sequence.
+      bool occupied {};  ///< Whether this fixed slot is live.
+    };
+
+    /** @brief One authenticated FlexFEC packet retained until decode or bounded expiry. */
+    struct PendingFlexFecRepair {
+      std::uint64_t expires_microseconds {};  ///< Negotiated repair-window expiry.
+      std::uint64_t slab_token {};  ///< Retained receive-pool repair slab token.
+      std::uint64_t source_mask {};  ///< Exact RFC 8627 protected-source mask.
+      std::uint64_t bound_frame_id {};  ///< Bound source frame ID, or zero before metadata.
+      std::uint32_t repair_timestamp {};  ///< Repair-stream RTP timestamp for diagnostics.
+      std::uint32_t bound_rtp_timestamp {};  ///< Bound protected-source frame timestamp.
+      std::uint32_t bound_recovery_epoch {};  ///< Epoch assigned when the frame association is known.
+      std::size_t length {};  ///< Populated plaintext byte count.
+      std::uint16_t repair_sequence_number {};  ///< Repair-stream replay identity.
+      std::uint16_t base_sequence_number {};  ///< First source sequence represented by `source_mask`.
+      bool frame_bound {};  ///< Whether source evidence established `bound_rtp_timestamp`.
+      bool occupied {};  ///< Whether deterministic recovery remains possible.
+    };
+
+    /** @brief Atomically reserve globally unique RTP SSRC and dynamic PT identifiers. */
+    [[nodiscard]] bool reserve_media_identifiers_locked(
+      const std::span<const std::uint32_t> ssrcs,
+      const std::span<const std::uint8_t> payload_types
+    ) noexcept {
+      if (reserved_ssrc_count_ + ssrcs.size() > reserved_ssrcs_.size() ||
+          reserved_payload_type_count_ + payload_types.size() > reserved_payload_types_.size()) {
+        return false;
+      }
+      const auto existing_ssrcs = std::span<const std::uint32_t> {reserved_ssrcs_}.first(reserved_ssrc_count_);
+      for (std::size_t index = 0; index < ssrcs.size(); ++index) {
+        if (ssrcs[index] == 0 ||
+            std::ranges::find(existing_ssrcs, ssrcs[index]) != existing_ssrcs.end()) {
+          return false;
+        }
+        const auto preceding = ssrcs.first(index);
+        if (std::ranges::find(preceding, ssrcs[index]) != preceding.end()) {
+          return false;
+        }
+      }
+      const auto existing_payload_types =
+        std::span<const std::uint8_t> {reserved_payload_types_}.first(reserved_payload_type_count_);
+      for (std::size_t index = 0; index < payload_types.size(); ++index) {
+        if (!lumen::lsp::transport::valid_lsp_dynamic_payload_type(payload_types[index]) ||
+            std::ranges::find(existing_payload_types, payload_types[index]) != existing_payload_types.end()) {
+          return false;
+        }
+        const auto preceding = payload_types.first(index);
+        if (std::ranges::find(preceding, payload_types[index]) != preceding.end()) {
+          return false;
+        }
+      }
+      std::copy(ssrcs.begin(), ssrcs.end(), reserved_ssrcs_.begin() + static_cast<std::ptrdiff_t>(reserved_ssrc_count_));
+      std::copy(
+        payload_types.begin(),
+        payload_types.end(),
+        reserved_payload_types_.begin() + static_cast<std::ptrdiff_t>(reserved_payload_type_count_)
+      );
+      reserved_ssrc_count_ += ssrcs.size();
+      reserved_payload_type_count_ += payload_types.size();
+      return true;
+    }
+
+    /** @brief Roll back the most recent reservation while the registry mutex remains held. */
+    void rollback_media_identifiers_locked(
+      const std::size_t ssrc_count,
+      const std::size_t payload_type_count
+    ) noexcept {
+      if (ssrc_count <= reserved_ssrc_count_) {
+        reserved_ssrc_count_ -= ssrc_count;
+        std::fill(reserved_ssrcs_.begin() + static_cast<std::ptrdiff_t>(reserved_ssrc_count_), reserved_ssrcs_.end(), 0);
+      }
+      if (payload_type_count <= reserved_payload_type_count_) {
+        reserved_payload_type_count_ -= payload_type_count;
+        std::fill(
+          reserved_payload_types_.begin() + static_cast<std::ptrdiff_t>(reserved_payload_type_count_),
+          reserved_payload_types_.end(),
+          0
+        );
+      }
+    }
+
     /** @brief Optional reliable PATH_PROBE intent kept outside fatal control operations. */
     struct PathIntentControlFrame {
       lumen::lsp::packet_slab<maximum_control_frame> frame {};  ///< Exact LSPC bytes.
@@ -1706,26 +2523,73 @@ namespace umbra::lsp {
       }
     }
 
-    /** @brief Validate the exact complete-access-unit SDR H.264/HEVC generation
-     * mapping. */
+    /** @brief Validate one exact schema-revision-three video generation mapping. */
     [[nodiscard]] static bool
     valid_video_configuration(const clsp_video_configuration_t &value) noexcept {
+      const auto valid_codec_profile =
+        (value.codec == CLSP_VIDEO_CODEC_H264 &&
+         ((value.profile == CLSP_VIDEO_PROFILE_H264_HIGH && value.pixel_format == CLSP_VIDEO_PIXEL_420_8) ||
+          (value.profile == CLSP_VIDEO_PROFILE_H264_HIGH_444 && value.pixel_format == CLSP_VIDEO_PIXEL_444_8))) ||
+        (value.codec == CLSP_VIDEO_CODEC_HEVC &&
+         ((value.profile == CLSP_VIDEO_PROFILE_HEVC_MAIN && value.pixel_format == CLSP_VIDEO_PIXEL_420_8) ||
+          (value.profile == CLSP_VIDEO_PROFILE_HEVC_MAIN10 && value.pixel_format == CLSP_VIDEO_PIXEL_420_10) ||
+          (value.profile == CLSP_VIDEO_PROFILE_HEVC_REXT &&
+           (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10)))) ||
+        (value.codec == CLSP_VIDEO_CODEC_AV1 &&
+         ((value.profile == CLSP_VIDEO_PROFILE_AV1_MAIN &&
+           (value.pixel_format == CLSP_VIDEO_PIXEL_420_8 || value.pixel_format == CLSP_VIDEO_PIXEL_420_10)) ||
+          (value.profile == CLSP_VIDEO_PROFILE_AV1_HIGH &&
+           (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10))));
+      const auto valid_payload_format =
+        value.codec == CLSP_VIDEO_CODEC_AV1 ?
+          value.payload_format == CLSP_VIDEO_PAYLOAD_AV1_LOW_OVERHEAD_OBU :
+          value.payload_format == CLSP_VIDEO_PAYLOAD_ANNEX_B;
+      const auto ten_bit = value.pixel_format == CLSP_VIDEO_PIXEL_420_10 ||
+                           value.pixel_format == CLSP_VIDEO_PIXEL_444_10;
+      const auto valid_color =
+        (value.color_primaries == 1U && value.transfer_characteristics == 1U &&
+         value.matrix_coefficients == 1U) ||
+        (value.codec != CLSP_VIDEO_CODEC_H264 && ten_bit && value.full_range == 0U &&
+         value.color_primaries == 9U && value.matrix_coefficients == 9U &&
+         (value.transfer_characteristics == 16U || value.transfer_characteristics == 18U));
+      const auto flexfec_disabled =
+        value.flexfec_ssrc == 0 && value.flexfec_payload_type == 0 &&
+        value.flexfec_repair_window_microseconds == 0 && value.flexfec_maximum_group_packets == 0;
+      const auto flexfec_enabled =
+        value.flexfec_ssrc != 0 && value.flexfec_ssrc != value.primary_ssrc &&
+        lumen::lsp::transport::valid_lsp_dynamic_payload_type(value.flexfec_payload_type) &&
+        value.flexfec_payload_type != value.primary_payload_type &&
+        value.flexfec_repair_window_microseconds != 0 &&
+        value.flexfec_repair_window_microseconds <= value.maximum_frame_age_microseconds &&
+        value.flexfec_maximum_group_packets == 15U;
+      const auto rtx_disabled =
+        value.rtx_ssrc == 0 && value.rtx_payload_type == 0 && value.rtx_associated_payload_type == 0;
+      const auto rtx_enabled =
+        value.rtx_ssrc != 0 && value.rtx_ssrc != value.primary_ssrc &&
+        value.rtx_ssrc != value.flexfec_ssrc &&
+        lumen::lsp::transport::valid_lsp_dynamic_payload_type(value.rtx_payload_type) &&
+        value.rtx_payload_type != value.primary_payload_type &&
+        value.rtx_payload_type != value.flexfec_payload_type &&
+        value.rtx_associated_payload_type == value.primary_payload_type;
       return value.abi_version == CLSP_CORE_ABI_VERSION &&
              value.structure_size == sizeof(clsp_video_configuration_t) &&
              value.stream_generation != 0 && value.video_generation != 0 &&
              value.primary_ssrc != 0 && value.clock_rate == 90'000U &&
-             value.width != 0 && value.height != 0 &&
+             value.width != 0 && value.width <= 16'384U &&
+             value.height != 0 && value.height <= 16'384U &&
              value.refresh_numerator != 0 && value.refresh_denominator != 0 &&
-             value.bitrate != 0 && value.maximum_access_unit_bytes != 0 &&
-             value.maximum_access_unit_bytes <=
-               lumen::lsp::media::absolute_frame_size_limit &&
+             value.bitrate >= 1'000U && value.bitrate <= 1'000'000'000U &&
+             value.maximum_access_unit_bytes != 0 &&
+             value.maximum_access_unit_bytes <= 16U * 1024U * 1024U &&
              value.maximum_frame_age_microseconds != 0 &&
+             value.maximum_frame_age_microseconds <= 1'000'000U &&
              value.frame_id_origin != 0 && value.recovery_epoch != 0 &&
              value.udp_payload_size == 1'200U &&
-             value.primary_payload_type >= 96U &&
-             value.primary_payload_type <= 127U &&
-             ((value.codec == 1U && value.profile == 1U) ||
-              (value.codec == 2U && value.profile == 2U)) &&
+             lumen::lsp::transport::valid_lsp_dynamic_payload_type(value.primary_payload_type) &&
+             valid_codec_profile && value.full_range <= 1U && valid_color &&
+             value.delivery == CLSP_VIDEO_DELIVERY_COMPLETE_ACCESS_UNIT &&
+             valid_payload_format && (flexfec_disabled || flexfec_enabled) &&
+             (rtx_disabled || rtx_enabled) &&
              value.decoder_surfaces >= 2U && value.decoder_surfaces <= 4U &&
              valid_video_extension_ids(value);
     }
@@ -1750,13 +2614,44 @@ namespace umbra::lsp {
              left.udp_payload_size == right.udp_payload_size &&
              left.primary_payload_type == right.primary_payload_type &&
              left.codec == right.codec && left.profile == right.profile &&
+             left.pixel_format == right.pixel_format &&
+             left.color_primaries == right.color_primaries &&
+             left.transfer_characteristics == right.transfer_characteristics &&
+             left.matrix_coefficients == right.matrix_coefficients &&
+             left.full_range == right.full_range && left.delivery == right.delivery &&
+             left.payload_format == right.payload_format &&
              left.decoder_surfaces == right.decoder_surfaces &&
              left.frame_marking_extension == right.frame_marking_extension &&
              left.absolute_capture_extension ==
                right.absolute_capture_extension &&
              left.frame_id_extension == right.frame_id_extension &&
              left.input_watermark_extension == right.input_watermark_extension &&
-             left.encoder_timing_extension == right.encoder_timing_extension;
+             left.encoder_timing_extension == right.encoder_timing_extension &&
+             left.flexfec_ssrc == right.flexfec_ssrc &&
+             left.flexfec_repair_window_microseconds == right.flexfec_repair_window_microseconds &&
+             left.rtx_ssrc == right.rtx_ssrc &&
+             left.flexfec_payload_type == right.flexfec_payload_type &&
+             left.flexfec_maximum_group_packets == right.flexfec_maximum_group_packets &&
+             left.rtx_payload_type == right.rtx_payload_type &&
+             left.rtx_associated_payload_type == right.rtx_associated_payload_type;
+    }
+
+    /** @brief Compare every immutable native input-generation field. */
+    [[nodiscard]] static bool same_input_configuration(
+      const clsp_input_configuration_t &left,
+      const clsp_input_configuration_t &right
+    ) noexcept {
+      return left.stream_generation == right.stream_generation &&
+             left.input_generation == right.input_generation &&
+             left.input_ssrc == right.input_ssrc &&
+             left.acknowledgement_ssrc == right.acknowledgement_ssrc &&
+             left.pointer_rate == right.pointer_rate &&
+             left.controller_rate == right.controller_rate &&
+             left.sensor_rate == right.sensor_rate &&
+             left.reconciliation_rate == right.reconciliation_rate &&
+             left.reserved_input_wire_bits_per_second == right.reserved_input_wire_bits_per_second &&
+             left.input_payload_type == right.input_payload_type &&
+             left.baseline_required == right.baseline_required;
     }
 
     /** @brief Snapshot current bounded decoder/render state for protected LSPV.
@@ -1854,11 +2749,33 @@ namespace umbra::lsp {
         pending_video_deliveries_[index] = {};
       }
       pending_video_delivery_count_ = 0;
+      if (video_reassembler_) {
+        (void)video_reassembler_->clear([this](const std::uint64_t token) noexcept {
+          (void)video_receive_pool_.release(token);
+        });
+      }
       video_reassembler_.reset();
+      video_reassembly_slices_.reset();
       video_metadata_ = {};
       delivered_video_frames_ = {};
       video_retired_frames_ = {};
       authenticated_video_fingerprints_ = {};
+      authenticated_flexfec_fingerprints_ = {};
+      authenticated_rtx_fingerprints_ = {};
+      for (auto &source : authenticated_video_sources_) {
+        if (source.occupied) {
+          (void)video_receive_pool_.release(source.slab_token);
+          source = {};
+        }
+      }
+      for (auto &repair : pending_flexfec_repairs_) {
+        if (repair.occupied) {
+          (void)video_receive_pool_.release(repair.slab_token);
+          repair = {};
+        }
+      }
+      pending_video_nack_ = {};
+      video_nack_retries_ = {};
       outbound_path_probe_ = {};
       inbound_path_probe_intent_ = {};
       unmatched_path_probe_ = {};
@@ -1878,14 +2795,20 @@ namespace umbra::lsp {
       video_recovery_feedback_pending_ = false;
       video_recovery_evidence_watermark_ = 0;
       last_recovery_lspv_microseconds_ = 0;
+      authenticated_repair_abuse_window_start_ = 0;
+      authenticated_repair_abuse_count_ = 0;
       auto *pool = video_frame_pool_;
       video_frame_pool_ = nullptr;
+      const auto receive_pool_cleared = video_receive_pool_.clear();
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (mutex_ready_) {
         pthread_mutex_unlock(&mutex_);
       }
 #endif
       release_retained_frame_pool(pool);
+      if (!receive_pool_cleared) {
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+      }
     }
 
     /** @brief Validate one exact host-audio tuple before native admission. */
@@ -2185,7 +3108,12 @@ namespace umbra::lsp {
       auto last_dtls_progress = monotonic_microseconds();
       while (!stop_requested_.load(std::memory_order_acquire)) {
         std::array<struct kevent, 8> events {};
-        const timespec timeout {.tv_sec = 0, .tv_nsec = 1'000'000L};
+        const auto urgent_repair_timer = configuration_.profile == CLSP_PROFILE_COMPETITION_LAN &&
+                                         video_gap_tracker_.size() != 0;
+        const timespec timeout {
+          .tv_sec = 0,
+          .tv_nsec = urgent_repair_timer ? 100'000L : 1'000'000L,
+        };
         const auto count = kevent(kqueue_, nullptr, 0, events.data(), static_cast<int>(events.size()), &timeout);
         if (count < 0 && errno != EINTR) {
           fail_worker(CLSP_STATUS_SOCKET_FAILURE);
@@ -2234,6 +3162,18 @@ namespace umbra::lsp {
           continue;
         }
 
+        process_inbound_security_install();
+
+        if (video_configured_.load(std::memory_order_acquire)) {
+          const auto repair_now = monotonic_microseconds();
+          expire_video_repair_state(repair_now);
+          status = transmit_video_nacks(repair_now);
+          if (status != CLSP_STATUS_OK) {
+            fail_worker(status);
+            return;
+          }
+        }
+
         status = drain_control_queue();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
@@ -2272,7 +3212,9 @@ namespace umbra::lsp {
           return;
         }
         if (video_configured_.load(std::memory_order_acquire)) {
-          expire_video_frames(monotonic_microseconds());
+          const auto video_now = monotonic_microseconds();
+          expire_video_frames(video_now);
+          expire_video_repair_state(video_now);
         }
         const auto transport_now = monotonic_microseconds();
         status = drive_path_mtu(transport_now);
@@ -2295,6 +3237,11 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        status = transmit_video_nacks(transport_now);
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
         status = transmit_congestion_feedback(transport_now);
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
@@ -2311,9 +3258,15 @@ namespace umbra::lsp {
     /** @brief Drain up to the bounded initial receive batch from the UDP socket. */
     [[nodiscard]] clsp_status_t drain_socket() noexcept {
       for (std::size_t index = 0; index < receive_batch_size; ++index) {
-        std::array<std::uint8_t, maximum_udp_payload> packet {};
+        std::array<std::uint8_t, maximum_udp_payload> fallback_packet {};
+        VideoReceiveLease receive_lease;
+        auto receive_storage = std::span<std::uint8_t> {fallback_packet};
+        if (video_configured_.load(std::memory_order_acquire) &&
+            receive_lease.acquire(video_receive_pool_)) {
+          receive_storage = receive_lease.bytes();
+        }
         std::array<std::uint8_t, 128> control {};
-        iovec vector {.iov_base = packet.data(), .iov_len = packet.size()};
+        iovec vector {.iov_base = receive_storage.data(), .iov_len = receive_storage.size()};
         msghdr message {};
         message.msg_iov = &vector;
         message.msg_iovlen = 1;
@@ -2328,7 +3281,7 @@ namespace umbra::lsp {
           increment(RuntimeCounter::dropped);
           continue;
         }
-        if ((message.msg_flags & MSG_TRUNC) != 0 || static_cast<std::size_t>(received) > packet.size()) {
+        if ((message.msg_flags & MSG_TRUNC) != 0 || static_cast<std::size_t>(received) > receive_storage.size()) {
           increment(RuntimeCounter::dropped);
           continue;
         }
@@ -2365,7 +3318,7 @@ namespace umbra::lsp {
           }
           break;
         }
-        auto datagram = std::span<std::uint8_t> {packet.data(), static_cast<std::size_t>(received)};
+        auto datagram = receive_storage.first(static_cast<std::size_t>(received));
         const auto protected_datagram_size = static_cast<std::uint16_t>(datagram.size());
         switch (classify(datagram)) {
           case PacketClass::dtls: {
@@ -2391,9 +3344,12 @@ namespace umbra::lsp {
                                                                                    datagram.subspan(8, 4)
                                                                                  ) :
                                                                                  0U);
-            const auto use_video_context =
-              video_configured_.load(std::memory_order_acquire) &&
-              visible_ssrc == video_configuration_.primary_ssrc;
+            if (!inbound_ssrc_registered(visible_ssrc, rtcp)) {
+              increment(RuntimeCounter::dropped);
+              break;
+            }
+            const auto video_lane = video_lane_for_ssrc(visible_ssrc);
+            const auto use_video_context = video_lane != VideoRtpLane::none;
             const auto video_rtp_candidate = use_video_context && !rtcp && datagram.size() >= 28U;
             const auto audio_rtp_candidate = !use_video_context && !rtcp && datagram.size() >= 28U &&
                                              audio_configured_.load(std::memory_order_acquire) &&
@@ -2413,14 +3369,15 @@ namespace umbra::lsp {
             const auto second_header_byte = feedback_rtp_candidate ? datagram[1] : 0U;
             bool replay = false;
             const auto status = use_video_context ?
-                                  srtp_.unprotect_video(packet, packet_length, rtcp, replay) :
-                                  srtp_.unprotect(packet, packet_length, rtcp, replay);
+                                  srtp_.unprotect_video(receive_storage, packet_length, rtcp, replay) :
+                                  srtp_.unprotect(receive_storage, packet_length, rtcp, replay);
             if (status != CLSP_STATUS_OK) {
               if (replay && feedback_rtp_candidate) {
-                const auto &fingerprints = video_rtp_candidate ? authenticated_video_fingerprints_ :
-                                                                 authenticated_audio_fingerprints_;
-                if (const auto *fingerprint = authenticated_rtp_fingerprint(
-                      fingerprints,
+                auto *fingerprints = video_rtp_candidate ? video_fingerprints(video_lane) :
+                                                           &authenticated_audio_fingerprints_;
+                if (fingerprints != nullptr) {
+                  if (const auto *fingerprint = authenticated_rtp_fingerprint(
+                      *fingerprints,
                       visible_sequence,
                       visible_ssrc,
                       visible_timestamp,
@@ -2429,20 +3386,31 @@ namespace umbra::lsp {
                       second_header_byte,
                       authentication_tag
                     )) {
-                  if (video_rtp_candidate) {
-                    record_video_duplicate_ce(*fingerprint, ecn);
-                  } else {
-                    record_audio_duplicate_ce(*fingerprint, ecn);
+                    if (video_rtp_candidate) {
+                      record_video_duplicate_ce(*fingerprint, ecn, video_lane);
+                    } else {
+                      record_audio_duplicate_ce(*fingerprint, ecn);
+                    }
+                    increment(RuntimeCounter::received);
+                    break;
                   }
-                  increment(RuntimeCounter::received);
-                  break;
                 }
               }
               increment(RuntimeCounter::authentication_failure);
               break;
             }
             increment(RuntimeCounter::received);
-            const auto plaintext = std::span<const std::uint8_t> {packet.data(), packet_length};
+            if (use_video_context && !rtcp && receive_lease.token() == 0) {
+              record_local_video_pressure();
+              increment(RuntimeCounter::dropped);
+              if (realtime_failure_status_ != CLSP_STATUS_OK) {
+                const auto failure = realtime_failure_status_;
+                realtime_failure_status_ = CLSP_STATUS_OK;
+                return failure;
+              }
+              break;
+            }
+            const auto plaintext = std::span<const std::uint8_t> {receive_storage.data(), packet_length};
             const auto path_probe = rtcp ? handle_authenticated_path_probe(plaintext, visible_ssrc, protected_datagram_size, arrival_microseconds) :
                                            PathProbePacketResult::not_probe;
             if (path_probe == PathProbePacketResult::invalid ||
@@ -2456,20 +3424,29 @@ namespace umbra::lsp {
             }
             if (!rtcp && use_video_context) {
               const auto video_rtp = lumen::lsp::parse_rtp_fixed_header(plaintext);
-              if (video_rtp && video_rtp.header.ssrc == video_configuration_.primary_ssrc &&
-                  video_rtp.header.payload_type == video_configuration_.primary_payload_type) {
-                record_video_feedback(plaintext, protected_datagram_size, arrival_microseconds, ecn);
-                store_authenticated_rtp_fingerprint(
-                  authenticated_video_fingerprints_,
-                  visible_sequence,
-                  visible_ssrc,
-                  visible_timestamp,
+              if (video_rtp && video_rtp.header.ssrc == visible_ssrc &&
+                  video_rtp.header.payload_type == video_payload_type(video_lane)) {
+                record_video_feedback_for_lane(
+                  plaintext,
                   protected_datagram_size,
                   arrival_microseconds,
-                  first_header_byte,
-                  second_header_byte,
-                  authentication_tag
+                  ecn,
+                  video_lane
                 );
+                auto *fingerprints = video_fingerprints(video_lane);
+                if (fingerprints != nullptr) {
+                  store_authenticated_rtp_fingerprint(
+                    *fingerprints,
+                    visible_sequence,
+                    visible_ssrc,
+                    visible_timestamp,
+                    protected_datagram_size,
+                    arrival_microseconds,
+                    first_header_byte,
+                    second_header_byte,
+                    authentication_tag
+                  );
+                }
               }
             } else if (audio_rtp_candidate) {
               const auto audio_rtp = lumen::lsp::parse_rtp_fixed_header(plaintext);
@@ -2489,7 +3466,12 @@ namespace umbra::lsp {
                 );
               }
             }
-            const auto handled = handle_authenticated_realtime(plaintext, rtcp, arrival_microseconds);
+            const auto handled = handle_authenticated_realtime(
+              plaintext,
+              rtcp,
+              arrival_microseconds,
+              receive_lease.token()
+            );
             if (realtime_failure_status_ != CLSP_STATUS_OK) {
               const auto failure = realtime_failure_status_;
               realtime_failure_status_ = CLSP_STATUS_OK;
@@ -2506,6 +3488,95 @@ namespace umbra::lsp {
         }
       }
       return CLSP_STATUS_OK;
+    }
+
+    /** @brief Queue exact inbound SRTP installs and wait for socket-thread completion. */
+    [[nodiscard]] clsp_status_t install_inbound_security_streams(
+      const std::span<const InboundSecurityStream> streams
+    ) noexcept {
+      if (streams.empty() || streams.size() > 3U) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      pthread_mutex_lock(&mutex_);
+      if (pending_inbound_security_install_.pending ||
+          pending_inbound_security_install_.awaiting_result) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      auto token = next_inbound_security_install_token_++;
+      if (token == 0) {
+        token = next_inbound_security_install_token_++;
+      }
+      if (token == 0) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      pending_inbound_security_install_ = {};
+      std::copy(streams.begin(), streams.end(), pending_inbound_security_install_.streams.begin());
+      pending_inbound_security_install_.token = token;
+      pending_inbound_security_install_.stream_count = streams.size();
+      pending_inbound_security_install_.pending = true;
+      pending_inbound_security_install_.awaiting_result = true;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+
+      timespec deadline {};
+      if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      ++deadline.tv_sec;
+      pthread_mutex_lock(&mutex_);
+      while (completed_inbound_security_install_token_ < token) {
+        const auto wait = pthread_cond_timedwait(&condition_, &mutex_, &deadline);
+        if (wait == ETIMEDOUT) {
+          pending_inbound_security_install_.awaiting_result = false;
+          pthread_mutex_unlock(&mutex_);
+          return CLSP_STATUS_TIMEOUT;
+        }
+        if (wait != 0) {
+          pending_inbound_security_install_.awaiting_result = false;
+          pthread_mutex_unlock(&mutex_);
+          return CLSP_STATUS_INTERNAL_FAILURE;
+        }
+      }
+      const auto result = pending_inbound_security_install_.result;
+      pending_inbound_security_install_.awaiting_result = false;
+      pthread_mutex_unlock(&mutex_);
+      return result;
+    }
+
+    /** @brief Execute one queued exact-SSRC libSRTP install on the socket thread. */
+    void process_inbound_security_install() noexcept {
+      PendingInboundSecurityInstall selected;
+      pthread_mutex_lock(&mutex_);
+      if (!pending_inbound_security_install_.pending) {
+        pthread_mutex_unlock(&mutex_);
+        return;
+      }
+      selected = pending_inbound_security_install_;
+      pthread_mutex_unlock(&mutex_);
+
+      auto result = CLSP_STATUS_OK;
+      for (const auto &stream : std::span<const InboundSecurityStream> {selected.streams}.first(
+             selected.stream_count
+           )) {
+        result = srtp_.configure_inbound_stream(
+          stream.ssrc,
+          std::span<const int> {stream.encrypted_extensions}.first(stream.encrypted_extension_count)
+        );
+        if (result != CLSP_STATUS_OK) {
+          break;
+        }
+      }
+      pthread_mutex_lock(&mutex_);
+      if (pending_inbound_security_install_.pending &&
+          pending_inbound_security_install_.token == selected.token) {
+        pending_inbound_security_install_.result = result;
+        pending_inbound_security_install_.pending = false;
+        completed_inbound_security_install_token_ = selected.token;
+        pthread_cond_broadcast(&condition_);
+      }
+      pthread_mutex_unlock(&mutex_);
     }
 
     /** @brief Install a pending input authority on the socket-owner thread. */
@@ -3102,53 +4173,152 @@ namespace umbra::lsp {
       return static_cast<std::uint32_t>(((seconds & 0xffffU) << 16U) | (fraction >> 16U));
     }
 
-    /** @brief Extend video sequence numbers independently for RFC 8888 reporting. */
-    [[nodiscard]] std::uint64_t extend_feedback_sequence(const std::uint16_t sequence) noexcept {
-      if (!feedback_sequence_initialized_) {
-        feedback_sequence_initialized_ = true;
-        feedback_largest_extended_sequence_ = sequence;
+    /** @brief Classify one visible SSRC through the authenticated video registry. */
+    [[nodiscard]] VideoRtpLane video_lane_for_ssrc(const std::uint32_t ssrc) const noexcept {
+      if (!video_configured_.load(std::memory_order_acquire) || ssrc == 0) {
+        return VideoRtpLane::none;
+      }
+      if (ssrc == video_configuration_.primary_ssrc) {
+        return VideoRtpLane::primary;
+      }
+      if (video_configuration_.flexfec_ssrc != 0 && ssrc == video_configuration_.flexfec_ssrc) {
+        return VideoRtpLane::flexfec;
+      }
+      if (video_configuration_.rtx_ssrc != 0 && ssrc == video_configuration_.rtx_ssrc) {
+        return VideoRtpLane::rtx;
+      }
+      return VideoRtpLane::none;
+    }
+
+    /** @brief Reject unnegotiated visible SSRCs before any libSRTP state lookup. */
+    [[nodiscard]] bool inbound_ssrc_registered(
+      const std::uint32_t ssrc,
+      const bool rtcp
+    ) const noexcept {
+      if (ssrc == 0) {
+        return false;
+      }
+      if (video_lane_for_ssrc(ssrc) != VideoRtpLane::none) {
+        return true;
+      }
+      if (audio_configured_.load(std::memory_order_acquire) &&
+          ssrc == audio_configuration_.audio_ssrc) {
+        return true;
+      }
+      return rtcp && input_configured_ && ssrc == input_configuration_.acknowledgement_ssrc;
+    }
+
+    /** @brief Return the exact authenticated-datagram fingerprint table for one video lane. */
+    [[nodiscard]] std::array<AuthenticatedRtpFingerprint, 128> *video_fingerprints(
+      const VideoRtpLane lane
+    ) noexcept {
+      switch (lane) {
+        case VideoRtpLane::primary:
+          return &authenticated_video_fingerprints_;
+        case VideoRtpLane::flexfec:
+          return &authenticated_flexfec_fingerprints_;
+        case VideoRtpLane::rtx:
+          return &authenticated_rtx_fingerprints_;
+        case VideoRtpLane::none:
+          return nullptr;
+      }
+      return nullptr;
+    }
+
+    /** @brief Return the exact negotiated RTP payload type for one video lane. */
+    [[nodiscard]] std::uint8_t video_payload_type(const VideoRtpLane lane) const noexcept {
+      switch (lane) {
+        case VideoRtpLane::primary:
+          return video_configuration_.primary_payload_type;
+        case VideoRtpLane::flexfec:
+          return video_configuration_.flexfec_payload_type;
+        case VideoRtpLane::rtx:
+          return video_configuration_.rtx_payload_type;
+        case VideoRtpLane::none:
+          return 0;
+      }
+      return 0;
+    }
+
+    /** @brief Extend one RTP lane's sequence around its independent RFC 8888 origin. */
+    [[nodiscard]] static std::uint64_t extend_feedback_sequence(
+      const std::uint16_t sequence,
+      bool &initialized,
+      std::uint64_t &largest_extended_sequence
+    ) noexcept {
+      if (!initialized) {
+        initialized = true;
+        largest_extended_sequence = sequence;
         return sequence;
       }
       constexpr std::uint64_t modulus = std::uint64_t {1} << 16U;
       constexpr std::uint64_t half = modulus / 2U;
-      auto candidate = (feedback_largest_extended_sequence_ & ~(modulus - 1U)) | sequence;
-      if (candidate + half < feedback_largest_extended_sequence_) {
+      auto candidate = (largest_extended_sequence & ~(modulus - 1U)) | sequence;
+      if (candidate + half < largest_extended_sequence) {
         candidate += modulus;
-      } else if (candidate > feedback_largest_extended_sequence_ + half && candidate >= modulus) {
+      } else if (candidate > largest_extended_sequence + half && candidate >= modulus) {
         candidate -= modulus;
       }
-      feedback_largest_extended_sequence_ = std::max(feedback_largest_extended_sequence_, candidate);
+      largest_extended_sequence = std::max(largest_extended_sequence, candidate);
       return candidate;
     }
 
     /** @brief Extend audio sequence numbers independently for RFC 8888 reporting. */
     [[nodiscard]] std::uint64_t extend_audio_feedback_sequence(const std::uint16_t sequence) noexcept {
-      if (!audio_feedback_sequence_initialized_) {
-        audio_feedback_sequence_initialized_ = true;
-        audio_feedback_largest_extended_sequence_ = sequence;
-        return sequence;
-      }
-      constexpr std::uint64_t modulus = std::uint64_t {1} << 16U;
-      constexpr std::uint64_t half = modulus / 2U;
-      auto candidate = (audio_feedback_largest_extended_sequence_ & ~(modulus - 1U)) | sequence;
-      if (candidate + half < audio_feedback_largest_extended_sequence_) {
-        candidate += modulus;
-      } else if (candidate > audio_feedback_largest_extended_sequence_ + half && candidate >= modulus) {
-        candidate -= modulus;
-      }
-      audio_feedback_largest_extended_sequence_ = std::max(audio_feedback_largest_extended_sequence_, candidate);
-      return candidate;
+      return extend_feedback_sequence(
+        sequence,
+        audio_feedback_sequence_initialized_,
+        audio_feedback_largest_extended_sequence_
+      );
     }
 
-    /** @brief Record one authenticated primary-video packet with actual ECN availability. */
-    void record_video_feedback(
+    /** @brief Record one authenticated negotiated video-lane packet and its RR state. */
+    void record_video_feedback_for_lane(
       const std::span<const std::uint8_t> packet,
       const std::uint16_t protected_udp_bytes,
       const std::uint64_t arrival_microseconds,
-      const native_ecn_mark ecn
+      const native_ecn_mark ecn,
+      const VideoRtpLane lane
     ) noexcept {
       const auto rtp = lumen::lsp::parse_rtp_fixed_header(packet);
-      if (!rtp || rtp.header.ssrc != video_configuration_.primary_ssrc) {
+      if (!rtp) {
+        return;
+      }
+      native_video_feedback_tracker<> *feedback = nullptr;
+      native_rtp_reception_stats *reception = nullptr;
+      bool *sequence_initialized = nullptr;
+      std::uint64_t *largest_sequence = nullptr;
+      std::uint32_t expected_ssrc = 0;
+      std::uint8_t expected_payload_type = 0;
+      switch (lane) {
+        case VideoRtpLane::primary:
+          feedback = &video_feedback_;
+          reception = &video_reception_;
+          sequence_initialized = &feedback_sequence_initialized_;
+          largest_sequence = &feedback_largest_extended_sequence_;
+          expected_ssrc = video_configuration_.primary_ssrc;
+          expected_payload_type = video_configuration_.primary_payload_type;
+          break;
+        case VideoRtpLane::flexfec:
+          feedback = &flexfec_feedback_;
+          reception = &flexfec_reception_;
+          sequence_initialized = &flexfec_feedback_sequence_initialized_;
+          largest_sequence = &flexfec_feedback_largest_extended_sequence_;
+          expected_ssrc = video_configuration_.flexfec_ssrc;
+          expected_payload_type = video_configuration_.flexfec_payload_type;
+          break;
+        case VideoRtpLane::rtx:
+          feedback = &rtx_feedback_;
+          reception = &rtx_reception_;
+          sequence_initialized = &rtx_feedback_sequence_initialized_;
+          largest_sequence = &rtx_feedback_largest_extended_sequence_;
+          expected_ssrc = video_configuration_.rtx_ssrc;
+          expected_payload_type = video_configuration_.rtx_payload_type;
+          break;
+        case VideoRtpLane::none:
+          return;
+      }
+      if (rtp.header.ssrc != expected_ssrc || rtp.header.payload_type != expected_payload_type) {
         return;
       }
       const auto ip_overhead = socket_family_ == AF_INET6 ? 48U : 28U;
@@ -3156,28 +4326,34 @@ namespace umbra::lsp {
       if (complete_bytes > UINT16_MAX) {
         return;
       }
-      const auto extended = extend_feedback_sequence(rtp.header.sequence_number);
-      const auto result = video_feedback_.record({
+      const auto extended = extend_feedback_sequence(
+        rtp.header.sequence_number,
+        *sequence_initialized,
+        *largest_sequence
+      );
+      const auto result = feedback->record({
         .extended_sequence = extended,
         .arrival_microseconds = arrival_microseconds,
         .received_ip_bytes = static_cast<std::uint16_t>(complete_bytes),
         .ecn = ecn,
       });
       if (result == native_feedback_record_result::accepted) {
-        video_reception_.record(
+        reception->record(
           extended,
           rtp.header.timestamp,
           arrival_microseconds,
           90'000U
         );
-        video_received_ip_bytes_ += complete_bytes;
-        increment(RuntimeCounter::video_received_ip_bytes, complete_bytes);
-        if (ecn == native_ecn_mark::unknown) {
-          ++video_ecn_unknown_packets_;
-          increment(RuntimeCounter::video_ecn_unknown_packets);
-        } else if (ecn == native_ecn_mark::congestion_experienced) {
-          ++video_ecn_ce_packets_;
-          increment(RuntimeCounter::video_ecn_ce_packets);
+        if (lane == VideoRtpLane::primary) {
+          video_received_ip_bytes_ += complete_bytes;
+          increment(RuntimeCounter::video_received_ip_bytes, complete_bytes);
+          if (ecn == native_ecn_mark::unknown) {
+            ++video_ecn_unknown_packets_;
+            increment(RuntimeCounter::video_ecn_unknown_packets);
+          } else if (ecn == native_ecn_mark::congestion_experienced) {
+            ++video_ecn_ce_packets_;
+            increment(RuntimeCounter::video_ecn_ce_packets);
+          }
         }
       }
     }
@@ -3228,10 +4404,11 @@ namespace umbra::lsp {
                nullptr;
     }
 
-    /** @brief Upgrade one exact authenticated replay to ECN-CE without media re-admission. */
+    /** @brief Upgrade one exact authenticated video-lane replay to ECN-CE without media re-admission. */
     void record_video_duplicate_ce(
       const AuthenticatedRtpFingerprint &fingerprint,
-      const native_ecn_mark ecn
+      const native_ecn_mark ecn,
+      const VideoRtpLane lane
     ) noexcept {
       if (ecn != native_ecn_mark::congestion_experienced) {
         return;
@@ -3241,8 +4418,30 @@ namespace umbra::lsp {
       if (complete_bytes > UINT16_MAX) {
         return;
       }
-      (void) video_feedback_.record({
-        .extended_sequence = extend_feedback_sequence(fingerprint.sequence),
+      native_video_feedback_tracker<> *feedback = nullptr;
+      bool *initialized = nullptr;
+      std::uint64_t *largest_sequence = nullptr;
+      switch (lane) {
+        case VideoRtpLane::primary:
+          feedback = &video_feedback_;
+          initialized = &feedback_sequence_initialized_;
+          largest_sequence = &feedback_largest_extended_sequence_;
+          break;
+        case VideoRtpLane::flexfec:
+          feedback = &flexfec_feedback_;
+          initialized = &flexfec_feedback_sequence_initialized_;
+          largest_sequence = &flexfec_feedback_largest_extended_sequence_;
+          break;
+        case VideoRtpLane::rtx:
+          feedback = &rtx_feedback_;
+          initialized = &rtx_feedback_sequence_initialized_;
+          largest_sequence = &rtx_feedback_largest_extended_sequence_;
+          break;
+        case VideoRtpLane::none:
+          return;
+      }
+      (void)feedback->record({
+        .extended_sequence = extend_feedback_sequence(fingerprint.sequence, *initialized, *largest_sequence),
         .arrival_microseconds = fingerprint.first_arrival_microseconds,
         .received_ip_bytes = static_cast<std::uint16_t>(complete_bytes),
         .ecn = native_ecn_mark::congestion_experienced,
@@ -3550,6 +4749,12 @@ namespace umbra::lsp {
           if (pending_rtcp_.video_feedback) {
             (void) video_feedback_.commit(pending_rtcp_.video_feedback, now);
           }
+          if (pending_rtcp_.flexfec_feedback) {
+            (void)flexfec_feedback_.commit(pending_rtcp_.flexfec_feedback, now);
+          }
+          if (pending_rtcp_.rtx_feedback) {
+            (void)rtx_feedback_.commit(pending_rtcp_.rtx_feedback, now);
+          }
           if (pending_rtcp_.audio_feedback) {
             (void) audio_feedback_.commit(pending_rtcp_.audio_feedback, now);
           }
@@ -3580,6 +4785,182 @@ namespace umbra::lsp {
       return CLSP_STATUS_SOCKET_FAILURE;
     }
 
+    /** @brief Submit one urgent already-protected Generic NACK across backpressure. */
+    [[nodiscard]] clsp_status_t transmit_pending_video_nack(const std::uint64_t now) noexcept {
+      if (!pending_video_nack_) {
+        return CLSP_STATUS_OK;
+      }
+      const auto estimate = rtx_deadline_estimate();
+      for (std::size_t index = 0; index < pending_video_nack_.sequence_count; ++index) {
+        if (!lumen::lsp::transport::rtx_deadline_eligible(
+              now,
+              pending_video_nack_.frame_deadlines[index],
+              estimate
+            )) {
+          pending_video_nack_ = {};
+          return CLSP_STATUS_OK;
+        }
+      }
+      const auto sent = ::send(socket_, pending_video_nack_.bytes.data(), pending_video_nack_.length, 0);
+      if (sent == static_cast<ssize_t>(pending_video_nack_.length)) {
+        if (pending_video_nack_.initial) {
+          const auto marked = video_gap_tracker_.mark_nacks_sent(
+            std::span<const std::uint16_t> {pending_video_nack_.sequences}.first(
+              pending_video_nack_.sequence_count
+            )
+          );
+          if (marked != pending_video_nack_.sequence_count) {
+            pending_video_nack_ = {};
+            return CLSP_STATUS_INTERNAL_FAILURE;
+          }
+        }
+        const auto repeat_interval = configuration_.profile == CLSP_PROFILE_COMPETITION_LAN ?
+                                       competition_nack_repeat_microseconds :
+                                       adaptive_nack_repeat_microseconds;
+        for (std::size_t index = 0; index < pending_video_nack_.sequence_count; ++index) {
+          auto *retry = std::ranges::find_if(video_nack_retries_, [&](const VideoNackRetry &candidate) {
+            return candidate.occupied && candidate.sequence_number == pending_video_nack_.sequences[index];
+          });
+          if (retry == video_nack_retries_.end()) {
+            retry = std::ranges::find_if(video_nack_retries_, [](const VideoNackRetry &candidate) {
+              return !candidate.occupied;
+            });
+          }
+          if (retry == video_nack_retries_.end()) {
+            record_local_video_pressure();
+            continue;
+          }
+          if (!retry->occupied) {
+            *retry = {
+              .frame_deadline_microseconds = pending_video_nack_.frame_deadlines[index],
+              .sequence_number = pending_video_nack_.sequences[index],
+              .occupied = true,
+            };
+          }
+          if (retry->attempts < maximum_video_nack_attempts) {
+            ++retry->attempts;
+          }
+          retry->next_retry_microseconds = saturating_add(now, repeat_interval);
+          if (retry->attempts >= maximum_video_nack_attempts) {
+            retry->occupied = false;
+          }
+        }
+        pending_video_nack_ = {};
+        increment(RuntimeCounter::transmitted);
+        return realtime_failure_status_ == CLSP_STATUS_OK ? CLSP_STATUS_OK : realtime_failure_status_;
+      }
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+        return CLSP_STATUS_OK;
+      }
+      return CLSP_STATUS_SOCKET_FAILURE;
+    }
+
+    /** @brief Build and immediately submit one deadline-qualified reduced-size Generic NACK. */
+    [[nodiscard]] clsp_status_t transmit_video_nacks(const std::uint64_t now) noexcept {
+      if (video_configuration_.rtx_ssrc == 0 || !compound_rtcp_sent_) {
+        return CLSP_STATUS_OK;
+      }
+      if (pending_video_nack_) {
+        return transmit_pending_video_nack(now);
+      }
+      std::array<lumen::lsp::transport::video_gap_nack_candidate, maximum_video_gap_count> candidates {};
+      const auto batch = video_gap_tracker_.pending_nacks(now, rtx_deadline_estimate(), candidates);
+      if (!batch) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      auto candidate_count = batch.count;
+      auto initial = candidate_count != 0;
+      if (candidate_count == 0) {
+        const auto estimate = rtx_deadline_estimate();
+        for (auto &retry : video_nack_retries_) {
+          if (!retry.occupied) {
+            continue;
+          }
+          if (retry.attempts >= maximum_video_nack_attempts ||
+              !lumen::lsp::transport::rtx_deadline_eligible(
+                now,
+                retry.frame_deadline_microseconds,
+                estimate
+              )) {
+            retry = {};
+            continue;
+          }
+          if (now < retry.next_retry_microseconds) {
+            continue;
+          }
+          candidates[candidate_count++] = {
+            .frame_deadline_microseconds = retry.frame_deadline_microseconds,
+            .sequence_number = retry.sequence_number,
+          };
+        }
+      }
+      if (candidate_count == 0) {
+        return CLSP_STATUS_OK;
+      }
+      lumen::lsp::transport::generic_nack<maximum_video_gap_count> nack;
+      nack.sender_ssrc = input_configuration_.input_ssrc;
+      nack.media_ssrc = video_configuration_.primary_ssrc;
+      nack.pair_count = candidate_count;
+      for (std::size_t index = 0; index < candidate_count; ++index) {
+        nack.pairs[index] = {
+          .packet_id = candidates[index].sequence_number,
+          .lost_packet_bitmask = 0,
+        };
+        pending_video_nack_.sequences[index] = candidates[index].sequence_number;
+        pending_video_nack_.frame_deadlines[index] = candidates[index].frame_deadline_microseconds;
+      }
+      const auto written = lumen::lsp::transport::write_generic_nack(nack, pending_video_nack_.bytes);
+      if (!written) {
+        pending_video_nack_ = {};
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      auto length = written.bytes_written;
+      const auto protected_status = srtp_.protect(pending_video_nack_.bytes, length, true);
+      if (protected_status != CLSP_STATUS_OK ||
+          length > current_udp_payload_size_.load(std::memory_order_acquire)) {
+        pending_video_nack_ = {};
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      pending_video_nack_.length = length;
+      pending_video_nack_.sequence_count = candidate_count;
+      pending_video_nack_.initial = initial;
+      return transmit_pending_video_nack(now);
+    }
+
+    /** @brief Expire fixed repair sources, pending parity, and deadline-past gaps. */
+    void expire_video_repair_state(const std::uint64_t now) noexcept {
+      for (auto &source : authenticated_video_sources_) {
+        if (source.occupied && now >= source.frame_deadline_microseconds) {
+          (void)video_receive_pool_.release(source.slab_token);
+          source = {};
+        }
+      }
+      for (auto &repair : pending_flexfec_repairs_) {
+        if (repair.occupied && now >= repair.expires_microseconds) {
+          (void)video_receive_pool_.release(repair.slab_token);
+          repair = {};
+        }
+      }
+      for (auto &retry : video_nack_retries_) {
+        if (retry.occupied && now >= retry.frame_deadline_microseconds) {
+          retry = {};
+        }
+      }
+      if (pending_video_nack_) {
+        const auto deadlines = std::span<const std::uint64_t> {pending_video_nack_.frame_deadlines}.first(
+          pending_video_nack_.sequence_count
+        );
+        if (std::ranges::any_of(deadlines, [now](const std::uint64_t deadline) {
+              return now >= deadline;
+            })) {
+          pending_video_nack_ = {};
+        }
+      }
+      if (video_gap_tracker_.erase_expired(now) != 0 && pending_video_nack_) {
+        pending_video_nack_ = {};
+      }
+    }
+
     /** @brief Send the initial and periodic regular compound RR plus privacy-safe SDES CNAME. */
     [[nodiscard]] clsp_status_t transmit_compound_rtcp(const std::uint64_t now) noexcept {
       if (pending_rtcp_ || !video_delivery_active_.load(std::memory_order_acquire) || !input_configured_ ||
@@ -3587,10 +4968,16 @@ namespace umbra::lsp {
            now - last_compound_rtcp_microseconds_ < compound_rtcp_interval_microseconds)) {
         return CLSP_STATUS_OK;
       }
-      std::array<native_receiver_report_block, 2> reports {};
+      std::array<native_receiver_report_block, 4> reports {};
       std::size_t report_count = 0;
       if (video_configured_.load(std::memory_order_acquire) && video_reception_.initialized()) {
         reports[report_count++] = video_reception_.report(video_configuration_.primary_ssrc, now);
+      }
+      if (video_configuration_.flexfec_ssrc != 0 && flexfec_reception_.initialized()) {
+        reports[report_count++] = flexfec_reception_.report(video_configuration_.flexfec_ssrc, now);
+      }
+      if (video_configuration_.rtx_ssrc != 0 && rtx_reception_.initialized()) {
+        reports[report_count++] = rtx_reception_.report(video_configuration_.rtx_ssrc, now);
       }
       if (audio_configured_.load(std::memory_order_acquire) && audio_reception_.initialized()) {
         reports[report_count++] = audio_reception_.report(audio_configuration_.audio_ssrc, now);
@@ -3617,7 +5004,8 @@ namespace umbra::lsp {
 
     /** @brief Send one reduced-size RFC 8888 CCFB report after regular compound RTCP. */
     [[nodiscard]] clsp_status_t transmit_congestion_feedback(const std::uint64_t now) noexcept {
-      const auto feedback_due = video_feedback_.due(now) || audio_feedback_.due(now);
+      const auto feedback_due = video_feedback_.due(now) || flexfec_feedback_.due(now) ||
+                                rtx_feedback_.due(now) || audio_feedback_.due(now);
       if (pending_rtcp_ || !compound_rtcp_sent_ || !feedback_due || !input_configured_) {
         return CLSP_STATUS_OK;
       }
@@ -3661,14 +5049,22 @@ namespace umbra::lsp {
         offset += block_bytes;
       };
       native_feedback_write_result video_written;
+      native_feedback_write_result flexfec_written;
+      native_feedback_write_result rtx_written;
       native_feedback_write_result audio_written;
       if (video_configured_.load(std::memory_order_acquire)) {
         append_block(video_feedback_, video_configuration_.primary_ssrc, video_written);
+        if (video_configuration_.flexfec_ssrc != 0) {
+          append_block(flexfec_feedback_, video_configuration_.flexfec_ssrc, flexfec_written);
+        }
+        if (video_configuration_.rtx_ssrc != 0) {
+          append_block(rtx_feedback_, video_configuration_.rtx_ssrc, rtx_written);
+        }
       }
       if (audio_configured_.load(std::memory_order_acquire)) {
         append_block(audio_feedback_, audio_configuration_.audio_ssrc, audio_written);
       }
-      if (!video_written && !audio_written) {
+      if (!video_written && !flexfec_written && !rtx_written && !audio_written) {
         return CLSP_STATUS_OK;
       }
       lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(offset, 4), report_timestamp);
@@ -3680,6 +5076,8 @@ namespace umbra::lsp {
       }
       pending_rtcp_.kind = PendingProtectedRtcp::Kind::congestion_feedback;
       pending_rtcp_.video_feedback = video_written;
+      pending_rtcp_.flexfec_feedback = flexfec_written;
+      pending_rtcp_.rtx_feedback = rtx_written;
       pending_rtcp_.audio_feedback = audio_written;
       pending_rtcp_.length = length;
       pending_rtcp_.created_microseconds = now;
@@ -3869,12 +5267,14 @@ namespace umbra::lsp {
      *
      * @param key Current authenticated provisional frame key to preserve.
      * @param extensions Validated repeated metadata carrying the next epoch.
+     * @param sequence_number Boundary packet primary RTP sequence.
      * @param current_frame_expired Whether the validated current frame is already retired or expired.
      * @return True only when the epoch and coalescer advanced atomically.
      */
     [[nodiscard]] bool advance_video_epoch(
       const lumen::lsp::media::frame_key key,
       const VideoExtensions &extensions,
+      const std::uint16_t sequence_number,
       const bool current_frame_expired
     ) noexcept {
       pthread_mutex_lock(&mutex_);
@@ -3911,6 +5311,66 @@ namespace umbra::lsp {
           metadata = {};
         }
       }
+      if (video_reassembler_) {
+        (void)video_reassembler_->clear_except(
+          key,
+          [this](const std::uint64_t token) noexcept {
+            (void)video_receive_pool_.release(token);
+          }
+        );
+      }
+      for (auto &source : authenticated_video_sources_) {
+        const auto same_frame = source.rtp_timestamp == static_cast<std::uint32_t>(key.extended_timestamp) &&
+                                (source.frame_id == 0 || source.frame_id == extensions.frame_id);
+        if (source.occupied && !same_frame) {
+          (void)video_receive_pool_.release(source.slab_token);
+          source = {};
+        }
+      }
+      for (auto &repair : pending_flexfec_repairs_) {
+        if (!repair.occupied) {
+          continue;
+        }
+        const auto association_valid = bind_pending_flexfec_repair(
+          repair,
+          extensions.recovery_epoch
+        );
+        auto same_frame = association_valid && flexfec_repair_matches_advancing_frame(
+          repair.frame_bound,
+          repair.bound_rtp_timestamp,
+          repair.bound_frame_id,
+          repair.bound_recovery_epoch,
+          repair.repair_timestamp,
+          repair.base_sequence_number,
+          repair.source_mask,
+          sequence_number,
+          static_cast<std::uint32_t>(key.extended_timestamp),
+          extensions.frame_id,
+          extensions.recovery_epoch
+        );
+        if (same_frame && !repair.frame_bound) {
+          repair.bound_rtp_timestamp = static_cast<std::uint32_t>(key.extended_timestamp);
+          repair.bound_frame_id = extensions.frame_id;
+          repair.bound_recovery_epoch = extensions.recovery_epoch;
+          repair.frame_bound = true;
+          same_frame = true;
+        }
+        if (!same_frame) {
+          (void)video_receive_pool_.release(repair.slab_token);
+          repair = {};
+        }
+      }
+      pending_video_nack_ = {};
+      video_nack_retries_ = {};
+      if (!video_gap_tracker_.reset(
+            video_configuration_.primary_ssrc,
+            video_configuration_.video_generation,
+            configuration_.profile == CLSP_PROFILE_COMPETITION_LAN ?
+              competition_reorder_delay_microseconds :
+              adaptive_reorder_delay_microseconds
+          )) {
+        return false;
+      }
       wake_worker();
       return true;
     }
@@ -3934,7 +5394,9 @@ namespace umbra::lsp {
           ++expired;
         }
       }
-      (void)video_reassembler_->expire(now);
+      (void)video_reassembler_->expire(now, [this](const std::uint64_t token) noexcept {
+        (void)video_receive_pool_.release(token);
+      });
       if (expired != 0) {
         coalesce_video_capacity_status(
           lumen::lsp::transport::lspv_event::capacity_transition,
@@ -3993,7 +5455,11 @@ namespace umbra::lsp {
     /** @brief Merge repeated boundary metadata and reject authenticated
      * conflicts. */
     [[nodiscard]] bool
-    merge_video_metadata(VideoFrameMetadata &metadata, const VideoExtensions &extensions) noexcept {
+    merge_video_metadata(
+      VideoFrameMetadata &metadata,
+      const VideoExtensions &extensions,
+      const std::uint16_t sequence_number
+    ) noexcept {
       if (extensions.has_frame_id) {
         if (extensions.frame_id < video_configuration_.frame_id_origin ||
             (metadata.frame_id != 0 && metadata.frame_id != extensions.frame_id) ||
@@ -4029,18 +5495,306 @@ namespace umbra::lsp {
         metadata.has_independent_marking = true;
         metadata.independent = extensions.independent;
       }
+      if (extensions.starts_frame) {
+        if (metadata.has_start_sequence && metadata.start_sequence_number != sequence_number) {
+          return false;
+        }
+        metadata.has_start_sequence = true;
+        metadata.start_sequence_number = sequence_number;
+      }
       return true;
+    }
+
+    /** @brief Return one exact retained authenticated source by generation and sequence. */
+    [[nodiscard]] const AuthenticatedVideoSourcePacket *authenticated_video_source(
+      const std::uint16_t sequence_number
+    ) const noexcept {
+      const auto &slot = authenticated_video_sources_[sequence_number % authenticated_video_sources_.size()];
+      return slot.occupied && slot.sequence_number == sequence_number &&
+                     slot.video_generation == video_configuration_.video_generation ?
+               &slot :
+               nullptr;
+    }
+
+    /** @brief Borrow one retained authenticated source packet. */
+    [[nodiscard]] std::span<const std::uint8_t> authenticated_video_source_bytes(
+      const AuthenticatedVideoSourcePacket &source
+    ) const noexcept {
+      const auto slab = video_receive_pool_.bytes(source.slab_token);
+      return source.occupied && source.length <= slab.size() ? slab.first(source.length) :
+                                                              std::span<const std::uint8_t> {};
+    }
+
+    /** @brief Borrow one retained authenticated FlexFEC repair packet. */
+    [[nodiscard]] std::span<const std::uint8_t> pending_flexfec_repair_bytes(
+      const PendingFlexFecRepair &repair
+    ) const noexcept {
+      const auto slab = video_receive_pool_.bytes(repair.slab_token);
+      return repair.occupied && repair.length <= slab.size() ? slab.first(repair.length) :
+                                                              std::span<const std::uint8_t> {};
+    }
+
+    /** @brief Bind pending parity to authenticated contributing-source frame evidence. */
+    [[nodiscard]] bool bind_pending_flexfec_repair(
+      PendingFlexFecRepair &repair,
+      const std::uint32_t recovery_epoch = 0
+    ) noexcept {
+      auto found_source = false;
+      auto bound_timestamp = repair.bound_rtp_timestamp;
+      auto bound_frame_id = repair.bound_frame_id;
+      auto bound_epoch = repair.bound_recovery_epoch;
+      for (std::size_t offset = 0; offset < lumen::lsp::transport::maximum_flexfec_group_packets; ++offset) {
+        if ((repair.source_mask & (std::uint64_t {1} << offset)) == 0) {
+          continue;
+        }
+        const auto sequence = static_cast<std::uint16_t>(repair.base_sequence_number + offset);
+        const auto *source = authenticated_video_source(sequence);
+        if (source == nullptr) {
+          continue;
+        }
+        if ((repair.frame_bound && source->rtp_timestamp != bound_timestamp) ||
+            (found_source && source->rtp_timestamp != bound_timestamp) ||
+            (bound_frame_id != 0 && source->frame_id != 0 && source->frame_id != bound_frame_id) ||
+            (bound_epoch != 0 && source->recovery_epoch != 0 && source->recovery_epoch != bound_epoch)) {
+          return false;
+        }
+        if (!repair.frame_bound && !found_source) {
+          bound_timestamp = source->rtp_timestamp;
+        }
+        if (bound_frame_id == 0 && source->frame_id != 0) {
+          bound_frame_id = source->frame_id;
+        }
+        if (bound_epoch == 0 && source->recovery_epoch != 0) {
+          bound_epoch = source->recovery_epoch;
+        }
+        found_source = true;
+      }
+      if (found_source) {
+        repair.bound_rtp_timestamp = bound_timestamp;
+        repair.bound_frame_id = bound_frame_id;
+        repair.bound_recovery_epoch = bound_epoch;
+        repair.frame_bound = true;
+      }
+      if (repair.frame_bound && repair.bound_recovery_epoch == 0 && recovery_epoch != 0) {
+        repair.bound_recovery_epoch = recovery_epoch;
+      }
+      return true;
+    }
+
+    /** @brief Count hostile authenticated malformed repair and close only at the rolling limit. */
+    void record_authenticated_malformed_repair(const std::uint64_t now) noexcept {
+      if (authenticated_repair_abuse_window_start_ == 0 ||
+          now < authenticated_repair_abuse_window_start_ ||
+          now - authenticated_repair_abuse_window_start_ >= authenticated_repair_abuse_window_microseconds) {
+        authenticated_repair_abuse_window_start_ = now;
+        authenticated_repair_abuse_count_ = 0;
+      }
+      if (authenticated_repair_abuse_count_ < std::numeric_limits<std::uint16_t>::max()) {
+        ++authenticated_repair_abuse_count_;
+      }
+      if (authenticated_repair_abuse_count_ >= authenticated_repair_abuse_limit) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
+      }
+    }
+
+    /** @brief Report local pool/queue pressure without fabricating decoder damage. */
+    void record_local_video_pressure(const bool deadline_miss = false) noexcept {
+      coalesce_video_status(
+        lumen::lsp::transport::lspv_decoder_status::surface_exhausted,
+        lumen::lsp::transport::lspv_event::capacity_transition,
+        deadline_miss
+      );
+    }
+
+    /** @brief Report genuine unrepaired source damage as recoverable decoder evidence. */
+    void record_genuine_video_damage() noexcept {
+      coalesce_video_status(
+        lumen::lsp::transport::lspv_decoder_status::recoverable_error,
+        lumen::lsp::transport::lspv_event::decode_completion,
+        false
+      );
+    }
+
+    /** @brief Retain one admitted primary plaintext packet in fixed FlexFEC source storage. */
+    [[nodiscard]] bool retain_authenticated_video_source(
+      const std::span<const std::uint8_t> packet,
+      const ParsedVideoPacket &parsed,
+      const VideoFrameMetadata &metadata,
+      const std::uint64_t source_token
+    ) noexcept {
+      if (video_configuration_.flexfec_ssrc == 0) {
+        return true;
+      }
+      const auto slab = video_receive_pool_.bytes(source_token);
+      if (source_token == 0 || packet.empty() || packet.size() > maximum_udp_payload ||
+          metadata.deadline_microseconds == 0 || slab.data() != packet.data() || packet.size() > slab.size() ||
+          !video_receive_pool_.retain(source_token)) {
+        return false;
+      }
+      auto &slot = authenticated_video_sources_[
+        parsed.header.sequence_number % authenticated_video_sources_.size()
+      ];
+      if (slot.occupied) {
+        (void)video_receive_pool_.release(slot.slab_token);
+      }
+      slot = {};
+      slot.frame_deadline_microseconds = metadata.deadline_microseconds;
+      slot.frame_id = metadata.frame_id;
+      slot.slab_token = source_token;
+      slot.video_generation = video_configuration_.video_generation;
+      slot.rtp_timestamp = parsed.header.timestamp;
+      slot.recovery_epoch = metadata.recovery_epoch;
+      slot.length = packet.size();
+      slot.sequence_number = parsed.header.sequence_number;
+      slot.occupied = true;
+      return true;
+    }
+
+    /** @brief Drop any protected unsent NACK that names a newly resolved source. */
+    void cancel_pending_nack_for(const std::uint16_t sequence_number) noexcept {
+      if (pending_video_nack_) {
+        const auto sequences = std::span<const std::uint16_t> {pending_video_nack_.sequences}.first(
+          pending_video_nack_.sequence_count
+        );
+        if (std::ranges::find(sequences, sequence_number) != sequences.end()) {
+          pending_video_nack_ = {};
+        }
+      }
+      for (auto &retry : video_nack_retries_) {
+        if (retry.occupied && retry.sequence_number == sequence_number) {
+          retry = {};
+          break;
+        }
+      }
+    }
+
+    /** @brief Return strict receiver-side RTX timing reserves for the active profile. */
+    [[nodiscard]] lumen::lsp::transport::rtx_deadline_estimate rtx_deadline_estimate() const noexcept {
+      if (configuration_.profile == CLSP_PROFILE_COMPETITION_LAN &&
+          configuration_.competition_capacity_mbps != 0) {
+        const auto bits = static_cast<std::uint64_t>(current_udp_payload_size_.load(std::memory_order_acquire)) * 8U;
+        const auto rate = static_cast<std::uint64_t>(configuration_.competition_capacity_mbps) * 1'000'000U;
+        return {
+          .reverse_feedback_microseconds = competition_reorder_delay_microseconds,
+          .retransmission_serialization_microseconds = (bits * 1'000'000U + rate - 1U) / rate,
+          .forward_delivery_microseconds = competition_reorder_delay_microseconds,
+          .decode_safety_reserve_microseconds = 500U,
+        };
+      }
+      return {
+        .reverse_feedback_microseconds = 2'000U,
+        .retransmission_serialization_microseconds = 1'000U,
+        .forward_delivery_microseconds = 2'000U,
+        .decode_safety_reserve_microseconds = 1'000U,
+      };
+    }
+
+    /** @brief Admit one primary sequence into shared replay and deadline-aware gap state. */
+    [[nodiscard]] VideoSourceAdmission admit_video_source_sequence(
+      const ParsedVideoPacket &parsed,
+      const VideoFrameMetadata &metadata,
+      const std::uint64_t now
+    ) noexcept {
+      const auto previous_highest = video_source_replay_.highest_sequence();
+      const auto replay = video_source_replay_.admit(
+        parsed.header.ssrc,
+        video_configuration_.video_generation,
+        parsed.header.sequence_number
+      );
+      if (replay == lumen::lsp::transport::source_replay_result::duplicate ||
+          replay == lumen::lsp::transport::source_replay_result::too_old) {
+        return VideoSourceAdmission::duplicate;
+      }
+      if (replay != lumen::lsp::transport::source_replay_result::accepted_new_highest &&
+          replay != lumen::lsp::transport::source_replay_result::accepted_reordered) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
+        return VideoSourceAdmission::rejected;
+      }
+      if (previous_highest && replay == lumen::lsp::transport::source_replay_result::accepted_new_highest) {
+        const auto forward = static_cast<std::uint16_t>(parsed.header.sequence_number - *previous_highest);
+        if (forward > maximum_video_gap_count + 1U) {
+          record_genuine_video_damage();
+          return VideoSourceAdmission::rejected;
+        }
+        auto gap_frame_id = metadata.frame_id;
+        auto gap_deadline = metadata.deadline_microseconds;
+        if (parsed.extensions.starts_frame) {
+          if (const auto *previous = authenticated_video_source(*previous_highest);
+              previous != nullptr && previous->rtp_timestamp != parsed.header.timestamp &&
+              previous->frame_id != 0) {
+            gap_frame_id = previous->frame_id;
+            gap_deadline = previous->frame_deadline_microseconds;
+          }
+        }
+        if (gap_frame_id != 0) {
+          for (std::uint16_t offset = 1; offset < forward; ++offset) {
+            const auto missing = static_cast<std::uint16_t>(*previous_highest + offset);
+            const auto recorded = video_gap_tracker_.record_gap(
+              video_configuration_.primary_ssrc,
+              video_configuration_.video_generation,
+              missing,
+              gap_frame_id,
+              gap_deadline,
+              now
+            );
+            if (recorded == lumen::lsp::transport::video_gap_result::capacity_exceeded) {
+              record_local_video_pressure();
+              return VideoSourceAdmission::rejected;
+            }
+            if (recorded == lumen::lsp::transport::video_gap_result::conflicting_gap ||
+                recorded == lumen::lsp::transport::video_gap_result::invalid_gap ||
+                recorded == lumen::lsp::transport::video_gap_result::invalid_identifier) {
+              record_authenticated_malformed_repair(now);
+              return VideoSourceAdmission::rejected;
+            }
+          }
+        }
+      }
+      const auto observed = video_gap_tracker_.observe_source(
+        video_configuration_.primary_ssrc,
+        video_configuration_.video_generation,
+        parsed.header.sequence_number
+      );
+      if (observed == lumen::lsp::transport::video_gap_result::invalid_identifier) {
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+        return VideoSourceAdmission::rejected;
+      }
+      cancel_pending_nack_for(parsed.header.sequence_number);
+      return VideoSourceAdmission::accepted;
     }
 
     /** @brief Admit one authenticated primary video RTP packet into bounded
      * native reassembly. */
     [[nodiscard]] bool
-    handle_authenticated_video(const std::span<const std::uint8_t> packet, const std::uint64_t now) noexcept {
+    handle_authenticated_video(
+      const std::span<const std::uint8_t> packet,
+      const std::uint64_t now,
+      const VideoSourceOrigin origin = VideoSourceOrigin::primary_srtp,
+      const lumen::lsp::transport::authenticated_recovered_packet *recovered_marker = nullptr,
+      const std::uint64_t source_token = 0
+    ) noexcept {
       if (!video_reassembler_) {
         return false;
       }
       const auto parsed = parse_video_packet(packet, video_configuration_);
       if (!parsed) {
+        return false;
+      }
+      const auto source_slab = video_receive_pool_.bytes(source_token);
+      if (source_token == 0 || source_slab.data() != packet.data() || packet.size() > source_slab.size()) {
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+        return false;
+      }
+      if (origin == VideoSourceOrigin::flexfec &&
+          (recovered_marker == nullptr ||
+           recovered_marker->source_ssrc() != video_configuration_.primary_ssrc ||
+           recovered_marker->generation() != video_configuration_.video_generation ||
+           recovered_marker->payload_type() != video_configuration_.primary_payload_type)) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
+        return false;
+      }
+      if (origin != VideoSourceOrigin::flexfec && recovered_marker != nullptr) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
         return false;
       }
       const auto key = lumen::lsp::media::frame_key{
@@ -4074,10 +5828,10 @@ namespace umbra::lsp {
         realtime_failure_status_ = CLSP_STATUS_INVALID_STATE;
         return false;
       }
-      lumen::lsp::packet_slab<maximum_depacketized_video_bytes> chunk;
-      const auto payload_type =
-        video_configuration_.codec == 1U ? static_cast<std::uint8_t>(parsed->payload[0] & 0x1fU) : static_cast<std::uint8_t>((parsed->payload[0] >> 1U) & 0x3fU);
-      if (video_configuration_.codec == 1U &&
+      const auto payload_type = video_configuration_.codec == CLSP_VIDEO_CODEC_H264 ?
+                                  static_cast<std::uint8_t>(parsed->payload[0] & 0x1fU) :
+                                  static_cast<std::uint8_t>((parsed->payload[0] >> 1U) & 0x3fU);
+      if (video_configuration_.codec == CLSP_VIDEO_CODEC_H264 &&
           payload_type == lumen::lsp::media::h264_fu_a_type) {
         if ((parsed->extensions.starts_frame &&
              (parsed->payload.size() < 2U ||
@@ -4093,7 +5847,7 @@ namespace umbra::lsp {
           return false;
         }
       }
-      if (video_configuration_.codec == 2U &&
+      if (video_configuration_.codec == CLSP_VIDEO_CODEC_HEVC &&
           payload_type == lumen::lsp::media::hevc_fu_type) {
         if ((parsed->extensions.starts_frame &&
              (parsed->payload.size() < 3U ||
@@ -4109,8 +5863,19 @@ namespace umbra::lsp {
           return false;
         }
       }
-      const auto depacketized = video_configuration_.codec == 1U ? depacketize_h264(parsed->payload, chunk) : depacketize_hevc(parsed->payload, chunk);
-      if (!depacketized) {
+      auto valid_payload = false;
+      if (video_configuration_.codec == CLSP_VIDEO_CODEC_H264) {
+        valid_payload = valid_h264_payload(parsed->payload);
+      } else if (video_configuration_.codec == CLSP_VIDEO_CODEC_HEVC) {
+        valid_payload = valid_hevc_payload(parsed->payload);
+      } else {
+        const auto aggregation = lumen::lsp::media::parse_av1_aggregation_header(parsed->payload);
+        valid_payload = aggregation &&
+                        (!parsed->extensions.starts_frame ||
+                         !aggregation.header.continuation_from_previous) &&
+                        (!parsed->extensions.ends_frame || !aggregation.header.continues_in_next);
+      }
+      if (!valid_payload) {
         retire_video_frame(
           key,
           VideoRetirementReason::malformed,
@@ -4136,7 +5901,7 @@ namespace umbra::lsp {
       }
       auto *metadata = video_metadata_for(key, now);
       if (metadata == nullptr ||
-          !merge_video_metadata(*metadata, parsed->extensions)) {
+          !merge_video_metadata(*metadata, parsed->extensions, parsed->header.sequence_number)) {
         if (metadata != nullptr) {
           retire_video_frame(
             key,
@@ -4148,9 +5913,18 @@ namespace umbra::lsp {
         erase_video_metadata(key);
         return false;
       }
+      const auto source_admission = admit_video_source_sequence(*parsed, *metadata, now);
+      if (source_admission != VideoSourceAdmission::accepted) {
+        return source_admission == VideoSourceAdmission::duplicate;
+      }
       const auto current_frame_expired = retired_before_validation.has_value() || metadata->deadline_microseconds <= now;
       if (epoch == VideoEpochDisposition::advance &&
-          !advance_video_epoch(key, parsed->extensions, current_frame_expired)) {
+          !advance_video_epoch(
+            key,
+            parsed->extensions,
+            parsed->header.sequence_number,
+            current_frame_expired
+          )) {
         erase_video_metadata(key);
         realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
         return false;
@@ -4164,7 +5938,9 @@ namespace umbra::lsp {
             metadata->recovery_epoch
           );
           erase_video_metadata(key);
-          (void)video_reassembler_->expire(now);
+          (void)video_reassembler_->expire(now, [this](const std::uint64_t token) noexcept {
+            (void)video_receive_pool_.release(token);
+          });
         } else {
           expire_video_frames(now);
         }
@@ -4174,6 +5950,10 @@ namespace umbra::lsp {
       if (video_frame_retired(key)) {
         return true;
       }
+      if (!retain_authenticated_video_source(packet, *parsed, *metadata, source_token)) {
+        realtime_failure_status_ = CLSP_STATUS_INTERNAL_FAILURE;
+        return false;
+      }
       const auto result = video_reassembler_->add(
         {
           .key = key,
@@ -4181,12 +5961,19 @@ namespace umbra::lsp {
           .extended_sequence =
             extend_video_sequence(parsed->header.sequence_number),
           .deadline_us = metadata->deadline_microseconds,
+          .slice_token = source_token,
           .starts_frame = parsed->extensions.starts_frame,
           .ends_frame = parsed->extensions.ends_frame,
           .marker = parsed->header.marker,
-          .payload = chunk.bytes(),
+          .payload = parsed->payload,
         },
-        now
+        now,
+        [this](const std::uint64_t token) noexcept {
+          return video_receive_pool_.retain(token);
+        },
+        [this](const std::uint64_t token) noexcept {
+          (void)video_receive_pool_.release(token);
+        }
       );
       if (result.evicted) {
         const auto *evicted = find_video_metadata(*result.evicted);
@@ -4228,21 +6015,22 @@ namespace umbra::lsp {
       const auto completed = result.frame;
       if (!completed || completed.frame_id == 0 ||
           completed.frame_id != metadata->frame_id || metadata->recovery_epoch == 0 ||
-          !metadata->has_independent_marking || completed.total_size == 0 ||
-          completed.total_size > video_configuration_.maximum_access_unit_bytes) {
-        (void) video_reassembler_->release(completed);
+          !metadata->has_independent_marking || !metadata->has_start_sequence ||
+          completed.total_size == 0 ||
+          completed.total_size > lumen::lsp::media::absolute_frame_size_limit) {
+        (void)video_reassembler_->release(completed, [this](const std::uint64_t token) noexcept {
+          (void)video_receive_pool_.release(token);
+        });
         retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
         return false;
       }
-      pthread_mutex_lock(&mutex_);
-      video_largest_complete_frame_id_ =
-        std::max(video_largest_complete_frame_id_, completed.frame_id);
-      pthread_mutex_unlock(&mutex_);
-      auto *buffer =
-        acquire_retained_frame_buffer(video_frame_pool_, completed.total_size);
+      const auto buffer_size = static_cast<std::size_t>(video_configuration_.maximum_access_unit_bytes);
+      auto *buffer = acquire_retained_frame_buffer(video_frame_pool_, buffer_size);
       if (buffer == nullptr) {
-        (void) video_reassembler_->release(completed);
+        (void)video_reassembler_->release(completed, [this](const std::uint64_t token) noexcept {
+          (void)video_receive_pool_.release(token);
+        });
         coalesce_video_status(
           lumen::lsp::transport::lspv_decoder_status::surface_exhausted,
           lumen::lsp::transport::lspv_event::capacity_transition,
@@ -4254,25 +6042,66 @@ namespace umbra::lsp {
       }
       auto destination = mutable_retained_frame_bytes(buffer);
       std::size_t offset = 0;
-      for (const auto source : completed.slices) {
-        if (source.size() > destination.size() - offset) {
-          (void) video_reassembler_->release(completed);
+      if (video_configuration_.codec == CLSP_VIDEO_CODEC_AV1) {
+        lumen::lsp::media::av1_depacketizer depacketizer {destination};
+        lumen::lsp::media::av1_depacketization_result state;
+        for (std::size_t index = 0; index < completed.slices.size(); ++index) {
+          state = depacketizer.push_packet(
+            static_cast<std::uint16_t>(metadata->start_sequence_number + index),
+            parsed->header.timestamp,
+            index + 1U == completed.slices.size(),
+            completed.slices[index].bytes
+          );
+          if (!state || !state.packet_consumed) {
+            break;
+          }
+        }
+        if (!state || !state.packet_consumed || !state.temporal_unit_complete ||
+            !depacketizer.complete() || depacketizer.fragment_pending() || depacketizer.bytes().empty() ||
+            !resize_retained_frame_buffer(buffer, depacketizer.bytes().size())) {
+          (void)video_reassembler_->release(completed, [this](const std::uint64_t token) noexcept {
+            (void)video_receive_pool_.release(token);
+          });
           clsp_buffer_release(buffer);
           retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
           erase_video_metadata(key);
           return false;
         }
-        std::copy(source.begin(), source.end(), destination.begin() + static_cast<std::ptrdiff_t>(offset));
-        offset += source.size();
+        offset = depacketizer.bytes().size();
+      } else {
+        for (const auto source : completed.slices) {
+          lumen::lsp::packet_slab<maximum_depacketized_video_bytes> chunk;
+          const auto depacketized = video_configuration_.codec == CLSP_VIDEO_CODEC_H264 ?
+                                      depacketize_h264(source.bytes, chunk) :
+                                      depacketize_hevc(source.bytes, chunk);
+          if (!depacketized || chunk.size() > destination.size() - offset) {
+            (void)video_reassembler_->release(completed, [this](const std::uint64_t token) noexcept {
+              (void)video_receive_pool_.release(token);
+            });
+            clsp_buffer_release(buffer);
+            retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
+            erase_video_metadata(key);
+            return false;
+          }
+          std::copy(chunk.bytes().begin(), chunk.bytes().end(), destination.begin() + static_cast<std::ptrdiff_t>(offset));
+          offset += chunk.size();
+        }
+        if (offset == 0 || !resize_retained_frame_buffer(buffer, offset)) {
+          (void)video_reassembler_->release(completed, [this](const std::uint64_t token) noexcept {
+            (void)video_receive_pool_.release(token);
+          });
+          clsp_buffer_release(buffer);
+          retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
+          erase_video_metadata(key);
+          return false;
+        }
       }
-      if (offset != destination.size()) {
-        (void) video_reassembler_->release(completed);
-        clsp_buffer_release(buffer);
-        retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
-        erase_video_metadata(key);
-        return false;
-      }
-      if (!video_reassembler_->release(completed)) {
+      pthread_mutex_lock(&mutex_);
+      video_largest_complete_frame_id_ = std::max(video_largest_complete_frame_id_, completed.frame_id);
+      pthread_mutex_unlock(&mutex_);
+      if (!video_reassembler_->release(completed, [this](const std::uint64_t token) noexcept {
+            (void)video_receive_pool_.release(token);
+          })) {
         clsp_buffer_release(buffer);
         retire_video_frame(key, VideoRetirementReason::malformed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
@@ -4336,12 +6165,259 @@ namespace umbra::lsp {
         .recovery_epoch = metadata->recovery_epoch,
         .independent = static_cast<std::uint8_t>(metadata->independent),
         .codec = video_configuration_.codec,
+        .payload_format = video_configuration_.payload_format,
         .reserved_zero = 0,
-        .frame = buffer,
+        .encoded_access_unit = buffer,
       };
       retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
       erase_video_metadata(key);
       pending_video_deliveries_[pending_video_delivery_count_++] = event;
+      return true;
+    }
+
+    /** @brief Attempt one RFC 8627 decode from authenticated fixed-pool inputs. */
+    [[nodiscard]] FlexFecAttempt attempt_flexfec_repair(
+      const std::span<const std::uint8_t> packet,
+      const std::uint64_t now
+    ) noexcept {
+      const auto parsed = lumen::lsp::transport::parse_flexfec_repair(packet);
+      if (!parsed || parsed.repair.primary_ssrc != video_configuration_.primary_ssrc ||
+          parsed.repair.repair_ssrc != video_configuration_.flexfec_ssrc ||
+          parsed.repair.repair_payload_type != video_configuration_.flexfec_payload_type ||
+          std::popcount(parsed.repair.source_mask) > video_configuration_.flexfec_maximum_group_packets ||
+          std::bit_width(parsed.repair.source_mask) > video_configuration_.flexfec_maximum_group_packets) {
+        return FlexFecAttempt::invalid;
+      }
+      std::array<std::span<const std::uint8_t>, lumen::lsp::transport::maximum_flexfec_group_packets> sources {};
+      std::size_t source_count = 0;
+      std::optional<std::uint16_t> missing;
+      std::uint64_t frame_deadline = 0;
+      std::uint32_t frame_timestamp = 0;
+      for (std::size_t offset = 0; offset < lumen::lsp::transport::maximum_flexfec_group_packets; ++offset) {
+        if ((parsed.repair.source_mask & (std::uint64_t {1} << offset)) == 0) {
+          continue;
+        }
+        const auto sequence = static_cast<std::uint16_t>(parsed.repair.base_sequence_number + offset);
+        const auto *source = authenticated_video_source(sequence);
+        if (source == nullptr) {
+          if (missing) {
+            return FlexFecAttempt::waiting;
+          }
+          missing = sequence;
+          continue;
+        }
+        if (frame_timestamp != 0 && source->rtp_timestamp != frame_timestamp) {
+          return FlexFecAttempt::invalid;
+        }
+        frame_timestamp = source->rtp_timestamp;
+        frame_deadline = frame_deadline == 0 ?
+                           source->frame_deadline_microseconds :
+                           std::min(frame_deadline, source->frame_deadline_microseconds);
+        const auto source_bytes = authenticated_video_source_bytes(*source);
+        if (source_bytes.empty()) {
+          return FlexFecAttempt::invalid;
+        }
+        sources[source_count++] = source_bytes;
+      }
+      if (!missing) {
+        return FlexFecAttempt::redundant;
+      }
+      VideoReceiveLease recovered_lease;
+      if (!recovered_lease.acquire(video_receive_pool_)) {
+        return FlexFecAttempt::waiting;
+      }
+      const auto recovered = lumen::lsp::transport::recover_flexfec_source(
+        parsed.repair,
+        *missing,
+        std::span<const std::span<const std::uint8_t>> {sources}.first(source_count),
+        recovered_lease.bytes()
+      );
+      if (!recovered) {
+        return FlexFecAttempt::invalid;
+      }
+      const auto recovered_packet = std::span<const std::uint8_t> {recovered_lease.bytes()}.first(recovered.bytes_written);
+      const auto recovered_rtp = parse_video_packet(recovered_packet, video_configuration_);
+      if (!recovered_rtp || (frame_timestamp != 0 && recovered_rtp->header.timestamp != frame_timestamp)) {
+        return FlexFecAttempt::invalid;
+      }
+      if (frame_deadline == 0) {
+        frame_deadline = saturating_add(now, video_configuration_.maximum_frame_age_microseconds);
+      }
+      const auto authorization = lumen::lsp::transport::recovered_packet_admission::authorize({
+        .repair_authenticated_and_decrypted = true,
+        .all_contributing_sources_authenticated_and_decrypted = true,
+        .expected_source_ssrc = video_configuration_.primary_ssrc,
+        .recovered_source_ssrc = recovered_rtp->header.ssrc,
+        .expected_generation = video_configuration_.video_generation,
+        .recovered_generation = video_configuration_.video_generation,
+        .expected_payload_type = video_configuration_.primary_payload_type,
+        .recovered_payload_type = recovered_rtp->header.payload_type,
+        .recovered_packet_bytes = recovered.bytes_written,
+        .maximum_packet_bytes = current_udp_payload_size_.load(std::memory_order_acquire),
+        .now_microseconds = now,
+        .frame_deadline_microseconds = frame_deadline,
+      });
+      if (!authorization) {
+        return authorization.error == lumen::lsp::transport::recovered_packet_error::expired ?
+                 FlexFecAttempt::redundant :
+                 FlexFecAttempt::invalid;
+      }
+      if (!handle_authenticated_video(
+            recovered_packet,
+            now,
+            VideoSourceOrigin::flexfec,
+            &*authorization.marker,
+            recovered_lease.token()
+          )) {
+        return FlexFecAttempt::invalid;
+      }
+      return FlexFecAttempt::recovered;
+    }
+
+    /** @brief Revisit retained authenticated repairs after one source admission. */
+    [[nodiscard]] bool attempt_pending_flexfec_repairs(const std::uint64_t now) noexcept {
+      for (auto &repair : pending_flexfec_repairs_) {
+        if (!repair.occupied) {
+          continue;
+        }
+        if (now >= repair.expires_microseconds) {
+          (void)video_receive_pool_.release(repair.slab_token);
+          repair = {};
+          continue;
+        }
+        if (!bind_pending_flexfec_repair(repair)) {
+          (void)video_receive_pool_.release(repair.slab_token);
+          repair = {};
+          record_authenticated_malformed_repair(now);
+          return false;
+        }
+        const auto repair_bytes = pending_flexfec_repair_bytes(repair);
+        if (repair_bytes.empty()) {
+          (void)video_receive_pool_.release(repair.slab_token);
+          repair = {};
+          record_local_video_pressure();
+          return false;
+        }
+        const auto attempted = attempt_flexfec_repair(repair_bytes, now);
+        if (attempted == FlexFecAttempt::waiting) {
+          continue;
+        }
+        (void)video_receive_pool_.release(repair.slab_token);
+        repair = {};
+        if (attempted == FlexFecAttempt::invalid) {
+          record_authenticated_malformed_repair(now);
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /** @brief Authenticate registry fields, decode immediately, or retain one FlexFEC repair. */
+    [[nodiscard]] bool handle_authenticated_flexfec(
+      const std::span<const std::uint8_t> packet,
+      const std::uint64_t now,
+      const std::uint64_t packet_token
+    ) noexcept {
+      if (video_configuration_.flexfec_ssrc == 0 || packet.size() > maximum_udp_payload) {
+        record_authenticated_malformed_repair(now);
+        return false;
+      }
+      const auto parsed = lumen::lsp::transport::parse_flexfec_repair(packet);
+      if (!parsed || parsed.repair.primary_ssrc != video_configuration_.primary_ssrc ||
+          parsed.repair.repair_ssrc != video_configuration_.flexfec_ssrc ||
+          parsed.repair.repair_payload_type != video_configuration_.flexfec_payload_type) {
+        record_authenticated_malformed_repair(now);
+        return false;
+      }
+      const auto attempted = attempt_flexfec_repair(packet, now);
+      if (attempted == FlexFecAttempt::recovered || attempted == FlexFecAttempt::redundant) {
+        return true;
+      }
+      if (attempted == FlexFecAttempt::invalid) {
+        record_authenticated_malformed_repair(now);
+        return false;
+      }
+      for (const auto &repair : pending_flexfec_repairs_) {
+        if (repair.occupied && repair.repair_sequence_number == parsed.repair.repair_sequence_number) {
+          return true;
+        }
+      }
+      auto *slot = std::ranges::find_if(pending_flexfec_repairs_, [](const PendingFlexFecRepair &repair) {
+        return !repair.occupied;
+      });
+      if (slot == pending_flexfec_repairs_.end()) {
+        record_local_video_pressure();
+        return false;
+      }
+      const auto slab = video_receive_pool_.bytes(packet_token);
+      if (packet_token == 0 || slab.data() != packet.data() || packet.size() > slab.size() ||
+          !video_receive_pool_.retain(packet_token)) {
+        record_local_video_pressure();
+        return false;
+      }
+      *slot = {};
+      slot->expires_microseconds = saturating_add(
+        now,
+        video_configuration_.flexfec_repair_window_microseconds
+      );
+      slot->slab_token = packet_token;
+      slot->source_mask = parsed.repair.source_mask;
+      slot->repair_timestamp = parsed.repair.repair_timestamp;
+      slot->length = packet.size();
+      slot->repair_sequence_number = parsed.repair.repair_sequence_number;
+      slot->base_sequence_number = parsed.repair.base_sequence_number;
+      slot->occupied = true;
+      if (!bind_pending_flexfec_repair(*slot)) {
+        (void)video_receive_pool_.release(slot->slab_token);
+        *slot = {};
+        record_authenticated_malformed_repair(now);
+        return false;
+      }
+      return true;
+    }
+
+    /** @brief Reconstruct and admit one authenticated RFC 4588 retransmission. */
+    [[nodiscard]] bool handle_authenticated_rtx(
+      const std::span<const std::uint8_t> packet,
+      const std::uint64_t now
+    ) noexcept {
+      if (video_configuration_.rtx_ssrc == 0) {
+        record_authenticated_malformed_repair(now);
+        return false;
+      }
+      VideoReceiveLease reconstructed_lease;
+      if (!reconstructed_lease.acquire(video_receive_pool_)) {
+        record_local_video_pressure();
+        return false;
+      }
+      const auto reconstructed = reconstruct_rtx_source(
+        packet,
+        video_configuration_.rtx_ssrc,
+        video_configuration_.rtx_payload_type,
+        video_configuration_.primary_ssrc,
+        video_configuration_.rtx_associated_payload_type,
+        reconstructed_lease.bytes()
+      );
+      if (!reconstructed || reconstructed.bytes_written > current_udp_payload_size_.load(std::memory_order_acquire)) {
+        record_authenticated_malformed_repair(now);
+        return false;
+      }
+      const auto source = std::span<const std::uint8_t> {reconstructed_lease.bytes()}.first(reconstructed.bytes_written);
+      if (!handle_authenticated_video(
+            source,
+            now,
+            VideoSourceOrigin::rtx,
+            nullptr,
+            reconstructed_lease.token()
+          )) {
+        if (realtime_failure_status_ == CLSP_STATUS_OK) {
+          record_authenticated_malformed_repair(now);
+        }
+        return false;
+      }
+      if (!attempt_pending_flexfec_repairs(now)) {
+        return false;
+      }
       return true;
     }
 
@@ -4471,7 +6547,8 @@ namespace umbra::lsp {
     [[nodiscard]] bool handle_authenticated_realtime(
       const std::span<const std::uint8_t> packet,
       const bool rtcp,
-      const std::uint64_t arrival_microseconds
+      const std::uint64_t arrival_microseconds,
+      const std::uint64_t packet_token
     ) noexcept {
       if (packet.size() < 12U || (packet[0] >> 6U) != 2U) {
         return false;
@@ -4481,9 +6558,23 @@ namespace umbra::lsp {
         if (!rtp) {
           return false;
         }
-        if (video_configured_.load(std::memory_order_acquire) &&
-            rtp.header.ssrc == video_configuration_.primary_ssrc) {
-          return handle_authenticated_video(packet, monotonic_microseconds());
+        const auto video_lane = video_lane_for_ssrc(rtp.header.ssrc);
+        const auto now = monotonic_microseconds();
+        if (video_lane == VideoRtpLane::primary) {
+          return handle_authenticated_video(
+                   packet,
+                   now,
+                   VideoSourceOrigin::primary_srtp,
+                   nullptr,
+                   packet_token
+                 ) &&
+                 attempt_pending_flexfec_repairs(now);
+        }
+        if (video_lane == VideoRtpLane::flexfec) {
+          return handle_authenticated_flexfec(packet, now, packet_token);
+        }
+        if (video_lane == VideoRtpLane::rtx) {
+          return handle_authenticated_rtx(packet, now);
         }
         if (!audio_configured_.load(std::memory_order_acquire)) return false;
         const auto audio = audio_configuration_;
@@ -4517,11 +6608,13 @@ namespace umbra::lsp {
         }
         const auto sender_ssrc =
           lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4));
-        if (video_configured_.load(std::memory_order_acquire) &&
-            sender_ssrc == video_configuration_.primary_ssrc) {
+          const auto video_lane = video_lane_for_ssrc(sender_ssrc);
+          if (video_lane != VideoRtpLane::none) {
           const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4));
           const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4));
-          video_reception_.note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
+            auto *reception = video_lane == VideoRtpLane::primary ? &video_reception_ :
+                              (video_lane == VideoRtpLane::flexfec ? &flexfec_reception_ : &rtx_reception_);
+            reception->note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
           return true;
         }
         if (!audio_configured_.load(std::memory_order_acquire) ||
@@ -4916,6 +7009,7 @@ namespace umbra::lsp {
     /** @brief Fail the worker without exposing parser/security details to the peer. */
     void fail_worker(const clsp_status_t status) noexcept {
       signal_startup(status);
+      terminal_failed_.store(true, std::memory_order_release);
       authenticated_.store(false, std::memory_order_release);
       stop_requested_.store(true, std::memory_order_release);
       publish_lifecycle(CLSP_LIFECYCLE_FAILED);
@@ -5010,6 +7104,7 @@ namespace umbra::lsp {
     std::array<std::array<ControllerSensorLatest, 2>, 16> controller_sensors_ {};  ///< Latest gyro/accel states.
     std::array<TouchLatest, 16> touch_states_ {};  ///< Latest controller touch contacts.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
+    std::atomic<bool> terminal_failed_ {false};  ///< Preserve FAILED while reclaiming a failed runtime.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::atomic<bool> audio_configured_ {false};  ///< Exact host-audio mapping admission gate.
     std::atomic<bool> video_configured_ {false};  ///< Exact primary-video mapping admission gate.
@@ -5023,19 +7118,34 @@ namespace umbra::lsp {
     clsp_audio_configuration_t audio_configuration_ {};  ///< Installed audio generation/SSRC/PT tuple.
     clsp_video_configuration_t video_configuration_ {};  ///< Immutable active video generation mapping.
     retained_frame_pool *video_frame_pool_ {};  ///< Preallocated complete-frame ABI storage.
-    std::optional<lumen::lsp::media::pooled_video_frame_reassembler> video_reassembler_ {};  ///< Allocation-free two-frame storage.
+    VideoReceivePool video_receive_pool_ {};  ///< Fixed in-place UDP/video packet slab owner.
+    std::unique_ptr<lumen::lsp::media::token_frame_slice[]> video_reassembly_slices_ {};  ///< Two fixed zero-copy descriptor tables.
+    std::optional<lumen::lsp::media::token_video_frame_reassembler> video_reassembler_ {};  ///< Token-retained two-frame storage.
     lumen::lsp::media::decoder_credit_state video_decoder_credit_;  ///< Two-to-four hardware submissions.
     lumen::lsp::transport::lspv_coalescer lspv_coalescer_;  ///< Protected 500-microsecond status coalescer.
     native_video_feedback_tracker<> video_feedback_;  ///< Sorted bounded RFC 8888 observations.
+    native_video_feedback_tracker<> flexfec_feedback_;  ///< FlexFEC-SSRC RFC 8888 observations.
+    native_video_feedback_tracker<> rtx_feedback_;  ///< RTX-SSRC RFC 8888 observations.
     native_video_feedback_tracker<> audio_feedback_;  ///< Sorted bounded audio RFC 8888 observations.
     native_rtp_reception_stats video_reception_;  ///< Cumulative primary-video RR loss/jitter/SR state.
+    native_rtp_reception_stats flexfec_reception_;  ///< FlexFEC-SSRC RR loss/jitter/SR state.
+    native_rtp_reception_stats rtx_reception_;  ///< RTX-SSRC RR loss/jitter/SR state.
     native_rtp_reception_stats audio_reception_;  ///< Cumulative host-audio RR loss/jitter/SR state.
     std::optional<lumen::lsp::transport::path_mtu_discovery> path_mtu_ {};  ///< RFC 8899 search state.
     std::array<VideoFrameMetadata, 2> video_metadata_ {};  ///< Repeated metadata for two incomplete frames.
     std::array<DeliveredVideoFrame, video_delivery_queue_capacity> delivered_video_frames_ {};  ///< Exact native-to-Swift decoder submissions.
     std::array<VideoRetiredFrame, 128> video_retired_frames_ {};  ///< Mirrors the inbound SRTP replay window.
     std::array<AuthenticatedRtpFingerprint, 128> authenticated_video_fingerprints_ {};  ///< Exact video replay identities.
+    std::array<AuthenticatedRtpFingerprint, 128> authenticated_flexfec_fingerprints_ {};  ///< Exact FlexFEC replay identities.
+    std::array<AuthenticatedRtpFingerprint, 128> authenticated_rtx_fingerprints_ {};  ///< Exact RTX replay identities.
     std::array<AuthenticatedRtpFingerprint, 128> authenticated_audio_fingerprints_ {};  ///< Exact audio replay identities.
+    std::array<AuthenticatedVideoSourcePacket, authenticated_video_source_capacity> authenticated_video_sources_ {};  ///< Fixed authenticated primary plaintext retention.
+    std::array<PendingFlexFecRepair, pending_flexfec_repair_capacity> pending_flexfec_repairs_ {};  ///< Authenticated repairs awaiting one source.
+    std::array<VideoNackRetry, maximum_video_gap_count> video_nack_retries_ {};  ///< Bounded fresh-index NACK repeats.
+    std::array<std::uint32_t, 16> reserved_ssrcs_ {};  ///< Globally unique per-association SSRC registry.
+    std::array<std::uint8_t, 16> reserved_payload_types_ {};  ///< Globally unique dynamic PT registry.
+    lumen::lsp::transport::source_replay_window video_source_replay_;  ///< Shared original/FEC/RTX-OSN admission state.
+    lumen::lsp::transport::video_gap_tracker<maximum_video_gap_count> video_gap_tracker_;  ///< Primary gap/NACK state.
     std::array<clsp_video_frame_event_t, video_delivery_queue_capacity> pending_video_deliveries_ {};  ///< Post-drain frame callbacks.
     std::array<clsp_path_probe_event_t, 4> pending_path_probe_events_ {};  ///< Retained coarse probe callbacks.
     clsp_microphone_configuration_t microphone_configuration_ {};  ///< Installed reverse microphone tuple.
@@ -5054,16 +7164,24 @@ namespace umbra::lsp {
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.
     std::size_t pending_video_delivery_count_ {};  ///< Completed frames awaiting post-drain callback.
+    std::size_t reserved_ssrc_count_ {};  ///< Populated SSRC reservations.
+    std::size_t reserved_payload_type_count_ {};  ///< Populated dynamic PT reservations.
     std::size_t pending_path_probe_event_count_ {};  ///< Populated retained path callbacks.
     PendingProtectedRtcp pending_rtcp_ {};  ///< Exact protected regular/reduced RTCP retry.
+    PendingInboundSecurityInstall pending_inbound_security_install_ {};  ///< Socket-thread provider mutation.
+    PendingProtectedNack pending_video_nack_ {};  ///< Urgent protected Generic NACK retry.
     PendingControllerAck pending_controller_ack_ {};  ///< Exact protected controller ACK retry.
     PathIntentControlFrame path_intent_control_ {};  ///< Optional nonfatal reliable probe intent.
     std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
     std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
+    std::uint64_t next_inbound_security_install_token_ {1};  ///< Next provider-install request token.
+    std::uint64_t completed_inbound_security_install_token_ {};  ///< Last provider-install completion token.
     std::uint64_t video_next_metadata_order_ {1};  ///< Oldest-frame eviction ordering.
     std::uint64_t video_next_retirement_order_ {1};  ///< Retired-key replacement ordering.
     std::uint64_t feedback_largest_extended_sequence_ {};  ///< RFC 8888 sequence expansion origin.
+    std::uint64_t flexfec_feedback_largest_extended_sequence_ {};  ///< FlexFEC RFC 8888 sequence origin.
+    std::uint64_t rtx_feedback_largest_extended_sequence_ {};  ///< RTX RFC 8888 sequence origin.
     std::uint64_t audio_feedback_largest_extended_sequence_ {};  ///< Audio CCFB sequence origin.
     std::uint64_t next_path_probe_id_ {1};  ///< Per-association logical probe ID sequence.
     std::uint64_t path_probe_notification_microseconds_ {};  ///< Swift intent callback origin.
@@ -5086,11 +7204,13 @@ namespace umbra::lsp {
     std::uint64_t video_largest_metal_frame_id_ {};  ///< LSPV Metal-commit watermark.
     std::uint64_t video_recovery_evidence_watermark_ {};  ///< Decoded watermark that must advance to clear repeated recovery evidence.
     std::uint64_t last_recovery_lspv_microseconds_ {};  ///< Last submitted recovery-relevant LSPV.
+    std::uint64_t authenticated_repair_abuse_window_start_ {};  ///< Rolling repair-abuse window origin.
     std::uint32_t video_current_recovery_epoch_ {};  ///< Dynamic epoch seeded by VIDEO_CONFIG and advanced by authenticated media.
     std::uint8_t video_render_mailbox_occupancy_ {};  ///< Current Swift render mailbox occupancy.
     std::uint16_t last_acknowledged_probe_size_ {};  ///< Idempotent confirmed payload size.
     std::uint16_t last_received_probe_size_ {};  ///< Idempotent received payload size.
     std::uint16_t path_intent_probe_size_ {};  ///< Candidate paired with ACK-gated intent.
+    std::uint16_t authenticated_repair_abuse_count_ {};  ///< Malformed/resource repair events in the current window.
     std::array<std::uint8_t, 36> compound_cname_ {};  ///< Privacy-safe random per-session CNAME.
     std::size_t compound_cname_length_ {};  ///< Populated CNAME byte count.
     InboundPathProbeIntent inbound_path_probe_intent_ {};  ///< Host intent awaiting LSPP.
@@ -5120,6 +7240,8 @@ namespace umbra::lsp {
     bool video_sequence_initialized_ {};  ///< Whether extended sequence state has an origin.
     bool video_timestamp_initialized_ {};  ///< Whether extended timestamp state has an origin.
     bool feedback_sequence_initialized_ {};  ///< Whether CCFB sequence expansion has an origin.
+    bool flexfec_feedback_sequence_initialized_ {};  ///< Whether FlexFEC CCFB expansion has an origin.
+    bool rtx_feedback_sequence_initialized_ {};  ///< Whether RTX CCFB expansion has an origin.
     bool audio_feedback_sequence_initialized_ {};  ///< Whether audio CCFB expansion has an origin.
     bool video_deadline_miss_latched_ {};  ///< Deadline miss retained until LSPV consumption.
     bool video_recovery_feedback_pending_ {};  ///< Recovery evidence must repeat until a later ready decode or epoch.

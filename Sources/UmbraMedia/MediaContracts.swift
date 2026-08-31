@@ -10,13 +10,34 @@ public struct VideoStreamFormat: Sendable, Equatable {
     public let height: Int
     public let redrawRate: Int
     public let flags: Int32
+    public let colorRange: VideoColorRange
+    public let requiresExactDecodedFormat: Bool
+    public let colorPrimariesCode: UInt8?
+    public let transferCharacteristicsCode: UInt8?
+    public let matrixCoefficientsCode: UInt8?
 
-    public init(codecMask: Int32, width: Int, height: Int, redrawRate: Int, flags: Int32 = 0) {
+    public init(
+        codecMask: Int32,
+        width: Int,
+        height: Int,
+        redrawRate: Int,
+        flags: Int32 = 0,
+        colorRange: VideoColorRange = .full,
+        requiresExactDecodedFormat: Bool = false,
+        colorPrimariesCode: UInt8? = nil,
+        transferCharacteristicsCode: UInt8? = nil,
+        matrixCoefficientsCode: UInt8? = nil
+    ) {
         self.codecMask = codecMask
         self.width = width
         self.height = height
         self.redrawRate = redrawRate
         self.flags = flags
+        self.colorRange = colorRange
+        self.requiresExactDecodedFormat = requiresExactDecodedFormat
+        self.colorPrimariesCode = colorPrimariesCode
+        self.transferCharacteristicsCode = transferCharacteristicsCode
+        self.matrixCoefficientsCode = matrixCoefficientsCode
     }
 }
 
@@ -776,6 +797,7 @@ public protocol MetalVideoRendering: AnyObject, Sendable {
     /// This is a software presentation proxy, not physical scanout evidence.
     func installFirstPresentationProxyHandler(_ handler: @escaping @Sendable (Int) -> Void)
     func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void)
+    func installFrameDropHandler(_ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void)
     func setMailboxDropNewest(_ enabled: Bool)
     func installTelemetryProfile(_ profile: StreamingTelemetryProfile)
     func installTelemetryClient(_ client: StreamingTelemetryClient)
@@ -787,6 +809,7 @@ public extension MetalVideoRendering {
     }
 
     func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) { _ = handler }
+    func installFrameDropHandler(_ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void) { _ = handler }
     func setMailboxDropNewest(_ enabled: Bool) { _ = enabled }
 
     func installTelemetryProfile(_ profile: StreamingTelemetryProfile) {
@@ -796,6 +819,13 @@ public extension MetalVideoRendering {
     func installTelemetryClient(_ client: StreamingTelemetryClient) {
         _ = client
     }
+}
+
+/// Renderer disposition for a decoded frame that will not reach Metal commit.
+public enum MetalFrameDropReason: Sendable, Equatable {
+    case mailboxEviction
+    case rendererUnavailable
+    case mailboxRejectedNewest
 }
 
 public struct OpusStreamFormat: Sendable, Equatable {

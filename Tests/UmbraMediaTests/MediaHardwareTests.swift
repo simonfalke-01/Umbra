@@ -520,6 +520,42 @@ final class MediaHardwareTests: XCTestCase {
         XCTAssertFalse(snapshot.committedFrames.contains(1))
     }
 
+    func testDepthOneMailboxEvictsStaleQueuedFrameAndReportsItsIdentity() async throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let layer = CAMetalLayer()
+        layer.drawableSize = CGSize(width: 64, height: 64)
+        let renderer = try MetalVideoRenderer(
+            layer: layer,
+            device: device,
+            configuration: MetalDisplayConfiguration(verticalSyncEnabled: false),
+            maximumQueuedFrames: 1
+        )
+        let enteredDrawableBarrier = DispatchSemaphore(value: 0)
+        let releaseDrawableBarrier = DispatchSemaphore(value: 0)
+        let dropped = MediaHardwareLockedBox<[Int]>([])
+        renderer.installFrameDropHandler { frameNumber, reason in
+            if reason == .mailboxEviction {
+                dropped.withValue { $0.append(frameNumber) }
+            }
+        }
+        renderer.setTestingHooks(MetalRendererTestingHooks(
+            beforeDrawableAcquisition: { frameNumber in
+                guard frameNumber == 1 else { return }
+                enteredDrawableBarrier.signal()
+                releaseDrawableBarrier.wait()
+            }
+        ))
+
+        renderer.enqueue(try makeMetalFrame(frameNumber: 1, color: .rec709SDR))
+        XCTAssertEqual(enteredDrawableBarrier.wait(timeout: .now() + 1), .success)
+        renderer.enqueue(try makeMetalFrame(frameNumber: 2, color: .rec709SDR))
+        renderer.enqueue(try makeMetalFrame(frameNumber: 3, color: .rec709SDR))
+        XCTAssertEqual(dropped.value, [2])
+
+        releaseDrawableBarrier.signal()
+        await renderer.awaitPresentationQuiescence()
+    }
+
     func testImmediatePresentationRunsOnDedicatedUserInteractiveExecutor() async throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let layer = CAMetalLayer()

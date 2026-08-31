@@ -19,6 +19,13 @@ namespace umbra::lsp {
   /** @brief Exact directional DTLS-SRTP exporter bytes. */
   using DtlsSrtpExporter = std::array<std::uint8_t, dtls_srtp_exporter_size>;
 
+  /** @brief Exact negotiated inbound video SRTP stream registry. */
+  struct VideoSrtpInboundConfiguration {
+    std::uint32_t primary_ssrc {};  ///< Required primary video SSRC using encrypted extensions.
+    std::uint32_t flexfec_ssrc {};  ///< Optional FlexFEC SSRC without encrypted extensions.
+    std::uint32_t rtx_ssrc {};  ///< Optional RFC 4588 SSRC using encrypted copied extensions.
+  };
+
   /** @brief Authenticated DTLS application-record receiver. */
   using DtlsApplicationDataCallback = bool (*)(void *context, std::span<const std::uint8_t> plaintext) noexcept;
 
@@ -143,9 +150,32 @@ namespace umbra::lsp {
     /** @brief Query exact libSRTP bytes appended by outbound SRTCP protection. */
     [[nodiscard]] clsp_status_t rtcp_protect_trailer_length(std::size_t &length) const noexcept;
 
-    /** @brief Install one video-specific inbound context with RFC6904 encrypted extension IDs. */
-    [[nodiscard]] clsp_status_t configure_video_inbound(
+    /**
+     * @brief Add one exact negotiated inbound SSRC policy.
+     *
+     * @param ssrc Nonzero negotiated inbound synchronization source.
+     * @param encrypted_extension_ids Optional RFC 6904 extension IDs.
+     * @return Exact provider status.
+     */
+    [[nodiscard]] clsp_status_t configure_inbound_stream(
       std::uint32_t ssrc,
+      std::span<const int> encrypted_extension_ids = {}
+    ) noexcept;
+
+    /**
+     * @brief Install the negotiated primary, FlexFEC, and RTX inbound policies.
+     *
+     * RFC 6904 applies only to the primary stream and the RTX stream that copies
+     * primary RTP header extensions. The FlexFEC repair stream uses the same
+     * server-write master material and an independent replay database without
+     * encrypted-extension processing.
+     *
+     * @param configuration Exact noncolliding negotiated video SSRC registry.
+     * @param encrypted_extension_ids RFC 6904 extension IDs for primary and RTX.
+     * @return Exact provider status.
+     */
+    [[nodiscard]] clsp_status_t configure_video_inbound(
+      const VideoSrtpInboundConfiguration &configuration,
       std::span<const int> encrypted_extension_ids
     ) noexcept;
 

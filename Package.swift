@@ -295,7 +295,7 @@ let package = Package(
         ),
         .testTarget(
             name: "UmbraLSPTests",
-            dependencies: ["UmbraCore", "UmbraNetworking", "UmbraLSP", "UmbraLSPTransport"],
+            dependencies: ["UmbraCore", "UmbraNetworking", "UmbraLSP", "UmbraLSPTransport", "UmbraMedia"],
             path: "Tests/UmbraLSPTests"
         ),
         .testTarget(

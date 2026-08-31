@@ -1,5 +1,7 @@
 import Foundation
+import UmbraCore
 import UmbraLSPTransport
+import UmbraMedia
 
 /// Exact LSP/1 control-message registry implemented by Lumen and Umbra.
 public enum LSPControlMessageType: UInt16, Sendable {
@@ -23,6 +25,7 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case audioConfigAck = 0x0213
     case microphoneConfig = 0x0214
     case microphoneConfigAck = 0x0215
+    case streamEnded = 0x0220
     case pathProbe = 0x0300
     case pathProbeAck = 0x0301
 }
@@ -123,32 +126,286 @@ public struct LSPInputStartRequest: Equatable, Sendable {
     }
 }
 
-/// Exact hardware-only SDR video offer in START key twelve.
+/// LSP video codec identifier frozen by video schema revision three.
+public enum LSPVideoCodec: UInt8, CaseIterable, Sendable {
+    case h264 = 1
+    case hevc = 2
+    case av1 = 3
+}
+
+/// LSP codec-profile identifier frozen by video schema revision three.
+public enum LSPVideoProfile: UInt8, CaseIterable, Sendable {
+    case h264High = 1
+    case h264High444 = 2
+    case hevcMain = 3
+    case hevcMain10 = 4
+    case hevcRangeExtensions = 5
+    case av1Main = 6
+    case av1High = 7
+}
+
+/// Exact decoded pixel tuple frozen by video schema revision three.
+public enum LSPVideoPixelFormat: UInt8, CaseIterable, Sendable {
+    case yuv4208Bit = 1
+    case yuv42010Bit = 2
+    case yuv4448Bit = 3
+    case yuv44410Bit = 4
+
+    public var isTenBit: Bool {
+        self == .yuv42010Bit || self == .yuv44410Bit
+    }
+
+    public var isYUV444: Bool {
+        self == .yuv4448Bit || self == .yuv44410Bit
+    }
+}
+
+/// Coarse encoded-access-unit delivery boundary selected by LSP control.
+public enum LSPVideoDelivery: UInt8, Sendable {
+    case completeAccessUnit = 1
+    case boundedIncremental = 2
+}
+
+/// H.273 color tuple carried directly on the LSP wire.
+public struct LSPVideoColorDescription: Equatable, Sendable {
+    public var colorPrimaries: UInt8
+    public var transferCharacteristics: UInt8
+    public var matrixCoefficients: UInt8
+    public var fullRange: Bool
+
+    public static let rec709SDR = Self(
+        colorPrimaries: 1,
+        transferCharacteristics: 1,
+        matrixCoefficients: 1,
+        fullRange: false
+    )
+    public static let rec2020PQ = Self(
+        colorPrimaries: 9,
+        transferCharacteristics: 16,
+        matrixCoefficients: 9,
+        fullRange: false
+    )
+    public static let rec2020HLG = Self(
+        colorPrimaries: 9,
+        transferCharacteristics: 18,
+        matrixCoefficients: 9,
+        fullRange: false
+    )
+
+    public var isSupported: Bool {
+        if colorPrimaries == 1, transferCharacteristics == 1, matrixCoefficients == 1 {
+            return true
+        }
+        return !fullRange && colorPrimaries == 9 && matrixCoefficients == 9 &&
+            (transferCharacteristics == 16 || transferCharacteristics == 18)
+    }
+
+    public var isHDR: Bool {
+        transferCharacteristics == 16 || transferCharacteristics == 18
+    }
+}
+
+/// Exact hardware-derived video offer in START key twelve.
 public struct LSPVideoOffer: Equatable, Sendable {
-    public var codec: UInt8
-    public var profile: UInt8
+    public var codec: LSPVideoCodec
+    public var profile: LSPVideoProfile
     public var width: UInt32
     public var height: UInt32
     public var refreshNumerator: UInt32
     public var refreshDenominator: UInt32
     public var preferredBitsPerSecond: UInt64
     public var maximumBitsPerSecond: UInt64
+    public var pixelFormat: LSPVideoPixelFormat
+    public var color: LSPVideoColorDescription
+    public var delivery: LSPVideoDelivery
+    public var supportsFlexFEC: Bool
+    public var supportsRTX: Bool
+    public var maximumAccessUnitBytes: UInt32
 
     public init(
-        codec: UInt8, profile: UInt8, width: UInt32, height: UInt32,
+        codec: LSPVideoCodec, profile: LSPVideoProfile, width: UInt32, height: UInt32,
         refreshNumerator: UInt32, refreshDenominator: UInt32,
-        preferredBitsPerSecond: UInt64, maximumBitsPerSecond: UInt64
+        preferredBitsPerSecond: UInt64, maximumBitsPerSecond: UInt64,
+        pixelFormat: LSPVideoPixelFormat = .yuv4208Bit,
+        color: LSPVideoColorDescription = .rec709SDR,
+        delivery: LSPVideoDelivery = .completeAccessUnit,
+        supportsFlexFEC: Bool = true,
+        supportsRTX: Bool = true,
+        maximumAccessUnitBytes: UInt32 = 16 * 1_024 * 1_024
     ) {
         self.codec = codec; self.profile = profile; self.width = width; self.height = height
         self.refreshNumerator = refreshNumerator; self.refreshDenominator = refreshDenominator
         self.preferredBitsPerSecond = preferredBitsPerSecond
         self.maximumBitsPerSecond = maximumBitsPerSecond
+        self.pixelFormat = pixelFormat
+        self.color = color
+        self.delivery = delivery
+        self.supportsFlexFEC = supportsFlexFEC
+        self.supportsRTX = supportsRTX
+        self.maximumAccessUnitBytes = maximumAccessUnitBytes
     }
 }
 
-/// Exact selected 28-key SDR video tuple.
+public extension LSPVideoOffer {
+    /// Builds only exact tuples proven by VideoToolbox and the selected product policy.
+    static func hardwareOffers(
+        capabilities: AppleStreamingCapabilities,
+        width: UInt32,
+        height: UInt32,
+        refreshNumerator: UInt32,
+        refreshDenominator: UInt32,
+        preferredBitsPerSecond: UInt64,
+        maximumBitsPerSecond: UInt64,
+        codecPreference: VideoCodecPreference,
+        enableHDR: Bool,
+        hdrTransferPreference: HDRTransferPreference,
+        enableYUV444: Bool,
+        maximumAccessUnitBytes: UInt32 = 16 * 1_024 * 1_024
+    ) -> [Self] {
+        guard capabilities.hasMetalDevice,
+              width > 0, height > 0,
+              refreshNumerator > 0, refreshDenominator > 0,
+              preferredBitsPerSecond >= 1_000,
+              preferredBitsPerSecond <= maximumBitsPerSecond,
+              maximumBitsPerSecond <= 1_000_000_000,
+              maximumAccessUnitBytes > 0,
+              maximumAccessUnitBytes <= 16 * 1_024 * 1_024
+        else { return [] }
+
+        let priority: [VideoCodec] = switch codecPreference {
+        case .automatic: [.hevc, .h264, .av1]
+        case .h264: [.h264]
+        case .hevc, .hevcHDRDeprecated: [.hevc, .h264]
+        case .av1: [.av1, .hevc, .h264]
+        }
+        let formatOrder = priority.flatMap { codec in
+            capabilities.supportedHardwareVideoFormats
+                .filter { Self.codec(for: $0) == codec }
+                .sorted { left, right in
+                    let leftRank = Self.formatRank(
+                        left,
+                        wantsYUV444: enableYUV444,
+                        wantsTenBit: enableHDR
+                    )
+                    let rightRank = Self.formatRank(
+                        right,
+                        wantsYUV444: enableYUV444,
+                        wantsTenBit: enableHDR
+                    )
+                    return leftRank < rightRank
+                }
+        }
+
+        var offers: [Self] = []
+        for format in formatOrder where format.isYUV444 == enableYUV444 {
+            guard let tuple = Self.lspTuple(for: format) else { continue }
+            let colors: [LSPVideoColorDescription]
+            if enableHDR {
+                guard tuple.pixel.isTenBit else { continue }
+                colors = switch hdrTransferPreference {
+                case .automatic: [.rec2020PQ, .rec2020HLG]
+                case .pq: [.rec2020PQ]
+                case .hlg: [.rec2020HLG]
+                }
+            } else {
+                colors = [.rec709SDR]
+            }
+            for color in colors {
+                offers.append(.init(
+                    codec: tuple.codec,
+                    profile: tuple.profile,
+                    width: width,
+                    height: height,
+                    refreshNumerator: refreshNumerator,
+                    refreshDenominator: refreshDenominator,
+                    preferredBitsPerSecond: preferredBitsPerSecond,
+                    maximumBitsPerSecond: maximumBitsPerSecond,
+                    pixelFormat: tuple.pixel,
+                    color: color,
+                    supportsFlexFEC: true,
+                    supportsRTX: true,
+                    maximumAccessUnitBytes: maximumAccessUnitBytes
+                ))
+            }
+        }
+        return Array(offers.prefix(8))
+    }
+
+    private static func codec(for format: MoonlightVideoFormat) -> VideoCodec {
+        switch format {
+        case .h264, .h264High8YUV444: .h264
+        case .hevc, .hevcMain10, .hevcRext8YUV444, .hevcRext10YUV444: .hevc
+        case .av1Main8, .av1Main10, .av1High8YUV444, .av1High10YUV444: .av1
+        }
+    }
+
+    private static func formatRank(
+        _ format: MoonlightVideoFormat,
+        wantsYUV444: Bool,
+        wantsTenBit: Bool
+    ) -> Int {
+        (format.isYUV444 == wantsYUV444 ? 0 : 10) + (format.isTenBit == wantsTenBit ? 0 : 1)
+    }
+
+    private static func lspTuple(
+        for format: MoonlightVideoFormat
+    ) -> (codec: LSPVideoCodec, profile: LSPVideoProfile, pixel: LSPVideoPixelFormat)? {
+        switch format {
+        case .h264: (.h264, .h264High, .yuv4208Bit)
+        case .h264High8YUV444: (.h264, .h264High444, .yuv4448Bit)
+        case .hevc: (.hevc, .hevcMain, .yuv4208Bit)
+        case .hevcMain10: (.hevc, .hevcMain10, .yuv42010Bit)
+        case .hevcRext8YUV444: (.hevc, .hevcRangeExtensions, .yuv4448Bit)
+        case .hevcRext10YUV444: (.hevc, .hevcRangeExtensions, .yuv44410Bit)
+        case .av1Main8: (.av1, .av1Main, .yuv4208Bit)
+        case .av1Main10: (.av1, .av1Main, .yuv42010Bit)
+        case .av1High8YUV444: (.av1, .av1High, .yuv4448Bit)
+        case .av1High10YUV444: (.av1, .av1High, .yuv44410Bit)
+        }
+    }
+}
+
+/// Selected RFC 8627 single-stream FlexFEC association.
+public struct LSPVideoFlexFECSelection: Equatable, Sendable {
+    public var ssrc: UInt32
+    public var payloadType: UInt8
+    public var repairWindowMicroseconds: UInt32
+    public var maximumGroupPackets: UInt8
+}
+
+/// Selected RFC 4588 retransmission association.
+public struct LSPVideoRTXSelection: Equatable, Sendable {
+    public var ssrc: UInt32
+    public var payloadType: UInt8
+    public var associatedPayloadType: UInt8
+}
+
+/// Exact selected 30-key video tuple.
 public struct LSPVideoSelection: Equatable, Sendable {
     public var nativeConfiguration: LSPNativeVideoConfiguration
+}
+
+/// Codec-specific revision-three initialization units.
+public struct LSPVideoCodecConfiguration: Equatable, Sendable {
+    public var codec: LSPVideoCodec
+    public var units: [Data]
+}
+
+/// SMPTE ST 2086 / CTA-861 static HDR metadata carried as integer wire units.
+public struct LSPVideoHDRMetadata: Equatable, Sendable {
+    public var displayPrimaryRedX: UInt32
+    public var displayPrimaryRedY: UInt32
+    public var displayPrimaryGreenX: UInt32
+    public var displayPrimaryGreenY: UInt32
+    public var displayPrimaryBlueX: UInt32
+    public var displayPrimaryBlueY: UInt32
+    public var whitePointX: UInt32
+    public var whitePointY: UInt32
+    public var maximumDisplayLuminance: UInt32
+    public var minimumDisplayLuminance: UInt32
+    public var maximumContentLightLevel: UInt32
+    public var maximumFrameAverageLightLevel: UInt32
+    public var maximumFullFrameLuminance: UInt32
 }
 
 /// Optional mono 20-ms reverse-microphone START offer.
@@ -240,7 +497,14 @@ public struct LSPMicrophoneConfigurationRequest: Equatable, Sendable {
 public struct LSPVideoConfigurationRequest: Equatable, Sendable {
     public var sessionID: UUID
     public var nativeConfiguration: LSPNativeVideoConfiguration
-    public var parameterSets: [Data]
+    public var codecConfiguration: LSPVideoCodecConfiguration
+    public var hdrMetadata: LSPVideoHDRMetadata?
+}
+
+/// Authenticated host notification that one exact LSP stream has ended.
+public struct LSPStreamEnded: Equatable, Sendable {
+    public var sessionID: UUID
+    public var reason: UInt8
 }
 
 /// Exact authenticated PATH_PROBE intent or acknowledgement fields.
@@ -251,7 +515,7 @@ public struct LSPPathProbeIntent: Equatable, Sendable {
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
 public enum LSPControlWire {
-    private static let videoSchemaVersion: UInt64 = 2
+    private static let videoSchemaVersion: UInt64 = 3
 
     public static func clientHello(clientNonce: Data) throws -> Data {
         try fixed(clientNonce, count: 32)
@@ -406,7 +670,7 @@ public enum LSPControlWire {
               (1...8).contains(request.videoOffers.count),
               (1...64).contains(request.receiveBatchCapacity),
               (2...4).contains(request.decoderSurfaces),
-              request.maximumCaptureToPresentMicroseconds > 0
+              (1...1_000_000).contains(request.maximumCaptureToPresentMicroseconds)
         else {
             throw DeterministicCBORError.malformed
         }
@@ -440,26 +704,36 @@ public enum LSPControlWire {
             microphone = .null
         }
         let videoOffers = try request.videoOffers.map { offer -> DeterministicCBORValue in
-            guard ((offer.codec == 2 && offer.profile == 2) || (offer.codec == 1 && offer.profile == 1)),
-                  offer.width > 0, offer.height > 0,
+            guard videoTupleIsValid(codec: offer.codec, profile: offer.profile, pixelFormat: offer.pixelFormat),
+                  (1...16_384).contains(offer.width), (1...16_384).contains(offer.height),
                   offer.refreshNumerator > 0, offer.refreshDenominator > 0,
-                  offer.preferredBitsPerSecond > 0,
+                  offer.preferredBitsPerSecond >= 1_000,
                   offer.preferredBitsPerSecond <= offer.maximumBitsPerSecond,
-                  offer.maximumBitsPerSecond <= 1_000_000_000
+                  offer.maximumBitsPerSecond <= 1_000_000_000,
+                  offer.color.isSupported,
+                  !offer.color.isHDR || offer.pixelFormat.isTenBit,
+                  offer.delivery == .completeAccessUnit,
+                  (1...16 * 1_024 * 1_024).contains(offer.maximumAccessUnitBytes)
             else { throw DeterministicCBORError.malformed }
             return .map([
-                .init(key: 1, value: .unsigned(UInt64(offer.codec))),
-                .init(key: 2, value: .unsigned(UInt64(offer.profile))),
-                .init(key: 3, value: .unsigned(UInt64(offer.width))),
-                .init(key: 4, value: .unsigned(UInt64(offer.height))),
-                .init(key: 5, value: .unsigned(UInt64(offer.refreshNumerator))),
-                .init(key: 6, value: .unsigned(UInt64(offer.refreshDenominator))),
-                .init(key: 7, value: .unsigned(offer.preferredBitsPerSecond)),
-                .init(key: 8, value: .unsigned(offer.maximumBitsPerSecond)),
-                .init(key: 9, value: .unsigned(1)),
-                .init(key: 10, value: .unsigned(1)),
-                .init(key: 11, value: .boolean(false)),
-                .init(key: 12, value: .boolean(false)),
+                .init(key: 1, value: .unsigned(videoSchemaVersion)),
+                .init(key: 2, value: .unsigned(UInt64(offer.codec.rawValue))),
+                .init(key: 3, value: .unsigned(UInt64(offer.profile.rawValue))),
+                .init(key: 4, value: .unsigned(UInt64(offer.width))),
+                .init(key: 5, value: .unsigned(UInt64(offer.height))),
+                .init(key: 6, value: .unsigned(UInt64(offer.refreshNumerator))),
+                .init(key: 7, value: .unsigned(UInt64(offer.refreshDenominator))),
+                .init(key: 8, value: .unsigned(offer.preferredBitsPerSecond)),
+                .init(key: 9, value: .unsigned(offer.maximumBitsPerSecond)),
+                .init(key: 10, value: .unsigned(UInt64(offer.pixelFormat.rawValue))),
+                .init(key: 11, value: .unsigned(UInt64(offer.color.colorPrimaries))),
+                .init(key: 12, value: .unsigned(UInt64(offer.color.transferCharacteristics))),
+                .init(key: 13, value: .unsigned(UInt64(offer.color.matrixCoefficients))),
+                .init(key: 14, value: .boolean(offer.color.fullRange)),
+                .init(key: 15, value: .unsigned(UInt64(offer.delivery.rawValue))),
+                .init(key: 16, value: .boolean(offer.supportsFlexFEC)),
+                .init(key: 17, value: .boolean(offer.supportsRTX)),
+                .init(key: 18, value: .unsigned(UInt64(offer.maximumAccessUnitBytes))),
             ])
         }
         return try encodeMap([
@@ -511,6 +785,14 @@ public enum LSPControlWire {
         let audio = try audioConfiguration(values: values, offset: 15, streamGeneration: streamGeneration)
         let microphone = try microphoneConfiguration(value: values[29], streamGeneration: streamGeneration)
         let video = try videoSelection(value: values[30], streamGeneration: streamGeneration)
+        guard laneIdentifiersAreGloballyUnique(
+            inputSSRC: inputSSRC,
+            acknowledgementSSRC: acknowledgementSSRC,
+            inputPayloadType: UInt8(payloadType),
+            audio: audio,
+            microphone: microphone,
+            video: video.nativeConfiguration
+        ) else { throw DeterministicCBORError.malformed }
         return LSPInputStartResponse(
             sessionID: sessionID,
             attachToken: attachToken,
@@ -573,6 +855,14 @@ public enum LSPControlWire {
         let audio = try audioConfiguration(values: values, offset: 16, streamGeneration: streamGeneration)
         let microphone = try microphoneConfiguration(value: values[30], streamGeneration: streamGeneration)
         let video = try videoSelection(value: values[31], streamGeneration: streamGeneration)
+        guard laneIdentifiersAreGloballyUnique(
+            inputSSRC: inputSSRC,
+            acknowledgementSSRC: acknowledgementSSRC,
+            inputPayloadType: UInt8(payloadType),
+            audio: audio,
+            microphone: microphone,
+            video: video.nativeConfiguration
+        ) else { throw DeterministicCBORError.malformed }
         return LSPAttachResponse(
             sessionID: sessionID,
             replacementAttachToken: replacement,
@@ -598,7 +888,9 @@ public enum LSPControlWire {
 
     public static func videoConfig(from event: LSPControlEvent) throws -> LSPVideoConfigurationRequest {
         guard event.messageType == LSPControlMessageType.videoConfig.rawValue,
-              !event.flags.contains(.response), event.requestID != 0 else {
+              !event.flags.contains(.response),
+              event.flags.contains(.acknowledgementRequired),
+              event.requestID != 0 else {
             throw DeterministicCBORError.malformed
         }
         let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 8)
@@ -606,34 +898,28 @@ public enum LSPControlWire {
         let sessionID = try uuid(try bytes(values[1], count: 16))
         let streamGeneration = try uint32(values[2], nonzero: true)
         let selection = try videoSelection(value: values[3], streamGeneration: streamGeneration)
-        guard case .array(let encodedSets) = values[4], encodedSets.count == (selection.nativeConfiguration.codec == 1 ? 2 : 3) else {
-            throw DeterministicCBORError.malformed
-        }
-        let sets = try encodedSets.map { value -> Data in
-            guard case .bytes(let bytes) = value, !bytes.isEmpty, bytes.count <= 4_096 else {
-                throw DeterministicCBORError.malformed
-            }
-            return bytes
-        }
-        let validTypes: [UInt8] = if selection.nativeConfiguration.codec == 1 {
-            sets.map { $0[0] & 0x1f }
-        } else {
-            sets.map { ($0[0] >> 1) & 0x3f }
-        }
-        guard validTypes == (selection.nativeConfiguration.codec == 1 ? [7, 8] : [32, 33, 34]),
-              sets.allSatisfy({ bytes in
-                  !(bytes.count >= 3 && bytes[0] == 0 && bytes[1] == 0 &&
-                    (bytes[2] == 1 || (bytes.count >= 4 && bytes[2] == 0 && bytes[3] == 1)))
-              })
-        else { throw DeterministicCBORError.malformed }
+        let codecConfiguration = try videoCodecConfiguration(
+            value: values[4],
+            expectedCodec: selection.nativeConfiguration.codec
+        )
         var native = selection.nativeConfiguration
         native.frameIDOrigin = try uint(values[5])
         native.recoveryEpoch = try uint32(values[6], nonzero: true)
-        native.maximumAccessUnitBytes = try uint32(values[7], nonzero: true)
-        guard native.frameIDOrigin != 0, native.maximumAccessUnitBytes <= 16 * 1_024 * 1_024 else {
+        let hdrMetadata = try videoHDRMetadata(value: values[7])
+        guard native.frameIDOrigin != 0,
+              (native.transferCharacteristics == 1 && hdrMetadata == nil) ||
+              native.transferCharacteristics == 16 ||
+              (native.transferCharacteristics == 18 && hdrMetadata == nil),
+              (native.transferCharacteristics == 16) == (hdrMetadata != nil)
+        else {
             throw DeterministicCBORError.malformed
         }
-        return LSPVideoConfigurationRequest(sessionID: sessionID, nativeConfiguration: native, parameterSets: sets)
+        return LSPVideoConfigurationRequest(
+            sessionID: sessionID,
+            nativeConfiguration: native,
+            codecConfiguration: codecConfiguration,
+            hdrMetadata: hdrMetadata
+        )
     }
 
     public static func videoConfigAck(
@@ -647,6 +933,19 @@ public enum LSPControlWire {
             .unsigned(videoSchemaVersion), .unsigned(UInt64(status.rawValue)), .bytes(uuidBytes(sessionID)),
             .unsigned(UInt64(videoGeneration)), .unsigned(UInt64(decoderCredit)),
         ])
+    }
+
+    public static func streamEnded(from event: LSPControlEvent) throws -> LSPStreamEnded {
+        guard event.messageType == LSPControlMessageType.streamEnded.rawValue,
+              !event.flags.contains(.response), event.requestID == 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 3)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        return .init(
+            sessionID: try uuid(try bytes(values[1], count: 16)),
+            reason: try uint8(values[2], nonzero: false)
+        )
     }
 
     public static func pathProbe(probeID: UInt64, udpPayloadSize: UInt16) throws -> Data {
@@ -870,54 +1169,276 @@ public enum LSPControlWire {
         value: DeterministicCBORValue,
         streamGeneration: UInt32
     ) throws -> LSPVideoSelection {
-        let values = try DeterministicCBOR.exactMap(value, count: 28)
-        let generation = try uint32(values[0], nonzero: true)
-        let ssrc = try uint32(values[1], nonzero: true)
-        let payloadType = try uint32(values[2], nonzero: true)
-        let clock = try uint32(values[3], nonzero: true)
-        let codec = try uint32(values[4], nonzero: true)
-        let profile = try uint32(values[5], nonzero: true)
-        let width = try uint32(values[6], nonzero: true)
-        let height = try uint32(values[7], nonzero: true)
-        let refreshNumerator = try uint32(values[8], nonzero: true)
-        let refreshDenominator = try uint32(values[9], nonzero: true)
-        let bitrate = try uint32(values[10], nonzero: true)
-        let extensionIDs = try (20...24).map { try uint(values[$0]) }
-        guard try uint(values[11]) == 1, try uint(values[12]) == 1,
-              try uint(values[13]) == 1, try uint(values[14]) == 1,
-              case .boolean(false) = values[15], try uint(values[16]) == 1_200,
-              (2...4).contains(try uint(values[17])), try uint(values[18]) == 1,
-              try uint(values[19]) == 1,
+        let values = try DeterministicCBOR.exactMap(value, count: 30)
+        guard try uint(values[0]) == videoSchemaVersion else { throw DeterministicCBORError.malformed }
+        let generation = try uint32(values[1], nonzero: true)
+        let ssrc = try uint32(values[2], nonzero: true)
+        let payloadType = try uint8(values[3], nonzero: true)
+        let clock = try uint32(values[4], nonzero: true)
+        guard let codec = LSPVideoCodec(rawValue: try uint8(values[5], nonzero: true)),
+              let profile = LSPVideoProfile(rawValue: try uint8(values[6], nonzero: true))
+        else { throw DeterministicCBORError.malformed }
+        let width = try uint32(values[7], nonzero: true)
+        let height = try uint32(values[8], nonzero: true)
+        let refreshNumerator = try uint32(values[9], nonzero: true)
+        let refreshDenominator = try uint32(values[10], nonzero: true)
+        let bitrate = try uint32(values[11], nonzero: true)
+        guard let pixelFormat = LSPVideoPixelFormat(rawValue: try uint8(values[12], nonzero: true)) else {
+            throw DeterministicCBORError.malformed
+        }
+        let color = LSPVideoColorDescription(
+            colorPrimaries: try uint8(values[13], nonzero: true),
+            transferCharacteristics: try uint8(values[14], nonzero: true),
+            matrixCoefficients: try uint8(values[15], nonzero: true),
+            fullRange: try boolean(values[16])
+        )
+        let extensionIDs = try (21...25).map { try uint(values[$0]) }
+        let flexFEC = try flexFECSelection(value: values[26], primarySSRC: ssrc, primaryPayloadType: payloadType)
+        let rtx = try rtxSelection(value: values[27], primarySSRC: ssrc, primaryPayloadType: payloadType)
+        let delivery = try uint(values[20])
+        guard videoTupleIsValid(codec: codec, profile: profile, pixelFormat: pixelFormat),
+              color.isSupported, !color.isHDR || pixelFormat.isTenBit,
+              width <= 16_384, height <= 16_384,
+              flexFEC == nil || rtx == nil ||
+                (flexFEC?.ssrc != rtx?.ssrc && flexFEC?.payloadType != rtx?.payloadType),
+              try uint(values[17]) == 1_200,
+              (2...4).contains(try uint(values[18])), try uint(values[19]) == 1,
+              delivery == UInt64(LSPVideoDelivery.completeAccessUnit.rawValue),
               extensionIDs == [1, 2, 3, 4, 5],
-              case .boolean(false) = values[25], case .boolean(false) = values[26],
-              ((codec == 1 && profile == 1) || (codec == 2 && profile == 2)),
               (96...127).contains(payloadType), clock == 90_000
         else { throw DeterministicCBORError.malformed }
-        let maximumFrameAge = try uint32(values[27], nonzero: true)
+        let maximumFrameAge = try uint32(values[28], nonzero: true)
+        let maximumAccessUnitBytes = try uint32(values[29], nonzero: true)
+        guard bitrate >= 1_000,
+              maximumFrameAge <= 1_000_000,
+              maximumAccessUnitBytes <= 16 * 1_024 * 1_024,
+              flexFEC == nil || (flexFEC?.repairWindowMicroseconds ?? 0) <= maximumFrameAge
+        else { throw DeterministicCBORError.malformed }
         return LSPVideoSelection(nativeConfiguration: LSPNativeVideoConfiguration(
             streamGeneration: streamGeneration,
             videoGeneration: generation,
             primarySSRC: ssrc,
-            primaryPayloadType: UInt8(payloadType),
-            codec: UInt8(codec),
-            profile: UInt8(profile),
+            primaryPayloadType: payloadType,
+            codec: codec.rawValue,
+            profile: profile.rawValue,
+            pixelFormat: pixelFormat.rawValue,
+            colorPrimaries: color.colorPrimaries,
+            transferCharacteristics: color.transferCharacteristics,
+            matrixCoefficients: color.matrixCoefficients,
+            fullRange: color.fullRange,
+            delivery: UInt8(delivery),
+            payloadFormat: codec == .av1 ? LSPVideoPayloadFormat.av1LowOverheadOBU.rawValue : LSPVideoPayloadFormat.annexB.rawValue,
             width: width,
             height: height,
             refreshNumerator: refreshNumerator,
             refreshDenominator: refreshDenominator,
             bitrate: bitrate,
-            maximumAccessUnitBytes: 0,
+            maximumAccessUnitBytes: maximumAccessUnitBytes,
             maximumFrameAgeMicroseconds: maximumFrameAge,
             frameIDOrigin: 0,
             recoveryEpoch: 0,
-            decoderSurfaces: UInt8(try uint(values[17])),
+            decoderSurfaces: UInt8(try uint(values[18])),
             udpPayloadSize: 1_200,
             frameMarkingExtension: UInt8(extensionIDs[0]),
             absoluteCaptureExtension: UInt8(extensionIDs[1]),
             frameIDExtension: UInt8(extensionIDs[2]),
             inputWatermarkExtension: UInt8(extensionIDs[3]),
-            encoderTimingExtension: UInt8(extensionIDs[4])
+            encoderTimingExtension: UInt8(extensionIDs[4]),
+            flexFECSSRC: flexFEC?.ssrc ?? 0,
+            flexFECPayloadType: flexFEC?.payloadType ?? 0,
+            flexFECRepairWindowMicroseconds: flexFEC?.repairWindowMicroseconds ?? 0,
+            flexFECMaximumGroupPackets: flexFEC?.maximumGroupPackets ?? 0,
+            rtxSSRC: rtx?.ssrc ?? 0,
+            rtxPayloadType: rtx?.payloadType ?? 0,
+            rtxAssociatedPayloadType: rtx?.associatedPayloadType ?? 0
         ))
+    }
+
+    private static func videoCodecConfiguration(
+        value: DeterministicCBORValue,
+        expectedCodec: UInt8
+    ) throws -> LSPVideoCodecConfiguration {
+        let values = try DeterministicCBOR.exactMap(value, count: 2)
+        guard let codec = LSPVideoCodec(rawValue: try uint8(values[0], nonzero: true)),
+              codec.rawValue == expectedCodec,
+              case .array(let encodedUnits) = values[1]
+        else { throw DeterministicCBORError.malformed }
+        let expectedCount = switch codec {
+        case .h264: 2
+        case .hevc: 3
+        case .av1: 1
+        }
+        guard encodedUnits.count == expectedCount else { throw DeterministicCBORError.malformed }
+        let units = try encodedUnits.map { value -> Data in
+            guard case .bytes(let bytes) = value, !bytes.isEmpty, bytes.count <= 512 else {
+                throw DeterministicCBORError.malformed
+            }
+            return bytes
+        }
+        switch codec {
+        case .h264:
+            guard units.map({ $0[0] & 0x1f }) == [7, 8], units.allSatisfy(isPrefixFreeNAL) else {
+                throw DeterministicCBORError.malformed
+            }
+        case .hevc:
+            guard units.allSatisfy({ $0.count >= 2 }),
+                  units.map({ ($0[0] >> 1) & 0x3f }) == [32, 33, 34],
+                  units.allSatisfy(isPrefixFreeNAL) else {
+                throw DeterministicCBORError.malformed
+            }
+        case .av1:
+            guard isCanonicalAV1SequenceHeader(units[0]) else { throw DeterministicCBORError.malformed }
+        }
+        return .init(codec: codec, units: units)
+    }
+
+    private static func videoHDRMetadata(value: DeterministicCBORValue) throws -> LSPVideoHDRMetadata? {
+        if case .null = value { return nil }
+        let values = try DeterministicCBOR.exactMap(value, count: 13)
+        let fields = try values.map { try uint32($0, nonzero: false) }
+        let points = stride(from: 0, to: 8, by: 2).map { (fields[$0], fields[$0 + 1]) }
+        guard points.allSatisfy({ $0.0 > 0 && $0.1 > 0 && $0.0 <= 50_000 && $0.1 <= 50_000 }),
+              points[0] != points[1], points[0] != points[2], points[1] != points[2],
+              fields[8] > 0, fields[8] <= UInt16.max,
+              UInt64(fields[9]) <= UInt64(fields[8]) * 10_000,
+              fields[9] <= UInt16.max,
+              fields[10] <= UInt16.max, fields[11] <= UInt16.max,
+              (fields[10] == 0) == (fields[11] == 0),
+              fields[11] <= fields[10],
+              fields[12] <= UInt16.max,
+              fields[12] == 0 || fields[12] <= fields[8]
+        else { throw DeterministicCBORError.malformed }
+        return .init(
+            displayPrimaryRedX: fields[0], displayPrimaryRedY: fields[1],
+            displayPrimaryGreenX: fields[2], displayPrimaryGreenY: fields[3],
+            displayPrimaryBlueX: fields[4], displayPrimaryBlueY: fields[5],
+            whitePointX: fields[6], whitePointY: fields[7],
+            maximumDisplayLuminance: fields[8], minimumDisplayLuminance: fields[9],
+            maximumContentLightLevel: fields[10], maximumFrameAverageLightLevel: fields[11],
+            maximumFullFrameLuminance: fields[12]
+        )
+    }
+
+    private static func flexFECSelection(
+        value: DeterministicCBORValue,
+        primarySSRC: UInt32,
+        primaryPayloadType: UInt8
+    ) throws -> LSPVideoFlexFECSelection? {
+        if case .null = value { return nil }
+        let values = try DeterministicCBOR.exactMap(value, count: 4)
+        let result = LSPVideoFlexFECSelection(
+            ssrc: try uint32(values[0], nonzero: true),
+            payloadType: try uint8(values[1], nonzero: true),
+            repairWindowMicroseconds: try uint32(values[2], nonzero: true),
+            maximumGroupPackets: try uint8(values[3], nonzero: true)
+        )
+        guard result.ssrc != primarySSRC,
+              (96...127).contains(result.payloadType),
+              result.payloadType != primaryPayloadType,
+              result.repairWindowMicroseconds <= 1_000_000,
+              result.maximumGroupPackets == 15
+        else { throw DeterministicCBORError.malformed }
+        return result
+    }
+
+    private static func rtxSelection(
+        value: DeterministicCBORValue,
+        primarySSRC: UInt32,
+        primaryPayloadType: UInt8
+    ) throws -> LSPVideoRTXSelection? {
+        if case .null = value { return nil }
+        let values = try DeterministicCBOR.exactMap(value, count: 3)
+        let result = LSPVideoRTXSelection(
+            ssrc: try uint32(values[0], nonzero: true),
+            payloadType: try uint8(values[1], nonzero: true),
+            associatedPayloadType: try uint8(values[2], nonzero: true)
+        )
+        guard result.ssrc != primarySSRC,
+              (96...127).contains(result.payloadType),
+              result.payloadType != primaryPayloadType,
+              result.associatedPayloadType == primaryPayloadType
+        else { throw DeterministicCBORError.malformed }
+        return result
+    }
+
+    private static func videoTupleIsValid(
+        codec: LSPVideoCodec,
+        profile: LSPVideoProfile,
+        pixelFormat: LSPVideoPixelFormat
+    ) -> Bool {
+        switch (codec, profile, pixelFormat) {
+        case (.h264, .h264High, .yuv4208Bit),
+             (.h264, .h264High444, .yuv4448Bit),
+             (.hevc, .hevcMain, .yuv4208Bit),
+             (.hevc, .hevcMain10, .yuv42010Bit),
+             (.hevc, .hevcRangeExtensions, .yuv4448Bit),
+             (.hevc, .hevcRangeExtensions, .yuv44410Bit),
+             (.av1, .av1Main, .yuv4208Bit),
+             (.av1, .av1Main, .yuv42010Bit),
+             (.av1, .av1High, .yuv4448Bit),
+             (.av1, .av1High, .yuv44410Bit):
+            true
+        default:
+            false
+        }
+    }
+
+    private static func laneIdentifiersAreGloballyUnique(
+        inputSSRC: UInt32,
+        acknowledgementSSRC: UInt32,
+        inputPayloadType: UInt8,
+        audio: LSPNativeAudioConfiguration,
+        microphone: LSPNativeMicrophoneConfiguration?,
+        video: LSPNativeVideoConfiguration
+    ) -> Bool {
+        var ssrcs = [inputSSRC, acknowledgementSSRC, audio.audioSSRC, video.primarySSRC]
+        var payloadTypes = [inputPayloadType, audio.audioPayloadType, video.primaryPayloadType]
+        if let microphone {
+            ssrcs.append(microphone.microphoneSSRC)
+            payloadTypes.append(microphone.microphonePayloadType)
+        }
+        if video.flexFECSSRC != 0 {
+            ssrcs.append(video.flexFECSSRC)
+            payloadTypes.append(video.flexFECPayloadType)
+        }
+        if video.rtxSSRC != 0 {
+            ssrcs.append(video.rtxSSRC)
+            payloadTypes.append(video.rtxPayloadType)
+        }
+        return Set(ssrcs).count == ssrcs.count && Set(payloadTypes).count == payloadTypes.count
+    }
+
+    private static func isPrefixFreeNAL(_ bytes: Data) -> Bool {
+        !(bytes.count >= 3 && bytes[0] == 0 && bytes[1] == 0 &&
+          (bytes[2] == 1 || (bytes.count >= 4 && bytes[2] == 0 && bytes[3] == 1)))
+    }
+
+    private static func isCanonicalAV1SequenceHeader(_ bytes: Data) -> Bool {
+        guard bytes.count >= 3,
+              bytes[0] & 0x81 == 0,
+              (bytes[0] >> 3) & 0x0f == 1,
+              bytes[0] & 0x02 != 0
+        else { return false }
+        var value = 0
+        var shift = 0
+        var index = 1
+        var encodedLength = 0
+        if bytes[0] & 0x04 != 0 {
+            guard index < bytes.count, bytes[index] & 0x07 == 0 else { return false }
+            index += 1
+        }
+        while index < bytes.count, encodedLength < 8 {
+            let byte = bytes[index]
+            index += 1
+            encodedLength += 1
+            value |= Int(byte & 0x7f) << shift
+            if byte & 0x80 == 0 {
+                return value != 0 && value == bytes.count - index &&
+                    (encodedLength == 1 || byte & 0x7f != 0)
+            }
+            shift += 7
+        }
+        return false
     }
 
     private static func requireSuccess(_ value: DeterministicCBORValue) throws {
@@ -943,6 +1464,19 @@ public enum LSPControlWire {
             throw DeterministicCBORError.malformed
         }
         return UInt32(integer)
+    }
+
+    private static func uint8(_ value: DeterministicCBORValue, nonzero: Bool) throws -> UInt8 {
+        let integer = try uint(value)
+        guard integer <= UInt8.max, !nonzero || integer != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        return UInt8(integer)
+    }
+
+    private static func boolean(_ value: DeterministicCBORValue) throws -> Bool {
+        guard case .boolean(let decoded) = value else { throw DeterministicCBORError.malformed }
+        return decoded
     }
 
     private static func bytes(_ value: DeterministicCBORValue, count: Int) throws -> Data {

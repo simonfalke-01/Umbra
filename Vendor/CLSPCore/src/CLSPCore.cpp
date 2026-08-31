@@ -1,6 +1,6 @@
 /**
  * @file CLSPCore.cpp
- * @brief Fail-closed implementation of the version-one Umbra LSP C ABI.
+ * @brief Fail-closed implementation of Umbra's versioned LSP C ABI.
  */
 
 #include "CLSPCore.h"
@@ -10,12 +10,14 @@
 #include "runtime/Runtime.h"
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 
 extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
   clsp_apple_input_capture_t *capture,
@@ -34,7 +36,7 @@ extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
   #define CLSP_CORE_HAS_RUNTIME 0
 #endif
 
-static_assert(lumen::lsp::core_api_version == CLSP_CORE_ABI_VERSION);
+static_assert(lumen::lsp::core_api_version == 1U);
 
 /** @brief Native core object hidden behind `clsp_core_t`. */
 struct clsp_core {
@@ -44,6 +46,7 @@ struct clsp_core {
   std::atomic<bool> audio_callback_active {false};  ///< Prevents recursive complete-audio delivery.
   std::atomic<bool> video_callback_active {false};  ///< Prevents recursive complete-frame delivery.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
+  mutable std::shared_mutex runtime_mutex;  ///< Prevents runtime reclamation during ABI calls.
   clsp_apple_input_capture_t *apple_capture {};  ///< Active native controller-output owner.
   umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
   clsp_configuration_t configuration {};  ///< Caller configuration copied at creation.
@@ -187,9 +190,83 @@ namespace umbra::lsp {
     }
     return {slot->storage, buffer->length};
   }
+
+  bool resize_retained_frame_buffer(
+    clsp_buffer_t *buffer,
+    const std::size_t frame_bytes
+  ) noexcept {
+    if (buffer == nullptr || buffer->context == nullptr || frame_bytes == 0) {
+      return false;
+    }
+    const auto *slot = static_cast<const retained_frame_slot *>(buffer->context);
+    if (&slot->abi != buffer || slot->owner == nullptr ||
+        !slot->occupied.load(std::memory_order_acquire) ||
+        slot->storage != buffer->data || frame_bytes > slot->owner->maximum_frame_bytes) {
+      return false;
+    }
+    buffer->length = frame_bytes;
+    return true;
+  }
 }  // namespace umbra::lsp
 
 namespace {
+  inline constexpr std::size_t maximum_callback_stack_depth = 16;  ///< Bounded nested callbacks across distinct cores.
+  thread_local std::array<const clsp_core_t *, maximum_callback_stack_depth> active_callback_cores {};  ///< Current thread callback owners.
+  thread_local std::size_t active_callback_depth {};  ///< Occupied callback-owner entries.
+
+  /** @brief Return whether this thread is executing a callback from `core`. */
+  [[nodiscard]] bool callback_stack_contains(const clsp_core_t *core) noexcept {
+    for (std::size_t index = 0; index < active_callback_depth; ++index) {
+      if (active_callback_cores[index] == core) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** @brief Bounded callback-stack marker enabling same-core reentry rejection. */
+  class callback_core_scope {
+  public:
+    explicit callback_core_scope(const clsp_core_t *core) noexcept:
+        active_ {active_callback_depth < active_callback_cores.size()} {
+      if (active_) {
+        active_callback_cores[active_callback_depth++] = core;
+      }
+    }
+
+    callback_core_scope(const callback_core_scope &) = delete;
+    callback_core_scope &operator=(const callback_core_scope &) = delete;
+
+    ~callback_core_scope() {
+      if (active_) {
+        active_callback_cores[--active_callback_depth] = nullptr;
+      }
+    }
+
+    [[nodiscard]] bool active() const noexcept {
+      return active_;
+    }
+
+  private:
+    bool active_ {};  ///< Whether this scope owns one stack entry.
+  };
+
+  /** @brief Invoke one ABI operation while preventing runtime reclamation. */
+  template<typename Operation>
+  [[nodiscard]] clsp_status_t with_runtime(
+    clsp_core_t *core,
+    Operation &&operation
+  ) noexcept {
+    if (callback_stack_contains(core)) {
+      return CLSP_STATUS_REENTRANT_CALLBACK;
+    }
+    std::shared_lock runtime_lock(core->runtime_mutex);
+    if (core->runtime == nullptr) {
+      return CLSP_STATUS_NOT_AUTHENTICATED;
+    }
+    return operation(*core->runtime);
+  }
+
   /** @brief Return provider flags compiled into this target. */
   [[nodiscard]] constexpr std::uint32_t compiled_provider_flags() noexcept {
     return (CLSP_CORE_HAS_WOLFSSL ? CLSP_PROVIDER_WOLFSSL : 0U) |
@@ -221,6 +298,67 @@ namespace {
     return CLSP_STATUS_OK;
   }
 
+  /** @brief Validate the complete ABI-v2 video tuple before runtime admission. */
+  [[nodiscard]] constexpr bool validate_video_configuration(
+    const clsp_video_configuration_t &value
+  ) noexcept {
+    const auto valid_profile =
+      (value.codec == CLSP_VIDEO_CODEC_H264 &&
+       ((value.profile == CLSP_VIDEO_PROFILE_H264_HIGH && value.pixel_format == CLSP_VIDEO_PIXEL_420_8) ||
+        (value.profile == CLSP_VIDEO_PROFILE_H264_HIGH_444 && value.pixel_format == CLSP_VIDEO_PIXEL_444_8))) ||
+      (value.codec == CLSP_VIDEO_CODEC_HEVC &&
+       ((value.profile == CLSP_VIDEO_PROFILE_HEVC_MAIN && value.pixel_format == CLSP_VIDEO_PIXEL_420_8) ||
+        (value.profile == CLSP_VIDEO_PROFILE_HEVC_MAIN10 && value.pixel_format == CLSP_VIDEO_PIXEL_420_10) ||
+        (value.profile == CLSP_VIDEO_PROFILE_HEVC_REXT &&
+         (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10)))) ||
+      (value.codec == CLSP_VIDEO_CODEC_AV1 &&
+       ((value.profile == CLSP_VIDEO_PROFILE_AV1_MAIN &&
+         (value.pixel_format == CLSP_VIDEO_PIXEL_420_8 || value.pixel_format == CLSP_VIDEO_PIXEL_420_10)) ||
+        (value.profile == CLSP_VIDEO_PROFILE_AV1_HIGH &&
+         (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10))));
+    const auto sdr = value.color_primaries == 1U && value.transfer_characteristics == 1U &&
+                     value.matrix_coefficients == 1U;
+    const auto hdr = value.codec != CLSP_VIDEO_CODEC_H264 &&
+                     (value.pixel_format == CLSP_VIDEO_PIXEL_420_10 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10) &&
+                     value.full_range == 0U && value.color_primaries == 9U &&
+                     (value.transfer_characteristics == 16U || value.transfer_characteristics == 18U) &&
+                     value.matrix_coefficients == 9U;
+    const auto flexfec_disabled = value.flexfec_ssrc == 0U && value.flexfec_payload_type == 0U &&
+                                  value.flexfec_repair_window_microseconds == 0U &&
+                                  value.flexfec_maximum_group_packets == 0U;
+    const auto flexfec_enabled = value.flexfec_ssrc != 0U && value.flexfec_ssrc != value.primary_ssrc &&
+                                 value.flexfec_payload_type >= 96U && value.flexfec_payload_type <= 127U &&
+                                 value.flexfec_payload_type != value.primary_payload_type &&
+                                 value.flexfec_repair_window_microseconds != 0U &&
+                                 value.flexfec_repair_window_microseconds <= value.maximum_frame_age_microseconds &&
+                                 value.flexfec_maximum_group_packets == 15U;
+    const auto rtx_disabled = value.rtx_ssrc == 0U && value.rtx_payload_type == 0U &&
+                              value.rtx_associated_payload_type == 0U;
+    const auto rtx_enabled = value.rtx_ssrc != 0U && value.rtx_ssrc != value.primary_ssrc &&
+                             value.rtx_ssrc != value.flexfec_ssrc && value.rtx_payload_type >= 96U &&
+                             value.rtx_payload_type <= 127U && value.rtx_payload_type != value.primary_payload_type &&
+                             value.rtx_payload_type != value.flexfec_payload_type &&
+                             value.rtx_associated_payload_type == value.primary_payload_type;
+    return value.abi_version == CLSP_CORE_ABI_VERSION &&
+           value.structure_size == sizeof(clsp_video_configuration_t) &&
+           value.stream_generation != 0U && value.video_generation != 0U && value.primary_ssrc != 0U &&
+           value.clock_rate == 90'000U && value.width >= 1U && value.width <= 16'384U &&
+           value.height >= 1U && value.height <= 16'384U && value.refresh_numerator != 0U &&
+           value.refresh_denominator != 0U && value.bitrate >= 1'000U && value.bitrate <= 1'000'000'000U &&
+           value.maximum_access_unit_bytes != 0U && value.maximum_access_unit_bytes <= 16U * 1'024U * 1'024U &&
+           value.maximum_frame_age_microseconds != 0U && value.frame_id_origin != 0U &&
+           value.recovery_epoch != 0U && value.udp_payload_size == 1'200U &&
+           value.primary_payload_type >= 96U && value.primary_payload_type <= 127U && valid_profile &&
+           value.full_range <= 1U && (sdr || hdr) && value.delivery == CLSP_VIDEO_DELIVERY_COMPLETE_ACCESS_UNIT &&
+           ((value.codec == CLSP_VIDEO_CODEC_AV1 && value.payload_format == CLSP_VIDEO_PAYLOAD_AV1_LOW_OVERHEAD_OBU) ||
+            (value.codec != CLSP_VIDEO_CODEC_AV1 && value.payload_format == CLSP_VIDEO_PAYLOAD_ANNEX_B)) &&
+           value.decoder_surfaces >= 2U && value.decoder_surfaces <= 4U &&
+           value.frame_marking_extension == 1U && value.absolute_capture_extension == 2U &&
+           value.frame_id_extension == 3U && value.input_watermark_extension == 4U &&
+           value.encoder_timing_extension == 5U &&
+           (flexfec_disabled || flexfec_enabled) && (rtx_disabled || rtx_enabled);
+  }
+
   /** @brief Publish one non-reentrant lifecycle event without protocol locks held. */
   void publish_lifecycle(clsp_core_t *core, const std::uint32_t state) noexcept {
     core->state.store(state, std::memory_order_release);
@@ -238,6 +376,12 @@ namespace {
       .state = state,
       .reserved_zero = 0,
     };
+    callback_core_scope callback_scope {core};
+    if (!callback_scope.active()) {
+      core->callback_active.store(false, std::memory_order_release);
+      clsp_core_release(core);
+      return;
+    }
     core->callbacks.lifecycle(core->callbacks.context, &event);
     core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
@@ -253,6 +397,12 @@ namespace {
       return;
     }
     clsp_core_retain(core);
+    callback_core_scope callback_scope {core};
+    if (!callback_scope.active()) {
+      core->callback_active.store(false, std::memory_order_release);
+      clsp_core_release(core);
+      return;
+    }
     core->callbacks.control(core->callbacks.context, &event);
     core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
@@ -275,6 +425,12 @@ namespace {
     auto expected = false;
     if (!core->audio_callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     clsp_core_retain(core);
+    callback_core_scope callback_scope {core};
+    if (!callback_scope.active()) {
+      core->audio_callback_active.store(false, std::memory_order_release);
+      clsp_core_release(core);
+      return;
+    }
     core->callbacks.audio_packet(core->callbacks.context, &event);
     core->audio_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
@@ -287,6 +443,12 @@ namespace {
     auto expected = false;
     if (!core->audio_callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     clsp_core_retain(core);
+    callback_core_scope callback_scope {core};
+    if (!callback_scope.active()) {
+      core->audio_callback_active.store(false, std::memory_order_release);
+      clsp_core_release(core);
+      return;
+    }
     core->callbacks.audio_timing(core->callbacks.context, &event);
     core->audio_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
@@ -296,7 +458,7 @@ namespace {
    */
   void runtime_video_frame(void *context, const clsp_video_frame_event_t &event) noexcept {
     auto *core = static_cast<clsp_core_t *>(context);
-    if (core->callbacks.video_frame == nullptr) {
+    if (core->callbacks.video_access_unit == nullptr) {
       clsp_buffer_release(event.frame);
       return;
     }
@@ -320,7 +482,15 @@ namespace {
       return;
     }
     clsp_core_retain(core);
-    core->callbacks.video_frame(core->callbacks.context, &event);
+    callback_core_scope callback_scope {core};
+    if (!callback_scope.active()) {
+      core->callback_active.store(false, std::memory_order_release);
+      core->video_callback_active.store(false, std::memory_order_release);
+      clsp_buffer_release(event.frame);
+      clsp_core_release(core);
+      return;
+    }
+    core->callbacks.video_access_unit(core->callbacks.context, &event);
     core->callback_active.store(false, std::memory_order_release);
     core->video_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
@@ -337,6 +507,12 @@ namespace {
       return false;
     }
     clsp_core_retain(core);
+    callback_core_scope callback_scope {core};
+    if (!callback_scope.active()) {
+      core->callback_active.store(false, std::memory_order_release);
+      clsp_core_release(core);
+      return false;
+    }
     core->callbacks.path_probe(core->callbacks.context, &event);
     core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
@@ -489,9 +665,10 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
   if (core == nullptr || endpoint == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
+  std::unique_lock runtime_lock(core->runtime_mutex);
   const auto providers = compiled_provider_flags();
   if ((providers & CLSP_PROVIDER_WOLFSSL) == 0) {
     return CLSP_STATUS_MISSING_WOLFSSL;
@@ -544,15 +721,25 @@ extern "C" clsp_status_t clsp_core_stop(clsp_core_t *core) {
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  if (core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED || core->runtime == nullptr) {
+  std::unique_lock runtime_lock(core->runtime_mutex);
+  const auto prior_state = core->state.load(std::memory_order_acquire);
+  if (core->runtime == nullptr) {
+    return prior_state == CLSP_LIFECYCLE_STOPPED || prior_state == CLSP_LIFECYCLE_FAILED ?
+             CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+  }
+  if (prior_state != CLSP_LIFECYCLE_AUTHENTICATED && prior_state != CLSP_LIFECYCLE_FAILED) {
     return CLSP_STATUS_INVALID_STATE;
   }
   const auto status = core->runtime->stop();
   delete core->runtime;
   core->runtime = nullptr;
+  if (prior_state == CLSP_LIFECYCLE_FAILED) {
+    core->state.store(CLSP_LIFECYCLE_FAILED, std::memory_order_release);
+    return CLSP_STATUS_OK;
+  }
   return status;
 }
 
@@ -569,10 +756,12 @@ extern "C" clsp_status_t clsp_core_send_control(
   if (core->callback_active.load(std::memory_order_acquire)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  if (core->runtime == nullptr || core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
-    return CLSP_STATUS_NOT_AUTHENTICATED;
-  }
-  return core->runtime->send_control(message_type, request_id, payload, deadline_milliseconds);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    if (core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
+      return CLSP_STATUS_NOT_AUTHENTICATED;
+    }
+    return runtime.send_control(message_type, request_id, payload, deadline_milliseconds);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_configure_input(
@@ -585,10 +774,12 @@ extern "C" clsp_status_t clsp_core_configure_input(
   if (core->callback_active.load(std::memory_order_acquire)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  if (core->runtime == nullptr || core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
-    return CLSP_STATUS_NOT_AUTHENTICATED;
-  }
-  return core->runtime->configure_input(*configuration);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    if (core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
+      return CLSP_STATUS_NOT_AUTHENTICATED;
+    }
+    return runtime.configure_input(*configuration);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_send_control_response(
@@ -601,14 +792,15 @@ extern "C" clsp_status_t clsp_core_send_control_response(
 ) {
   if (core == nullptr || error_response > 1U) return CLSP_STATUS_INVALID_ARGUMENT;
   if (core->callback_active.load(std::memory_order_acquire)) return CLSP_STATUS_REENTRANT_CALLBACK;
-  if (core->runtime == nullptr) return CLSP_STATUS_NOT_AUTHENTICATED;
-  return core->runtime->send_control_response(
-    message_type,
-    request_id,
-    payload,
-    error_response != 0,
-    deadline_milliseconds
-  );
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.send_control_response(
+      message_type,
+      request_id,
+      payload,
+      error_response != 0,
+      deadline_milliseconds
+    );
+  });
 }
 
 extern "C" clsp_status_t clsp_core_configure_audio(
@@ -616,8 +808,9 @@ extern "C" clsp_status_t clsp_core_configure_audio(
   const clsp_audio_configuration_t *configuration
 ) {
   if (core == nullptr || configuration == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  if (core->runtime == nullptr) return CLSP_STATUS_NOT_AUTHENTICATED;
-  return core->runtime->configure_audio(*configuration);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.configure_audio(*configuration);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_wait_control_response(
@@ -626,8 +819,9 @@ extern "C" clsp_status_t clsp_core_wait_control_response(
   const std::uint32_t timeout_milliseconds
 ) {
   if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
-                                    core->runtime->wait_control_response(request_id, timeout_milliseconds);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.wait_control_response(request_id, timeout_milliseconds);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_configure_microphone(
@@ -635,7 +829,9 @@ extern "C" clsp_status_t clsp_core_configure_microphone(
   const clsp_microphone_configuration_t *configuration
 ) {
   if (core == nullptr || configuration == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->configure_microphone(*configuration);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.configure_microphone(*configuration);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_submit_microphone_packet(
@@ -643,17 +839,23 @@ extern "C" clsp_status_t clsp_core_submit_microphone_packet(
   const clsp_const_byte_span_t opus_packet
 ) {
   if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_microphone_packet(opus_packet);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.submit_microphone_packet(opus_packet);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_mark_microphone_discontinuity(clsp_core_t *core) {
   if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->mark_microphone_discontinuity();
+  return with_runtime(core, [](umbra::lsp::Runtime &runtime) {
+    return runtime.mark_microphone_discontinuity();
+  });
 }
 
 extern "C" clsp_status_t clsp_core_stop_microphone(clsp_core_t *core) {
   if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->stop_microphone();
+  return with_runtime(core, [](umbra::lsp::Runtime &runtime) {
+    return runtime.stop_microphone();
+  });
 }
 
 extern "C" clsp_status_t
@@ -661,7 +863,12 @@ clsp_core_configure_video(clsp_core_t *core, const clsp_video_configuration_t *c
   if (core == nullptr || configuration == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->configure_video(*configuration);
+  if (!validate_video_configuration(*configuration)) {
+    return CLSP_STATUS_INVALID_CONFIGURATION;
+  }
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.configure_video(*configuration);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_activate_video(
@@ -671,15 +878,18 @@ extern "C" clsp_status_t clsp_core_activate_video(
   if (core == nullptr || video_generation == 0) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
-                                    core->runtime->activate_video(video_generation);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.activate_video(video_generation);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_start_path_discovery(clsp_core_t *core) {
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->start_path_discovery();
+  return with_runtime(core, [](umbra::lsp::Runtime &runtime) {
+    return runtime.start_path_discovery();
+  });
 }
 
 extern "C" clsp_status_t clsp_core_send_path_probe(
@@ -693,14 +903,15 @@ extern "C" clsp_status_t clsp_core_send_path_probe(
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
-                                    core->runtime->send_path_probe(
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.send_path_probe(
                                       probe_id,
                                       udp_payload_size,
                                       request_id,
                                       payload,
                                       deadline_milliseconds
                                     );
+  });
 }
 
 extern "C" clsp_status_t clsp_core_accept_path_probe(
@@ -712,8 +923,9 @@ extern "C" clsp_status_t clsp_core_accept_path_probe(
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
-                                    core->runtime->accept_path_probe(probe_id, udp_payload_size, request_id);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.accept_path_probe(probe_id, udp_payload_size, request_id);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_confirm_path_probe(
@@ -724,8 +936,9 @@ extern "C" clsp_status_t clsp_core_confirm_path_probe(
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
-                                    core->runtime->confirm_path_probe(probe_id, received_payload_size);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.confirm_path_probe(probe_id, received_payload_size);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_report_video_decode(
@@ -742,7 +955,16 @@ extern "C" clsp_status_t clsp_core_report_video_decode(
       render_mailbox_occupancy > 1U) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->report_video_decode(video_generation, frame_id, recovery_epoch, decoder_status, decoder_credit, render_mailbox_occupancy);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.report_video_decode(
+      video_generation,
+      frame_id,
+      recovery_epoch,
+      decoder_status,
+      decoder_credit,
+      render_mailbox_occupancy
+    );
+  });
 }
 
 extern "C" clsp_status_t clsp_core_report_video_commit(
@@ -754,7 +976,9 @@ extern "C" clsp_status_t clsp_core_report_video_commit(
   if (core == nullptr || render_mailbox_occupancy > 1U) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->report_video_commit(video_generation, frame_id, render_mailbox_occupancy);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.report_video_commit(video_generation, frame_id, render_mailbox_occupancy);
+  });
 }
 
 extern "C" clsp_status_t clsp_core_submit_pointer(
@@ -767,7 +991,7 @@ extern "C" clsp_status_t clsp_core_submit_pointer(
   if (core->callback_active.load(std::memory_order_acquire)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_pointer(*sample);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_pointer(*sample); });
 }
 
 extern "C" clsp_status_t clsp_core_submit_input_edge(
@@ -780,7 +1004,7 @@ extern "C" clsp_status_t clsp_core_submit_input_edge(
   if (core->callback_active.load(std::memory_order_acquire)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_input_edge(*edge);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_input_edge(*edge); });
 }
 
 extern "C" clsp_status_t clsp_core_neutralize_input(clsp_core_t *core) {
@@ -790,7 +1014,7 @@ extern "C" clsp_status_t clsp_core_neutralize_input(clsp_core_t *core) {
   if (core->callback_active.load(std::memory_order_acquire)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->neutralize_input();
+  return with_runtime(core, [](umbra::lsp::Runtime &runtime) { return runtime.neutralize_input(); });
 }
 
 extern "C" clsp_status_t clsp_core_submit_controller_edge(
@@ -798,7 +1022,7 @@ extern "C" clsp_status_t clsp_core_submit_controller_edge(
   const clsp_controller_edge_t *edge
 ) {
   if (core == nullptr || edge == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_edge(*edge);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_edge(*edge); });
 }
 
 extern "C" clsp_status_t clsp_core_submit_controller_state(
@@ -806,7 +1030,7 @@ extern "C" clsp_status_t clsp_core_submit_controller_state(
   const clsp_controller_state_t *state
 ) {
   if (core == nullptr || state == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_state(*state);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_state(*state); });
 }
 
 extern "C" clsp_status_t clsp_core_submit_controller_sensor(
@@ -814,7 +1038,7 @@ extern "C" clsp_status_t clsp_core_submit_controller_sensor(
   const clsp_controller_sensor_t *sensor
 ) {
   if (core == nullptr || sensor == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_sensor(*sensor);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_sensor(*sensor); });
 }
 
 extern "C" clsp_status_t clsp_core_submit_controller_touch_edge(
@@ -822,7 +1046,7 @@ extern "C" clsp_status_t clsp_core_submit_controller_touch_edge(
   const clsp_controller_touch_edge_t *edge
 ) {
   if (core == nullptr || edge == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_touch_edge(*edge);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_touch_edge(*edge); });
 }
 
 extern "C" clsp_status_t clsp_core_submit_controller_touch_state(
@@ -830,7 +1054,7 @@ extern "C" clsp_status_t clsp_core_submit_controller_touch_state(
   const clsp_controller_touch_state_t *state
 ) {
   if (core == nullptr || state == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
-  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->submit_controller_touch_state(*state);
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_touch_state(*state); });
 }
 
 extern "C" bool clsp_core_register_apple_capture(
@@ -860,6 +1084,10 @@ extern "C" clsp_status_t clsp_core_copy_telemetry(
   if (core == nullptr || output == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
+  if (callback_stack_contains(core)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  std::shared_lock runtime_lock(core->runtime_mutex);
   *output = {
     .abi_version = CLSP_CORE_ABI_VERSION,
     .structure_size = sizeof(clsp_telemetry_snapshot_t),

@@ -1978,6 +1978,12 @@ final class NativeVideoRendererRouter: UmbraMedia.MetalVideoRendering, @unchecke
         lock.withLock { commandCommitHandler = handler }
     }
 
+    func installFrameDropHandler(
+        _ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void
+    ) {
+        metal?.installFrameDropHandler(handler)
+    }
+
     func setMailboxDropNewest(_ enabled: Bool) {
         metal?.setMailboxDropNewest(enabled)
     }

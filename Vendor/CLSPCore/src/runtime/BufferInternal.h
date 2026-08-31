@@ -53,4 +53,16 @@ namespace umbra::lsp {
    */
   [[nodiscard]] std::span<std::uint8_t>
   mutable_retained_frame_bytes(clsp_buffer_t *buffer) noexcept;
+
+  /**
+   * @brief Shrink one occupied retained buffer to its completed logical size.
+   *
+   * @param buffer Pool-backed occupied buffer.
+   * @param frame_bytes Positive logical byte count no greater than slot capacity.
+   * @return `true` only when the occupied buffer was resized.
+   */
+  [[nodiscard]] bool resize_retained_frame_buffer(
+    clsp_buffer_t *buffer,
+    std::size_t frame_bytes
+  ) noexcept;
 }  // namespace umbra::lsp

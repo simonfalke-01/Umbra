@@ -14,10 +14,10 @@ extern "C" {
 #endif
 
 /** @brief C ABI version implemented by CLSPCore. */
-#define CLSP_CORE_ABI_VERSION UINT32_C(1)
+#define CLSP_CORE_ABI_VERSION UINT32_C(2)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "dae452bffdcb05a60a9632f4020d23c1e5258972dce71b475e2b82f14915e1b0"
+#define CLSP_CORE_SOURCE_DIGEST "1aeb5b57f3812c957dd35877954b0a27edbcfeeb3555dc2853024e0257a55d41"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
@@ -82,6 +82,44 @@ extern "C" {
     CLSP_PROVIDER_WOLFSSL = 1U << 0U,  ///< wolfSSL DTLS 1.3 provider is linked.
     CLSP_PROVIDER_LIBSRTP = 1U << 1U,  ///< libSRTP AES-128-GCM provider is linked.
   } clsp_provider_flag_t;
+
+  /** @brief Video codec identifiers frozen by LSP video schema revision three. */
+  typedef enum clsp_video_codec {
+    CLSP_VIDEO_CODEC_H264 = 1,  ///< H.264/AVC.
+    CLSP_VIDEO_CODEC_HEVC = 2,  ///< H.265/HEVC.
+    CLSP_VIDEO_CODEC_AV1 = 3,  ///< Alliance for Open Media AV1.
+  } clsp_video_codec_t;
+
+  /** @brief Codec profile identifiers frozen by LSP video schema revision three. */
+  typedef enum clsp_video_profile {
+    CLSP_VIDEO_PROFILE_H264_HIGH = 1,  ///< H.264 High 4:2:0.
+    CLSP_VIDEO_PROFILE_H264_HIGH_444 = 2,  ///< H.264 High 4:4:4.
+    CLSP_VIDEO_PROFILE_HEVC_MAIN = 3,  ///< HEVC Main 8-bit.
+    CLSP_VIDEO_PROFILE_HEVC_MAIN10 = 4,  ///< HEVC Main10.
+    CLSP_VIDEO_PROFILE_HEVC_REXT = 5,  ///< HEVC Range Extensions 4:4:4.
+    CLSP_VIDEO_PROFILE_AV1_MAIN = 6,  ///< AV1 Main 4:2:0.
+    CLSP_VIDEO_PROFILE_AV1_HIGH = 7,  ///< AV1 High 4:4:4.
+  } clsp_video_profile_t;
+
+  /** @brief Exact decoded pixel tuples frozen by video schema revision three. */
+  typedef enum clsp_video_pixel_format {
+    CLSP_VIDEO_PIXEL_420_8 = 1,  ///< 8-bit YUV 4:2:0.
+    CLSP_VIDEO_PIXEL_420_10 = 2,  ///< 10-bit YUV 4:2:0.
+    CLSP_VIDEO_PIXEL_444_8 = 3,  ///< 8-bit YUV 4:4:4.
+    CLSP_VIDEO_PIXEL_444_10 = 4,  ///< 10-bit YUV 4:4:4.
+  } clsp_video_pixel_format_t;
+
+  /** @brief Encoded access-unit delivery modes. */
+  typedef enum clsp_video_delivery {
+    CLSP_VIDEO_DELIVERY_COMPLETE_ACCESS_UNIT = 1,  ///< Publish one retained complete access unit.
+    CLSP_VIDEO_DELIVERY_BOUNDED_INCREMENTAL = 2,  ///< Bounded incremental delivery.
+  } clsp_video_delivery_t;
+
+  /** @brief Encoded access-unit byte representation crossing the ABI. */
+  typedef enum clsp_video_payload_format {
+    CLSP_VIDEO_PAYLOAD_ANNEX_B = 1,  ///< Annex-B-prefixed H.264 or HEVC access unit.
+    CLSP_VIDEO_PAYLOAD_AV1_LOW_OVERHEAD_OBU = 2,  ///< Canonical AV1 low-overhead OBU stream.
+  } clsp_video_payload_format_t;
 
   /** @brief Fixed-layout construction configuration copied by `clsp_core_create`. */
   typedef struct clsp_configuration {
@@ -190,7 +228,7 @@ extern "C" {
     uint8_t dtx;  ///< Boolean Opus DTX selection.
   } clsp_microphone_configuration_t;
 
-  /** @brief Exact first-slice SDR H.264/HEVC native video admission mapping. */
+  /** @brief Exact schema-revision-three native video admission mapping. */
   typedef struct clsp_video_configuration {
     uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
     uint32_t structure_size;  ///< Must equal `sizeof(clsp_video_configuration_t)`.
@@ -209,18 +247,32 @@ extern "C" {
     uint32_t recovery_epoch;  ///< Nonzero initial recovery-epoch seed.
     uint16_t udp_payload_size;  ///< Exactly 1,200 for the first slice.
     uint8_t primary_payload_type;  ///< Dynamic RTP PT 96 through 127.
-    uint8_t codec;  ///< One H.264 or two HEVC.
-    uint8_t profile;  ///< One H.264 High or two HEVC Main.
+    uint8_t codec;  ///< One `clsp_video_codec_t`.
+    uint8_t profile;  ///< One `clsp_video_profile_t` valid for `codec`.
+    uint8_t pixel_format;  ///< One exact `clsp_video_pixel_format_t`.
+    uint8_t color_primaries;  ///< Direct H.273 colour_primaries value.
+    uint8_t transfer_characteristics;  ///< Direct H.273 transfer_characteristics value.
+    uint8_t matrix_coefficients;  ///< Direct H.273 matrix_coefficients value.
+    uint8_t full_range;  ///< Boolean full-range indicator.
+    uint8_t delivery;  ///< One `clsp_video_delivery_t`.
+    uint8_t payload_format;  ///< One `clsp_video_payload_format_t`.
     uint8_t decoder_surfaces;  ///< Two through four.
     uint8_t frame_marking_extension;  ///< RFC8285 ID.
     uint8_t absolute_capture_extension;  ///< RFC8285 ID.
     uint8_t frame_id_extension;  ///< Encrypted RFC8285 ID.
     uint8_t input_watermark_extension;  ///< Encrypted RFC8285 ID.
     uint8_t encoder_timing_extension;  ///< Encrypted RFC8285 ID.
+    uint32_t flexfec_ssrc;  ///< RFC 8627 repair SSRC, or zero when unselected.
+    uint32_t flexfec_repair_window_microseconds;  ///< Nonzero only with `flexfec_ssrc`.
+    uint32_t rtx_ssrc;  ///< RFC 4588 retransmission SSRC, or zero when unselected.
+    uint8_t flexfec_payload_type;  ///< Dynamic repair PT, or zero when unselected.
+    uint8_t flexfec_maximum_group_packets;  ///< Exactly fifteen when selected.
+    uint8_t rtx_payload_type;  ///< Dynamic retransmission PT, or zero when unselected.
+    uint8_t rtx_associated_payload_type;  ///< Exact primary PT, or zero when unselected.
   } clsp_video_configuration_t;
 
-  /** @brief One retained complete Annex-B access unit transferred across the C ABI. */
-  typedef struct clsp_video_frame_event {
+  /** @brief One retained complete encoded access unit transferred across the C ABI. */
+  typedef struct clsp_video_access_unit_event {
     uint32_t abi_version;  ///< Event ABI version.
     uint32_t structure_size;  ///< Size of this event.
     uint32_t video_generation;  ///< Exact installed video generation.
@@ -232,10 +284,17 @@ extern "C" {
     uint64_t input_edge_id;  ///< Applied input watermark edge.
     uint32_t recovery_epoch;  ///< Authenticated per-frame recovery epoch.
     uint8_t independent;  ///< Codec-independent frame marking.
-    uint8_t codec;  ///< One H.264 or two HEVC.
-    uint16_t reserved_zero;  ///< Reserved and zero.
-    clsp_buffer_t *frame;  ///< Owning retained complete-frame handle transferred to callback.
-  } clsp_video_frame_event_t;
+    uint8_t codec;  ///< One `clsp_video_codec_t`.
+    uint8_t payload_format;  ///< One `clsp_video_payload_format_t`.
+    uint8_t reserved_zero;  ///< Reserved and zero.
+    union {
+      clsp_buffer_t *encoded_access_unit;  ///< Owning retained complete encoded-AU handle.
+      clsp_buffer_t *frame;  ///< ABI-v2 source-compatibility name for native runtime integration.
+    };
+  } clsp_video_access_unit_event_t;
+
+  /** @brief Source-compatible native runtime alias for the ABI-v2 encoded-AU event. */
+  typedef clsp_video_access_unit_event_t clsp_video_frame_event_t;
 
   /** @brief Decoder outcome values carried unchanged in protected LSPV. */
   typedef enum clsp_video_decoder_status {
@@ -414,8 +473,11 @@ extern "C" {
   /** @brief Authenticated low-rate audio sender-report callback. */
   typedef void (*clsp_audio_timing_callback_t)(void *context, const clsp_audio_timing_event_t *event);
 
-  /** @brief Complete retained access-unit callback; never invoked per RTP packet. */
-  typedef void (*clsp_video_frame_callback_t)(void *context, const clsp_video_frame_event_t *event);
+  /** @brief Complete retained encoded-access-unit callback; never invoked per RTP packet. */
+  typedef void (*clsp_video_access_unit_callback_t)(void *context, const clsp_video_access_unit_event_t *event);
+
+  /** @brief Source-compatible callback alias retained within the native implementation. */
+  typedef clsp_video_access_unit_callback_t clsp_video_frame_callback_t;
 
   /** @brief Low-rate authenticated path-probe lifecycle callback. */
   typedef void (*clsp_path_probe_callback_t)(void *context, const clsp_path_probe_event_t *event);
@@ -449,7 +511,10 @@ extern "C" {
     clsp_control_callback_t control;  ///< Optional authenticated control-frame callback.
     clsp_audio_packet_callback_t audio_packet;  ///< Optional complete Opus packet callback.
     clsp_audio_timing_callback_t audio_timing;  ///< Optional authenticated sender-report callback.
-    clsp_video_frame_callback_t video_frame;  ///< Optional retained complete access-unit callback.
+    union {
+      clsp_video_access_unit_callback_t video_access_unit;  ///< Optional retained complete encoded-AU callback.
+      clsp_video_frame_callback_t video_frame;  ///< ABI-v2 native source-compatibility name.
+    };
     clsp_path_probe_callback_t path_probe;  ///< Optional coarse DPLPMTUD control callback.
   } clsp_callbacks_t;
 

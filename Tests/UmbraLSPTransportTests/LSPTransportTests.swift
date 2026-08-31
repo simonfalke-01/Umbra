@@ -4,7 +4,7 @@ import XCTest
 
 final class LSPTransportTests: XCTestCase {
     func testABIVersionDigestAndInitialTelemetryMatchNativeCore() throws {
-        XCTAssertEqual(clsp_core_abi_version(), 1)
+        XCTAssertEqual(clsp_core_abi_version(), 2)
         XCTAssertEqual(String(cString: clsp_core_source_digest()), LSPTransport.sourceDigest)
 
         let transport = try LSPTransport()

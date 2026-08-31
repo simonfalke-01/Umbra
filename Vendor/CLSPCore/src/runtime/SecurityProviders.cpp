@@ -537,9 +537,6 @@ namespace umbra::lsp {
       if (outbound_ != nullptr) {
         srtp_dealloc(outbound_);
       }
-      if (video_inbound_ != nullptr) {
-        srtp_dealloc(video_inbound_);
-      }
       clear_secret(inbound_master_key_);
     }
 
@@ -569,18 +566,9 @@ namespace umbra::lsp {
       outbound_policy.allow_repeat_tx = 0;
       outbound_policy.next = nullptr;
 
-      srtp_policy_t inbound_policy {};
-      srtp_crypto_policy_set_aes_gcm_128_16_auth(&inbound_policy.rtp);
-      srtp_crypto_policy_set_aes_gcm_128_16_auth(&inbound_policy.rtcp);
-      inbound_policy.ssrc.type = ssrc_any_inbound;
-      inbound_policy.key = inbound_key.data();
-      inbound_policy.window_size = 128;
-      inbound_policy.allow_repeat_tx = 0;
-      inbound_policy.next = nullptr;
-
       const auto outbound_status = srtp_create(&outbound_, &outbound_policy);
       const auto inbound_status = outbound_status == srtp_err_status_ok ?
-                                    srtp_create(&inbound_, &inbound_policy) :
+                                    srtp_create(&inbound_, nullptr) :
                                     srtp_err_status_init_fail;
       clear_secret(outbound_key);
       clear_secret(inbound_key);
@@ -662,17 +650,64 @@ namespace umbra::lsp {
     }
 
     [[nodiscard]] clsp_status_t configure_video_inbound(
+      const VideoSrtpInboundConfiguration &configuration,
+      const std::span<const int> encrypted_extension_ids
+    ) noexcept {
+      const auto duplicate_flexfec = configuration.flexfec_ssrc != 0 &&
+                                     configuration.flexfec_ssrc == configuration.primary_ssrc;
+      const auto duplicate_rtx = configuration.rtx_ssrc != 0 &&
+                                 (configuration.rtx_ssrc == configuration.primary_ssrc ||
+                                  configuration.rtx_ssrc == configuration.flexfec_ssrc);
+      if (configuration.primary_ssrc == 0 || duplicate_flexfec || duplicate_rtx ||
+          encrypted_extension_ids.empty() ||
+          encrypted_extension_ids.size() > 3U) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      auto status = configure_inbound_stream(configuration.primary_ssrc, encrypted_extension_ids);
+      if (status == CLSP_STATUS_OK && configuration.flexfec_ssrc != 0) {
+        status = configure_inbound_stream(configuration.flexfec_ssrc, {});
+      }
+      if (status == CLSP_STATUS_OK && configuration.rtx_ssrc != 0) {
+        status = configure_inbound_stream(configuration.rtx_ssrc, encrypted_extension_ids);
+      }
+      return status;
+    }
+
+    /** @brief Add one exact inbound SSRC to the empty-by-default libSRTP session. */
+    [[nodiscard]] clsp_status_t configure_inbound_stream(
       const std::uint32_t ssrc,
       const std::span<const int> encrypted_extension_ids
     ) noexcept {
-      if (ssrc == 0 || encrypted_extension_ids.empty() ||
-          encrypted_extension_ids.size() > encrypted_extensions_.size()) {
+      if (inbound_ == nullptr || ssrc == 0 || encrypted_extension_ids.size() > 3U) {
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
-      if (video_inbound_ != nullptr) {
-        return CLSP_STATUS_INVALID_STATE;
+      for (const auto &registered : registered_inbound_) {
+        if (registered.ssrc == ssrc) {
+          return registered.encrypted_extension_count == encrypted_extension_ids.size() &&
+                         std::ranges::equal(
+                           encrypted_extension_ids,
+                           std::span<const int> {registered.encrypted_extensions}.first(
+                             registered.encrypted_extension_count
+                           )
+                         ) ?
+                   CLSP_STATUS_OK :
+                   CLSP_STATUS_INVALID_STATE;
+        }
       }
-      std::copy(encrypted_extension_ids.begin(), encrypted_extension_ids.end(), encrypted_extensions_.begin());
+      auto *registration = std::ranges::find_if(registered_inbound_, [](const RegisteredInbound &entry) {
+        return entry.ssrc == 0;
+      });
+      if (registration == registered_inbound_.end()) {
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
+      *registration = {};
+      registration->ssrc = ssrc;
+      registration->encrypted_extension_count = encrypted_extension_ids.size();
+      std::copy(
+        encrypted_extension_ids.begin(),
+        encrypted_extension_ids.end(),
+        registration->encrypted_extensions.begin()
+      );
       srtp_policy_t policy {};
       srtp_crypto_policy_set_aes_gcm_128_16_auth(&policy.rtp);
       srtp_crypto_policy_set_aes_gcm_128_16_auth(&policy.rtcp);
@@ -681,9 +716,16 @@ namespace umbra::lsp {
       policy.key = inbound_master_key_.data();
       policy.window_size = 128;
       policy.allow_repeat_tx = 0;
-      policy.enc_xtn_hdr = encrypted_extensions_.data();
-      policy.enc_xtn_hdr_count = static_cast<int>(encrypted_extension_ids.size());
-      return srtp_create(&video_inbound_, &policy) == srtp_err_status_ok ? CLSP_STATUS_OK : CLSP_STATUS_SRTP_FAILURE;
+      if (!encrypted_extension_ids.empty()) {
+        policy.enc_xtn_hdr = registration->encrypted_extensions.data();
+        policy.enc_xtn_hdr_count = static_cast<int>(encrypted_extension_ids.size());
+      }
+      const auto added = srtp_add_stream(inbound_, &policy);
+      if (added != srtp_err_status_ok) {
+        *registration = {};
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      return CLSP_STATUS_OK;
     }
 
     [[nodiscard]] clsp_status_t unprotect_video(
@@ -693,30 +735,21 @@ namespace umbra::lsp {
       bool &replay
     ) noexcept {
       replay = false;
-      if (video_inbound_ == nullptr || length > packet.size() ||
-          length > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        return CLSP_STATUS_INVALID_STATE;
-      }
-      auto encoded_length = static_cast<int>(length);
-      const auto status = rtcp ? srtp_unprotect_rtcp(video_inbound_, packet.data(), &encoded_length) :
-                                 srtp_unprotect(video_inbound_, packet.data(), &encoded_length);
-      if (status == srtp_err_status_replay_fail || status == srtp_err_status_replay_old) {
-        replay = true;
-        return CLSP_STATUS_SRTP_FAILURE;
-      }
-      if (status != srtp_err_status_ok || encoded_length < 0) {
-        return CLSP_STATUS_SRTP_FAILURE;
-      }
-      length = static_cast<std::size_t>(encoded_length);
-      return CLSP_STATUS_OK;
+      return unprotect(packet, length, rtcp, replay);
     }
 
   private:
+    /** @brief Exact dynamically installed inbound stream policy identity. */
+    struct RegisteredInbound {
+      std::array<int, 3> encrypted_extensions {};  ///< Copied RFC 6904 extension IDs.
+      std::uint32_t ssrc {};  ///< Nonzero registered SSRC.
+      std::size_t encrypted_extension_count {};  ///< Populated extension count.
+    };
+
     srtp_t inbound_ {};  ///< Server-write inbound replay/authentication context.
     srtp_t outbound_ {};  ///< Client-write outbound replay/authentication context.
-    srtp_t video_inbound_ {};  ///< Video-specific RFC6904 inbound context.
     std::array<std::uint8_t, 28> inbound_master_key_ {};  ///< Retained server-write video key+salt.
-    std::array<int, 3> encrypted_extensions_ {};  ///< Installed RFC6904 extension IDs.
+    std::array<RegisteredInbound, 8> registered_inbound_ {};  ///< Exact configured inbound SSRC policies.
 #else
     /** @brief No-op destructor for dependency-free builds. */
     ~Impl() = default;
@@ -747,7 +780,14 @@ namespace umbra::lsp {
       return false;
     }
 
-    [[nodiscard]] clsp_status_t configure_video_inbound(std::uint32_t, std::span<const int>) noexcept {
+    [[nodiscard]] clsp_status_t configure_video_inbound(
+      const VideoSrtpInboundConfiguration &,
+      std::span<const int>
+    ) noexcept {
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
+
+    [[nodiscard]] clsp_status_t configure_inbound_stream(std::uint32_t, std::span<const int>) noexcept {
       return CLSP_STATUS_MISSING_LIBSRTP;
     }
 
@@ -799,10 +839,19 @@ namespace umbra::lsp {
   }
 
   clsp_status_t SrtpSession::configure_video_inbound(
+    const VideoSrtpInboundConfiguration &configuration,
+    const std::span<const int> encrypted_extension_ids
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->configure_video_inbound(configuration, encrypted_extension_ids);
+  }
+
+  clsp_status_t SrtpSession::configure_inbound_stream(
     const std::uint32_t ssrc,
     const std::span<const int> encrypted_extension_ids
   ) noexcept {
-    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_video_inbound(ssrc, encrypted_extension_ids);
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->configure_inbound_stream(ssrc, encrypted_extension_ids);
   }
 
   clsp_status_t SrtpSession::unprotect_video(
