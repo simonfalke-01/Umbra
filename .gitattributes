@@ -1,0 +1,7 @@
+Scripts/sync-lsp-core.sh text eol=lf
+Vendor/CLSPCore/photon.lock text eol=lf
+Vendor/CLSPCore/source-digest.sha256 text eol=lf
+Vendor/CLSPCore/src/core/*.h text eol=lf
+Vendor/CLSPCore/src/input_plane/*.h text eol=lf
+Vendor/CLSPCore/src/media/*.h text eol=lf
+Vendor/CLSPCore/src/transport/*.h text eol=lf

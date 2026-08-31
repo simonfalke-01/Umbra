@@ -460,8 +460,8 @@ public final class LSPTransport: @unchecked Sendable {
     /// ABI version compiled into the Swift façade.
     public static let abiVersion: UInt32 = 1
 
-    /// Expected source digest for Lumen's mirrored portable protocol core.
-    public static let sourceDigest = "6f15029d9c2ddc79fcebc59ae0608610ea0e70ad7abf8a2400c9c3bc48ef2c66"
+    /// Expected source digest for the pinned Photon portable protocol core.
+    public static let sourceDigest = "fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {
