@@ -14,6 +14,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         var decoder: VideoToolboxDecoder?
         var outstanding: [UInt64: FrameState] = [:]
         var pendingCommits: Set<UInt64> = []
+        var active = false
     }
 
     private let transport: LSPTransport
@@ -70,6 +71,8 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             state.configuration = request
             state.decoder = decoder
             state.outstanding.removeAll(keepingCapacity: true)
+            state.pendingCommits.removeAll(keepingCapacity: true)
+            state.active = false
             return old
         }
         old?.stop()
@@ -79,6 +82,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     /// Transfers renderer reporting only after VIDEO_CONFIG_ACK was submitted.
     public func activate() {
+        lock.withLock { state.active = true }
         renderer.setMailboxDropNewest(true)
         renderer.installCommandCommitHandler { [weak self] frameNumber in
             self?.reportCommit(frameNumber: frameNumber)
@@ -127,6 +131,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     private func submit(_ frame: LSPVideoFrame) {
         let ticket = lock.withLock { () -> (VideoToolboxDecoder, LSPNativeVideoConfiguration)? in
             guard let request = state.configuration,
+                  state.active,
                   request.nativeConfiguration.videoGeneration == frame.videoGeneration,
                   request.nativeConfiguration.codec == frame.codec,
                   let decoder = state.decoder else { return nil }

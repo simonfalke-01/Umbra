@@ -510,12 +510,6 @@ public actor LSPClientSession {
                 }
             }
         }
-        if status == .success {
-            if let previous = pendingRetirementPrevious {
-                await previous.retireVideoBeforeAttachAcknowledgement()
-            }
-            videoPipeline?.activate()
-        }
         do {
             try transport.sendControlResponse(
                 messageType: LSPControlMessageType.videoConfigAck.rawValue,
@@ -530,6 +524,10 @@ public actor LSPClientSession {
             )
             if status == .success {
                 installedVideoGeneration = request.nativeConfiguration.videoGeneration
+                if let previous = pendingRetirementPrevious {
+                    await previous.retireVideoAfterAttachAcknowledgement()
+                }
+                videoPipeline?.activate()
             }
         } catch {
             if status == .success { videoPipeline?.abortConfiguration() }
@@ -718,7 +716,7 @@ public actor LSPClientSession {
                replacement.dtx == old.dtx
     }
 
-    private func retireVideoBeforeAttachAcknowledgement() {
+    private func retireVideoAfterAttachAcknowledgement() {
         videoPipeline?.disablePublication()
         videoPipeline?.retireAfterHandoff()
     }
