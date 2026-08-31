@@ -469,7 +469,12 @@ public actor LSPClientSession {
                 Task { await self?.receiveMicrophoneConfiguration(event) }
             } else if event.messageType == LSPControlMessageType.videoConfig.rawValue {
                 Task { await self?.receiveVideoConfiguration(event) }
+            } else if event.messageType == LSPControlMessageType.pathProbe.rawValue {
+                Task { await self?.receivePathProbeIntent(event) }
             }
+        }
+        transport.setPathProbeHandler { [weak self] event in
+            Task { await self?.handlePathProbeEvent(event) }
         }
     }
 
@@ -527,7 +532,8 @@ public actor LSPClientSession {
                 if let previous = pendingRetirementPrevious {
                     await previous.retireVideoAfterAttachAcknowledgement()
                 }
-                videoPipeline?.activate()
+                try videoPipeline?.activate()
+                try transport.startPathDiscovery()
             }
         } catch {
             if status == .success { videoPipeline?.abortConfiguration() }
@@ -536,6 +542,59 @@ public actor LSPClientSession {
             return
         }
         await completePendingRetirementIfReady()
+    }
+
+    private func receivePathProbeIntent(_ event: LSPControlEvent) async {
+        do {
+            let intent = try LSPControlWire.pathProbe(from: event)
+            try transport.acceptPathProbe(
+                probeID: intent.probeID,
+                udpPayloadSize: intent.udpPayloadSize,
+                requestID: event.requestID
+            )
+        } catch {
+            try? transport.stop()
+            state = .failed(.internalFailure)
+        }
+    }
+
+    private func handlePathProbeEvent(_ event: LSPPathProbeEvent) async {
+        do {
+            switch event.kind {
+            case .sendIntent:
+                let response = try await transport.requestPathProbe(
+                    probeID: event.probeID,
+                    udpPayloadSize: event.udpPayloadSize,
+                    payload: try LSPControlWire.pathProbe(
+                        probeID: event.probeID,
+                        udpPayloadSize: event.udpPayloadSize
+                    )
+                )
+                let acknowledgement = try LSPControlWire.pathProbeAck(from: response)
+                guard acknowledgement.probeID == event.probeID,
+                      acknowledgement.udpPayloadSize == event.udpPayloadSize else {
+                    throw LSPTransportError.internalFailure
+                }
+                try transport.confirmPathProbe(
+                    probeID: acknowledgement.probeID,
+                    receivedPayloadSize: acknowledgement.udpPayloadSize
+                )
+            case .received:
+                guard event.requestID != 0 else { throw LSPTransportError.internalFailure }
+                try transport.sendControlResponse(
+                    messageType: LSPControlMessageType.pathProbeAck.rawValue,
+                    requestID: event.requestID,
+                    payload: try LSPControlWire.pathProbeAck(
+                        probeID: event.probeID,
+                        receivedSize: event.udpPayloadSize
+                    )
+                )
+            case .requestFailed:
+                return
+            }
+        } catch {
+            _ = error
+        }
     }
 
     private func receiveAudioConfiguration(_ event: LSPControlEvent) async {

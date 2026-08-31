@@ -326,6 +326,21 @@ public enum LSPVideoDecodeStatus: UInt8, Sendable {
     case unrecoverableError = 3
 }
 
+/// Coarse native DPLPMTUD event kind; never emitted per media packet.
+public enum LSPPathProbeEventKind: UInt8, Sendable {
+    case sendIntent = 1
+    case received = 2
+    case requestFailed = 3
+}
+
+/// One native path-probe lifecycle event at reliable-control frequency.
+public struct LSPPathProbeEvent: Equatable, Sendable {
+    public var kind: LSPPathProbeEventKind
+    public var probeID: UInt64
+    public var requestID: UInt64
+    public var udpPayloadSize: UInt16
+}
+
 /// Native exactly-once input-edge kind.
 public enum LSPNativeInputEdgeKind: UInt8, Sendable {
     case keyDown = 1
@@ -353,6 +368,16 @@ public struct LSPTelemetrySnapshot: Equatable, Sendable {
 
     /// DTLS, SRTP, and SRTCP authentication failure count.
     public var authenticationFailures: UInt64
+
+    public var videoReceivedIPBytes: UInt64
+    public var congestionFeedbackIPBytes: UInt64
+    public var congestionFeedbackPackets: UInt64
+    public var videoECNUnknownPackets: UInt64
+    public var videoECNCEPackets: UInt64
+    public var pathProbesSent: UInt64
+    public var pathProbesAcknowledged: UInt64
+    public var pathProbeTimeouts: UInt64
+    public var currentUDPPayloadSize: UInt16
 }
 
 /// Stable typed failure returned by the coarse LSP transport façade.
@@ -436,7 +461,7 @@ public final class LSPTransport: @unchecked Sendable {
     public static let abiVersion: UInt32 = 1
 
     /// Expected source digest for Lumen's mirrored portable protocol core.
-    public static let sourceDigest = "aabe7048d657dc27d248bfbb2878c7274401d7ecee15dc30e304924c1ef60681"
+    public static let sourceDigest = "6f15029d9c2ddc79fcebc59ae0608610ea0e70ad7abf8a2400c9c3bc48ef2c66"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {
@@ -473,6 +498,7 @@ public final class LSPTransport: @unchecked Sendable {
         nativeCallbacks.audio_packet = lspAudioPacketCallback
         nativeCallbacks.audio_timing = lspAudioTimingCallback
         nativeCallbacks.video_frame = lspVideoFrameCallback
+        nativeCallbacks.path_probe = lspPathProbeCallback
         var output: OpaquePointer?
         let status = clsp_core_create(&nativeConfiguration, &nativeCallbacks, &output)
         try Self.requireSuccess(status)
@@ -539,7 +565,16 @@ public final class LSPTransport: @unchecked Sendable {
             receivedDatagrams: native.received_datagrams,
             transmittedDatagrams: native.transmitted_datagrams,
             droppedDatagrams: native.dropped_datagrams,
-            authenticationFailures: native.authentication_failures
+            authenticationFailures: native.authentication_failures,
+            videoReceivedIPBytes: native.video_received_ip_bytes,
+            congestionFeedbackIPBytes: native.congestion_feedback_ip_bytes,
+            congestionFeedbackPackets: native.congestion_feedback_packets,
+            videoECNUnknownPackets: native.video_ecn_unknown_packets,
+            videoECNCEPackets: native.video_ecn_ce_packets,
+            pathProbesSent: native.path_probes_sent,
+            pathProbesAcknowledged: native.path_probes_acknowledged,
+            pathProbeTimeouts: native.path_probe_timeouts,
+            currentUDPPayloadSize: native.current_udp_payload_size
         )
     }
 
@@ -619,6 +654,11 @@ public final class LSPTransport: @unchecked Sendable {
         callbackState.setVideoHandler(handler)
     }
 
+    /// Installs the low-rate path-probe lifecycle handler.
+    public func setPathProbeHandler(_ handler: (@Sendable (LSPPathProbeEvent) -> Void)?) {
+        callbackState.setPathProbeHandler(handler)
+    }
+
     /// Installs the exact authenticated native video mapping before semantic ACK.
     public func configureVideo(_ configuration: LSPNativeVideoConfiguration) throws {
         var native = clsp_video_configuration_t()
@@ -648,6 +688,66 @@ public final class LSPTransport: @unchecked Sendable {
         native.input_watermark_extension = configuration.inputWatermarkExtension
         native.encoder_timing_extension = configuration.encoderTimingExtension
         try Self.requireSuccess(clsp_core_configure_video(core, &native))
+    }
+
+    /// Opens native complete-frame publication after the reliable video ACK is submitted.
+    public func activateVideo(videoGeneration: UInt32) throws {
+        try Self.requireSuccess(clsp_core_activate_video(core, videoGeneration))
+    }
+
+    /// Enables native RFC 8899 search after video ACK and renderer activation.
+    public func startPathDiscovery() throws {
+        try Self.requireSuccess(clsp_core_start_path_discovery(core))
+    }
+
+    /// Sends one reliable client PATH_PROBE intent; native emits LSPP after intent submission.
+    public func requestPathProbe(
+        probeID: UInt64,
+        udpPayloadSize: UInt16,
+        payload: Data,
+        timeout: Duration = .seconds(60)
+    ) async throws -> LSPControlEvent {
+        guard probeID != 0, udpPayloadSize >= 1_200, payload.count <= 1_100 else {
+            throw LSPTransportError.invalidConfiguration
+        }
+        let milliseconds = UInt32(60_000)
+        let requestID = callbackState.reserveRequestID()
+        return try await withCheckedThrowingContinuation { continuation in
+            callbackState.install(requestID: requestID) { result in continuation.resume(with: result) }
+            let status = payload.withUnsafeBytes { bytes in
+                clsp_core_send_path_probe(
+                    core,
+                    probeID,
+                    udpPayloadSize,
+                    requestID,
+                    clsp_const_byte_span_t(
+                        data: bytes.bindMemory(to: UInt8.self).baseAddress,
+                        length: bytes.count
+                    ),
+                    milliseconds
+                )
+            }
+            do {
+                try Self.requireSuccess(status)
+            } catch {
+                callbackState.fail(requestID: requestID, error: error as? LSPTransportError ?? .internalFailure)
+                return
+            }
+            Task.detached { [callbackState] in
+                try? await Task.sleep(for: timeout)
+                callbackState.fail(requestID: requestID, error: .timeout)
+            }
+        }
+    }
+
+    /// Retains one authenticated host intent until native exact LSPP validation.
+    public func acceptPathProbe(probeID: UInt64, udpPayloadSize: UInt16, requestID: UInt64) throws {
+        try Self.requireSuccess(clsp_core_accept_path_probe(core, probeID, udpPayloadSize, requestID))
+    }
+
+    /// Confirms one exact reliable ACK in native path-search state.
+    public func confirmPathProbe(probeID: UInt64, receivedPayloadSize: UInt16) throws {
+        try Self.requireSuccess(clsp_core_confirm_path_probe(core, probeID, receivedPayloadSize))
     }
 
     /// Reports one terminal decoder outcome and current bounded capacities.
@@ -988,6 +1088,7 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
     private var audioHandler: (@Sendable (LSPAudioPacket) -> Void)?
     private var audioTimingHandler: (@Sendable (LSPAudioTiming) -> Void)?
     private var videoHandler: (@Sendable (LSPVideoFrame) -> Void)?
+    private var pathProbeHandler: (@Sendable (LSPPathProbeEvent) -> Void)?
 
     func reserveRequestID() -> UInt64 {
         lock.withLock {
@@ -1066,6 +1167,19 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
 
     func setVideoHandler(_ handler: (@Sendable (LSPVideoFrame) -> Void)?) {
         lock.withLock { videoHandler = handler }
+    }
+
+    func receivePathProbe(_ event: LSPPathProbeEvent) {
+        if event.kind == .requestFailed {
+            fail(requestID: event.requestID, error: .timeout)
+            return
+        }
+        let handler = lock.withLock { pathProbeHandler }
+        handler?(event)
+    }
+
+    func setPathProbeHandler(_ handler: (@Sendable (LSPPathProbeEvent) -> Void)?) {
+        lock.withLock { pathProbeHandler = handler }
     }
 }
 
@@ -1200,4 +1314,25 @@ private let lspVideoFrameCallback: @convention(c) (
         annexBAccessUnit: Data(referencing: storage)
     )
     Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receiveVideo(frame)
+}
+
+private let lspPathProbeCallback: @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<clsp_path_probe_event_t>?
+) -> Void = { context, nativeEvent in
+    guard let context, let nativeEvent else { return }
+    let native = nativeEvent.pointee
+    guard native.abi_version == LSPTransport.abiVersion,
+          native.structure_size == MemoryLayout<clsp_path_probe_event_t>.size,
+          native.probe_id != 0,
+          native.udp_payload_size >= 1_200,
+          native.reserved_zero == 0,
+          let kind = LSPPathProbeEventKind(rawValue: native.kind)
+    else { return }
+    Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receivePathProbe(.init(
+        kind: kind,
+        probeID: native.probe_id,
+        requestID: native.request_id,
+        udpPayloadSize: native.udp_payload_size
+    ))
 }

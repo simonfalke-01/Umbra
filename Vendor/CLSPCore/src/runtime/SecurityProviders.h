@@ -116,12 +116,14 @@ namespace umbra::lsp {
      * @param packet Mutable packet capacity containing the protected packet.
      * @param length In/out protected/plaintext size.
      * @param rtcp Selects SRTCP instead of SRTP.
+     * @param replay Set only when libSRTP rejected an authenticated-sequence replay candidate.
      * @return Exact authentication result.
      */
     [[nodiscard]] clsp_status_t unprotect(
       std::span<std::uint8_t> packet,
       std::size_t &length,
-      bool rtcp
+      bool rtcp,
+      bool &replay
     ) noexcept;
 
     /**
@@ -138,6 +140,9 @@ namespace umbra::lsp {
       bool rtcp
     ) noexcept;
 
+    /** @brief Query exact libSRTP bytes appended by outbound SRTCP protection. */
+    [[nodiscard]] clsp_status_t rtcp_protect_trailer_length(std::size_t &length) const noexcept;
+
     /** @brief Install one video-specific inbound context with RFC6904 encrypted extension IDs. */
     [[nodiscard]] clsp_status_t configure_video_inbound(
       std::uint32_t ssrc,
@@ -148,7 +153,8 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t unprotect_video(
       std::span<std::uint8_t> packet,
       std::size_t &length,
-      bool rtcp
+      bool rtcp,
+      bool &replay
     ) noexcept;
 
     /** @brief Return whether both directional contexts are live. */

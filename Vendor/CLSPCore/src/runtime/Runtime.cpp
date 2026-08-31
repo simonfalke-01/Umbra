@@ -4,16 +4,18 @@
  */
 
 #include "Runtime.h"
+
 #include "../core/control.h"
 #include "../core/rtp.h"
 #include "../input_plane/input_plane.h"
 #include "../media/media.h"
+#include "../transport/congestion.h"
 #include "../transport/rtcp.h"
 #include "BufferInternal.h"
 #include "SecurityProviders.h"
+#include "TransportFeedback.h"
 
 #include <algorithm>
-
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -54,6 +56,12 @@ namespace umbra::lsp {
       4;  ///< Maximum negotiated hardware submissions.
     constexpr std::size_t maximum_depacketized_video_bytes =
       4'096;  ///< Worst-case small-NAL aggregation expansion.
+    constexpr std::uint64_t path_probe_timer_microseconds = 15'000'000U;  ///< RFC 8899 conservative PROBE_TIMER.
+    constexpr std::uint64_t path_probe_intent_retention_microseconds = 60'000'000U;  ///< Authenticated intent lifetime.
+    constexpr std::uint64_t path_probe_smoothed_rtt_microseconds = 20'000U;  ///< Local-path initial SRTT estimate.
+    constexpr std::uint8_t maximum_path_probe_attempts = 3;  ///< RFC 8899 default MAX_PROBES.
+    constexpr std::uint64_t compound_rtcp_interval_microseconds = 1'000'000U;  ///< Regular RR/SDES cadence.
+    constexpr std::uint64_t path_mtu_raise_interval_microseconds = 600'000'000U;  ///< RFC 8899 PMTU_RAISE_TIMER.
     constexpr std::array<std::uint8_t, 4> annex_b_start_code{
       0,
       0,
@@ -66,6 +74,13 @@ namespace umbra::lsp {
       dtls,  ///< DTLS record, first byte 20 through 63.
       srtp_or_srtcp,  ///< RTP/RTCP packet, first byte 128 through 191.
       invalid,  ///< Reserved or invalid LSP/1 datagram.
+    };
+
+    /** @brief Result of classifying authenticated SRTCP as an LSPP probe. */
+    enum class PathProbePacketResult : std::uint8_t {
+      not_probe,  ///< Packet belongs to another authenticated RTCP lane.
+      accepted,  ///< Exact LSPP matched or entered the bounded reorder record.
+      invalid,  ///< LSPP name was present but its exact contract failed.
     };
 
     /** @brief Classify one complete UDP datagram without side effects. */
@@ -86,6 +101,22 @@ namespace umbra::lsp {
     /** @brief Apply RFC 5761 RTP/RTCP-mux classification to an authenticated candidate. */
     [[nodiscard]] constexpr bool is_rtcp(const std::span<const std::uint8_t> datagram) noexcept {
       return datagram.size() >= 2U && datagram[1] >= 192U && datagram[1] <= 223U;
+    }
+
+    /** @brief Return whether one LSPC ACK base/bitmap explicitly covers a message ID. */
+    [[nodiscard]] constexpr bool acknowledges_message(
+      const std::uint64_t base,
+      const std::uint64_t bitmap,
+      const std::uint64_t message_id
+    ) noexcept {
+      if (base == 0 || message_id == 0 || message_id > base) {
+        return false;
+      }
+      if (message_id == base) {
+        return true;
+      }
+      const auto distance = base - message_id;
+      return distance <= 64U && (bitmap & (std::uint64_t {1} << (distance - 1U))) != 0;
     }
 
     /** @brief Return monotonic microseconds with saturation on clock failure. */
@@ -592,6 +623,9 @@ namespace umbra::lsp {
       command.flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required);
       command.response = false;
       command.activate_microphone = false;
+      command.transmit_path_probe = false;
+      command.path_probe_id = 0;
+      command.path_probe_size = 0;
       command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
       const auto now = monotonic_microseconds();
       const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
@@ -638,6 +672,9 @@ namespace umbra::lsp {
                       (error_response ? static_cast<std::uint8_t>(lumen::lsp::lspc_flag::error_response) : 0U);
       command.response = true;
       command.activate_microphone = message_type == 0x0215U && !error_response;
+      command.transmit_path_probe = false;
+      command.path_probe_id = 0;
+      command.path_probe_size = 0;
       command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
       const auto now = monotonic_microseconds();
       const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
@@ -684,16 +721,25 @@ namespace umbra::lsp {
 
     [[nodiscard]] clsp_status_t configure_audio(const clsp_audio_configuration_t &configuration) noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
-      if (!authenticated_.load(std::memory_order_acquire)) return CLSP_STATUS_NOT_AUTHENTICATED;
-      if (!valid_audio_configuration(configuration)) return CLSP_STATUS_INVALID_CONFIGURATION;
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      if (!valid_audio_configuration(configuration)) {
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
       if (audio_configured_.load(std::memory_order_acquire)) {
         return same_audio_configuration(audio_configuration_, configuration) ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
       }
       audio_configuration_ = configuration;
+      audio_feedback_.reset(monotonic_microseconds());
+      audio_reception_.reset();
+      audio_feedback_sequence_initialized_ = false;
+      audio_feedback_largest_extended_sequence_ = 0;
+      authenticated_audio_fingerprints_ = {};
       audio_configured_.store(true, std::memory_order_release);
       return CLSP_STATUS_OK;
 #else
-      (void)configuration;
+      (void) configuration;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
     }
@@ -821,6 +867,7 @@ namespace umbra::lsp {
       video_frame_pool_ = pool;
       video_metadata_ = {};
       video_retired_frames_ = {};
+      authenticated_video_fingerprints_ = {};
       video_sequence_initialized_ = false;
       video_timestamp_initialized_ = false;
       video_largest_extended_sequence_ = 0;
@@ -832,6 +879,28 @@ namespace umbra::lsp {
       video_next_retirement_order_ = 1;
       video_render_mailbox_occupancy_ = 0;
       video_deadline_miss_latched_ = false;
+      video_delivery_active_.store(false, std::memory_order_release);
+      video_feedback_.reset(monotonic_microseconds());
+      video_reception_.reset();
+      feedback_sequence_initialized_ = false;
+      feedback_largest_extended_sequence_ = 0;
+      compound_rtcp_sent_ = false;
+      last_compound_rtcp_microseconds_ = 0;
+      pending_rtcp_ = {};
+      path_discovery_enabled_.store(false, std::memory_order_release);
+      outbound_path_probe_ = {};
+      inbound_path_probe_intent_ = {};
+      unmatched_path_probe_ = {};
+      path_probe_notification_pending_ = false;
+      emitted_path_probe_id_.store(0, std::memory_order_release);
+      emitted_path_probe_size_.store(0, std::memory_order_release);
+      pending_path_ack_id_.store(0, std::memory_order_release);
+      pending_path_probe_event_count_ = 0;
+      path_intent_message_id_ = 0;
+      path_intent_request_id_ = 0;
+      path_intent_probe_id_ = 0;
+      path_intent_probe_size_ = 0;
+      path_intent_control_ = {};
       lspv_coalescer_ = {};
       video_configured_.store(true, std::memory_order_release);
       pthread_mutex_unlock(&mutex_);
@@ -840,6 +909,176 @@ namespace umbra::lsp {
       (void)configuration;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
+    }
+
+    /** @brief Open retained complete-frame delivery only after the semantic ACK crossed DTLS. */
+    [[nodiscard]] clsp_status_t activate_video(const std::uint32_t video_generation) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!video_configured_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      pthread_mutex_lock(&mutex_);
+      const auto matches = video_configured_.load(std::memory_order_acquire) &&
+                           video_configuration_.video_generation == video_generation;
+      if (matches) {
+        video_delivery_active_.store(true, std::memory_order_release);
+      }
+      pthread_mutex_unlock(&mutex_);
+      if (!matches) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void) video_generation;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Enable native DPLPMTUD after video and input mappings are installed. */
+    [[nodiscard]] clsp_status_t start_path_discovery() noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire) ||
+          !video_configured_.load(std::memory_order_acquire) || !input_configured_ || !path_mtu_) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      path_discovery_enabled_.store(true, std::memory_order_release);
+      last_path_raise_microseconds_ = monotonic_microseconds();
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Queue one reliable client intent that gates exact-size LSPP submission. */
+    [[nodiscard]] clsp_status_t send_path_probe(
+      const std::uint64_t probe_id,
+      const std::uint16_t udp_payload_size,
+      const std::uint64_t request_id,
+      const clsp_const_byte_span_t payload,
+      const std::uint32_t deadline_milliseconds
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      if (probe_id == 0 || request_id == 0 || udp_payload_size < 1'200U ||
+          deadline_milliseconds < 20U || deadline_milliseconds > 60'000U ||
+          payload.length > maximum_control_payload || (payload.data == nullptr && payload.length != 0)) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      pthread_mutex_lock(&mutex_);
+      const auto emitted_probe_id = emitted_path_probe_id_.load(std::memory_order_acquire);
+      const auto emitted_probe_size = emitted_path_probe_size_.load(std::memory_order_acquire);
+      const auto queue_full = queued_control_count_ == control_queue_capacity;
+      if (emitted_probe_id != probe_id || emitted_probe_size != udp_payload_size || queue_full) {
+        pthread_mutex_unlock(&mutex_);
+        return queue_full ? CLSP_STATUS_CONTROL_WINDOW_FULL : CLSP_STATUS_INVALID_STATE;
+      }
+      auto &command = control_queue_[control_queue_tail_];
+      command.message_type = 0x0300U;
+      command.request_id = request_id;
+      command.flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required);
+      command.response = false;
+      command.activate_microphone = false;
+      command.transmit_path_probe = true;
+      command.path_probe_id = probe_id;
+      command.path_probe_size = udp_payload_size;
+      command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
+      const auto now = monotonic_microseconds();
+      const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
+      command.deadline_microseconds = saturating_add(now, duration);
+      control_queue_tail_ = (control_queue_tail_ + 1U) % control_queue_capacity;
+      ++queued_control_count_;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void) probe_id;
+      (void) udp_payload_size;
+      (void) request_id;
+      (void) payload;
+      (void) deadline_milliseconds;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Retain one authenticated host intent and match one reordered LSPP record. */
+    [[nodiscard]] clsp_status_t accept_path_probe(
+      const std::uint64_t probe_id,
+      const std::uint16_t udp_payload_size,
+      const std::uint64_t request_id
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (probe_id == 0 || request_id == 0 || udp_payload_size < 1'200U || !path_mtu_ ||
+          udp_payload_size > path_mtu_->ceiling_payload_bytes()) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      pthread_mutex_lock(&mutex_);
+      if (inbound_path_probe_intent_.occupied &&
+          (inbound_path_probe_intent_.probe_id != probe_id ||
+           inbound_path_probe_intent_.udp_payload_size != udp_payload_size ||
+           inbound_path_probe_intent_.request_id != request_id)) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      inbound_path_probe_intent_ = {
+        .probe_id = probe_id,
+        .request_id = request_id,
+        .received_microseconds = monotonic_microseconds(),
+        .udp_payload_size = udp_payload_size,
+        .occupied = true,
+      };
+      if (unmatched_path_probe_.occupied && unmatched_path_probe_.probe_id == probe_id &&
+          unmatched_path_probe_.udp_payload_size == udp_payload_size) {
+        if (!queue_path_probe_event_locked(CLSP_PATH_PROBE_RECEIVED, probe_id, udp_payload_size, request_id)) {
+          pthread_mutex_unlock(&mutex_);
+          return CLSP_STATUS_RESOURCE_EXHAUSTED;
+        }
+        unmatched_path_probe_ = {};
+        inbound_path_probe_intent_ = {};
+        last_received_probe_id_ = probe_id;
+        last_received_probe_size_ = udp_payload_size;
+      }
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void) probe_id;
+      (void) udp_payload_size;
+      (void) request_id;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Commit one exact client-initiated ACK and advance confirmed PMTU. */
+    [[nodiscard]] clsp_status_t confirm_path_probe(
+      const std::uint64_t probe_id,
+      const std::uint16_t received_payload_size
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (probe_id == 0 || received_payload_size < 1'200U || received_payload_size > maximum_udp_payload) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      pending_path_ack_size_.store(received_payload_size, std::memory_order_release);
+      auto expected = std::uint64_t {0};
+      if (!pending_path_ack_id_.compare_exchange_strong(expected, probe_id, std::memory_order_acq_rel) &&
+          expected != probe_id) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void) probe_id;
+      (void) received_payload_size;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Return the authenticated confirmed UDP payload ceiling. */
+    [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept {
+      return current_udp_payload_size_.load(std::memory_order_acquire);
     }
 
     /** @brief Record one terminal hardware decode outcome for bounded credit and
@@ -1137,6 +1376,9 @@ namespace umbra::lsp {
       std::uint8_t flags {};  ///< Exact LSPC request/response/error flags.
       bool response {};  ///< Whether response cache insertion is required.
       bool activate_microphone {};  ///< Enable prepared microphone only after ACK submission.
+      bool transmit_path_probe {};  ///< Submit exact-size LSPP only after this intent is sent.
+      std::uint64_t path_probe_id {};  ///< Logical LSPP probe ID.
+      std::uint16_t path_probe_size {};  ///< Exact protected UDP probe size.
     };
 
     /** @brief One retained authenticated host request awaiting a semantic response. */
@@ -1218,6 +1460,86 @@ namespace umbra::lsp {
       std::uint64_t retirement_order {};  ///< Bounded oldest-key replacement order.
     };
 
+    /** @brief One authenticated host PATH_PROBE intent awaiting exact LSPP. */
+    struct InboundPathProbeIntent {
+      std::uint64_t probe_id {};  ///< Nonzero authenticated intent ID.
+      std::uint64_t request_id {};  ///< Reliable host request ID.
+      std::uint64_t received_microseconds {};  ///< Intent retention origin.
+      std::uint16_t udp_payload_size {};  ///< Exact expected protected datagram size.
+      bool occupied {};  ///< Whether one intent is live.
+    };
+
+    /** @brief One authenticated LSPP retained across intent/probe UDP reordering. */
+    struct UnmatchedPathProbe {
+      std::uint64_t probe_id {};  ///< Validated probe ID.
+      std::uint64_t received_microseconds {};  ///< Bounded retention origin.
+      std::uint16_t udp_payload_size {};  ///< Exact received protected datagram size.
+      bool occupied {};  ///< Whether one unmatched record is live.
+    };
+
+    /** @brief Exact protected client LSPP retained for immediate would-block retry. */
+    struct OutboundPathProbePacket {
+      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Protected SRTCP bytes.
+      std::uint64_t probe_id {};  ///< Logical probe ID shared across timed attempts.
+      std::uint64_t last_send_microseconds {};  ///< Last successful kernel submission.
+      std::size_t length {};  ///< Exact protected datagram length.
+      std::uint16_t udp_payload_size {};  ///< Candidate size.
+      std::uint8_t attempts {};  ///< Successful timed submissions, at most three.
+      bool pending_send {};  ///< Exact protected bytes await first/EAGAIN submission.
+      bool active {};  ///< Probe timer remains live after successful submission.
+    };
+
+    /** @brief One protected compound or CCFB packet retained across immediate backpressure. */
+    struct PendingProtectedRtcp {
+      enum class Kind : std::uint8_t {
+        none,  ///< No packet retained.
+        compound,  ///< Regular RR plus SDES CNAME.
+        congestion_feedback,  ///< Reduced-size RFC 8888 CCFB.
+        lspv,  ///< Protected decoder/render status.
+        microphone_report,  ///< Reverse microphone sender report.
+      } kind {Kind::none};  ///< Retained packet semantic.
+      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Exact protected bytes.
+      native_feedback_write_result video_feedback {};  ///< Video commit watermark for CCFB.
+      native_feedback_write_result audio_feedback {};  ///< Audio commit watermark for CCFB.
+      std::size_t length {};  ///< Exact protected datagram length.
+      std::uint64_t created_microseconds {};  ///< Report timestamp and successful commit time.
+
+      /** @brief Return whether exact protected bytes await submission. */
+      [[nodiscard]] explicit operator bool() const noexcept {
+        return kind != Kind::none && length != 0;
+      }
+    };
+
+    /** @brief One exact protected controller command ACK retained across backpressure. */
+    struct PendingControllerAck {
+      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Exact protected SRTCP bytes.
+      std::size_t length {};  ///< Protected datagram length.
+      bool occupied {};  ///< Whether immediate retry remains pending.
+    };
+
+    /** @brief Bounded exact fingerprint of one previously authenticated SRTP packet. */
+    struct AuthenticatedRtpFingerprint {
+      std::array<std::uint8_t, 16> authentication_tag {};  ///< Exact AES-GCM tag from authenticated SRTP.
+      std::uint64_t first_arrival_microseconds {};  ///< Earliest authenticated arrival.
+      std::uint32_t ssrc {};  ///< Visible primary SSRC.
+      std::uint32_t rtp_timestamp {};  ///< Authenticated RTP timestamp.
+      std::uint16_t sequence {};  ///< RTP sequence number.
+      std::uint16_t protected_bytes {};  ///< Exact protected UDP payload bytes.
+      std::uint8_t first_header_byte {};  ///< Authenticated RTP flags/CSRC byte.
+      std::uint8_t second_header_byte {};  ///< Authenticated marker/payload type byte.
+      bool occupied {};  ///< Whether this ring slot is authenticated.
+    };
+
+    /** @brief Optional reliable PATH_PROBE intent kept outside fatal control operations. */
+    struct PathIntentControlFrame {
+      lumen::lsp::packet_slab<maximum_control_frame> frame {};  ///< Exact LSPC bytes.
+      std::uint64_t message_id {};  ///< Logical control message ID.
+      std::uint64_t deadline_microseconds {};  ///< Optional intent retry deadline.
+      std::uint64_t next_retry_microseconds {};  ///< Next byte-identical retry.
+      std::uint8_t transmissions {};  ///< Completed DTLS submissions.
+      bool occupied {};  ///< Whether peer ACK remains outstanding.
+    };
+
     /** @brief Increment one C ABI telemetry counter. */
     void increment(const RuntimeCounter counter, const std::uint64_t amount = 1) const noexcept {
       if (callbacks_.counter != nullptr) {
@@ -1282,7 +1604,7 @@ namespace umbra::lsp {
      */
     [[nodiscard]] lumen::lsp::transport::lspv_status current_lspv_status(
       const lumen::lsp::transport::lspv_decoder_status decoder_status
-    ) const noexcept {
+    ) noexcept {
       return {
         .session_generation = video_configuration_.stream_generation,
         .video_generation = video_configuration_.video_generation,
@@ -1302,6 +1624,8 @@ namespace umbra::lsp {
      * quiescent. */
     void release_video_state() noexcept {
       video_configured_.store(false, std::memory_order_release);
+      video_delivery_active_.store(false, std::memory_order_release);
+      path_discovery_enabled_.store(false, std::memory_order_release);
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (mutex_ready_) {
         pthread_mutex_lock(&mutex_);
@@ -1316,6 +1640,22 @@ namespace umbra::lsp {
       video_reassembler_.reset();
       video_metadata_ = {};
       video_retired_frames_ = {};
+      authenticated_video_fingerprints_ = {};
+      outbound_path_probe_ = {};
+      inbound_path_probe_intent_ = {};
+      unmatched_path_probe_ = {};
+      path_probe_notification_pending_ = false;
+      emitted_path_probe_id_.store(0, std::memory_order_release);
+      emitted_path_probe_size_.store(0, std::memory_order_release);
+      pending_path_ack_id_.store(0, std::memory_order_release);
+      pending_path_probe_event_count_ = 0;
+      path_intent_message_id_ = 0;
+      path_intent_request_id_ = 0;
+      path_intent_probe_id_ = 0;
+      path_intent_probe_size_ = 0;
+      path_intent_control_ = {};
+      compound_rtcp_sent_ = false;
+      pending_rtcp_ = {};
       auto *pool = video_frame_pool_;
       video_frame_pool_ = nullptr;
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
@@ -1435,6 +1775,87 @@ namespace umbra::lsp {
       }
     }
 
+    /** @brief Retain one low-rate DPLPMTUD event until the C ABI callback accepts it. */
+    [[nodiscard]] bool queue_path_probe_event(
+      const std::uint8_t kind,
+      const std::uint64_t probe_id,
+      const std::uint16_t udp_payload_size,
+      const std::uint64_t request_id
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      pthread_mutex_lock(&mutex_);
+      const auto queued = queue_path_probe_event_locked(kind, probe_id, udp_payload_size, request_id);
+      pthread_mutex_unlock(&mutex_);
+      if (queued) {
+        wake_worker();
+      }
+      return queued;
+#else
+      (void) kind;
+      (void) probe_id;
+      (void) udp_payload_size;
+      (void) request_id;
+      return false;
+#endif
+    }
+
+    /** @brief Append one path event while `mutex_` is already held. */
+    [[nodiscard]] bool queue_path_probe_event_locked(
+      const std::uint8_t kind,
+      const std::uint64_t probe_id,
+      const std::uint16_t udp_payload_size,
+      const std::uint64_t request_id
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (pending_path_probe_event_count_ == pending_path_probe_events_.size()) {
+        return false;
+      }
+      pending_path_probe_events_[pending_path_probe_event_count_++] = {
+        .abi_version = CLSP_CORE_ABI_VERSION,
+        .structure_size = sizeof(clsp_path_probe_event_t),
+        .probe_id = probe_id,
+        .request_id = request_id,
+        .udp_payload_size = udp_payload_size,
+        .kind = kind,
+        .reserved_zero = 0,
+      };
+      return true;
+#else
+      (void) kind;
+      (void) probe_id;
+      (void) udp_payload_size;
+      (void) request_id;
+      return false;
+#endif
+    }
+
+    /** @brief Deliver retained path events without dropping them during another active callback. */
+    void deliver_path_probe_events() noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (callbacks_.path_probe == nullptr) {
+        return;
+      }
+      for (;;) {
+        pthread_mutex_lock(&mutex_);
+        if (pending_path_probe_event_count_ == 0) {
+          pthread_mutex_unlock(&mutex_);
+          return;
+        }
+        const auto event = pending_path_probe_events_[0];
+        pthread_mutex_unlock(&mutex_);
+        if (!callbacks_.path_probe(callbacks_.context, event)) {
+          return;
+        }
+        pthread_mutex_lock(&mutex_);
+        for (std::size_t index = 1; index < pending_path_probe_event_count_; ++index) {
+          pending_path_probe_events_[index - 1U] = pending_path_probe_events_[index];
+        }
+        --pending_path_probe_event_count_;
+        pthread_mutex_unlock(&mutex_);
+      }
+#endif
+    }
+
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
     /** @brief Resolve and connect one nonblocking UDP socket, then register kqueue readiness. */
     [[nodiscard]] clsp_status_t open_socket(const clsp_endpoint_t &endpoint) noexcept {
@@ -1473,6 +1894,7 @@ namespace umbra::lsp {
           continue;
         }
         socket_ = descriptor;
+        socket_family_ = candidate->ai_family;
         std::memcpy(&peer_address_, candidate->ai_addr, candidate->ai_addrlen);
         peer_address_size_ = static_cast<unsigned int>(candidate->ai_addrlen);
         break;
@@ -1486,6 +1908,32 @@ namespace umbra::lsp {
       const int enabled = 1;
       (void)setsockopt(socket_, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &enabled, sizeof(enabled));
 #endif
+      const int receive_ecn = 1;
+      if (socket_family_ == AF_INET) {
+  #ifdef IP_RECVTOS
+        (void) setsockopt(socket_, IPPROTO_IP, IP_RECVTOS, &receive_ecn, sizeof(receive_ecn));
+  #endif
+        path_mtu_.emplace(lumen::lsp::transport::path_mtu_config {
+          .ip_version = lumen::lsp::transport::path_ip_version::ipv4,
+          .sender_interface_limit = 1'472,
+          .receiver_advertised_limit = 1'472,
+          .operator_configured_limit = 1'472,
+        });
+      } else if (socket_family_ == AF_INET6) {
+  #ifdef IPV6_RECVTCLASS
+        (void) setsockopt(socket_, IPPROTO_IPV6, IPV6_RECVTCLASS, &receive_ecn, sizeof(receive_ecn));
+  #endif
+        path_mtu_.emplace(lumen::lsp::transport::path_mtu_config {
+          .ip_version = lumen::lsp::transport::path_ip_version::ipv6,
+          .sender_interface_limit = 1'452,
+          .receiver_advertised_limit = 1'452,
+          .operator_configured_limit = 1'452,
+        });
+      }
+      if (!path_mtu_ || !path_mtu_->valid()) {
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
+      current_udp_payload_size_.store(1'200U, std::memory_order_release);
       kqueue_ = kqueue();
       if (kqueue_ < 0) {
         return CLSP_STATUS_SOCKET_FAILURE;
@@ -1540,6 +1988,10 @@ namespace umbra::lsp {
             fail_worker(status);
             return;
           }
+          next_path_probe_id_ = (static_cast<std::uint64_t>(arc4random()) << 32U) | arc4random();
+          if (next_path_probe_id_ == 0) {
+            next_path_probe_id_ = 1;
+          }
           authenticated_.store(true, std::memory_order_release);
           signal_startup(CLSP_STATUS_OK);
           publish_lifecycle(CLSP_LIFECYCLE_AUTHENTICATED);
@@ -1565,6 +2017,7 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        deliver_path_probe_events();
         deliver_video_frames();
         status = retry_control();
         if (status != CLSP_STATUS_OK) {
@@ -1586,6 +2039,11 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        status = transmit_pending_controller_ack();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
         status = transmit_microphone();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
@@ -1593,6 +2051,32 @@ namespace umbra::lsp {
         }
         if (video_configured_.load(std::memory_order_acquire)) {
           expire_video_frames(monotonic_microseconds());
+        }
+        const auto transport_now = monotonic_microseconds();
+        status = drive_path_mtu(transport_now);
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = transmit_outbound_path_probe(transport_now);
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = transmit_pending_rtcp(transport_now);
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = transmit_compound_rtcp(transport_now);
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = transmit_congestion_feedback(transport_now);
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
         }
         status = transmit_lspv();
         if (status != CLSP_STATUS_OK) {
@@ -1606,7 +2090,15 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t drain_socket() noexcept {
       for (std::size_t index = 0; index < receive_batch_size; ++index) {
         std::array<std::uint8_t, maximum_udp_payload> packet {};
-        const auto received = recv(socket_, packet.data(), packet.size(), 0);
+        std::array<std::uint8_t, 128> control {};
+        iovec vector {.iov_base = packet.data(), .iov_len = packet.size()};
+        msghdr message {};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        const auto received = recvmsg(socket_, &message, 0);
+        const auto arrival_microseconds = monotonic_microseconds();
         if (received < 0) {
           return errno == EAGAIN || errno == EWOULDBLOCK ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
         }
@@ -1614,7 +2106,45 @@ namespace umbra::lsp {
           increment(RuntimeCounter::dropped);
           continue;
         }
+        if ((message.msg_flags & MSG_TRUNC) != 0 || static_cast<std::size_t>(received) > packet.size()) {
+          increment(RuntimeCounter::dropped);
+          continue;
+        }
+        auto ecn = native_ecn_mark::unknown;
+        for (auto *header = CMSG_FIRSTHDR(&message); header != nullptr; header = CMSG_NXTHDR(&message, header)) {
+          auto ipv4_tos = header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_TOS;
+  #ifdef IP_RECVTOS
+          ipv4_tos = ipv4_tos || (header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_RECVTOS);
+  #endif
+  #ifdef IPV6_TCLASS
+          const auto ipv6_class = header->cmsg_level == IPPROTO_IPV6 && header->cmsg_type == IPV6_TCLASS;
+  #else
+          const auto ipv6_class = false;
+  #endif
+          if (!ipv4_tos && !ipv6_class) {
+            continue;
+          }
+          int traffic_class = 0;
+          const auto available = header->cmsg_len > CMSG_LEN(0) ? header->cmsg_len - CMSG_LEN(0) : 0;
+          std::memcpy(&traffic_class, CMSG_DATA(header), std::min<std::size_t>(available, sizeof(traffic_class)));
+          switch (static_cast<unsigned int>(traffic_class) & 0x03U) {
+            case 0U:
+              ecn = native_ecn_mark::not_ect;
+              break;
+            case 1U:
+              ecn = native_ecn_mark::ect1;
+              break;
+            case 2U:
+              ecn = native_ecn_mark::ect0;
+              break;
+            case 3U:
+              ecn = native_ecn_mark::congestion_experienced;
+              break;
+          }
+          break;
+        }
         auto datagram = std::span<std::uint8_t> {packet.data(), static_cast<std::size_t>(received)};
+        const auto protected_datagram_size = static_cast<std::uint16_t>(datagram.size());
         switch (classify(datagram)) {
           case PacketClass::dtls: {
             const auto status = dtls_.receive(datagram);
@@ -1632,28 +2162,116 @@ namespace umbra::lsp {
             auto packet_length = datagram.size();
             const auto rtcp = is_rtcp(datagram);
             const auto visible_ssrc =
-            rtcp && datagram.size() >= 8U ? lumen::lsp::wire::read_be<std::uint32_t>(
-                                              datagram.subspan(4, 4)
-                                            )
-                                          : (!rtcp && datagram.size() >= 12U ? lumen::lsp::wire::read_be<std::uint32_t>(
-                                                                                 datagram.subspan(8, 4)
-                                                                               )
-                                                                             : 0U);
-          const auto use_video_context =
-            video_configured_.load(std::memory_order_acquire) &&
-            visible_ssrc == video_configuration_.primary_ssrc;
-          const auto status =
-            use_video_context ? srtp_.unprotect_video(packet, packet_length, rtcp) : srtp_.unprotect(packet, packet_length, rtcp);
+              rtcp && datagram.size() >= 8U ? lumen::lsp::wire::read_be<std::uint32_t>(
+                                                datagram.subspan(4, 4)
+                                              ) :
+                                              (!rtcp && datagram.size() >= 12U ? lumen::lsp::wire::read_be<std::uint32_t>(
+                                                                                   datagram.subspan(8, 4)
+                                                                                 ) :
+                                                                                 0U);
+            const auto use_video_context =
+              video_configured_.load(std::memory_order_acquire) &&
+              visible_ssrc == video_configuration_.primary_ssrc;
+            const auto video_rtp_candidate = use_video_context && !rtcp && datagram.size() >= 28U;
+            const auto audio_rtp_candidate = !use_video_context && !rtcp && datagram.size() >= 28U &&
+                                             audio_configured_.load(std::memory_order_acquire) &&
+                                             visible_ssrc == audio_configuration_.audio_ssrc;
+            const auto feedback_rtp_candidate = video_rtp_candidate || audio_rtp_candidate;
+            std::array<std::uint8_t, 16> authentication_tag {};
+            if (feedback_rtp_candidate) {
+              std::copy(datagram.end() - 16, datagram.end(), authentication_tag.begin());
+            }
+            const auto visible_sequence = feedback_rtp_candidate ?
+                                            lumen::lsp::wire::read_be<std::uint16_t>(datagram.subspan(2, 2)) :
+                                            0U;
+            const auto visible_timestamp = feedback_rtp_candidate ?
+                                             lumen::lsp::wire::read_be<std::uint32_t>(datagram.subspan(4, 4)) :
+                                             0U;
+            const auto first_header_byte = feedback_rtp_candidate ? datagram[0] : 0U;
+            const auto second_header_byte = feedback_rtp_candidate ? datagram[1] : 0U;
+            bool replay = false;
+            const auto status = use_video_context ?
+                                  srtp_.unprotect_video(packet, packet_length, rtcp, replay) :
+                                  srtp_.unprotect(packet, packet_length, rtcp, replay);
             if (status != CLSP_STATUS_OK) {
+              if (replay && feedback_rtp_candidate) {
+                const auto &fingerprints = video_rtp_candidate ? authenticated_video_fingerprints_ :
+                                                                 authenticated_audio_fingerprints_;
+                if (const auto *fingerprint = authenticated_rtp_fingerprint(
+                      fingerprints,
+                      visible_sequence,
+                      visible_ssrc,
+                      visible_timestamp,
+                      protected_datagram_size,
+                      first_header_byte,
+                      second_header_byte,
+                      authentication_tag
+                    )) {
+                  if (video_rtp_candidate) {
+                    record_video_duplicate_ce(*fingerprint, ecn);
+                  } else {
+                    record_audio_duplicate_ce(*fingerprint, ecn);
+                  }
+                  increment(RuntimeCounter::received);
+                  break;
+                }
+              }
               increment(RuntimeCounter::authentication_failure);
               break;
             }
             increment(RuntimeCounter::received);
-            if (!handle_authenticated_realtime(std::span<const std::uint8_t> {packet.data(), packet_length}, rtcp)) {
+            const auto plaintext = std::span<const std::uint8_t> {packet.data(), packet_length};
+            const auto path_probe = rtcp ? handle_authenticated_path_probe(plaintext, visible_ssrc, protected_datagram_size, arrival_microseconds) :
+                                           PathProbePacketResult::not_probe;
+            if (path_probe == PathProbePacketResult::invalid ||
+                (path_probe == PathProbePacketResult::not_probe &&
+                 protected_datagram_size > current_udp_payload_size_.load(std::memory_order_acquire))) {
+              increment(RuntimeCounter::dropped);
+              break;
+            }
+            if (path_probe == PathProbePacketResult::accepted) {
+              break;
+            }
+            if (!rtcp && use_video_context) {
+              const auto video_rtp = lumen::lsp::parse_rtp_fixed_header(plaintext);
+              if (video_rtp && video_rtp.header.ssrc == video_configuration_.primary_ssrc &&
+                  video_rtp.header.payload_type == video_configuration_.primary_payload_type) {
+                record_video_feedback(plaintext, protected_datagram_size, arrival_microseconds, ecn);
+                store_authenticated_rtp_fingerprint(
+                  authenticated_video_fingerprints_,
+                  visible_sequence,
+                  visible_ssrc,
+                  visible_timestamp,
+                  protected_datagram_size,
+                  arrival_microseconds,
+                  first_header_byte,
+                  second_header_byte,
+                  authentication_tag
+                );
+              }
+            } else if (audio_rtp_candidate) {
+              const auto audio_rtp = lumen::lsp::parse_rtp_fixed_header(plaintext);
+              if (audio_rtp && audio_rtp.header.ssrc == audio_configuration_.audio_ssrc &&
+                  audio_rtp.header.payload_type == audio_configuration_.audio_payload_type) {
+                record_audio_feedback(plaintext, protected_datagram_size, arrival_microseconds, ecn);
+                store_authenticated_rtp_fingerprint(
+                  authenticated_audio_fingerprints_,
+                  visible_sequence,
+                  visible_ssrc,
+                  visible_timestamp,
+                  protected_datagram_size,
+                  arrival_microseconds,
+                  first_header_byte,
+                  second_header_byte,
+                  authentication_tag
+                );
+              }
+            }
+            if (!handle_authenticated_realtime(plaintext, rtcp, arrival_microseconds)) {
               increment(RuntimeCounter::dropped);
             }
             break;
-          }
+            }
           case PacketClass::invalid:
             increment(RuntimeCounter::dropped);
             break;
@@ -1682,6 +2300,7 @@ namespace umbra::lsp {
                                           input_configuration_.acknowledgement_ssrc == selected.acknowledgement_ssrc &&
                                           input_configuration_.input_payload_type == selected.input_payload_type;
       input_configuration_ = selected;
+      pending_controller_ack_ = {};
       if (!pointer_composer_.reset(1, 1) || !edge_sender_.reset(selected.input_generation)) {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
@@ -1700,6 +2319,36 @@ namespace umbra::lsp {
       next_state_sequence_ = 2;
       if (!restoring_same_mapping) {
         rtp_sequence_ = static_cast<std::uint16_t>(arc4random());
+      }
+      if (compound_cname_length_ == 0) {
+        constexpr std::array<std::uint8_t, 16> hexadecimal {
+          '0',
+          '1',
+          '2',
+          '3',
+          '4',
+          '5',
+          '6',
+          '7',
+          '8',
+          '9',
+          'a',
+          'b',
+          'c',
+          'd',
+          'e',
+          'f'
+        };
+        compound_cname_[0] = 'l';
+        compound_cname_[1] = 's';
+        compound_cname_[2] = 'p';
+        compound_cname_[3] = '-';
+        for (std::size_t index = 0; index < 16U; ++index) {
+          const auto byte = static_cast<std::uint8_t>(arc4random());
+          compound_cname_[4U + index * 2U] = hexadecimal[byte >> 4U];
+          compound_cname_[5U + index * 2U] = hexadecimal[byte & 0x0fU];
+        }
+        compound_cname_length_ = 36U;
       }
       input_tokens_bits_ = selected.reserved_input_wire_bits_per_second / 500U;
       input_last_credit_us_ = monotonic_microseconds();
@@ -2117,7 +2766,7 @@ namespace umbra::lsp {
 
     /** @brief Pace, protect, and submit at most one complete microphone Opus packet. */
     [[nodiscard]] clsp_status_t transmit_microphone() noexcept {
-#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+  #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (!microphone_active_.load(std::memory_order_acquire)) return CLSP_STATUS_OK;
       const auto now = monotonic_microseconds();
       replenish_microphone_credit(now);
@@ -2163,9 +2812,9 @@ namespace umbra::lsp {
         return send_microphone_report(now);
       }
       return CLSP_STATUS_OK;
-#else
+  #else
       return CLSP_STATUS_UNSUPPORTED;
-#endif
+  #endif
     }
 
     /** @brief Refill the reverse-microphone pacer below the dedicated input lane. */
@@ -2183,7 +2832,11 @@ namespace umbra::lsp {
 
     /** @brief Emit one protected RTCP sender report for the microphone timeline. */
     [[nodiscard]] clsp_status_t send_microphone_report(const std::uint64_t now) noexcept {
-      std::array<std::uint8_t, 64> packet {};
+      if (pending_rtcp_) {
+        return CLSP_STATUS_OK;
+      }
+      auto &packet = pending_rtcp_.bytes;
+      std::fill(packet.begin(), packet.end(), 0);
       packet[0] = 0x80;
       packet[1] = 200;
       lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan(2, 2), 6);
@@ -2203,13 +2856,600 @@ namespace umbra::lsp {
       auto length = std::size_t {28};
       const auto status = srtp_.protect(packet, length, true);
       if (status != CLSP_STATUS_OK) return status;
-      const auto sent = ::send(socket_, packet.data(), length, 0);
-      if (sent != static_cast<ssize_t>(length)) {
-        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
+      pending_rtcp_.kind = PendingProtectedRtcp::Kind::microphone_report;
+      pending_rtcp_.length = length;
+      pending_rtcp_.created_microseconds = now;
+      return transmit_pending_rtcp(now);
+    }
+
+    /** @brief Return the middle 32 bits of a current NTP timestamp. */
+    [[nodiscard]] std::uint32_t middle_ntp_timestamp() const noexcept {
+      timespec realtime {};
+      if (clock_gettime(CLOCK_REALTIME, &realtime) != 0 || realtime.tv_sec < 0 || realtime.tv_nsec < 0) {
+        return 0;
       }
-      microphone_last_report_us_ = now;
-      increment(RuntimeCounter::transmitted);
+      constexpr std::uint64_t ntp_epoch_offset = 2'208'988'800ULL;
+      const auto seconds = static_cast<std::uint64_t>(realtime.tv_sec) + ntp_epoch_offset;
+      const auto fraction = static_cast<std::uint64_t>(realtime.tv_nsec) * (std::uint64_t {1} << 32U) / 1'000'000'000ULL;
+      return static_cast<std::uint32_t>(((seconds & 0xffffU) << 16U) | (fraction >> 16U));
+    }
+
+    /** @brief Extend video sequence numbers independently for RFC 8888 reporting. */
+    [[nodiscard]] std::uint64_t extend_feedback_sequence(const std::uint16_t sequence) noexcept {
+      if (!feedback_sequence_initialized_) {
+        feedback_sequence_initialized_ = true;
+        feedback_largest_extended_sequence_ = sequence;
+        return sequence;
+      }
+      constexpr std::uint64_t modulus = std::uint64_t {1} << 16U;
+      constexpr std::uint64_t half = modulus / 2U;
+      auto candidate = (feedback_largest_extended_sequence_ & ~(modulus - 1U)) | sequence;
+      if (candidate + half < feedback_largest_extended_sequence_) {
+        candidate += modulus;
+      } else if (candidate > feedback_largest_extended_sequence_ + half && candidate >= modulus) {
+        candidate -= modulus;
+      }
+      feedback_largest_extended_sequence_ = std::max(feedback_largest_extended_sequence_, candidate);
+      return candidate;
+    }
+
+    /** @brief Extend audio sequence numbers independently for RFC 8888 reporting. */
+    [[nodiscard]] std::uint64_t extend_audio_feedback_sequence(const std::uint16_t sequence) noexcept {
+      if (!audio_feedback_sequence_initialized_) {
+        audio_feedback_sequence_initialized_ = true;
+        audio_feedback_largest_extended_sequence_ = sequence;
+        return sequence;
+      }
+      constexpr std::uint64_t modulus = std::uint64_t {1} << 16U;
+      constexpr std::uint64_t half = modulus / 2U;
+      auto candidate = (audio_feedback_largest_extended_sequence_ & ~(modulus - 1U)) | sequence;
+      if (candidate + half < audio_feedback_largest_extended_sequence_) {
+        candidate += modulus;
+      } else if (candidate > audio_feedback_largest_extended_sequence_ + half && candidate >= modulus) {
+        candidate -= modulus;
+      }
+      audio_feedback_largest_extended_sequence_ = std::max(audio_feedback_largest_extended_sequence_, candidate);
+      return candidate;
+    }
+
+    /** @brief Record one authenticated primary-video packet with actual ECN availability. */
+    void record_video_feedback(
+      const std::span<const std::uint8_t> packet,
+      const std::uint16_t protected_udp_bytes,
+      const std::uint64_t arrival_microseconds,
+      const native_ecn_mark ecn
+    ) noexcept {
+      const auto rtp = lumen::lsp::parse_rtp_fixed_header(packet);
+      if (!rtp || rtp.header.ssrc != video_configuration_.primary_ssrc) {
+        return;
+      }
+      const auto ip_overhead = socket_family_ == AF_INET6 ? 48U : 28U;
+      const auto complete_bytes = static_cast<std::uint32_t>(protected_udp_bytes) + ip_overhead;
+      if (complete_bytes > UINT16_MAX) {
+        return;
+      }
+      const auto extended = extend_feedback_sequence(rtp.header.sequence_number);
+      const auto result = video_feedback_.record({
+        .extended_sequence = extended,
+        .arrival_microseconds = arrival_microseconds,
+        .received_ip_bytes = static_cast<std::uint16_t>(complete_bytes),
+        .ecn = ecn,
+      });
+      if (result == native_feedback_record_result::accepted) {
+        video_reception_.record(
+          extended,
+          rtp.header.timestamp,
+          arrival_microseconds,
+          90'000U
+        );
+        video_received_ip_bytes_ += complete_bytes;
+        increment(RuntimeCounter::video_received_ip_bytes, complete_bytes);
+        if (ecn == native_ecn_mark::unknown) {
+          ++video_ecn_unknown_packets_;
+          increment(RuntimeCounter::video_ecn_unknown_packets);
+        } else if (ecn == native_ecn_mark::congestion_experienced) {
+          ++video_ecn_ce_packets_;
+          increment(RuntimeCounter::video_ecn_ce_packets);
+        }
+      }
+    }
+
+    /** @brief Retain one exact protected-RTP identity only after successful SRTP authentication. */
+    static void store_authenticated_rtp_fingerprint(
+      std::array<AuthenticatedRtpFingerprint, 128> &fingerprints,
+      const std::uint16_t sequence,
+      const std::uint32_t ssrc,
+      const std::uint32_t rtp_timestamp,
+      const std::uint16_t protected_bytes,
+      const std::uint64_t first_arrival_microseconds,
+      const std::uint8_t first_header_byte,
+      const std::uint8_t second_header_byte,
+      const std::array<std::uint8_t, 16> &authentication_tag
+    ) noexcept {
+      auto &slot = fingerprints[sequence % fingerprints.size()];
+      slot = {
+        .authentication_tag = authentication_tag,
+        .first_arrival_microseconds = first_arrival_microseconds,
+        .ssrc = ssrc,
+        .rtp_timestamp = rtp_timestamp,
+        .sequence = sequence,
+        .protected_bytes = protected_bytes,
+        .first_header_byte = first_header_byte,
+        .second_header_byte = second_header_byte,
+        .occupied = true,
+      };
+    }
+
+    /** @brief Return the exact prior authenticated fingerprint for one replayed datagram. */
+    [[nodiscard]] static const AuthenticatedRtpFingerprint *authenticated_rtp_fingerprint(
+      const std::array<AuthenticatedRtpFingerprint, 128> &fingerprints,
+      const std::uint16_t sequence,
+      const std::uint32_t ssrc,
+      const std::uint32_t rtp_timestamp,
+      const std::uint16_t protected_bytes,
+      const std::uint8_t first_header_byte,
+      const std::uint8_t second_header_byte,
+      const std::array<std::uint8_t, 16> &authentication_tag
+    ) noexcept {
+      const auto &slot = fingerprints[sequence % fingerprints.size()];
+      return slot.occupied && slot.sequence == sequence && slot.ssrc == ssrc &&
+                 slot.rtp_timestamp == rtp_timestamp && slot.protected_bytes == protected_bytes &&
+                 slot.first_header_byte == first_header_byte && slot.second_header_byte == second_header_byte &&
+                 slot.authentication_tag == authentication_tag ?
+               &slot :
+               nullptr;
+    }
+
+    /** @brief Upgrade one exact authenticated replay to ECN-CE without media re-admission. */
+    void record_video_duplicate_ce(
+      const AuthenticatedRtpFingerprint &fingerprint,
+      const native_ecn_mark ecn
+    ) noexcept {
+      if (ecn != native_ecn_mark::congestion_experienced) {
+        return;
+      }
+      const auto ip_overhead = socket_family_ == AF_INET6 ? 48U : 28U;
+      const auto complete_bytes = static_cast<std::uint32_t>(fingerprint.protected_bytes) + ip_overhead;
+      if (complete_bytes > UINT16_MAX) {
+        return;
+      }
+      (void) video_feedback_.record({
+        .extended_sequence = extend_feedback_sequence(fingerprint.sequence),
+        .arrival_microseconds = fingerprint.first_arrival_microseconds,
+        .received_ip_bytes = static_cast<std::uint16_t>(complete_bytes),
+        .ecn = native_ecn_mark::congestion_experienced,
+      });
+    }
+
+    /** @brief Upgrade one exact authenticated audio replay to ECN-CE without Opus re-admission. */
+    void record_audio_duplicate_ce(
+      const AuthenticatedRtpFingerprint &fingerprint,
+      const native_ecn_mark ecn
+    ) noexcept {
+      if (ecn != native_ecn_mark::congestion_experienced) {
+        return;
+      }
+      const auto ip_overhead = socket_family_ == AF_INET6 ? 48U : 28U;
+      const auto complete_bytes = static_cast<std::uint32_t>(fingerprint.protected_bytes) + ip_overhead;
+      if (complete_bytes > UINT16_MAX) {
+        return;
+      }
+      (void) audio_feedback_.record({
+        .extended_sequence = extend_audio_feedback_sequence(fingerprint.sequence),
+        .arrival_microseconds = fingerprint.first_arrival_microseconds,
+        .received_ip_bytes = static_cast<std::uint16_t>(complete_bytes),
+        .ecn = native_ecn_mark::congestion_experienced,
+      });
+    }
+
+    /** @brief Record one authenticated host-audio packet for CCFB and RR statistics. */
+    void record_audio_feedback(
+      const std::span<const std::uint8_t> packet,
+      const std::uint16_t protected_udp_bytes,
+      const std::uint64_t arrival_microseconds,
+      const native_ecn_mark ecn
+    ) noexcept {
+      if (!audio_configured_.load(std::memory_order_acquire)) {
+        return;
+      }
+      const auto rtp = lumen::lsp::parse_rtp_fixed_header(packet);
+      if (!rtp || rtp.header.ssrc != audio_configuration_.audio_ssrc ||
+          rtp.header.payload_type != audio_configuration_.audio_payload_type) {
+        return;
+      }
+      const auto ip_overhead = socket_family_ == AF_INET6 ? 48U : 28U;
+      const auto complete_bytes = static_cast<std::uint32_t>(protected_udp_bytes) + ip_overhead;
+      if (complete_bytes > UINT16_MAX) {
+        return;
+      }
+      const auto extended = extend_audio_feedback_sequence(rtp.header.sequence_number);
+      const auto result = audio_feedback_.record({
+        .extended_sequence = extended,
+        .arrival_microseconds = arrival_microseconds,
+        .received_ip_bytes = static_cast<std::uint16_t>(complete_bytes),
+        .ecn = ecn,
+      });
+      if (result == native_feedback_record_result::accepted) {
+        audio_reception_.record(extended, rtp.header.timestamp, arrival_microseconds, 48'000U);
+      }
+    }
+
+    /** @brief Match one authenticated exact-size host LSPP against its reliable intent. */
+    [[nodiscard]] PathProbePacketResult handle_authenticated_path_probe(
+      const std::span<const std::uint8_t> packet,
+      const std::uint32_t visible_ssrc,
+      const std::uint16_t protected_udp_size,
+      const std::uint64_t received_microseconds
+    ) noexcept {
+      if (packet.size() < 12U || packet[1] != 204U || packet[8] != 'L' || packet[9] != 'S' ||
+          packet[10] != 'P' || packet[11] != 'P') {
+        return PathProbePacketResult::not_probe;
+      }
+      if (!video_configured_.load(std::memory_order_acquire) || visible_ssrc != video_configuration_.primary_ssrc) {
+        return PathProbePacketResult::invalid;
+      }
+      const auto probe = parse_lspp(packet, visible_ssrc, protected_udp_size);
+      if (probe.probe_id == 0) {
+        return PathProbePacketResult::invalid;
+      }
+      std::uint64_t request_id = 0;
+      pthread_mutex_lock(&mutex_);
+      if (last_received_probe_id_ == probe.probe_id && last_received_probe_size_ == probe.udp_payload_size) {
+        pthread_mutex_unlock(&mutex_);
+        return PathProbePacketResult::accepted;
+      }
+      if (inbound_path_probe_intent_.occupied && inbound_path_probe_intent_.probe_id == probe.probe_id &&
+          inbound_path_probe_intent_.udp_payload_size == probe.udp_payload_size) {
+        request_id = inbound_path_probe_intent_.request_id;
+        if (!queue_path_probe_event_locked(
+              CLSP_PATH_PROBE_RECEIVED,
+              probe.probe_id,
+              probe.udp_payload_size,
+              request_id
+            )) {
+          pthread_mutex_unlock(&mutex_);
+          return PathProbePacketResult::invalid;
+        }
+        inbound_path_probe_intent_ = {};
+        unmatched_path_probe_ = {};
+        last_received_probe_id_ = probe.probe_id;
+        last_received_probe_size_ = probe.udp_payload_size;
+      } else if (!unmatched_path_probe_.occupied ||
+                 (unmatched_path_probe_.probe_id == probe.probe_id &&
+                  unmatched_path_probe_.udp_payload_size == probe.udp_payload_size)) {
+        unmatched_path_probe_ = {
+          .probe_id = probe.probe_id,
+          .received_microseconds = received_microseconds,
+          .udp_payload_size = probe.udp_payload_size,
+          .occupied = true,
+        };
+      } else {
+        pthread_mutex_unlock(&mutex_);
+        return PathProbePacketResult::invalid;
+      }
+      pthread_mutex_unlock(&mutex_);
+      if (request_id != 0) {
+        wake_worker();
+      }
+      return PathProbePacketResult::accepted;
+    }
+
+    /** @brief Protect one fresh SRTCP LSPP packet for first send or PROBE_TIMER retry. */
+    [[nodiscard]] clsp_status_t prepare_outbound_path_probe(
+      const std::uint64_t probe_id,
+      const std::uint16_t udp_payload_size
+    ) noexcept {
+      if (!input_configured_ || probe_id == 0 || udp_payload_size > maximum_udp_payload) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      std::size_t trailer = 0;
+      const auto trailer_status = srtp_.rtcp_protect_trailer_length(trailer);
+      if (trailer_status != CLSP_STATUS_OK || trailer >= udp_payload_size) {
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      const auto plaintext_size = static_cast<std::size_t>(udp_payload_size) - trailer;
+      auto &probe = outbound_path_probe_;
+      if (!probe.active || probe.probe_id != probe_id || probe.udp_payload_size != udp_payload_size) {
+        probe = {};
+        probe.probe_id = probe_id;
+        probe.udp_payload_size = udp_payload_size;
+      }
+      if (!write_lspp(input_configuration_.input_ssrc, probe_id, udp_payload_size, std::span<std::uint8_t> {probe.bytes}.first(plaintext_size))) {
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
+      auto length = plaintext_size;
+      const auto status = srtp_.protect(probe.bytes, length, true);
+      if (status != CLSP_STATUS_OK || length != udp_payload_size) {
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      probe.length = length;
+      probe.pending_send = true;
+      probe.active = true;
       return CLSP_STATUS_OK;
+    }
+
+    /** @brief Retry one already protected LSPP only across immediate socket backpressure. */
+    [[nodiscard]] clsp_status_t transmit_outbound_path_probe(const std::uint64_t now) noexcept {
+      auto &probe = outbound_path_probe_;
+      if (!probe.active || !probe.pending_send) {
+        return CLSP_STATUS_OK;
+      }
+      const auto sent = ::send(socket_, probe.bytes.data(), probe.length, 0);
+      if (sent == static_cast<ssize_t>(probe.length)) {
+        probe.pending_send = false;
+        probe.last_send_microseconds = now;
+        ++probe.attempts;
+        increment(RuntimeCounter::path_probes_sent);
+        increment(RuntimeCounter::transmitted);
+        return CLSP_STATUS_OK;
+      }
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+        return CLSP_STATUS_OK;
+      }
+      if (sent < 0 && errno == EMSGSIZE) {
+        pthread_mutex_lock(&mutex_);
+        if (path_mtu_) {
+          (void) path_mtu_->probe_timed_out();
+        }
+        last_path_raise_microseconds_ = now;
+        outbound_path_probe_ = {};
+        emitted_path_probe_id_.store(0, std::memory_order_release);
+        emitted_path_probe_size_.store(0, std::memory_order_release);
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_OK;
+      }
+      return CLSP_STATUS_SOCKET_FAILURE;
+    }
+
+    /** @brief Drive native RFC 8899 search, conservative timer retry, and bounded intent callbacks. */
+    [[nodiscard]] clsp_status_t drive_path_mtu(const std::uint64_t now) noexcept {
+      if (!path_discovery_enabled_.load(std::memory_order_acquire) || !path_mtu_ || !video_delivery_active_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_OK;
+      }
+      const auto acknowledged_id = pending_path_ack_id_.exchange(0, std::memory_order_acq_rel);
+      if (acknowledged_id != 0) {
+        const auto acknowledged_size = pending_path_ack_size_.load(std::memory_order_acquire);
+        if (last_acknowledged_probe_id_ != acknowledged_id || last_acknowledged_probe_size_ != acknowledged_size) {
+          if (path_mtu_->acknowledge_probe(acknowledged_id, acknowledged_size) !=
+              lumen::lsp::transport::path_mtu_result::accepted) {
+            return CLSP_STATUS_INVALID_ARGUMENT;
+          }
+          last_acknowledged_probe_id_ = acknowledged_id;
+          last_acknowledged_probe_size_ = acknowledged_size;
+          current_udp_payload_size_.store(acknowledged_size, std::memory_order_release);
+          increment(RuntimeCounter::path_probes_acknowledged);
+        }
+        outbound_path_probe_ = {};
+        path_probe_notification_pending_ = false;
+        emitted_path_probe_id_.store(0, std::memory_order_release);
+        emitted_path_probe_size_.store(0, std::memory_order_release);
+      }
+      pthread_mutex_lock(&mutex_);
+      if (inbound_path_probe_intent_.occupied && now >= inbound_path_probe_intent_.received_microseconds &&
+          now - inbound_path_probe_intent_.received_microseconds >= path_probe_intent_retention_microseconds) {
+        inbound_path_probe_intent_ = {};
+      }
+      if (unmatched_path_probe_.occupied && now >= unmatched_path_probe_.received_microseconds &&
+          now - unmatched_path_probe_.received_microseconds >= path_probe_timer_microseconds) {
+        unmatched_path_probe_ = {};
+      }
+      pthread_mutex_unlock(&mutex_);
+      if (outbound_path_probe_.active) {
+        if (outbound_path_probe_.pending_send) {
+          return transmit_outbound_path_probe(now);
+        }
+        if (now >= outbound_path_probe_.last_send_microseconds &&
+            now - outbound_path_probe_.last_send_microseconds >= path_probe_timer_microseconds) {
+          if (outbound_path_probe_.attempts >= maximum_path_probe_attempts) {
+            pthread_mutex_lock(&mutex_);
+            (void) path_mtu_->probe_timed_out();
+            outbound_path_probe_ = {};
+            path_probe_notification_pending_ = false;
+            emitted_path_probe_id_.store(0, std::memory_order_release);
+            emitted_path_probe_size_.store(0, std::memory_order_release);
+            increment(RuntimeCounter::path_probe_timeouts);
+            last_path_raise_microseconds_ = now;
+            pthread_mutex_unlock(&mutex_);
+          } else {
+            const auto status = prepare_outbound_path_probe(
+              outbound_path_probe_.probe_id,
+              outbound_path_probe_.udp_payload_size
+            );
+            if (status != CLSP_STATUS_OK) {
+              return status;
+            }
+            return transmit_outbound_path_probe(now);
+          }
+        }
+        return CLSP_STATUS_OK;
+      }
+      if (path_probe_notification_pending_) {
+        if (now >= path_probe_notification_microseconds_ &&
+            now - path_probe_notification_microseconds_ >= path_probe_timer_microseconds) {
+          const auto probe = path_mtu_->outstanding_probe();
+          path_probe_notification_microseconds_ = now;
+          if (probe && !queue_path_probe_event(CLSP_PATH_PROBE_SEND_INTENT, probe.probe_id, probe.payload_bytes, 0)) {
+            path_probe_notification_microseconds_ = 0;
+          }
+        }
+        return CLSP_STATUS_OK;
+      }
+
+      if (path_mtu_->candidate_payload_bytes() == 0) {
+        if (path_mtu_->current_payload_bytes() >= path_mtu_->ceiling_payload_bytes() ||
+            now < last_path_raise_microseconds_ ||
+            now - last_path_raise_microseconds_ < path_mtu_raise_interval_microseconds) {
+          return CLSP_STATUS_OK;
+        }
+        if (path_mtu_->raise_timer_elapsed() != lumen::lsp::transport::path_mtu_result::accepted) {
+          return CLSP_STATUS_OK;
+        }
+        last_path_raise_microseconds_ = now;
+      }
+      pthread_mutex_lock(&mutex_);
+      auto probe_id = next_path_probe_id_++;
+      if (probe_id == 0) {
+        probe_id = next_path_probe_id_++;
+      }
+      const auto started = path_mtu_->start_probe(probe_id, now, path_probe_smoothed_rtt_microseconds);
+      const auto probe = path_mtu_->outstanding_probe();
+      if (started == lumen::lsp::transport::path_mtu_result::accepted) {
+        path_probe_notification_pending_ = true;
+        path_probe_notification_microseconds_ = now;
+        emitted_path_probe_id_.store(probe.probe_id, std::memory_order_release);
+        emitted_path_probe_size_.store(probe.payload_bytes, std::memory_order_release);
+      }
+      pthread_mutex_unlock(&mutex_);
+      if (started == lumen::lsp::transport::path_mtu_result::accepted) {
+        if (!queue_path_probe_event(CLSP_PATH_PROBE_SEND_INTENT, probe.probe_id, probe.payload_bytes, 0)) {
+          path_probe_notification_microseconds_ = 0;
+        }
+      }
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Submit one already protected compound/CCFB packet exactly across backpressure. */
+    [[nodiscard]] clsp_status_t transmit_pending_rtcp(const std::uint64_t now) noexcept {
+      if (!pending_rtcp_) {
+        return CLSP_STATUS_OK;
+      }
+      const auto sent = ::send(socket_, pending_rtcp_.bytes.data(), pending_rtcp_.length, 0);
+      if (sent == static_cast<ssize_t>(pending_rtcp_.length)) {
+        if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::compound) {
+          compound_rtcp_sent_ = true;
+          last_compound_rtcp_microseconds_ = now;
+        } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::congestion_feedback) {
+          if (pending_rtcp_.video_feedback) {
+            (void) video_feedback_.commit(pending_rtcp_.video_feedback, now);
+          }
+          if (pending_rtcp_.audio_feedback) {
+            (void) audio_feedback_.commit(pending_rtcp_.audio_feedback, now);
+          }
+          congestion_feedback_ip_bytes_ += static_cast<std::uint64_t>(pending_rtcp_.length) +
+                                           (socket_family_ == AF_INET6 ? 48U : 28U);
+          ++congestion_feedback_packets_;
+          increment(
+            RuntimeCounter::congestion_feedback_ip_bytes,
+            static_cast<std::uint64_t>(pending_rtcp_.length) + (socket_family_ == AF_INET6 ? 48U : 28U)
+          );
+          increment(RuntimeCounter::congestion_feedback_packets);
+        } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::microphone_report) {
+          microphone_last_report_us_ = now;
+        }
+        pending_rtcp_ = {};
+        increment(RuntimeCounter::transmitted);
+        return CLSP_STATUS_OK;
+      }
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+        return CLSP_STATUS_OK;
+      }
+      return CLSP_STATUS_SOCKET_FAILURE;
+    }
+
+    /** @brief Send the initial and periodic regular compound RR plus privacy-safe SDES CNAME. */
+    [[nodiscard]] clsp_status_t transmit_compound_rtcp(const std::uint64_t now) noexcept {
+      if (pending_rtcp_ || !video_delivery_active_.load(std::memory_order_acquire) || !input_configured_ ||
+          (compound_rtcp_sent_ && now >= last_compound_rtcp_microseconds_ &&
+           now - last_compound_rtcp_microseconds_ < compound_rtcp_interval_microseconds)) {
+        return CLSP_STATUS_OK;
+      }
+      std::array<native_receiver_report_block, 2> reports {};
+      std::size_t report_count = 0;
+      if (video_configured_.load(std::memory_order_acquire) && video_reception_.initialized()) {
+        reports[report_count++] = video_reception_.report(video_configuration_.primary_ssrc, now);
+      }
+      if (audio_configured_.load(std::memory_order_acquire) && audio_reception_.initialized()) {
+        reports[report_count++] = audio_reception_.report(audio_configuration_.audio_ssrc, now);
+      }
+      const auto plaintext = write_compound_rr_sdes(
+        input_configuration_.input_ssrc,
+        std::span<const std::uint8_t> {compound_cname_}.first(compound_cname_length_),
+        std::span<const native_receiver_report_block> {reports}.first(report_count),
+        pending_rtcp_.bytes
+      );
+      if (plaintext == 0) {
+        return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      auto length = plaintext;
+      const auto protected_status = srtp_.protect(pending_rtcp_.bytes, length, true);
+      if (protected_status != CLSP_STATUS_OK) {
+        return protected_status;
+      }
+      pending_rtcp_.kind = PendingProtectedRtcp::Kind::compound;
+      pending_rtcp_.length = length;
+      pending_rtcp_.created_microseconds = now;
+      return transmit_pending_rtcp(now);
+    }
+
+    /** @brief Send one reduced-size RFC 8888 CCFB report after regular compound RTCP. */
+    [[nodiscard]] clsp_status_t transmit_congestion_feedback(const std::uint64_t now) noexcept {
+      const auto feedback_due = video_feedback_.due(now) || audio_feedback_.due(now);
+      if (pending_rtcp_ || !compound_rtcp_sent_ || !feedback_due || !input_configured_) {
+        return CLSP_STATUS_OK;
+      }
+      std::size_t trailer = 0;
+      const auto trailer_status = srtp_.rtcp_protect_trailer_length(trailer);
+      const auto maximum = current_udp_payload_size_.load(std::memory_order_acquire);
+      if (trailer_status != CLSP_STATUS_OK || trailer >= maximum) {
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      const auto plaintext_limit = static_cast<std::size_t>(maximum) - trailer;
+      auto &packet = pending_rtcp_.bytes;
+      std::fill(packet.begin(), packet.end(), 0);
+      packet[0] = 0x8bU;
+      packet[1] = 205U;
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(4, 4), input_configuration_.input_ssrc);
+      const auto report_timestamp = middle_ntp_timestamp();
+      std::array<std::uint8_t, maximum_udp_payload> scratch {};
+      std::size_t offset = 8U;
+      const auto append_block = [&](
+                                  auto &tracker,
+                                  const std::uint32_t media_ssrc,
+                                  native_feedback_write_result &result
+                                ) noexcept {
+        if (tracker.size() == 0 || offset + 12U > plaintext_limit) {
+          return;
+        }
+        const auto available_block = plaintext_limit - offset - 4U;
+        const auto scratch_limit = std::min<std::size_t>(scratch.size(), available_block + 12U);
+        result = tracker.write(
+          input_configuration_.input_ssrc,
+          media_ssrc,
+          now,
+          report_timestamp,
+          std::span<std::uint8_t> {scratch}.first(scratch_limit)
+        );
+        if (!result) {
+          return;
+        }
+        const auto block_bytes = result.bytes_written - 12U;
+        std::copy_n(scratch.begin() + 8, block_bytes, packet.begin() + static_cast<std::ptrdiff_t>(offset));
+        offset += block_bytes;
+      };
+      native_feedback_write_result video_written;
+      native_feedback_write_result audio_written;
+      if (video_configured_.load(std::memory_order_acquire)) {
+        append_block(video_feedback_, video_configuration_.primary_ssrc, video_written);
+      }
+      if (audio_configured_.load(std::memory_order_acquire)) {
+        append_block(audio_feedback_, audio_configuration_.audio_ssrc, audio_written);
+      }
+      if (!video_written && !audio_written) {
+        return CLSP_STATUS_OK;
+      }
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(offset, 4), report_timestamp);
+      auto length = offset + 4U;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan(2, 2), static_cast<std::uint16_t>(length / 4U - 1U));
+      const auto protected_status = srtp_.protect(pending_rtcp_.bytes, length, true);
+      if (protected_status != CLSP_STATUS_OK || length > maximum) {
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      pending_rtcp_.kind = PendingProtectedRtcp::Kind::congestion_feedback;
+      pending_rtcp_.video_feedback = video_written;
+      pending_rtcp_.audio_feedback = audio_written;
+      pending_rtcp_.length = length;
+      pending_rtcp_.created_microseconds = now;
+      return transmit_pending_rtcp(now);
     }
 
     /** @brief Extend a 16-bit RTP sequence into the nearest generation around the
@@ -2644,6 +3884,9 @@ namespace umbra::lsp {
     /** @brief Deliver complete-frame callbacks only after the current socket
      * drain finishes. */
     void deliver_video_frames() noexcept {
+      if (!video_delivery_active_.load(std::memory_order_acquire)) {
+        return;
+      }
       for (std::size_t index = 0; index < pending_video_delivery_count_;
            ++index) {
         callbacks_.video_frame(callbacks_.context, pending_video_deliveries_[index]);
@@ -2656,8 +3899,8 @@ namespace umbra::lsp {
      * status. */
     [[nodiscard]] clsp_status_t transmit_lspv() noexcept {
   #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
-      if (!video_configured_.load(std::memory_order_acquire) ||
-          !input_configured_) {
+      if (!video_delivery_active_.load(std::memory_order_acquire) || !compound_rtcp_sent_ ||
+          !video_configured_.load(std::memory_order_acquire) || !input_configured_ || pending_rtcp_) {
         return CLSP_STATUS_OK;
       }
       const auto now = monotonic_microseconds();
@@ -2676,7 +3919,8 @@ namespace umbra::lsp {
           lumen::lsp::transport::lspv_status_error::none) {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
-      std::array<std::uint8_t, 96> packet{};
+      auto &packet = pending_rtcp_.bytes;
+      std::fill(packet.begin(), packet.end(), 0);
       packet[0] = 0x80;
       packet[1] = lumen::lsp::transport::rtcp_app_type;
       lumen::lsp::wire::write_be<std::uint16_t>(
@@ -2723,20 +3967,10 @@ namespace umbra::lsp {
       if (protected_status != CLSP_STATUS_OK) {
         return protected_status;
       }
-      const auto sent = ::send(socket_, packet.data(), length, 0);
-      if (sent != static_cast<ssize_t>(length)) {
-        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-          pthread_mutex_lock(&mutex_);
-          video_deadline_miss_latched_ =
-            video_deadline_miss_latched_ || status.deadline_miss;
-          (void)lspv_coalescer_.update(status, event);
-          pthread_mutex_unlock(&mutex_);
-          return CLSP_STATUS_OK;
-        }
-        return CLSP_STATUS_SOCKET_FAILURE;
-      }
-      increment(RuntimeCounter::transmitted);
-      return CLSP_STATUS_OK;
+      pending_rtcp_.kind = PendingProtectedRtcp::Kind::lspv;
+      pending_rtcp_.length = length;
+      pending_rtcp_.created_microseconds = now;
+      return transmit_pending_rtcp(now);
   #else
       return CLSP_STATUS_UNSUPPORTED;
   #endif
@@ -2762,7 +3996,8 @@ namespace umbra::lsp {
     /** @brief Parse authenticated SRTCP LSPI and retire baseline/edge state. */
     [[nodiscard]] bool handle_authenticated_realtime(
       const std::span<const std::uint8_t> packet,
-      const bool rtcp
+      const bool rtcp,
+      const std::uint64_t arrival_microseconds
     ) noexcept {
       if (packet.size() < 12U || (packet[0] >> 6U) != 2U) {
         return false;
@@ -2807,9 +4042,12 @@ namespace umbra::lsp {
           return false;
         }
         const auto sender_ssrc =
-            lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4));
+          lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4));
         if (video_configured_.load(std::memory_order_acquire) &&
             sender_ssrc == video_configuration_.primary_ssrc) {
+          const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4));
+          const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4));
+          video_reception_.note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
           return true;
         }
         if (!audio_configured_.load(std::memory_order_acquire) ||
@@ -2820,6 +4058,9 @@ namespace umbra::lsp {
         if (sender_ssrc != audio.audio_ssrc) {
           return false;
         }
+        const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4));
+        const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4));
+        audio_reception_.note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
         const clsp_audio_timing_event_t timing {
           .abi_version = CLSP_CORE_ABI_VERSION,
           .structure_size = sizeof(clsp_audio_timing_event_t),
@@ -2871,7 +4112,24 @@ namespace umbra::lsp {
       return true;
     }
 
-    /** @brief Protect and send one terminal client-to-host LSPG command ACK. */
+    /** @brief Retry one exact protected controller ACK across immediate socket backpressure. */
+    [[nodiscard]] clsp_status_t transmit_pending_controller_ack() noexcept {
+      if (!pending_controller_ack_.occupied) {
+        return CLSP_STATUS_OK;
+      }
+      const auto sent = ::send(socket_, pending_controller_ack_.bytes.data(), pending_controller_ack_.length, 0);
+      if (sent == static_cast<ssize_t>(pending_controller_ack_.length)) {
+        pending_controller_ack_ = {};
+        increment(RuntimeCounter::transmitted);
+        return CLSP_STATUS_OK;
+      }
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+        return CLSP_STATUS_OK;
+      }
+      return CLSP_STATUS_SOCKET_FAILURE;
+    }
+
+    /** @brief Protect and retain one terminal client-to-host LSPG command ACK. */
     [[nodiscard]] clsp_status_t send_controller_ack(
       const lumen::lsp::input_plane::parsed_lspg &command,
       const lumen::lsp::input_plane::controller_command_status status
@@ -2879,7 +4137,15 @@ namespace umbra::lsp {
       if (!lumen::lsp::input_plane::valid_controller_command_status(status)) {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
-      std::array<std::uint8_t, maximum_udp_payload> packet {};
+      const auto pending_status = transmit_pending_controller_ack();
+      if (pending_status != CLSP_STATUS_OK) {
+        return pending_status;
+      }
+      if (pending_controller_ack_.occupied) {
+        return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      }
+      auto &packet = pending_controller_ack_.bytes;
+      std::fill(packet.begin(), packet.end(), 0);
       packet[0] = 0x80;
       packet[1] = 204;
       lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(4, 4), input_configuration_.input_ssrc);
@@ -2902,12 +4168,9 @@ namespace umbra::lsp {
       );
       const auto protected_status = srtp_.protect(packet, length, true);
       if (protected_status != CLSP_STATUS_OK) return protected_status;
-      const auto sent = ::send(socket_, packet.data(), length, 0);
-      if (sent != static_cast<ssize_t>(length)) {
-        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
-      }
-      increment(RuntimeCounter::transmitted);
-      return CLSP_STATUS_OK;
+      pending_controller_ack_.length = length;
+      pending_controller_ack_.occupied = true;
+      return transmit_pending_controller_ack();
     }
 
     /** @brief Receive one authenticated DTLS application record from wolfSSL. */
@@ -2924,6 +4187,21 @@ namespace umbra::lsp {
       if (!parsed) {
         increment(RuntimeCounter::dropped);
         return true;
+      }
+      if (path_intent_message_id_ != 0 && acknowledges_message(
+                                            parsed.header.acknowledgement_base,
+                                            parsed.header.acknowledgement_bitmap,
+                                            path_intent_message_id_
+                                          )) {
+        const auto probe_status = prepare_outbound_path_probe(path_intent_probe_id_, path_intent_probe_size_);
+        if (probe_status != CLSP_STATUS_OK) {
+          return false;
+        }
+        path_intent_message_id_ = 0;
+        path_intent_request_id_ = 0;
+        path_intent_probe_id_ = 0;
+        path_intent_probe_size_ = 0;
+        path_intent_control_ = {};
       }
       outbound_window_.acknowledge(parsed.header.acknowledgement_base, parsed.header.acknowledgement_bitmap);
       const auto observed = receive_window_.observe(parsed.header.message_id);
@@ -3053,17 +4331,35 @@ namespace umbra::lsp {
           return status;
         }
         increment(RuntimeCounter::transmitted);
-        const auto stored = outbound_window_.store(
-          message_id,
-          encoded,
-          monotonic_microseconds(),
-          command.deadline_microseconds,
-          rto_
-        );
-        if (stored != lumen::lsp::outbound_store_result::stored) {
-          return stored == lumen::lsp::outbound_store_result::window_full ?
-                   CLSP_STATUS_CONTROL_WINDOW_FULL :
-                   CLSP_STATUS_INTERNAL_FAILURE;
+        if (command.transmit_path_probe) {
+          if (path_intent_control_.occupied) {
+            return CLSP_STATUS_INVALID_STATE;
+          }
+          const auto now = monotonic_microseconds();
+          path_intent_control_.frame.assign(encoded);
+          path_intent_control_.message_id = message_id;
+          path_intent_control_.deadline_microseconds = command.deadline_microseconds;
+          path_intent_control_.next_retry_microseconds = saturating_add(now, rto_.timeout_for_attempt(1));
+          path_intent_control_.transmissions = 1;
+          path_intent_control_.occupied = true;
+          path_intent_message_id_ = message_id;
+          path_intent_request_id_ = command.request_id;
+          path_intent_probe_id_ = command.path_probe_id;
+          path_intent_probe_size_ = command.path_probe_size;
+          path_probe_notification_pending_ = false;
+        } else {
+          const auto stored = outbound_window_.store(
+            message_id,
+            encoded,
+            monotonic_microseconds(),
+            command.deadline_microseconds,
+            rto_
+          );
+          if (stored != lumen::lsp::outbound_store_result::stored) {
+            return stored == lumen::lsp::outbound_store_result::window_full ?
+                     CLSP_STATUS_CONTROL_WINDOW_FULL :
+                     CLSP_STATUS_INTERNAL_FAILURE;
+          }
         }
         if (pending_request != nullptr) {
           pending_request->occupied = false;
@@ -3086,6 +4382,38 @@ namespace umbra::lsp {
     /** @brief Retransmit byte-identical due LSPC frames or fail an exhausted operation. */
     [[nodiscard]] clsp_status_t retry_control() noexcept {
       const auto now = monotonic_microseconds();
+      if (path_intent_control_.occupied) {
+        if (path_intent_control_.transmissions >= 5U || now >= path_intent_control_.deadline_microseconds) {
+          if (path_intent_request_id_ != 0) {
+            if (!queue_path_probe_event(
+                  CLSP_PATH_PROBE_REQUEST_FAILED,
+                  path_intent_probe_id_,
+                  path_intent_probe_size_,
+                  path_intent_request_id_
+                )) {
+              return CLSP_STATUS_OK;
+            }
+          }
+          path_intent_control_ = {};
+          path_intent_message_id_ = 0;
+          path_intent_request_id_ = 0;
+          path_intent_probe_id_ = 0;
+          path_intent_probe_size_ = 0;
+          path_probe_notification_pending_ = true;
+          path_probe_notification_microseconds_ = 0;
+        } else if (now >= path_intent_control_.next_retry_microseconds) {
+          const auto status = dtls_.send_application_data(path_intent_control_.frame.bytes());
+          if (status != CLSP_STATUS_OK) {
+            return status;
+          }
+          increment(RuntimeCounter::transmitted);
+          ++path_intent_control_.transmissions;
+          path_intent_control_.next_retry_microseconds = saturating_add(
+            now,
+            rto_.timeout_for_attempt(path_intent_control_.transmissions)
+          );
+        }
+      }
       if (outbound_window_.has_failed(now)) {
         return CLSP_STATUS_TIMEOUT;
       }
@@ -3180,6 +4508,7 @@ namespace umbra::lsp {
     unsigned int peer_address_size_ {};  ///< Encoded peer-address size.
     int socket_ {-1};  ///< Connected nonblocking UDP socket.
     int kqueue_ {-1};  ///< Socket readiness and producer wake owner.
+    int socket_family_ {};  ///< Active address family for ECN and complete IP accounting.
     bool mutex_ready_ {};  ///< Mutex initialization state.
     bool condition_ready_ {};  ///< Condition initialization state.
     bool worker_started_ {};  ///< Join ownership state.
@@ -3209,15 +4538,30 @@ namespace umbra::lsp {
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::atomic<bool> audio_configured_ {false};  ///< Exact host-audio mapping admission gate.
     std::atomic<bool> video_configured_ {false};  ///< Exact primary-video mapping admission gate.
+    std::atomic<bool> video_delivery_active_ {false};  ///< ACK-gated complete-frame publication.
+    std::atomic<bool> path_discovery_enabled_ {false};  ///< Native PMTU search activation.
+    std::atomic<std::uint16_t> current_udp_payload_size_ {1'200};  ///< Authenticated confirmed ceiling.
+    std::atomic<std::uint64_t> emitted_path_probe_id_ {0};  ///< Native probe offered to Swift.
+    std::atomic<std::uint16_t> emitted_path_probe_size_ {0};  ///< Offered protected payload size.
+    std::atomic<std::uint64_t> pending_path_ack_id_ {0};  ///< Swift-confirmed ACK awaiting worker commit.
+    std::atomic<std::uint16_t> pending_path_ack_size_ {0};  ///< ACK payload size paired with pending ID.
     clsp_audio_configuration_t audio_configuration_ {};  ///< Installed audio generation/SSRC/PT tuple.
     clsp_video_configuration_t video_configuration_ {};  ///< Immutable active video generation mapping.
     retained_frame_pool *video_frame_pool_ {};  ///< Preallocated complete-frame ABI storage.
     std::optional<lumen::lsp::media::pooled_video_frame_reassembler> video_reassembler_ {};  ///< Allocation-free two-frame storage.
     lumen::lsp::media::decoder_credit_state video_decoder_credit_;  ///< Two-to-four hardware submissions.
     lumen::lsp::transport::lspv_coalescer lspv_coalescer_;  ///< Protected 500-microsecond status coalescer.
+    native_video_feedback_tracker<> video_feedback_;  ///< Sorted bounded RFC 8888 observations.
+    native_video_feedback_tracker<> audio_feedback_;  ///< Sorted bounded audio RFC 8888 observations.
+    native_rtp_reception_stats video_reception_;  ///< Cumulative primary-video RR loss/jitter/SR state.
+    native_rtp_reception_stats audio_reception_;  ///< Cumulative host-audio RR loss/jitter/SR state.
+    std::optional<lumen::lsp::transport::path_mtu_discovery> path_mtu_ {};  ///< RFC 8899 search state.
     std::array<VideoFrameMetadata, 2> video_metadata_ {};  ///< Repeated metadata for two incomplete frames.
     std::array<VideoRetiredFrame, 128> video_retired_frames_ {};  ///< Mirrors the inbound SRTP replay window.
+    std::array<AuthenticatedRtpFingerprint, 128> authenticated_video_fingerprints_ {};  ///< Exact video replay identities.
+    std::array<AuthenticatedRtpFingerprint, 128> authenticated_audio_fingerprints_ {};  ///< Exact audio replay identities.
     std::array<clsp_video_frame_event_t, video_delivery_queue_capacity> pending_video_deliveries_ {};  ///< Post-drain frame callbacks.
+    std::array<clsp_path_probe_event_t, 4> pending_path_probe_events_ {};  ///< Retained coarse probe callbacks.
     clsp_microphone_configuration_t microphone_configuration_ {};  ///< Installed reverse microphone tuple.
     std::array<lumen::lsp::packet_slab<maximum_microphone_opus_bytes>, microphone_queue_capacity> microphone_queue_ {};  ///< Complete Opus SPSC queue.
     std::atomic<std::size_t> microphone_read_ {0};  ///< Native sender queue read cursor.
@@ -3234,17 +4578,45 @@ namespace umbra::lsp {
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
     std::size_t queued_control_count_ {};  ///< Occupied pre-wire queue slots.
     std::size_t pending_video_delivery_count_ {};  ///< Completed frames awaiting post-drain callback.
+    std::size_t pending_path_probe_event_count_ {};  ///< Populated retained path callbacks.
+    PendingProtectedRtcp pending_rtcp_ {};  ///< Exact protected regular/reduced RTCP retry.
+    PendingControllerAck pending_controller_ack_ {};  ///< Exact protected controller ACK retry.
+    PathIntentControlFrame path_intent_control_ {};  ///< Optional nonfatal reliable probe intent.
     std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
     std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
     std::uint64_t video_next_metadata_order_ {1};  ///< Oldest-frame eviction ordering.
     std::uint64_t video_next_retirement_order_ {1};  ///< Retired-key replacement ordering.
+    std::uint64_t feedback_largest_extended_sequence_ {};  ///< RFC 8888 sequence expansion origin.
+    std::uint64_t audio_feedback_largest_extended_sequence_ {};  ///< Audio CCFB sequence origin.
+    std::uint64_t next_path_probe_id_ {1};  ///< Per-association logical probe ID sequence.
+    std::uint64_t path_probe_notification_microseconds_ {};  ///< Swift intent callback origin.
+    std::uint64_t path_intent_message_id_ {};  ///< LSPC intent awaiting explicit peer ACK.
+    std::uint64_t path_intent_request_id_ {};  ///< Swift continuation paired with optional intent.
+    std::uint64_t path_intent_probe_id_ {};  ///< Probe ID paired with the ACK-gated intent.
+    std::uint64_t last_acknowledged_probe_id_ {};  ///< Idempotent PATH_PROBE_ACK identity.
+    std::uint64_t last_received_probe_id_ {};  ///< Idempotent host LSPP identity.
+    std::uint64_t last_compound_rtcp_microseconds_ {};  ///< Last regular RTCP submission.
+    std::uint64_t last_path_raise_microseconds_ {};  ///< Safe PMTU raise-search timer origin.
+    std::uint64_t video_received_ip_bytes_ {};  ///< Complete authenticated video IP-layer bytes.
+    std::uint64_t congestion_feedback_ip_bytes_ {};  ///< Complete reverse CCFB IP-layer bytes.
+    std::uint64_t congestion_feedback_packets_ {};  ///< Successfully submitted CCFB count.
+    std::uint64_t video_ecn_unknown_packets_ {};  ///< Packets lacking kernel ECN ancillary data.
+    std::uint64_t video_ecn_ce_packets_ {};  ///< Authenticated ECN-CE video packets.
     std::uint64_t video_largest_extended_sequence_ {};  ///< RTP sequence wrap/reorder origin.
     std::uint64_t video_largest_extended_timestamp_ {};  ///< RTP timestamp wrap/reorder origin.
     std::uint64_t video_largest_complete_frame_id_ {};  ///< LSPV complete watermark.
     std::uint64_t video_largest_decoded_frame_id_ {};  ///< LSPV hardware-decode watermark.
     std::uint64_t video_largest_metal_frame_id_ {};  ///< LSPV Metal-commit watermark.
     std::uint8_t video_render_mailbox_occupancy_ {};  ///< Current Swift render mailbox occupancy.
+    std::uint16_t last_acknowledged_probe_size_ {};  ///< Idempotent confirmed payload size.
+    std::uint16_t last_received_probe_size_ {};  ///< Idempotent received payload size.
+    std::uint16_t path_intent_probe_size_ {};  ///< Candidate paired with ACK-gated intent.
+    std::array<std::uint8_t, 36> compound_cname_ {};  ///< Privacy-safe random per-session CNAME.
+    std::size_t compound_cname_length_ {};  ///< Populated CNAME byte count.
+    InboundPathProbeIntent inbound_path_probe_intent_ {};  ///< Host intent awaiting LSPP.
+    UnmatchedPathProbe unmatched_path_probe_ {};  ///< One authenticated reordered LSPP.
+    OutboundPathProbePacket outbound_path_probe_ {};  ///< Client probe send/timer state.
     std::uint64_t pending_input_configuration_token_ {};  ///< Token paired with pending START/ATTACH mapping.
     std::uint32_t connection_generation_ {};  ///< Zero through CLIENT_HELLO, then host-assigned generation.
     std::uint64_t baseline_id_ {};  ///< Current random neutral-baseline identifier.
@@ -3268,7 +4640,11 @@ namespace umbra::lsp {
     bool input_configuration_pending_ {};  ///< Producer installed a new START mapping.
     bool video_sequence_initialized_ {};  ///< Whether extended sequence state has an origin.
     bool video_timestamp_initialized_ {};  ///< Whether extended timestamp state has an origin.
+    bool feedback_sequence_initialized_ {};  ///< Whether CCFB sequence expansion has an origin.
+    bool audio_feedback_sequence_initialized_ {};  ///< Whether audio CCFB expansion has an origin.
     bool video_deadline_miss_latched_ {};  ///< Deadline miss retained until LSPV consumption.
+    bool path_probe_notification_pending_ {};  ///< Swift has not queued the emitted client intent.
+    bool compound_rtcp_sent_ {};  ///< RFC 5506 reduced-size feedback is unlocked.
     bool input_configured_ {};  ///< Worker has an active input mapping.
     bool capture_accepting_ {};  ///< New physical capture is authorized.
     bool baseline_acknowledged_ {};  ///< LSPI accepted the current baseline.
@@ -3350,6 +4726,52 @@ namespace umbra::lsp {
     const clsp_video_configuration_t &configuration
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_video(configuration);
+  }
+
+  clsp_status_t Runtime::activate_video(const std::uint32_t video_generation) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->activate_video(video_generation);
+  }
+
+  clsp_status_t Runtime::start_path_discovery() noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->start_path_discovery();
+  }
+
+  clsp_status_t Runtime::send_path_probe(
+    const std::uint64_t probe_id,
+    const std::uint16_t udp_payload_size,
+    const std::uint64_t request_id,
+    const clsp_const_byte_span_t payload,
+    const std::uint32_t deadline_milliseconds
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->send_path_probe(
+                                probe_id,
+                                udp_payload_size,
+                                request_id,
+                                payload,
+                                deadline_milliseconds
+                              );
+  }
+
+  clsp_status_t Runtime::accept_path_probe(
+    const std::uint64_t probe_id,
+    const std::uint16_t udp_payload_size,
+    const std::uint64_t request_id
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->accept_path_probe(probe_id, udp_payload_size, request_id);
+  }
+
+  clsp_status_t Runtime::confirm_path_probe(
+    const std::uint64_t probe_id,
+    const std::uint16_t received_payload_size
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->confirm_path_probe(probe_id, received_payload_size);
+  }
+
+  std::uint16_t Runtime::current_udp_payload_size() const noexcept {
+    return impl_ == nullptr ? std::uint16_t {1'200} : impl_->current_udp_payload_size();
   }
 
   clsp_status_t Runtime::report_video_decode(

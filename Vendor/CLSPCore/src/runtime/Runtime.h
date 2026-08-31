@@ -28,6 +28,7 @@ namespace umbra::lsp {
     using AudioPacket = void (*)(void *context, const clsp_audio_packet_event_t &event) noexcept;
     using AudioTiming = void (*)(void *context, const clsp_audio_timing_event_t &event) noexcept;
     using VideoFrame = void (*)(void *context, const clsp_video_frame_event_t &event) noexcept;
+    using PathProbe = bool (*)(void *context, const clsp_path_probe_event_t &event) noexcept;
 
     void *context {};  ///< Opaque C ABI owner.
     Lifecycle lifecycle {};  ///< Required lifecycle callback.
@@ -37,6 +38,7 @@ namespace umbra::lsp {
     AudioPacket audio_packet {};  ///< Optional complete Opus packet callback.
     AudioTiming audio_timing {};  ///< Optional authenticated sender-report callback.
     VideoFrame video_frame {};  ///< Optional retained complete access-unit callback.
+    PathProbe path_probe {};  ///< Optional low-rate DPLPMTUD lifecycle callback.
   };
 
   /** @brief Runtime telemetry counter identifiers. */
@@ -45,6 +47,14 @@ namespace umbra::lsp {
     transmitted = 1,  ///< Complete UDP datagram submitted.
     dropped = 2,  ///< Datagram or bounded command discarded.
     authentication_failure = 3,  ///< DTLS, SPKI, SRTP, or SRTCP authentication failure.
+    video_received_ip_bytes = 4,  ///< Complete authenticated forward IP bytes.
+    congestion_feedback_ip_bytes = 5,  ///< Complete submitted reverse CCFB IP bytes.
+    congestion_feedback_packets = 6,  ///< Submitted CCFB packet count.
+    video_ecn_unknown_packets = 7,  ///< Packets without actual ancillary ECN evidence.
+    video_ecn_ce_packets = 8,  ///< Authenticated ECN-CE video packets.
+    path_probes_sent = 9,  ///< Exact protected LSPP kernel submissions.
+    path_probes_acknowledged = 10,  ///< Exact authenticated probe ACKs.
+    path_probe_timeouts = 11,  ///< Three-attempt probe timeouts.
   };
 
   /** @brief One connection's native execution owner. */
@@ -130,6 +140,34 @@ namespace umbra::lsp {
     /** @brief Install exact video SSRC/PT/generation and encrypted extension admission. */
     [[nodiscard]] clsp_status_t configure_video(const clsp_video_configuration_t &configuration) noexcept;
 
+    /** @brief Open completed-frame publication after the semantic video ACK is submitted. */
+    [[nodiscard]] clsp_status_t activate_video(std::uint32_t video_generation) noexcept;
+
+    /** @brief Enable native DPLPMTUD after the video generation is active. */
+    [[nodiscard]] clsp_status_t start_path_discovery() noexcept;
+
+    /** @brief Queue the reliable client intent paired with one exact-size LSPP. */
+    [[nodiscard]] clsp_status_t send_path_probe(
+      std::uint64_t probe_id,
+      std::uint16_t udp_payload_size,
+      std::uint64_t request_id,
+      clsp_const_byte_span_t payload,
+      std::uint32_t deadline_milliseconds
+    ) noexcept;
+
+    /** @brief Retain an authenticated host intent until its matching LSPP arrives. */
+    [[nodiscard]] clsp_status_t accept_path_probe(
+      std::uint64_t probe_id,
+      std::uint16_t udp_payload_size,
+      std::uint64_t request_id
+    ) noexcept;
+
+    /** @brief Confirm one exact client-initiated PATH_PROBE_ACK. */
+    [[nodiscard]] clsp_status_t confirm_path_probe(
+      std::uint64_t probe_id,
+      std::uint16_t received_payload_size
+    ) noexcept;
+
     /** @brief Update native LSPV decode state. */
     [[nodiscard]] clsp_status_t report_video_decode(
       std::uint32_t video_generation,
@@ -173,6 +211,9 @@ namespace umbra::lsp {
 
     /** @brief Neutralize and stop the current native input authority. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept;
+
+    /** @brief Return the authenticated confirmed UDP payload ceiling. */
+    [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept;
 
   private:
     class Impl;

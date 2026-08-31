@@ -81,11 +81,22 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     }
 
     /// Transfers renderer reporting only after VIDEO_CONFIG_ACK was submitted.
-    public func activate() {
-        lock.withLock { state.active = true }
+    public func activate() throws {
         renderer.setMailboxDropNewest(true)
         renderer.installCommandCommitHandler { [weak self] frameNumber in
             self?.reportCommit(frameNumber: frameNumber)
+        }
+        lock.withLock { state.active = true }
+        do {
+            guard let generation = lock.withLock({ state.configuration?.nativeConfiguration.videoGeneration }) else {
+                throw LSPTransportError.invalidState
+            }
+            try transport.activateVideo(videoGeneration: generation)
+        } catch {
+            lock.withLock { state.active = false }
+            renderer.installCommandCommitHandler { _ in }
+            renderer.setMailboxDropNewest(false)
+            throw error
         }
     }
 

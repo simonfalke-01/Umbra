@@ -52,6 +52,14 @@ struct clsp_core {
   std::atomic<std::uint64_t> transmitted_datagrams {0};  ///< Socket submission count.
   std::atomic<std::uint64_t> dropped_datagrams {0};  ///< Bounded drop count.
   std::atomic<std::uint64_t> authentication_failures {0};  ///< Authentication failure count.
+  std::atomic<std::uint64_t> video_received_ip_bytes {0};  ///< Complete authenticated video IP bytes.
+  std::atomic<std::uint64_t> congestion_feedback_ip_bytes {0};  ///< Complete submitted CCFB IP bytes.
+  std::atomic<std::uint64_t> congestion_feedback_packets {0};  ///< Submitted CCFB packets.
+  std::atomic<std::uint64_t> video_ecn_unknown_packets {0};  ///< Packets missing ECN ancillary evidence.
+  std::atomic<std::uint64_t> video_ecn_ce_packets {0};  ///< Authenticated ECN-CE packets.
+  std::atomic<std::uint64_t> path_probes_sent {0};  ///< Exact LSPP submissions.
+  std::atomic<std::uint64_t> path_probes_acknowledged {0};  ///< Exact probe acknowledgements.
+  std::atomic<std::uint64_t> path_probe_timeouts {0};  ///< Three-attempt probe timeouts.
 
   /** @brief Release the explicitly retained callback context. */
   ~clsp_core() {
@@ -318,6 +326,23 @@ namespace {
     clsp_core_release(core);
   }
 
+  /** @brief Publish one low-rate authenticated path-probe lifecycle event. */
+  bool runtime_path_probe(void *context, const clsp_path_probe_event_t &event) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    if (core->callbacks.path_probe == nullptr) {
+      return true;
+    }
+    auto expected = false;
+    if (!core->callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      return false;
+    }
+    clsp_core_retain(core);
+    core->callbacks.path_probe(core->callbacks.context, &event);
+    core->callback_active.store(false, std::memory_order_release);
+    clsp_core_release(core);
+    return true;
+  }
+
   /** @brief Accumulate one native runtime telemetry counter. */
   void runtime_counter(
     void *context,
@@ -337,6 +362,30 @@ namespace {
         return;
       case umbra::lsp::RuntimeCounter::authentication_failure:
         core->authentication_failures.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::video_received_ip_bytes:
+        core->video_received_ip_bytes.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::congestion_feedback_ip_bytes:
+        core->congestion_feedback_ip_bytes.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::congestion_feedback_packets:
+        core->congestion_feedback_packets.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::video_ecn_unknown_packets:
+        core->video_ecn_unknown_packets.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::video_ecn_ce_packets:
+        core->video_ecn_ce_packets.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::path_probes_sent:
+        core->path_probes_sent.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::path_probes_acknowledged:
+        core->path_probes_acknowledged.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::path_probe_timeouts:
+        core->path_probe_timeouts.fetch_add(amount, std::memory_order_relaxed);
         return;
     }
   }
@@ -475,6 +524,7 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
       .audio_packet = runtime_audio_packet,
       .audio_timing = runtime_audio_timing,
       .video_frame = runtime_video_frame,
+      .path_probe = runtime_path_probe,
     },
   };
   if (runtime == nullptr) {
@@ -612,6 +662,70 @@ clsp_core_configure_video(clsp_core_t *core, const clsp_video_configuration_t *c
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
   return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->configure_video(*configuration);
+}
+
+extern "C" clsp_status_t clsp_core_activate_video(
+  clsp_core_t *core,
+  const std::uint32_t video_generation
+) {
+  if (core == nullptr || video_generation == 0) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->activate_video(video_generation);
+}
+
+extern "C" clsp_status_t clsp_core_start_path_discovery(clsp_core_t *core) {
+  if (core == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED : core->runtime->start_path_discovery();
+}
+
+extern "C" clsp_status_t clsp_core_send_path_probe(
+  clsp_core_t *core,
+  const std::uint64_t probe_id,
+  const std::uint16_t udp_payload_size,
+  const std::uint64_t request_id,
+  const clsp_const_byte_span_t payload,
+  const std::uint32_t deadline_milliseconds
+) {
+  if (core == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->send_path_probe(
+                                      probe_id,
+                                      udp_payload_size,
+                                      request_id,
+                                      payload,
+                                      deadline_milliseconds
+                                    );
+}
+
+extern "C" clsp_status_t clsp_core_accept_path_probe(
+  clsp_core_t *core,
+  const std::uint64_t probe_id,
+  const std::uint16_t udp_payload_size,
+  const std::uint64_t request_id
+) {
+  if (core == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->accept_path_probe(probe_id, udp_payload_size, request_id);
+}
+
+extern "C" clsp_status_t clsp_core_confirm_path_probe(
+  clsp_core_t *core,
+  const std::uint64_t probe_id,
+  const std::uint16_t received_payload_size
+) {
+  if (core == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->confirm_path_probe(probe_id, received_payload_size);
 }
 
 extern "C" clsp_status_t clsp_core_report_video_decode(
@@ -755,6 +869,17 @@ extern "C" clsp_status_t clsp_core_copy_telemetry(
     .transmitted_datagrams = core->transmitted_datagrams.load(std::memory_order_relaxed),
     .dropped_datagrams = core->dropped_datagrams.load(std::memory_order_relaxed),
     .authentication_failures = core->authentication_failures.load(std::memory_order_relaxed),
+    .video_received_ip_bytes = core->video_received_ip_bytes.load(std::memory_order_relaxed),
+    .congestion_feedback_ip_bytes = core->congestion_feedback_ip_bytes.load(std::memory_order_relaxed),
+    .congestion_feedback_packets = core->congestion_feedback_packets.load(std::memory_order_relaxed),
+    .video_ecn_unknown_packets = core->video_ecn_unknown_packets.load(std::memory_order_relaxed),
+    .video_ecn_ce_packets = core->video_ecn_ce_packets.load(std::memory_order_relaxed),
+    .path_probes_sent = core->path_probes_sent.load(std::memory_order_relaxed),
+    .path_probes_acknowledged = core->path_probes_acknowledged.load(std::memory_order_relaxed),
+    .path_probe_timeouts = core->path_probe_timeouts.load(std::memory_order_relaxed),
+    .current_udp_payload_size = core->runtime == nullptr ? std::uint16_t {1'200} :
+                                                           core->runtime->current_udp_payload_size(),
+    .reserved_zero = 0,
   };
   return CLSP_STATUS_OK;
 }

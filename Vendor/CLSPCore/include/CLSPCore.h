@@ -17,7 +17,7 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(1)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "aabe7048d657dc27d248bfbb2878c7274401d7ecee15dc30e304924c1ef60681"
+#define CLSP_CORE_SOURCE_DIGEST "6f15029d9c2ddc79fcebc59ae0608610ea0e70ad7abf8a2400c9c3bc48ef2c66"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
@@ -245,6 +245,24 @@ extern "C" {
     CLSP_VIDEO_DECODER_UNRECOVERABLE_ERROR = 3,  ///< An independent recovery frame is required.
   } clsp_video_decoder_status_t;
 
+  /** @brief Coarse authenticated path-probe lifecycle event kind. */
+  typedef enum clsp_path_probe_event_kind {
+    CLSP_PATH_PROBE_SEND_INTENT = 1,  ///< Swift must send the reliable client intent.
+    CLSP_PATH_PROBE_RECEIVED = 2,  ///< Swift must send the cached reliable ACK response.
+    CLSP_PATH_PROBE_REQUEST_FAILED = 3,  ///< Native optional intent retries exhausted.
+  } clsp_path_probe_event_kind_t;
+
+  /** @brief One low-rate native DPLPMTUD control-boundary event. */
+  typedef struct clsp_path_probe_event {
+    uint32_t abi_version;  ///< Event ABI version.
+    uint32_t structure_size;  ///< Size of this event.
+    uint64_t probe_id;  ///< Random nonzero probe identifier.
+    uint64_t request_id;  ///< Host request ID for `RECEIVED`, otherwise zero.
+    uint16_t udp_payload_size;  ///< Exact protected UDP probe size.
+    uint8_t kind;  ///< One `clsp_path_probe_event_kind_t`.
+    uint8_t reserved_zero;  ///< Reserved and zero.
+  } clsp_path_probe_event_t;
+
   /** @brief Exact input-only START_RESPONSE mapping installed in the native worker. */
   typedef struct clsp_input_configuration {
     uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
@@ -354,6 +372,16 @@ extern "C" {
     uint64_t transmitted_datagrams;  ///< Datagrams submitted by the core.
     uint64_t dropped_datagrams;  ///< Datagrams discarded by bounded policy.
     uint64_t authentication_failures;  ///< DTLS, SRTP, and SRTCP authentication failures.
+    uint64_t video_received_ip_bytes;  ///< Authenticated primary-video complete IP-layer bytes.
+    uint64_t congestion_feedback_ip_bytes;  ///< Submitted RFC 8888 complete IP-layer bytes.
+    uint64_t congestion_feedback_packets;  ///< Submitted protected RFC 8888 packets.
+    uint64_t video_ecn_unknown_packets;  ///< Video packets without kernel ECN ancillary evidence.
+    uint64_t video_ecn_ce_packets;  ///< Authenticated video packets marked ECN-CE.
+    uint64_t path_probes_sent;  ///< Exact protected LSPP kernel submissions.
+    uint64_t path_probes_acknowledged;  ///< Exact authenticated PATH_PROBE acknowledgements.
+    uint64_t path_probe_timeouts;  ///< Candidates exhausted after three PROBE_TIMER sends.
+    uint16_t current_udp_payload_size;  ///< Authenticated confirmed DPLPMTUD ceiling.
+    uint16_t reserved_zero;  ///< Reserved and zero.
   } clsp_telemetry_snapshot_t;
 
   /**
@@ -389,6 +417,9 @@ extern "C" {
   /** @brief Complete retained access-unit callback; never invoked per RTP packet. */
   typedef void (*clsp_video_frame_callback_t)(void *context, const clsp_video_frame_event_t *event);
 
+  /** @brief Low-rate authenticated path-probe lifecycle callback. */
+  typedef void (*clsp_path_probe_callback_t)(void *context, const clsp_path_probe_event_t *event);
+
   /**
    * @brief Retain an explicitly owned callback context.
    *
@@ -419,6 +450,7 @@ extern "C" {
     clsp_audio_packet_callback_t audio_packet;  ///< Optional complete Opus packet callback.
     clsp_audio_timing_callback_t audio_timing;  ///< Optional authenticated sender-report callback.
     clsp_video_frame_callback_t video_frame;  ///< Optional retained complete access-unit callback.
+    clsp_path_probe_callback_t path_probe;  ///< Optional coarse DPLPMTUD control callback.
   } clsp_callbacks_t;
 
   /**
@@ -554,6 +586,40 @@ extern "C" {
   clsp_status_t clsp_core_configure_video(
     clsp_core_t *core,
     const clsp_video_configuration_t *configuration
+  );
+
+  /** @brief Publish retained completed frames only after VIDEO_CONFIG_ACK submission. */
+  clsp_status_t clsp_core_activate_video(
+    clsp_core_t *core,
+    uint32_t video_generation
+  );
+
+  /** @brief Enable native 1,200-to-1,400-to-family-ceiling DPLPMTUD. */
+  clsp_status_t clsp_core_start_path_discovery(clsp_core_t *core);
+
+  /** @brief Queue one reliable client PATH_PROBE intent and its exact-size LSPP. */
+  clsp_status_t clsp_core_send_path_probe(
+    clsp_core_t *core,
+    uint64_t probe_id,
+    uint16_t udp_payload_size,
+    uint64_t request_id,
+    clsp_const_byte_span_t payload,
+    uint32_t deadline_milliseconds
+  );
+
+  /** @brief Retain one authenticated host PATH_PROBE intent until matching LSPP. */
+  clsp_status_t clsp_core_accept_path_probe(
+    clsp_core_t *core,
+    uint64_t probe_id,
+    uint16_t udp_payload_size,
+    uint64_t request_id
+  );
+
+  /** @brief Confirm one exact authenticated client-initiated PATH_PROBE_ACK. */
+  clsp_status_t clsp_core_confirm_path_probe(
+    clsp_core_t *core,
+    uint64_t probe_id,
+    uint16_t received_payload_size
   );
 
   /** @brief Report one terminal decoder result and current hardware credit. */

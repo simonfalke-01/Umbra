@@ -128,4 +128,28 @@ final class LSPClientSessionTests: XCTestCase {
         )
         XCTAssertEqual(ack[4], .unsigned(3))
     }
+
+    func testPathProbeIntentAndAcknowledgementUseExactThreeKeySchemas() throws {
+        let payload = try LSPControlWire.pathProbe(probeID: 77, udpPayloadSize: 1_400)
+        let intent = try LSPControlWire.pathProbe(from: LSPControlEvent(
+            messageType: LSPControlMessageType.pathProbe.rawValue,
+            flags: [.acknowledgementRequired],
+            connectionGeneration: 1,
+            messageID: 9,
+            requestID: 10,
+            payload: payload
+        ))
+        XCTAssertEqual(intent, .init(probeID: 77, udpPayloadSize: 1_400))
+
+        let acknowledgement = try LSPControlWire.pathProbeAck(from: LSPControlEvent(
+            messageType: LSPControlMessageType.pathProbeAck.rawValue,
+            flags: [.response],
+            connectionGeneration: 1,
+            messageID: 10,
+            requestID: 10,
+            payload: try LSPControlWire.pathProbeAck(probeID: 77, receivedSize: 1_400)
+        ))
+        XCTAssertEqual(acknowledgement, intent)
+        XCTAssertThrowsError(try LSPControlWire.pathProbe(probeID: 0, udpPayloadSize: 1_400))
+    }
 }

@@ -602,14 +602,20 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t unprotect(
       const std::span<std::uint8_t> packet,
       std::size_t &length,
-      const bool rtcp
+      const bool rtcp,
+      bool &replay
     ) noexcept {
+      replay = false;
       if (inbound_ == nullptr || length > packet.size() || length > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
       auto encoded_length = static_cast<int>(length);
       const auto status = rtcp ? srtp_unprotect_rtcp(inbound_, packet.data(), &encoded_length) :
                                  srtp_unprotect(inbound_, packet.data(), &encoded_length);
+      if (status == srtp_err_status_replay_fail || status == srtp_err_status_replay_old) {
+        replay = true;
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
       if (status != srtp_err_status_ok || encoded_length < 0) {
         return CLSP_STATUS_SRTP_FAILURE;
       }
@@ -634,6 +640,19 @@ namespace umbra::lsp {
         return CLSP_STATUS_SRTP_FAILURE;
       }
       length = static_cast<std::size_t>(encoded_length);
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Query exact outbound SRTCP trailer bytes for the installed policy. */
+    [[nodiscard]] clsp_status_t rtcp_protect_trailer_length(std::size_t &length) const noexcept {
+      if (outbound_ == nullptr) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      std::uint32_t trailer = 0;
+      if (srtp_get_protect_rtcp_trailer_length(outbound_, 0, 0, &trailer) != srtp_err_status_ok || trailer == 0) {
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
+      length = trailer;
       return CLSP_STATUS_OK;
     }
 
@@ -670,8 +689,10 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t unprotect_video(
       const std::span<std::uint8_t> packet,
       std::size_t &length,
-      const bool rtcp
+      const bool rtcp,
+      bool &replay
     ) noexcept {
+      replay = false;
       if (video_inbound_ == nullptr || length > packet.size() ||
           length > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         return CLSP_STATUS_INVALID_STATE;
@@ -679,6 +700,10 @@ namespace umbra::lsp {
       auto encoded_length = static_cast<int>(length);
       const auto status = rtcp ? srtp_unprotect_rtcp(video_inbound_, packet.data(), &encoded_length) :
                                  srtp_unprotect(video_inbound_, packet.data(), &encoded_length);
+      if (status == srtp_err_status_replay_fail || status == srtp_err_status_replay_old) {
+        replay = true;
+        return CLSP_STATUS_SRTP_FAILURE;
+      }
       if (status != srtp_err_status_ok || encoded_length < 0) {
         return CLSP_STATUS_SRTP_FAILURE;
       }
@@ -695,12 +720,40 @@ namespace umbra::lsp {
 #else
     /** @brief No-op destructor for dependency-free builds. */
     ~Impl() = default;
-    [[nodiscard]] clsp_status_t initialize(const DtlsSrtpExporter &) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
-    [[nodiscard]] clsp_status_t unprotect(std::span<std::uint8_t>, std::size_t &, bool) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
-    [[nodiscard]] clsp_status_t protect(std::span<std::uint8_t>, std::size_t &, bool) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
-    [[nodiscard]] bool ready() const noexcept { return false; }
-    [[nodiscard]] clsp_status_t configure_video_inbound(std::uint32_t, std::span<const int>) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
-    [[nodiscard]] clsp_status_t unprotect_video(std::span<std::uint8_t>, std::size_t &, bool) noexcept { return CLSP_STATUS_MISSING_LIBSRTP; }
+
+    [[nodiscard]] clsp_status_t initialize(const DtlsSrtpExporter &) noexcept {
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
+
+    [[nodiscard]] clsp_status_t unprotect(
+      std::span<std::uint8_t>,
+      std::size_t &,
+      bool,
+      bool &replay
+    ) noexcept {
+      replay = false;
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
+
+    [[nodiscard]] clsp_status_t protect(std::span<std::uint8_t>, std::size_t &, bool) noexcept {
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
+
+    [[nodiscard]] clsp_status_t rtcp_protect_trailer_length(std::size_t &) const noexcept {
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
+
+    [[nodiscard]] bool ready() const noexcept {
+      return false;
+    }
+
+    [[nodiscard]] clsp_status_t configure_video_inbound(std::uint32_t, std::span<const int>) noexcept {
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
+
+    [[nodiscard]] clsp_status_t unprotect_video(std::span<std::uint8_t>, std::size_t &, bool, bool &) noexcept {
+      return CLSP_STATUS_MISSING_LIBSRTP;
+    }
 #endif
   };
 
@@ -719,9 +772,14 @@ namespace umbra::lsp {
   clsp_status_t SrtpSession::unprotect(
     const std::span<std::uint8_t> packet,
     std::size_t &length,
-    const bool rtcp
+    const bool rtcp,
+    bool &replay
   ) noexcept {
-    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->unprotect(packet, length, rtcp);
+    if (impl_ == nullptr) {
+      replay = false;
+      return CLSP_STATUS_RESOURCE_EXHAUSTED;
+    }
+    return impl_->unprotect(packet, length, rtcp, replay);
   }
 
   clsp_status_t SrtpSession::protect(
@@ -730,6 +788,10 @@ namespace umbra::lsp {
     const bool rtcp
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->protect(packet, length, rtcp);
+  }
+
+  clsp_status_t SrtpSession::rtcp_protect_trailer_length(std::size_t &length) const noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->rtcp_protect_trailer_length(length);
   }
 
   bool SrtpSession::ready() const noexcept {
@@ -746,8 +808,9 @@ namespace umbra::lsp {
   clsp_status_t SrtpSession::unprotect_video(
     const std::span<std::uint8_t> packet,
     std::size_t &length,
-    const bool rtcp
+    const bool rtcp,
+    bool &replay
   ) noexcept {
-    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->unprotect_video(packet, length, rtcp);
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->unprotect_video(packet, length, rtcp, replay);
   }
 }  // namespace umbra::lsp

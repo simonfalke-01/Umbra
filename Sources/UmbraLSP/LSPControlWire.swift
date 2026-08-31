@@ -23,6 +23,8 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case audioConfigAck = 0x0213
     case microphoneConfig = 0x0214
     case microphoneConfigAck = 0x0215
+    case pathProbe = 0x0300
+    case pathProbeAck = 0x0301
 }
 
 /// Stable status codes in exact LSP control responses.
@@ -239,6 +241,12 @@ public struct LSPVideoConfigurationRequest: Equatable, Sendable {
     public var sessionID: UUID
     public var nativeConfiguration: LSPNativeVideoConfiguration
     public var parameterSets: [Data]
+}
+
+/// Exact authenticated PATH_PROBE intent or acknowledgement fields.
+public struct LSPPathProbeIntent: Equatable, Sendable {
+    public var probeID: UInt64
+    public var udpPayloadSize: UInt16
 }
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
@@ -637,6 +645,47 @@ public enum LSPControlWire {
             .unsigned(1), .unsigned(UInt64(status.rawValue)), .bytes(uuidBytes(sessionID)),
             .unsigned(UInt64(videoGeneration)), .unsigned(UInt64(decoderCredit)),
         ])
+    }
+
+    public static func pathProbe(probeID: UInt64, udpPayloadSize: UInt16) throws -> Data {
+        guard probeID != 0, (1_200...1_472).contains(udpPayloadSize) else {
+            throw DeterministicCBORError.malformed
+        }
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(probeID),
+            .unsigned(UInt64(udpPayloadSize)),
+        ])
+    }
+
+    public static func pathProbe(from event: LSPControlEvent) throws -> LSPPathProbeIntent {
+        guard event.messageType == LSPControlMessageType.pathProbe.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 3)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        let probeID = try uint(values[1])
+        let size = try uint(values[2])
+        guard probeID != 0, (1_200...1_472).contains(size) else { throw DeterministicCBORError.malformed }
+        return .init(probeID: probeID, udpPayloadSize: UInt16(size))
+    }
+
+    public static func pathProbeAck(probeID: UInt64, receivedSize: UInt16) throws -> Data {
+        try pathProbe(probeID: probeID, udpPayloadSize: receivedSize)
+    }
+
+    public static func pathProbeAck(from event: LSPControlEvent) throws -> LSPPathProbeIntent {
+        guard event.messageType == LSPControlMessageType.pathProbeAck.rawValue,
+              event.flags.contains(.response), !event.flags.contains(.errorResponse), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 3)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        let probeID = try uint(values[1])
+        let size = try uint(values[2])
+        guard probeID != 0, (1_200...1_472).contains(size) else { throw DeterministicCBORError.malformed }
+        return .init(probeID: probeID, udpPayloadSize: UInt16(size))
     }
 
     public static func stop(sessionID: UUID) throws -> Data {
