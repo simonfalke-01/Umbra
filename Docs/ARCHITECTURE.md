@@ -21,6 +21,9 @@ UmbraApp
             +-- CMoonlightBridge -> pinned moonlight-common-c
             +-- UmbraMedia -> VideoToolbox + Metal + AudioQueue
             +-- UmbraOpus / UmbraMicrophone
+    +-- UmbraLSP -> UmbraLSPTransport -> CLSPCore
+          native discovery, invitation pairing, auth, and app browsing
+          over raw UDP + kqueue + wolfSSL DTLS 1.3 + libSRTP
 ```
 
 `moonlight-common-c` owns the production GameStream RTSP/RTP/control wire,
@@ -33,6 +36,15 @@ pointer capture, event monitoring, menu commands, and display selection.
 VideoToolbox decodes compressed frames. Metal imports `CVPixelBuffer` planes as
 textures without a CPU pixel copy. AudioQueue is the production PCM output
 path.
+
+The separate native LSP path owns `_lumen-stream._udp` discovery, strict
+invitation import, a stable owner-private LSP-only Ed25519 identity, fresh LSP
+trust, a nonblocking UDP/kqueue worker, exact-policy wolfSSL 5.9.2 DTLS 1.3,
+SPKI pinning, DTLS-SRTP export, libSRTP 2.8.0 replay/authentication contexts,
+and reliable LSPC control. Swift receives authenticated control responses, not
+UDP packets. Pairing, reconnect authentication, and application browsing are
+wired into the product. Until START installs negotiated native lanes, launch
+fails explicitly and never downgrades to GameStream.
 
 ## Session policies
 
@@ -89,6 +101,11 @@ be described as brute-force resistant.
 Umbra stores the legacy RSA identity in its private Application Support
 directory with mode `0600`; it does not use the login Keychain. Paired host
 certificates are pinned.
+
+LSP uses separate `lsp-client-identity-v1.json`, `lsp-trust-v1.json`, and
+`lsp-hosts-v1.json` owner-private atomic files. It never reuses legacy identity
+or trust. The invitation/stored leaf SubjectPublicKeyInfo digest is checked
+before control or SRTP authority is exposed.
 
 ## Measurement boundaries
 

@@ -19,20 +19,27 @@ final class LSPTransportTests: XCTestCase {
     }
 
     func testStartFailsClosedAtFirstMissingSecurityProvider() throws {
-        let transport = try LSPTransport()
+        let transport = try LSPTransport(configuration: .init(handshakeTimeout: .seconds(1)))
         let providers = LSPTransport.availableProviders
+        let endpoint = LSPTransportEndpoint(
+            host: "127.0.0.1",
+            port: 9,
+            serverSPKISHA256: Data(repeating: 0x55, count: 32)
+        )
 
         if !providers.contains(.wolfSSL) {
-            XCTAssertThrowsError(try transport.start()) { error in
+            XCTAssertThrowsError(try transport.start(endpoint: endpoint)) { error in
                 XCTAssertEqual(error as? LSPTransportError, .missingWolfSSL)
             }
         } else if !providers.contains(.libSRTP) {
-            XCTAssertThrowsError(try transport.start()) { error in
+            XCTAssertThrowsError(try transport.start(endpoint: endpoint)) { error in
                 XCTAssertEqual(error as? LSPTransportError, .missingLibSRTP)
             }
         } else {
-            XCTAssertThrowsError(try transport.start()) { error in
-                XCTAssertEqual(error as? LSPTransportError, .unsupported)
+            XCTAssertThrowsError(try transport.start(endpoint: endpoint)) { error in
+                XCTAssertTrue(
+                    [.timeout, .dtlsFailure, .socketFailure].contains(error as? LSPTransportError)
+                )
             }
         }
     }

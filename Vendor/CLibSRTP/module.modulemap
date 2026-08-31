@@ -1,0 +1,5 @@
+module CLibSRTP [system] {
+    header "shim.h"
+    link "srtp2"
+    export *
+}

@@ -17,7 +17,7 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(1)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "7f338b3da343cc9b1fdc36d7a2590cfccdf00afd87c12d8cfc1acfff0c6e6362"
+#define CLSP_CORE_SOURCE_DIGEST "587cdc5f65b445162d02bf4bb0d54487967c93811c5565d2548321c526fbc0e5"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
@@ -47,6 +47,14 @@ extern "C" {
     CLSP_STATUS_RESOURCE_EXHAUSTED = 8,  ///< A bounded native resource could not be allocated.
     CLSP_STATUS_UNSUPPORTED = 9,  ///< The requested production capability is not implemented.
     CLSP_STATUS_INTERNAL_FAILURE = 10,  ///< An internal invariant failed without exposing details.
+    CLSP_STATUS_INVALID_ENDPOINT = 11,  ///< Remote host, port, or SPKI pin is invalid.
+    CLSP_STATUS_SOCKET_FAILURE = 12,  ///< UDP socket or kqueue ownership could not be established.
+    CLSP_STATUS_DTLS_FAILURE = 13,  ///< Exact-policy DTLS 1.3 setup or handshake failed.
+    CLSP_STATUS_SPKI_MISMATCH = 14,  ///< The authenticated certificate did not match the required SPKI pin.
+    CLSP_STATUS_SRTP_FAILURE = 15,  ///< Directional libSRTP contexts could not be installed or used.
+    CLSP_STATUS_NOT_AUTHENTICATED = 16,  ///< An operation requires a completed pinned DTLS association.
+    CLSP_STATUS_CONTROL_WINDOW_FULL = 17,  ///< The bounded 64-frame control window is full.
+    CLSP_STATUS_TIMEOUT = 18,  ///< A bounded handshake or control operation expired.
   } clsp_status_t;
 
   /** @brief Operator-selected congestion-control profile. */
@@ -58,8 +66,10 @@ extern "C" {
   /** @brief Native lifecycle state visible at coarse product boundaries. */
   typedef enum clsp_lifecycle_state {
     CLSP_LIFECYCLE_CREATED = 0,  ///< Core handle exists but owns no live transport.
-    CLSP_LIFECYCLE_RUNNING = 1,  ///< Native transport workers are active.
-    CLSP_LIFECYCLE_STOPPED = 2,  ///< Transport workers are quiesced and may be restarted.
+    CLSP_LIFECYCLE_CONNECTING = 1,  ///< UDP and DTLS workers are establishing exact-policy security.
+    CLSP_LIFECYCLE_AUTHENTICATED = 2,  ///< DTLS, SPKI pinning, exporter, and SRTP contexts are ready.
+    CLSP_LIFECYCLE_STOPPED = 3,  ///< Transport workers are quiesced and may be restarted.
+    CLSP_LIFECYCLE_FAILED = 4,  ///< Native transport failed and has quiesced.
   } clsp_lifecycle_state_t;
 
   /** @brief Bit mask describing linked production security providers. */
@@ -77,8 +87,19 @@ extern "C" {
     uint32_t profile;  ///< One `clsp_profile_t` value.
     uint32_t competition_capacity_mbps;  ///< Required nonzero ceiling only for competition mode.
     uint32_t telemetry_interval_milliseconds;  ///< Coarse snapshot interval, at least 250 ms.
+    uint32_t handshake_timeout_milliseconds;  ///< Bounded synchronous start timeout, 1000 through 30000 ms.
     uint32_t reserved_flags;  ///< Reserved and required to be zero.
   } clsp_configuration_t;
+
+  /** @brief Exact remote endpoint and invitation/trust SPKI pin copied at start. */
+  typedef struct clsp_endpoint {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_endpoint_t)`.
+    clsp_const_byte_span_t host;  ///< UTF-8 DNS name or numeric IP literal, at most 255 bytes.
+    uint16_t port;  ///< Nonzero LSP UDP application port.
+    uint16_t reserved_zero;  ///< Reserved and required to be zero.
+    uint8_t server_spki_sha256[32];  ///< Required nonzero SHA-256 leaf SubjectPublicKeyInfo pin.
+  } clsp_endpoint_t;
 
   /** @brief Coarse native lifecycle notification delivered without core locks held. */
   typedef struct clsp_lifecycle_event {
@@ -87,6 +108,19 @@ extern "C" {
     uint32_t state;  ///< One `clsp_lifecycle_state_t` value.
     uint32_t reserved_zero;  ///< Reserved and required to be zero.
   } clsp_lifecycle_event_t;
+
+  /** @brief One authenticated control frame delivered at application frequency. */
+  typedef struct clsp_control_event {
+    uint32_t abi_version;  ///< Event layout version.
+    uint32_t structure_size;  ///< Size of this event structure.
+    uint16_t message_type;  ///< LSP/1 control message type.
+    uint8_t flags;  ///< Authenticated LSPC flags.
+    uint8_t reserved_zero;  ///< Reserved and required to be zero.
+    uint32_t connection_generation;  ///< Authenticated LSPC connection generation.
+    uint64_t message_id;  ///< Authenticated peer logical-frame identifier.
+    uint64_t request_id;  ///< Correlated request identifier, or zero for an event.
+    clsp_const_byte_span_t payload;  ///< Transient deterministic-CBOR payload.
+  } clsp_control_event_t;
 
   /** @brief Low-rate telemetry snapshot copied across the ABI. */
   typedef struct clsp_telemetry_snapshot {
@@ -111,6 +145,18 @@ extern "C" {
    * @param event Transient lifecycle event.
    */
   typedef void (*clsp_lifecycle_callback_t)(void *context, const clsp_lifecycle_event_t *event);
+
+  /**
+   * @brief Coarse non-reentrant authenticated-control callback.
+   *
+   * The payload is valid only for the callback. The native worker has already
+   * completed DTLS authentication, SPKI pinning, LSPC validation, duplicate
+   * suppression, and ACK processing before invoking it.
+   *
+   * @param context Caller-owned retained callback context.
+   * @param event Transient authenticated control event.
+   */
+  typedef void (*clsp_control_callback_t)(void *context, const clsp_control_event_t *event);
 
   /**
    * @brief Retain an explicitly owned callback context.
@@ -138,6 +184,7 @@ extern "C" {
     clsp_context_retain_t retain_context;  ///< Required retain operation for nonnull context.
     clsp_context_release_t release_context;  ///< Required release operation for nonnull context.
     clsp_lifecycle_callback_t lifecycle;  ///< Optional coarse lifecycle callback.
+    clsp_control_callback_t control;  ///< Optional authenticated control-frame callback.
   } clsp_callbacks_t;
 
   /**
@@ -190,12 +237,13 @@ extern "C" {
   void clsp_core_release(clsp_core_t *core);
 
   /**
-   * @brief Start native transport ownership after provider validation.
+   * @brief Start a pinned DTLS association on a nonblocking UDP/kqueue worker.
    *
    * @param core Core handle.
+   * @param endpoint Exact remote endpoint and required leaf-SPKI pin.
    * @return Success or a fail-closed provider/lifecycle status.
    */
-  clsp_status_t clsp_core_start(clsp_core_t *core);
+  clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_t *endpoint);
 
   /**
    * @brief Stop native transport ownership and quiesce callbacks.
@@ -204,6 +252,28 @@ extern "C" {
    * @return Typed lifecycle status.
    */
   clsp_status_t clsp_core_stop(clsp_core_t *core);
+
+  /**
+   * @brief Queue one reliable LSPC request for DTLS protection and transmission.
+   *
+   * The native core assigns the message ID, includes the current selective ACK
+   * state, retains a byte-identical frame for bounded RTO retries, and delivers
+   * the authenticated response through `clsp_control_callback_t`.
+   *
+   * @param core Authenticated core handle.
+   * @param message_type Nonzero LSP/1 message type.
+   * @param request_id Random nonzero connection-local request identifier.
+   * @param payload Deterministic-CBOR payload fitting one path-safe record.
+   * @param deadline_milliseconds Relative operation deadline, 20 through 30000 ms.
+   * @return Typed queueing status.
+   */
+  clsp_status_t clsp_core_send_control(
+    clsp_core_t *core,
+    uint16_t message_type,
+    uint64_t request_id,
+    clsp_const_byte_span_t payload,
+    uint32_t deadline_milliseconds
+  );
 
   /**
    * @brief Copy a low-rate telemetry snapshot.

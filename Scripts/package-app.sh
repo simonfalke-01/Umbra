@@ -239,6 +239,8 @@ cd "$repository_root"
 if [[ "$configuration" == "release" ]]; then
     release_prefix="$("$repository_root/Scripts/bootstrap-release-deps.sh")"
     export UMBRA_RELEASE_DEPS_PREFIX="$release_prefix"
+    lsp_prefix="$(UMBRA_LSP_DEPS_PREFIX="$release_prefix" "$repository_root/Scripts/bootstrap-lsp-deps.sh")"
+    export UMBRA_LSP_DEPS_PREFIX="$lsp_prefix"
     export PKG_CONFIG_LIBDIR="$release_prefix/lib/pkgconfig"
     export PKG_CONFIG_PATH=""
     export MACOSX_DEPLOYMENT_TARGET="14.0"

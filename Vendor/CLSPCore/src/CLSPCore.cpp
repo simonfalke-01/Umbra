@@ -6,6 +6,7 @@
 #include "CLSPCore.h"
 
 #include "core/core.h"
+#include "runtime/Runtime.h"
 
 #include <atomic>
 #include <cstddef>
@@ -31,6 +32,7 @@ struct clsp_core {
   std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
   std::atomic<std::uint32_t> state {CLSP_LIFECYCLE_CREATED};  ///< Coarse lifecycle state.
   std::atomic<bool> callback_active {false};  ///< Rejects reentrant ABI operations.
+  umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
   clsp_configuration_t configuration {};  ///< Caller configuration copied at creation.
   clsp_callbacks_t callbacks {};  ///< Callback table copied at creation.
   std::atomic<std::uint64_t> received_datagrams {0};  ///< Authenticated receive count.
@@ -40,6 +42,10 @@ struct clsp_core {
 
   /** @brief Release the explicitly retained callback context. */
   ~clsp_core() {
+    if (runtime != nullptr) {
+      (void)runtime->stop();
+      delete runtime;
+    }
     if (callbacks.context != nullptr) {
       callbacks.release_context(callbacks.context);
     }
@@ -70,7 +76,9 @@ namespace {
       return CLSP_STATUS_ABI_MISMATCH;
     }
     if (configuration.port == 0 || configuration.reserved_zero != 0 ||
-        configuration.reserved_flags != 0 || configuration.telemetry_interval_milliseconds < 250U) {
+        configuration.reserved_flags != 0 || configuration.telemetry_interval_milliseconds < 250U ||
+        configuration.handshake_timeout_milliseconds < 1'000U ||
+        configuration.handshake_timeout_milliseconds > 30'000U) {
       return CLSP_STATUS_INVALID_CONFIGURATION;
     }
     if (configuration.profile != CLSP_PROFILE_ADAPTIVE_LOW_LATENCY &&
@@ -86,6 +94,7 @@ namespace {
 
   /** @brief Publish one non-reentrant lifecycle event without protocol locks held. */
   void publish_lifecycle(clsp_core_t *core, const std::uint32_t state) noexcept {
+    core->state.store(state, std::memory_order_release);
     if (core->callbacks.lifecycle == nullptr) {
       return;
     }
@@ -103,6 +112,68 @@ namespace {
     core->callbacks.lifecycle(core->callbacks.context, &event);
     core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
+  }
+
+  /** @brief Publish one authenticated control event without core locks held. */
+  void publish_control(clsp_core_t *core, const clsp_control_event_t &event) noexcept {
+    if (core->callbacks.control == nullptr) {
+      return;
+    }
+    auto expected = false;
+    if (!core->callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      return;
+    }
+    clsp_core_retain(core);
+    core->callbacks.control(core->callbacks.context, &event);
+    core->callback_active.store(false, std::memory_order_release);
+    clsp_core_release(core);
+  }
+
+  /** @brief Receive one native runtime lifecycle transition. */
+  void runtime_lifecycle(void *context, const std::uint32_t state) noexcept {
+    publish_lifecycle(static_cast<clsp_core_t *>(context), state);
+  }
+
+  /** @brief Receive one native authenticated LSPC frame. */
+  void runtime_control(void *context, const clsp_control_event_t &event) noexcept {
+    publish_control(static_cast<clsp_core_t *>(context), event);
+  }
+
+  /** @brief Accumulate one native runtime telemetry counter. */
+  void runtime_counter(
+    void *context,
+    const std::uint32_t counter,
+    const std::uint64_t amount
+  ) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    switch (static_cast<umbra::lsp::RuntimeCounter>(counter)) {
+      case umbra::lsp::RuntimeCounter::received:
+        core->received_datagrams.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::transmitted:
+        core->transmitted_datagrams.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::dropped:
+        core->dropped_datagrams.fetch_add(amount, std::memory_order_relaxed);
+        return;
+      case umbra::lsp::RuntimeCounter::authentication_failure:
+        core->authentication_failures.fetch_add(amount, std::memory_order_relaxed);
+        return;
+    }
+  }
+
+  /** @brief Validate an exact remote endpoint and nonzero 32-byte pin. */
+  [[nodiscard]] bool valid_endpoint(const clsp_endpoint_t &endpoint) noexcept {
+    if (endpoint.abi_version != CLSP_CORE_ABI_VERSION || endpoint.structure_size != sizeof(clsp_endpoint_t) ||
+        endpoint.host.data == nullptr || endpoint.host.length == 0 || endpoint.host.length > 255U ||
+        endpoint.port == 0 || endpoint.reserved_zero != 0) {
+      return false;
+    }
+    std::uint8_t aggregate = 0;
+    for (const auto byte : endpoint.server_spki_sha256) {
+      aggregate = static_cast<std::uint8_t>(aggregate | byte);
+    }
+    return aggregate != 0;
   }
 }  // namespace
 
@@ -178,8 +249,8 @@ extern "C" void clsp_core_release(clsp_core_t *core) {
   }
 }
 
-extern "C" clsp_status_t clsp_core_start(clsp_core_t *core) {
-  if (core == nullptr) {
+extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_t *endpoint) {
+  if (core == nullptr || endpoint == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
   if (core->callback_active.load(std::memory_order_acquire)) {
@@ -195,22 +266,37 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core) {
   if (!CLSP_CORE_HAS_RUNTIME) {
     return CLSP_STATUS_UNSUPPORTED;
   }
+  if (!valid_endpoint(*endpoint)) {
+    return CLSP_STATUS_INVALID_ENDPOINT;
+  }
 
   auto state = core->state.load(std::memory_order_acquire);
-  while (state != CLSP_LIFECYCLE_RUNNING) {
-    if (state != CLSP_LIFECYCLE_CREATED && state != CLSP_LIFECYCLE_STOPPED) {
-      return CLSP_STATUS_INVALID_STATE;
-    }
-    if (core->state.compare_exchange_weak(
-          state,
-          CLSP_LIFECYCLE_RUNNING,
-          std::memory_order_acq_rel
-        )) {
-      publish_lifecycle(core, CLSP_LIFECYCLE_RUNNING);
-      return CLSP_STATUS_OK;
-    }
+  if (state != CLSP_LIFECYCLE_CREATED && state != CLSP_LIFECYCLE_STOPPED && state != CLSP_LIFECYCLE_FAILED) {
+    return CLSP_STATUS_INVALID_STATE;
   }
-  return CLSP_STATUS_INVALID_STATE;
+  if (core->runtime != nullptr) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  auto *runtime = new (std::nothrow) umbra::lsp::Runtime {
+    core->configuration,
+    {
+      .context = core,
+      .lifecycle = runtime_lifecycle,
+      .control = runtime_control,
+      .counter = runtime_counter,
+    },
+  };
+  if (runtime == nullptr) {
+    return CLSP_STATUS_RESOURCE_EXHAUSTED;
+  }
+  core->runtime = runtime;
+  const auto status = runtime->start(*endpoint);
+  if (status != CLSP_STATUS_OK) {
+    delete core->runtime;
+    core->runtime = nullptr;
+    core->state.store(CLSP_LIFECYCLE_FAILED, std::memory_order_release);
+  }
+  return status;
 }
 
 extern "C" clsp_status_t clsp_core_stop(clsp_core_t *core) {
@@ -220,16 +306,32 @@ extern "C" clsp_status_t clsp_core_stop(clsp_core_t *core) {
   if (core->callback_active.load(std::memory_order_acquire)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
-  auto expected = static_cast<std::uint32_t>(CLSP_LIFECYCLE_RUNNING);
-  if (!core->state.compare_exchange_strong(
-        expected,
-        CLSP_LIFECYCLE_STOPPED,
-        std::memory_order_acq_rel
-      )) {
+  if (core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED || core->runtime == nullptr) {
     return CLSP_STATUS_INVALID_STATE;
   }
-  publish_lifecycle(core, CLSP_LIFECYCLE_STOPPED);
-  return CLSP_STATUS_OK;
+  const auto status = core->runtime->stop();
+  delete core->runtime;
+  core->runtime = nullptr;
+  return status;
+}
+
+extern "C" clsp_status_t clsp_core_send_control(
+  clsp_core_t *core,
+  const std::uint16_t message_type,
+  const std::uint64_t request_id,
+  const clsp_const_byte_span_t payload,
+  const std::uint32_t deadline_milliseconds
+) {
+  if (core == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (core->callback_active.load(std::memory_order_acquire)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  if (core->runtime == nullptr || core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
+    return CLSP_STATUS_NOT_AUTHENTICATED;
+  }
+  return core->runtime->send_control(message_type, request_id, payload, deadline_milliseconds);
 }
 
 extern "C" clsp_status_t clsp_core_copy_telemetry(
@@ -303,6 +405,22 @@ extern "C" const char *clsp_status_description(const clsp_status_t status) {
       return "unsupported LSP capability";
     case CLSP_STATUS_INTERNAL_FAILURE:
       return "internal LSP failure";
+    case CLSP_STATUS_INVALID_ENDPOINT:
+      return "invalid LSP endpoint or SPKI pin";
+    case CLSP_STATUS_SOCKET_FAILURE:
+      return "LSP UDP or kqueue failure";
+    case CLSP_STATUS_DTLS_FAILURE:
+      return "LSP DTLS 1.3 failure";
+    case CLSP_STATUS_SPKI_MISMATCH:
+      return "LSP server SPKI pin mismatch";
+    case CLSP_STATUS_SRTP_FAILURE:
+      return "LSP SRTP or SRTCP failure";
+    case CLSP_STATUS_NOT_AUTHENTICATED:
+      return "LSP association is not authenticated";
+    case CLSP_STATUS_CONTROL_WINDOW_FULL:
+      return "LSP control window is full";
+    case CLSP_STATUS_TIMEOUT:
+      return "LSP operation timed out";
   }
   return "unknown LSP status";
 }

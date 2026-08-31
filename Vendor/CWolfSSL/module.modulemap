@@ -1,0 +1,5 @@
+module CWolfSSL [system] {
+    header "shim.h"
+    link "wolfssl"
+    export *
+}

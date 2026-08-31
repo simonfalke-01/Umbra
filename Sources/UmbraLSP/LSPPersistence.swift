@@ -162,6 +162,33 @@ public struct LSPHostSnapshot: ValidatedPersistenceModel, Hashable, Sendable {
     }
 }
 
+/// Version-one LSP-only client application-identity payload.
+public struct LSPClientIdentitySnapshot: ValidatedPersistenceModel, Equatable, Sendable {
+    public static let defaultValue = LSPClientIdentitySnapshot()
+
+    public var schemaVersion: Int
+    public var identity: LSPClientIdentity?
+
+    public init(schemaVersion: Int = 1, identity: LSPClientIdentity? = nil) {
+        self.schemaVersion = schemaVersion
+        self.identity = identity
+    }
+
+    public func validate() throws {
+        guard schemaVersion == 1 else {
+            throw ModelValidationError(field: "lspIdentity.schemaVersion", reason: "must equal one")
+        }
+        if let identity {
+            guard identity.clientID != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+                  identity.privateKeyRawRepresentation.count == 32
+            else {
+                throw ModelValidationError(field: "lspIdentity.identity", reason: "must contain a nonzero ID and Ed25519 key")
+            }
+            _ = try identity.publicKeyRawRepresentation
+        }
+    }
+}
+
 /// Factory for LSP-only persistence files that never reuse retired v3 or legacy state.
 public enum LSPPersistence {
     /// LSP-only trust-store filename.
@@ -170,16 +197,24 @@ public enum LSPPersistence {
     /// LSP-only host-catalog filename.
     public static let hostsFileName = "lsp-hosts-v1.json"
 
+    /// LSP-only owner-private application identity filename.
+    public static let clientIdentityFileName = "lsp-client-identity-v1.json"
+
     /// Creates LSP stores rooted at an explicit application-support directory.
     ///
     /// - Parameter directory: Umbra application-support directory.
     /// - Returns: Independent trust and host JSON stores.
     public static func stores(
         in directory: URL
-    ) -> (trust: JSONFileStore<LSPTrustSnapshot>, hosts: JSONFileStore<LSPHostSnapshot>) {
+    ) -> (
+        trust: JSONFileStore<LSPTrustSnapshot>,
+        hosts: JSONFileStore<LSPHostSnapshot>,
+        identity: JSONFileStore<LSPClientIdentitySnapshot>
+    ) {
         (
             JSONFileStore(fileURL: directory.appendingPathComponent(trustFileName, isDirectory: false)),
-            JSONFileStore(fileURL: directory.appendingPathComponent(hostsFileName, isDirectory: false))
+            JSONFileStore(fileURL: directory.appendingPathComponent(hostsFileName, isDirectory: false)),
+            JSONFileStore(fileURL: directory.appendingPathComponent(clientIdentityFileName, isDirectory: false))
         )
     }
 
@@ -192,7 +227,11 @@ public enum LSPPersistence {
     public static func applicationSupportStores(
         fileManager: FileManager = .default,
         bundleIdentifier: String = "app.umbra.Umbra"
-    ) throws -> (trust: JSONFileStore<LSPTrustSnapshot>, hosts: JSONFileStore<LSPHostSnapshot>) {
+    ) throws -> (
+        trust: JSONFileStore<LSPTrustSnapshot>,
+        hosts: JSONFileStore<LSPHostSnapshot>,
+        identity: JSONFileStore<LSPClientIdentitySnapshot>
+    ) {
         let supportDirectory = try fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -200,5 +239,18 @@ public enum LSPPersistence {
             create: true
         )
         return stores(in: supportDirectory.appendingPathComponent(bundleIdentifier, isDirectory: true))
+    }
+
+    /// Loads the stable LSP-only identity or atomically creates it on first use.
+    public static func loadOrCreateClientIdentity(
+        from store: JSONFileStore<LSPClientIdentitySnapshot>
+    ) async throws -> LSPClientIdentity {
+        let snapshot = try await store.load()
+        if let identity = snapshot.identity {
+            return identity
+        }
+        let generated = LSPClientIdentity.generate()
+        try await store.save(LSPClientIdentitySnapshot(identity: generated))
+        return generated
     }
 }

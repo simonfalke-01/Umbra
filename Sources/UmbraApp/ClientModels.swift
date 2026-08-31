@@ -36,7 +36,7 @@ struct HostDisplayModel: Identifiable, Hashable, Sendable {
     var details: String
 
     var canBrowseApplications: Bool {
-        (status == .online || id.rawValue.hasPrefix("v3:")) && isPaired && isServerSupported
+        status == .online && isPaired && isServerSupported
     }
 }
 

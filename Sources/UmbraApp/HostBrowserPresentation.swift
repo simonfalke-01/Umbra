@@ -130,7 +130,9 @@ struct HostBrowserPresentation: Hashable, Sendable {
         case .online where !host.isPaired && host.hasActiveSession:
             ("Streaming, Pair Required", UmbraSymbol.unpaired, .warning)
         case .online where !host.isPaired:
-            ("Pair Required", UmbraSymbol.unpaired, .warning)
+            host.id.rawValue.hasPrefix("lsp:")
+                ? ("LSP Invitation Required", UmbraSymbol.unpaired, .warning)
+                : ("Pair Required", UmbraSymbol.unpaired, .warning)
         case .online where host.hasActiveSession:
             ("Streaming", UmbraSymbol.running, .neutral)
         case .online:
@@ -149,7 +151,7 @@ struct HostBrowserPresentation: Hashable, Sendable {
         case .online where !host.isServerSupported:
             detailsAction
         case .online where !host.isPaired:
-            pairAction
+            host.id.rawValue.hasPrefix("lsp:") ? detailsAction : pairAction
         case .online:
             openApplicationsAction
         }

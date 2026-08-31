@@ -54,7 +54,7 @@ struct AddHostSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space6) {
-            Text("Add Host")
+            Text("Add Host or LSP Invitation")
                 .font(.title2.weight(.semibold))
 
             legacyFields
@@ -64,7 +64,7 @@ struct AddHostSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Add Host") {
+                Button("Connect") {
                     store.addHost(address: address, portText: port)
                 }
                 .buttonStyle(.borderedProminent)
@@ -82,14 +82,17 @@ struct AddHostSheet: View {
     private var legacyFields: some View {
         Form {
             TextField(
-                "Host name or IP address",
+                "Host name, IP address, or LSP invitation",
                 text: $address,
-                prompt: Text("gaming-pc.local or 192.168.1.25")
+                prompt: Text("gaming-pc.local or umbra://pair/lsp1#…")
             )
             .focused($focusedField, equals: .address)
             .textContentType(.URL)
             TextField("Port (optional)", text: $port, prompt: Text("Default"))
                 .frame(maxWidth: 160)
+            Text("LSP invitations authenticate the host and include their own port. They never fall back to GameStream.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
     }

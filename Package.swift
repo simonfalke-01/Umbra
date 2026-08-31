@@ -4,6 +4,34 @@ import PackageDescription
 import Foundation
 
 let releaseDependencyPrefix = ProcessInfo.processInfo.environment["UMBRA_RELEASE_DEPS_PREFIX"]
+let lspDependencyPrefix = ProcessInfo.processInfo.environment["UMBRA_LSP_DEPS_PREFIX"] ?? releaseDependencyPrefix
+let lspSecurityAvailable = lspDependencyPrefix.map { prefix in
+    let requiredPaths = [
+        "include/wolfssl/ssl.h",
+        "include/srtp2/srtp.h",
+        "lib/libwolfssl.a",
+        "lib/libsrtp2.a",
+    ]
+    return requiredPaths.allSatisfy { relativePath in
+        FileManager.default.fileExists(atPath: "\(prefix)/\(relativePath)")
+    }
+} ?? false
+let lspCoreDependencies: [Target.Dependency] = lspSecurityAvailable ? ["CWolfSSL", "CLibSRTP"] : []
+let lspCoreCXXSettings: [CXXSetting] = lspSecurityAvailable ? [
+    .define("CLSP_CORE_HAS_WOLFSSL", to: "1"),
+    .define("CLSP_CORE_HAS_LIBSRTP", to: "1"),
+    .define("CLSP_CORE_HAS_RUNTIME", to: "1"),
+    .unsafeFlags(["-I\(lspDependencyPrefix!)/include"]),
+] : []
+let lspCoreLinkerSettings: [LinkerSetting] = lspSecurityAvailable ? [
+    .unsafeFlags([
+        "-L\(lspDependencyPrefix!)/lib",
+        "-lwolfssl",
+        "-lsrtp2",
+    ]),
+    .linkedFramework("Security"),
+    .linkedFramework("CoreFoundation"),
+] : []
 let releaseCSettings: [CSetting] = releaseDependencyPrefix.map { prefix in
     [.unsafeFlags(["-I\(prefix)/include", "-I\(prefix)/include/opus"])]
 } ?? []
@@ -51,13 +79,29 @@ let package = Package(
                 .brew(["opus"]),
             ] : []
         ),
+        .systemLibrary(
+            name: "CWolfSSL",
+            path: "Vendor/CWolfSSL",
+            pkgConfig: lspDependencyPrefix == nil ? "wolfssl" : nil,
+            providers: []
+        ),
+        .systemLibrary(
+            name: "CLibSRTP",
+            path: "Vendor/CLibSRTP",
+            pkgConfig: lspDependencyPrefix == nil ? "libsrtp2" : nil,
+            providers: lspDependencyPrefix == nil ? [
+                .brew(["srtp"]),
+            ] : []
+        ),
         .target(
             name: "CLSPCore",
+            dependencies: lspCoreDependencies,
             path: "Vendor/CLSPCore",
             publicHeadersPath: "include",
             cxxSettings: [
                 .unsafeFlags(["-std=c++23", "-fno-exceptions", "-fno-rtti"]),
-            ],
+            ] + lspCoreCXXSettings,
+            linkerSettings: lspCoreLinkerSettings,
             plugins: ["CLSPCoreSyncPlugin"]
         ),
         .target(
@@ -192,6 +236,7 @@ let package = Package(
                 "UmbraCLIExecution",
                 "UmbraDiagnostics",
                 "UmbraMicrophone",
+                "UmbraLSP",
             ],
             path: "Sources/UmbraApp",
             exclude: [
