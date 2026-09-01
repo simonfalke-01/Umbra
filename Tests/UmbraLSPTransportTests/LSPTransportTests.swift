@@ -61,4 +61,366 @@ final class LSPTransportTests: XCTestCase {
             XCTAssertEqual(error as? LSPTransportError, .invalidConfiguration)
         }
     }
+
+    func testNativeHandoffAtomicSubmitFailureRemainsDefinitelyNotSubmitted() throws {
+        let active = try makeInactiveNativeCore()
+        let candidate = try makeInactiveNativeCore()
+        defer {
+            clsp_core_release(candidate)
+            clsp_core_release(active)
+        }
+
+        let callbacks = NativeHandoffCallbackRecorder()
+        var callbackTable = clsp_handoff_callbacks_t()
+        callbackTable.abi_version = clsp_core_abi_version()
+        callbackTable.structure_size = UInt32(MemoryLayout<clsp_handoff_callbacks_t>.size)
+        callbackTable.context = Unmanaged.passUnretained(callbacks).toOpaque()
+        callbackTable.retain_context = nativeHandoffRetainContext
+        callbackTable.release_context = nativeHandoffReleaseContext
+        callbackTable.phase = nativeHandoffPhase
+        callbackTable.baseline = nativeHandoffBaseline
+        callbackTable.rekey = nativeHandoffRekey
+        callbackTable.terminal = nativeHandoffTerminal
+
+        var handoff: OpaquePointer?
+        XCTAssertEqual(
+            clsp_handoff_create(active, 1, 10, &callbackTable, &handoff),
+            CLSP_STATUS_OK
+        )
+        let owned = try XCTUnwrap(handoff)
+        callbacks.handle = owned
+        callbacks.core = active
+
+        XCTAssertEqual(callbacks.contextRetains, 1)
+        XCTAssertEqual(
+            clsp_handoff_begin(
+                owned,
+                candidate,
+                2,
+                UInt32(CLSP_HANDOFF_REASON_PLANNED_REKEY.rawValue)
+            ),
+            CLSP_STATUS_OK
+        )
+        XCTAssertEqual(clsp_handoff_authenticate(owned, 2), CLSP_STATUS_OK)
+        XCTAssertEqual(clsp_handoff_neutralize(owned), CLSP_STATUS_OK)
+        var submission = clsp_control_submission_t()
+        let emptyMap = Data([0xA0])
+        let submitStatus = emptyMap.withUnsafeBytes { bytes in
+            clsp_handoff_submit_attach(
+                owned,
+                0x0202,
+                99,
+                .init(data: bytes.bindMemory(to: UInt8.self).baseAddress, length: bytes.count),
+                1_000,
+                &submission
+            )
+        }
+        XCTAssertEqual(submitStatus, CLSP_STATUS_NOT_AUTHENTICATED)
+        XCTAssertEqual(submission.request_id, 0)
+        var notSubmitted = clsp_handoff_snapshot_t()
+        XCTAssertEqual(clsp_handoff_copy_snapshot(owned, &notSubmitted), CLSP_STATUS_OK)
+        XCTAssertEqual(notSubmitted.phase, UInt32(CLSP_HANDOFF_PHASE_OLD_INPUT_NEUTRALIZED.rawValue))
+        XCTAssertEqual(
+            clsp_handoff_cancel(owned, UInt32(CLSP_HANDOFF_CANCEL_DEFINITE_REJECTION.rawValue)),
+            CLSP_STATUS_NOT_AUTHENTICATED
+        )
+        XCTAssertEqual(callbacks.reentrantSnapshotStatus, CLSP_STATUS_REENTRANT_CALLBACK)
+        XCTAssertEqual(callbacks.reentrantCoreStatus, CLSP_STATUS_REENTRANT_CALLBACK)
+        XCTAssertEqual(callbacks.rekeyEvents, 1)
+        XCTAssertEqual(callbacks.baselineKinds, [
+            UInt32(CLSP_HANDOFF_BASELINE_REQUIRED.rawValue),
+        ])
+        XCTAssertEqual(callbacks.baselineAuthorityEpochs, [2])
+        XCTAssertEqual(callbacks.baselineConnectionGenerations, [1])
+        XCTAssertEqual(callbacks.baselineRollbackGenerations, [2])
+        XCTAssertEqual(callbacks.terminalEvents, 1)
+        callbacks.handle = nil
+        callbacks.core = nil
+        clsp_handoff_release(owned)
+        XCTAssertEqual(callbacks.contextReleases, 1)
+    }
+
+    func testNativeHandoffConsumesCanceledGeneration() throws {
+        let active = try makeInactiveNativeCore()
+        let firstCandidate = try makeInactiveNativeCore()
+        let secondCandidate = try makeInactiveNativeCore()
+        defer {
+            clsp_core_release(secondCandidate)
+            clsp_core_release(firstCandidate)
+            clsp_core_release(active)
+        }
+        var handoff: OpaquePointer?
+        XCTAssertEqual(clsp_handoff_create(active, 5, 50, nil, &handoff), CLSP_STATUS_OK)
+        let owned = try XCTUnwrap(handoff)
+        defer { clsp_handoff_release(owned) }
+
+        XCTAssertEqual(
+            clsp_handoff_begin(
+                owned,
+                firstCandidate,
+                6,
+                UInt32(CLSP_HANDOFF_REASON_PLANNED_REKEY.rawValue)
+            ),
+            CLSP_STATUS_OK
+        )
+        XCTAssertEqual(
+            clsp_handoff_cancel(
+                owned,
+                UInt32(CLSP_HANDOFF_CANCEL_DEFINITE_REJECTION.rawValue)
+            ),
+            CLSP_STATUS_OK
+        )
+        XCTAssertEqual(
+            clsp_handoff_begin(
+                owned,
+                secondCandidate,
+                6,
+                UInt32(CLSP_HANDOFF_REASON_PLANNED_REKEY.rawValue)
+            ),
+            CLSP_STATUS_INVALID_CONFIGURATION
+        )
+        XCTAssertEqual(
+            clsp_handoff_begin(
+                owned,
+                secondCandidate,
+                7,
+                UInt32(CLSP_HANDOFF_REASON_TRANSPORT_LOSS.rawValue)
+            ),
+            CLSP_STATUS_OK
+        )
+        XCTAssertEqual(clsp_handoff_authenticate(owned, 7), CLSP_STATUS_OK)
+        XCTAssertEqual(
+            clsp_handoff_cancel(owned, UInt32(CLSP_HANDOFF_CANCEL_DEFINITE_REJECTION.rawValue)),
+            CLSP_STATUS_OK
+        )
+        var snapshot = clsp_handoff_snapshot_t()
+        XCTAssertEqual(clsp_handoff_copy_snapshot(owned, &snapshot), CLSP_STATUS_OK)
+        XCTAssertEqual(snapshot.phase, UInt32(CLSP_HANDOFF_PHASE_AUTHORITATIVE.rawValue))
+        XCTAssertEqual(snapshot.connection_generation_high_watermark, 7)
+        XCTAssertEqual(snapshot.terminal_count, 0)
+    }
+
+    func testNativeHandoffContinuesForwardAfterOldTransportLoss() throws {
+        let active = try makeInactiveNativeCore()
+        let candidate = try makeInactiveNativeCore()
+        defer {
+            clsp_core_release(candidate)
+            clsp_core_release(active)
+        }
+        var handoff: OpaquePointer?
+        XCTAssertEqual(clsp_handoff_create(active, 8, 80, nil, &handoff), CLSP_STATUS_OK)
+        let owned = try XCTUnwrap(handoff)
+        defer { clsp_handoff_release(owned) }
+
+        XCTAssertEqual(
+            clsp_handoff_begin(
+                owned,
+                candidate,
+                9,
+                UInt32(CLSP_HANDOFF_REASON_TRANSPORT_LOSS.rawValue)
+            ),
+            CLSP_STATUS_OK
+        )
+        XCTAssertEqual(clsp_handoff_lost(owned, active), CLSP_STATUS_OK)
+        XCTAssertEqual(clsp_handoff_authenticate(owned, 9), CLSP_STATUS_OK)
+        XCTAssertEqual(clsp_handoff_neutralize(owned), CLSP_STATUS_OK)
+        var submission = clsp_control_submission_t()
+        XCTAssertEqual(
+            clsp_handoff_submit_attach(owned, 0x0202, 1, .init(), 1_000, &submission),
+            CLSP_STATUS_NOT_AUTHENTICATED
+        )
+        XCTAssertEqual(submission.request_id, 0)
+    }
+
+    private func makeInactiveNativeCore() throws -> OpaquePointer {
+        var configuration = clsp_configuration_t()
+        configuration.abi_version = clsp_core_abi_version()
+        configuration.structure_size = UInt32(MemoryLayout<clsp_configuration_t>.size)
+        configuration.port = 48_030
+        configuration.profile = UInt32(CLSP_PROFILE_ADAPTIVE_LOW_LATENCY.rawValue)
+        configuration.telemetry_interval_milliseconds = 1_000
+        configuration.handshake_timeout_milliseconds = 1_000
+        var core: OpaquePointer?
+        XCTAssertEqual(clsp_core_create(&configuration, nil, &core), CLSP_STATUS_OK)
+        return try XCTUnwrap(core)
+    }
+
+    func testNativeHandoffStartsAuthoritativeAndPublishesSecretFreeSnapshot() throws {
+        let active = try LSPTransport()
+        let handoff = try LSPNativeHandoff(
+            active: active,
+            activeConnectionGeneration: 4,
+            activeInputGeneration: 9
+        )
+        let snapshot = try handoff.snapshot()
+        XCTAssertEqual(snapshot.phase, .authoritative)
+        XCTAssertEqual(snapshot.activeConnectionGeneration, 4)
+        XCTAssertEqual(snapshot.activeInputGeneration, 9)
+        XCTAssertEqual(snapshot.connectionGenerationHighWatermark, 4)
+        XCTAssertFalse(snapshot.baselineRequired)
+        XCTAssertFalse(snapshot.forwardOnly)
+    }
+
+    func testAssociationBaselineObservationDoesNotRequireHandoffBinding() throws {
+        let core = try makeInactiveNativeCore()
+        defer { clsp_core_release(core) }
+        var snapshot = clsp_input_baseline_snapshot_t()
+        XCTAssertEqual(clsp_core_copy_input_baseline(core, &snapshot), CLSP_STATUS_OK)
+        XCTAssertEqual(snapshot.abi_version, clsp_core_abi_version())
+        XCTAssertEqual(snapshot.structure_size, UInt32(MemoryLayout<clsp_input_baseline_snapshot_t>.size))
+        XCTAssertEqual(snapshot.connection_generation, 0)
+        XCTAssertEqual(snapshot.input_generation, 0)
+        XCTAssertEqual(snapshot.input_authority_epoch, 0)
+        XCTAssertEqual(snapshot.event_generation, 0)
+        XCTAssertEqual(snapshot.acknowledged, 0)
+        XCTAssertEqual(
+            clsp_core_wait_input_baseline(core, 1, 1, &snapshot),
+            CLSP_STATUS_TIMEOUT
+        )
+    }
+
+    func testRollbackBaselineCompletionUsesLatchedEpochAfterSnapshotClearsRollbackGeneration() {
+        let snapshot = LSPNativeHandoffSnapshot(
+            phase: .authoritative,
+            activeConnectionGeneration: 41,
+            activeInputGeneration: 7,
+            candidateConnectionGeneration: 0,
+            inputAuthorityEpoch: 42,
+            connectionGenerationHighWatermark: 42,
+            rollbackConnectionGeneration: 0,
+            retiringConnectionGeneration: 0,
+            baselineRequired: false,
+            forwardOnly: false,
+            committedCount: 0,
+            rollbackCount: 1,
+            terminalCount: 0
+        )
+        let acknowledged = LSPNativeBaselineEvent(
+            kind: .acknowledged,
+            inputGeneration: 7,
+            inputAuthorityEpoch: 42,
+            connectionGeneration: 41,
+            rollbackConnectionGeneration: 42
+        )
+
+        XCTAssertTrue(LSPNativeHandoff.completedBaselineMatches(
+            event: acknowledged,
+            snapshot: snapshot,
+            inputGeneration: 7
+        ))
+        var stale = acknowledged
+        stale.rollbackConnectionGeneration = 43
+        XCTAssertFalse(LSPNativeHandoff.completedBaselineMatches(
+            event: stale,
+            snapshot: snapshot,
+            inputGeneration: 7
+        ))
+    }
+}
+
+private final class NativeHandoffCallbackRecorder {
+    private let lock = NSLock()
+    var handle: OpaquePointer?
+    var core: OpaquePointer?
+    private(set) var contextRetains = 0
+    private(set) var contextReleases = 0
+    private(set) var rekeyEvents = 0
+    private(set) var terminalEvents = 0
+    private(set) var baselineKinds: [UInt32] = []
+    private(set) var baselineAuthorityEpochs: [UInt32] = []
+    private(set) var baselineConnectionGenerations: [UInt32] = []
+    private(set) var baselineRollbackGenerations: [UInt32] = []
+    private(set) var reentrantSnapshotStatus: clsp_status_t?
+    private(set) var reentrantCoreStatus: clsp_status_t?
+
+    func retained() {
+        lock.lock()
+        contextRetains += 1
+        lock.unlock()
+    }
+
+    func released() {
+        lock.lock()
+        contextReleases += 1
+        lock.unlock()
+    }
+
+    func phase() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard reentrantSnapshotStatus == nil, let handle else { return }
+        var snapshot = clsp_handoff_snapshot_t()
+        reentrantSnapshotStatus = clsp_handoff_copy_snapshot(handle, &snapshot)
+        if let core {
+            var telemetry = clsp_telemetry_snapshot_t()
+            reentrantCoreStatus = clsp_core_copy_telemetry(core, &telemetry)
+        }
+    }
+
+    func baseline(_ event: clsp_handoff_baseline_event_t) {
+        lock.lock()
+        baselineKinds.append(event.kind)
+        baselineAuthorityEpochs.append(event.input_authority_epoch)
+        baselineConnectionGenerations.append(event.connection_generation)
+        baselineRollbackGenerations.append(event.rollback_connection_generation)
+        lock.unlock()
+    }
+
+    func rekey() {
+        lock.lock()
+        rekeyEvents += 1
+        lock.unlock()
+    }
+
+    func terminal() {
+        lock.lock()
+        terminalEvents += 1
+        lock.unlock()
+    }
+}
+
+private func nativeHandoffRetainContext(_ context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    let recorder = Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).takeUnretainedValue()
+    recorder.retained()
+    _ = Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).retain()
+}
+
+private func nativeHandoffReleaseContext(_ context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    let recorder = Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).takeUnretainedValue()
+    recorder.released()
+    Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).release()
+}
+
+private func nativeHandoffPhase(
+    _ context: UnsafeMutableRawPointer?,
+    _ event: UnsafePointer<clsp_handoff_phase_event_t>?
+) {
+    guard let context, event != nil else { return }
+    Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).takeUnretainedValue().phase()
+}
+
+private func nativeHandoffBaseline(
+    _ context: UnsafeMutableRawPointer?,
+    _ event: UnsafePointer<clsp_handoff_baseline_event_t>?
+) {
+    guard let context, let event else { return }
+    Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).takeUnretainedValue().baseline(event.pointee)
+}
+
+private func nativeHandoffRekey(
+    _ context: UnsafeMutableRawPointer?,
+    _ event: UnsafePointer<clsp_handoff_rekey_event_t>?
+) {
+    guard let context, event != nil else { return }
+    Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).takeUnretainedValue().rekey()
+}
+
+private func nativeHandoffTerminal(
+    _ context: UnsafeMutableRawPointer?,
+    _ event: UnsafePointer<clsp_handoff_terminal_event_t>?
+) {
+    guard let context, event != nil else { return }
+    Unmanaged<NativeHandoffCallbackRecorder>.fromOpaque(context).takeUnretainedValue().terminal()
 }

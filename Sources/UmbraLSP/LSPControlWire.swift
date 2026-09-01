@@ -468,6 +468,7 @@ public struct LSPAttachRequest: Equatable, Sendable {
     public var sessionID: UUID
     public var attachToken: Data
     public var intentID: UUID
+    public var successorAttachToken: Data
 }
 
 /// Authenticated ATTACH_RESPONSE with rotated ownership and input mapping.
@@ -817,17 +818,25 @@ public enum LSPControlWire {
 
     public static func attach(_ request: LSPAttachRequest) throws -> Data {
         try fixed(request.attachToken, count: 32)
+        try fixed(request.successorAttachToken, count: 32)
+        guard request.successorAttachToken != request.attachToken else {
+            throw DeterministicCBORError.malformed
+        }
         return try encodeMap([
             .unsigned(1),
             .bytes(uuidBytes(request.sessionID)),
             .bytes(request.attachToken),
             .bytes(uuidBytes(request.intentID)),
+            .bytes(request.successorAttachToken),
         ])
     }
 
     public static func attachResponse(from event: LSPControlEvent) throws -> LSPAttachResponse {
         let values = try responseValues(event, type: .attachResponse, count: 32)
-        try requireSuccess(values[1])
+        guard let status = LSPControlStatus(rawValue: try uint8(values[1], nonzero: false)) else {
+            throw DeterministicCBORError.malformed
+        }
+        guard status == .success else { throw status }
         let sessionID = try uuid(try bytes(values[2], count: 16))
         let replacement = try bytes(values[3], count: 32)
         let connectionGeneration = try uint32(values[4], nonzero: true)

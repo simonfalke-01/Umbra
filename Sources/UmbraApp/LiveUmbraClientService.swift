@@ -6,6 +6,7 @@ import UmbraCore
 import UmbraDiagnostics
 import UmbraIntegration
 import UmbraLSP
+import UmbraLSPTransport
 import UmbraMedia
 import UmbraMicrophone
 import UmbraNetworking
@@ -210,6 +211,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private weak var streamWindow: StreamWindowController?
     private let lspMediaCapabilities: AppleStreamingCapabilities
     private var activeLSPHostID: UUID?
+    private var plannedLSPRekeyTask: Task<Void, Never>?
+    private var lspTelemetryTask: Task<Void, Never>?
+    private var latestLSPTelemetry: LSPTelemetrySnapshot?
+    private var latestLSPReconnectTelemetry: LSPReconnectSnapshot?
+    private var lspReconnectTasks: [UUID: Task<Void, Error>] = [:]
     private var eventHandler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?
     private var sessionWarningDeliveryState = SessionWarningDeliveryState()
     private var artworkLoadingTasks: [String: Task<Void, Never>] = [:]
@@ -486,10 +492,16 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 decoderSurfaces: 3,
                 maximumCaptureToPresentMicroseconds: UInt32(max(10_000, Int(2_000_000 * Double(frameRate.denominator) / Double(frameRate.numerator))))
             )
+            do {
+                try lspInputCapture.transfer(to: session)
+            } catch {
+                await lspProduct.stop(hostID: nativeHostID)
+                throw error
+            }
             started = true
             activeLSPHostID = nativeHostID
-            lspInputCapture.start(session: session)
             installLSPReconnectHandler(session: session, hostID: nativeHostID)
+            scheduleLSPMaintenance(session: session, hostID: nativeHostID)
             return
         }
         do {
@@ -545,6 +557,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func disconnectSession() async {
+        for task in lspReconnectTasks.values { task.cancel() }
+        lspReconnectTasks.removeAll(keepingCapacity: true)
+        plannedLSPRekeyTask?.cancel()
+        plannedLSPRekeyTask = nil
+        lspTelemetryTask?.cancel()
+        lspTelemetryTask = nil
         lspInputCapture.stop()
         if let hostID = activeLSPHostID {
             await lspProduct?.stop(hostID: hostID)
@@ -559,17 +577,84 @@ final class LiveUmbraClientService: UmbraClientServicing {
         hostID: UUID,
         reason: LSPReconnectReason
     ) async throws {
+        if let existing = lspReconnectTasks[hostID] {
+            return try await existing.value
+        }
+        let task = Task { @MainActor [self] in
+            try await performLSPReconnect(hostID: hostID, reason: reason)
+        }
+        lspReconnectTasks[hostID] = task
+        do {
+            try await task.value
+            lspReconnectTasks.removeValue(forKey: hostID)
+        } catch {
+            lspReconnectTasks.removeValue(forKey: hostID)
+            throw error
+        }
+    }
+
+    private func performLSPReconnect(
+        hostID: UUID,
+        reason: LSPReconnectReason
+    ) async throws {
+        try Task.checkCancellation()
         guard let lspProduct else { throw UmbraClientServiceError.unavailable("Native LSP is unavailable.") }
-        let replacement = try await lspProduct.reconnectInput(hostID: hostID, reason: reason)
-        lspInputCapture.start(session: replacement)
-        installLSPReconnectHandler(session: replacement, hostID: hostID)
+        var publishedReplacement: LSPClientSession?
+        do {
+            let replacement = try await lspProduct.reconnectInput(
+                hostID: hostID,
+                reason: reason,
+                quiesceOldCapture: { @MainActor [weak self] in
+                    self?.lspInputCapture.stop()
+                }
+            )
+            publishedReplacement = replacement
+            try Task.checkCancellation()
+            guard await lspProduct.isCurrentSession(replacement, hostID: hostID) else {
+                throw CancellationError()
+            }
+            do {
+                try lspInputCapture.transfer(to: replacement)
+            } catch {
+                await replacement.invalidateAuthorityAfterAmbiguousAttach()
+                throw error
+            }
+            try Task.checkCancellation()
+            guard await lspProduct.isCurrentSession(replacement, hostID: hostID) else {
+                lspInputCapture.stop()
+                throw CancellationError()
+            }
+            await lspProduct.markCaptureTransferred(hostID: hostID, session: replacement)
+            try Task.checkCancellation()
+            guard await lspProduct.isCurrentSession(replacement, hostID: hostID) else {
+                lspInputCapture.stop()
+                throw CancellationError()
+            }
+            installLSPReconnectHandler(session: replacement, hostID: hostID)
+            scheduleLSPMaintenance(session: replacement, hostID: hostID)
+        } catch is CancellationError {
+            lspInputCapture.stop()
+            if let publishedReplacement {
+                await publishedReplacement.invalidateAuthorityAfterAmbiguousAttach()
+            }
+            throw CancellationError()
+        } catch {
+            if let current = await lspProduct.currentSession(hostID: hostID),
+               await current.state == .inputActive {
+                try? lspInputCapture.transfer(to: current)
+            }
+            throw error
+        }
     }
 
     private func installLSPReconnectHandler(session: LSPClientSession, hostID: UUID) {
         session.setTerminationHandler { [weak self, weak session] termination in
-            guard session != nil else { return }
-            Task { @MainActor [weak self] in
+            guard let session else { return }
+            Task { @MainActor [weak self, session] in
                 guard let self else { return }
+                guard await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
+                self.plannedLSPRekeyTask?.cancel()
+                self.lspTelemetryTask?.cancel()
                 self.lspInputCapture.stop()
                 self.activeLSPHostID = nil
                 await self.streamWindow?.finish()
@@ -584,9 +669,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
         }
         session.setTransportLifecycleHandler { [weak self, weak session] lifecycle in
-            guard lifecycle == .failed, session != nil else { return }
-            Task { @MainActor [weak self] in
+            guard lifecycle == .failed, let session else { return }
+            Task { @MainActor [weak self, session] in
                 guard let self else { return }
+                guard await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
                 do {
                     try await self.reconnectLSPInput(hostID: hostID, reason: .transportLoss)
                     self.eventHandler?(.sessionWarning("Native LSP input reconnected with fresh security keys."))
@@ -594,6 +680,32 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     self.lspInputCapture.stop()
                     self.eventHandler?(.sessionWarning("Native LSP reconnect failed: \(error.localizedDescription)"))
                 }
+            }
+        }
+    }
+
+    private func scheduleLSPMaintenance(session: LSPClientSession, hostID: UUID) {
+        plannedLSPRekeyTask?.cancel()
+        lspTelemetryTask?.cancel()
+        plannedLSPRekeyTask = Task { @MainActor [weak self, session] in
+            do {
+                try await Task.sleep(for: .seconds(30 * 60))
+                guard !Task.isCancelled, let self,
+                      await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
+                try await self.reconnectLSPInput(hostID: hostID, reason: .plannedRekey)
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.eventHandler?(.sessionWarning("Native LSP planned rekey failed: \(error.localizedDescription)"))
+            }
+        }
+        lspTelemetryTask = Task { @MainActor [weak self, session] in
+            while !Task.isCancelled {
+                guard let self,
+                      await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
+                self.latestLSPTelemetry = try? await session.telemetrySnapshot()
+                self.latestLSPReconnectTelemetry = await self.lspProduct?.reconnectTelemetry(hostID: hostID)
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }

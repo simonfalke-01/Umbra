@@ -23,6 +23,15 @@ final class LSPAppKitInputCapture {
 
     /// Disables AppKit mouse coalescing and begins focused-window capture.
     func start(session: LSPClientSession) {
+        do {
+            try transfer(to: session)
+        } catch {
+            failureHandler?(error)
+        }
+    }
+
+    /// Synchronously quiesces prior capture and transfers physical ownership.
+    func transfer(to session: LSPClientSession) throws {
         stop()
         self.session = session
         let center = NotificationCenter.default
@@ -42,10 +51,18 @@ final class LSPAppKitInputCapture {
                 MainActor.assumeIsolated { self?.startSources() }
             },
         ]
-        startSources()
+        try startSourcesThrowing()
     }
 
     private func startSources() {
+        do {
+            try startSourcesThrowing()
+        } catch {
+            failureHandler?(error)
+        }
+    }
+
+    private func startSourcesThrowing() throws {
         guard nativeCapture == nil, monitor == nil, let session, NSApp.isActive else { return }
         do {
             nativeCapture = try session.startAppleInputCapture()
@@ -54,8 +71,7 @@ final class LSPAppKitInputCapture {
             // Native start quiesces completely before returning, so AppKit now
             // becomes the sole keyboard/pointer owner.
         } catch {
-            failureHandler?(error)
-            return
+            throw error
         }
         priorMouseCoalescing = NSEvent.isMouseCoalescingEnabled
         NSEvent.isMouseCoalescingEnabled = false

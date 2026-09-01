@@ -20,6 +20,58 @@ public enum LSPReconnectReason: Equatable, Sendable {
     case plannedRekey
 }
 
+/// Observable phases of one fresh-association reconnect transaction.
+public enum LSPReconnectPhase: UInt8, Equatable, Sendable {
+    case idle
+    case candidateHandshake
+    case candidateAuthenticated
+    case oldCaptureQuiesced
+    case attachSubmitted
+    case attachCommitted
+    case configuring
+    case baselineAndMediaReady
+    case captureTransferred
+    case oldRetired
+    case rollbackPending
+    case failed
+}
+
+/// Low-rate reconnect state suitable for telemetry/UI polling.
+public struct LSPReconnectSnapshot: Equatable, Sendable {
+    public var phase: LSPReconnectPhase
+    public var attemptID: UUID?
+    public var phaseStartedAtUptime: TimeInterval
+    public var native: LSPNativeHandoffSnapshot?
+}
+
+struct LSPAmbiguousAttachFailure: Error, Sendable {
+    var prior: LSPActiveInputAuthority
+    var successorAttachToken: Data
+    var candidateConnectionGeneration: UInt32
+    var outcome: LSPAttachOutcome
+    var localCommitSucceeded: Bool
+}
+
+private struct LSPRollbackCompletedFailure: Error, Sendable {}
+
+enum LSPAttachOutcome: UInt8, Sendable {
+    case notSubmitted
+    case submittedNoAuthenticatedOutcome
+    case authenticatedRejected
+    case authenticatedCommitted
+}
+
+private final class LSPAttachOutcomeTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: LSPAttachOutcome = .notSubmitted
+
+    var value: LSPAttachOutcome { lock.withLock { stored } }
+
+    func set(_ value: LSPAttachOutcome) {
+        lock.withLock { stored = value }
+    }
+}
+
 /// Terminal product event emitted once after authenticated stream end or local failure.
 public enum LSPClientSessionTermination: Equatable, Sendable {
     case streamEnded(reason: UInt8)
@@ -92,6 +144,14 @@ public actor LSPClientSession {
     private var pendingRetirementPrevious: LSPClientSession?
     private var configurationFailure: LSPTransportError?
     private let terminationObserver = LSPTerminationObserver()
+    private var reconnectSnapshot = LSPReconnectSnapshot(
+        phase: .idle,
+        attemptID: nil,
+        phaseStartedAtUptime: 0,
+        native: nil
+    )
+    private var captureTransferred = true
+    private var pendingNativeHandoff: LSPNativeHandoff?
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -315,48 +375,99 @@ public actor LSPClientSession {
     /// Transfers an existing input session to this freshly authenticated association.
     public func attach(
         previous: LSPClientSession,
-        reason: LSPReconnectReason
+        reason: LSPReconnectReason,
+        presentedAuthority: LSPActiveInputAuthority? = nil,
+        neutralizePrevious: Bool = true,
+        nativeHandoff: LSPNativeHandoff? = nil
     ) async throws -> LSPAttachResponse {
+        try Task.checkCancellation()
         guard state == .authenticated, let hello else { throw LSPTransportError.notAuthenticated }
         installControlHandlerIfNeeded()
-        let prior = try await previous.activeInputAuthority()
-        var neutralizationAttempted = false
-        do {
-            neutralizationAttempted = true
-            try previous.neutralizeInput()
-        } catch let error as LSPTransportError {
-            if reason == .plannedRekey || (error != .notAuthenticated && error != .invalidState) {
-                if reason == .plannedRekey, neutralizationAttempted {
-                    try await previous.restoreInputAuthority(prior)
-                }
-                throw error
-            }
+        _ = reason
+        let prior: LSPActiveInputAuthority
+        if let presentedAuthority {
+            prior = presentedAuthority
+        } else {
+            prior = try await previous.activeInputAuthority()
+            try Task.checkCancellation()
         }
+        let successorToken = try LSPSecureRandom.bytes(count: 32)
+        var neutralized = false
+        let outcome = LSPAttachOutcomeTracker()
+        let effectiveNativeHandoff = nativeHandoff
+        var localCommitSucceeded = false
         do {
+            if neutralizePrevious {
+                if let nativeHandoff {
+                    do {
+                        try nativeHandoff.neutralize()
+                    } catch LSPTransportError.rollbackPending {
+                        setReconnectPhase(.rollbackPending)
+                        try await nativeHandoff.waitForBaseline(
+                            inputGeneration: prior.nativeConfiguration.inputGeneration
+                        )
+                        throw LSPRollbackCompletedFailure()
+                    }
+                } else {
+                    try previous.neutralizeInput()
+                }
+                neutralized = true
+            }
+            try Task.checkCancellation()
+            setReconnectPhase(.oldCaptureQuiesced)
             let intentID = UUID()
             let request = LSPAttachRequest(
                 sessionID: prior.sessionID,
                 attachToken: prior.attachToken,
-                intentID: intentID
+                intentID: intentID,
+                successorAttachToken: successorToken
             )
-            let event = try await transport.request(
-                messageType: LSPControlMessageType.attach.rawValue,
-                payload: try LSPControlWire.attach(request)
-            )
+            let payload = try LSPControlWire.attach(request)
+            var receivedEvent: LSPControlEvent?
+            var lastRequestError: Error?
+            if let nativeHandoff {
+                receivedEvent = try await transport.requestAttach(
+                    handoff: nativeHandoff,
+                    messageType: LSPControlMessageType.attach.rawValue,
+                    payload: payload,
+                    onSubmissionAccepted: {
+                        outcome.set(.submittedNoAuthenticatedOutcome)
+                    }
+                )
+            } else {
+                for _ in 0..<3 {
+                    do {
+                        receivedEvent = try await transport.request(
+                        messageType: LSPControlMessageType.attach.rawValue,
+                        payload: payload,
+                        onSubmissionAccepted: {
+                            guard outcome.value == .notSubmitted else { return }
+                            outcome.set(.submittedNoAuthenticatedOutcome)
+                        }
+                    )
+                        try Task.checkCancellation()
+                        break
+                    } catch let error as LSPTransportError
+                        where error == .timeout || error == .socketFailure || error == .dtlsFailure {
+                        lastRequestError = error
+                    }
+                }
+            }
+            guard let event = receivedEvent else {
+                throw lastRequestError ?? LSPTransportError.timeout
+            }
+            setReconnectPhase(.attachSubmitted)
             let response = try LSPControlWire.attachResponse(from: event)
             guard response.sessionID == prior.sessionID,
+                  hello.connectionGeneration > prior.connectionGeneration,
                   response.connectionGeneration == hello.connectionGeneration,
                   event.connectionGeneration == hello.connectionGeneration,
-                  response.nativeConfiguration.streamGeneration == prior.nativeConfiguration.streamGeneration,
-                  response.nativeConfiguration.inputGeneration != prior.nativeConfiguration.inputGeneration,
-                  response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.inputSSRC,
-                  response.nativeConfiguration.inputSSRC != prior.nativeConfiguration.acknowledgementSSRC,
-                  response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.inputSSRC,
-                  response.nativeConfiguration.acknowledgementSSRC != prior.nativeConfiguration.acknowledgementSSRC,
-                  response.audioConfiguration.audioGeneration != prior.audioConfiguration.audioGeneration,
-                  response.audioConfiguration.audioSSRC != prior.audioConfiguration.audioSSRC,
+                  attachedInputSelection(response.nativeConfiguration, retains: prior.nativeConfiguration),
+                  attachedAudioSelection(response.audioConfiguration, retains: prior.audioConfiguration),
                   microphoneAttachSelectionIsValid(response.microphoneConfiguration, prior: prior),
-                  response.videoSelection.nativeConfiguration.videoGeneration != prior.videoSelection.nativeConfiguration.videoGeneration,
+                  response.videoSelection.nativeConfiguration.videoGeneration == advanced(
+                      prior.videoSelection.nativeConfiguration.videoGeneration
+                  ),
                   response.videoSelection.nativeConfiguration.primarySSRC != prior.videoSelection.nativeConfiguration.primarySSRC,
                   attachedVideoSelection(response.videoSelection, retains: prior.videoSelection),
                   laneIdentifiersAreGloballyUnique(
@@ -365,10 +476,14 @@ public actor LSPClientSession {
                       microphone: response.microphoneConfiguration,
                       video: response.videoSelection.nativeConfiguration
                   ),
-                  response.replacementAttachToken != prior.attachToken
+                  response.replacementAttachToken == successorToken
             else {
                 throw LSPTransportError.internalFailure
             }
+            outcome.set(.authenticatedCommitted)
+            setReconnectPhase(.attachCommitted)
+            try effectiveNativeHandoff?.commit(inputGeneration: response.nativeConfiguration.inputGeneration)
+            localCommitSucceeded = true
             try transport.configureInput(response.nativeConfiguration)
             inputAuthority = LSPActiveInputAuthority(
                 applicationID: prior.applicationID,
@@ -387,20 +502,72 @@ public actor LSPClientSession {
             configurationFailure = nil
             microphoneConfigurationTerminal = response.microphoneConfiguration == nil
             pendingRetirementPrevious = previous
+            pendingNativeHandoff = effectiveNativeHandoff
+            captureTransferred = false
+            setReconnectPhase(.configuring)
             await drainPendingAudioConfigurations()
+            try Task.checkCancellation()
             await drainPendingMicrophoneConfigurations()
+            try Task.checkCancellation()
             await drainPendingVideoConfigurations()
+            try Task.checkCancellation()
             try await waitForTerminalConfiguration(authority: inputAuthority!)
+            try Task.checkCancellation()
+            try await effectiveNativeHandoff?.waitForBaseline(
+                inputGeneration: response.nativeConfiguration.inputGeneration
+            )
+            try Task.checkCancellation()
             state = .inputActive
+            setReconnectPhase(.baselineAndMediaReady)
             await completePendingRetirementIfReady()
             return response
-        } catch {
-            let attachError = error
-            failSession((error as? LSPTransportError) ?? .internalFailure)
-            if reason == .plannedRekey, neutralizationAttempted {
-                try await previous.restoreInputAuthority(prior)
+        } catch is LSPRollbackCompletedFailure {
+            failSession(.rollbackPending)
+            setReconnectPhase(.failed)
+            throw LSPTransportError.rollbackPending
+        } catch let status as LSPControlStatus {
+            outcome.set(.authenticatedRejected)
+            failSession(.internalFailure)
+            if neutralized, presentedAuthority == nil {
+                if let effectiveNativeHandoff {
+                    setReconnectPhase(.rollbackPending)
+                    try await resolveDefiniteRejection(
+                        effectiveNativeHandoff,
+                        inputGeneration: prior.nativeConfiguration.inputGeneration
+                    )
+                } else {
+                    try await previous.restoreInputAuthority(prior)
+                }
             }
-            throw attachError
+            setReconnectPhase(.failed)
+            throw status
+        } catch {
+            let attachOutcome = outcome.value
+            if attachOutcome == .notSubmitted || attachOutcome == .authenticatedCommitted {
+                failSession((error as? LSPTransportError) ?? .internalFailure)
+            }
+            if attachOutcome == .notSubmitted, neutralized, presentedAuthority == nil {
+                if let effectiveNativeHandoff {
+                    setReconnectPhase(.rollbackPending)
+                    try await resolveDefiniteRejection(
+                        effectiveNativeHandoff,
+                        inputGeneration: prior.nativeConfiguration.inputGeneration
+                    )
+                } else {
+                    try await previous.restoreInputAuthority(prior)
+                }
+            }
+            setReconnectPhase(.failed)
+            if attachOutcome != .notSubmitted {
+                throw LSPAmbiguousAttachFailure(
+                    prior: prior,
+                    successorAttachToken: successorToken,
+                    candidateConnectionGeneration: hello.connectionGeneration,
+                    outcome: attachOutcome,
+                    localCommitSucceeded: localCommitSucceeded
+                )
+            }
+            throw error
         }
     }
 
@@ -410,6 +577,67 @@ public actor LSPClientSession {
             throw LSPTransportError.invalidState
         }
         return inputAuthority
+    }
+
+    public func reconnectTelemetry() -> LSPReconnectSnapshot {
+        var value = reconnectSnapshot
+        if let pendingNativeHandoff {
+            value.native = try? pendingNativeHandoff.snapshot()
+        }
+        return value
+    }
+
+    public func beginReconnect(attemptID: UUID) {
+        setReconnectPhase(.candidateHandshake, attemptID: attemptID)
+    }
+
+    public func markCandidateAuthenticated() {
+        setReconnectPhase(.candidateAuthenticated)
+    }
+
+    public func makeNativeHandoff(
+        authority: LSPActiveInputAuthority? = nil
+    ) throws -> LSPNativeHandoff {
+        let active: LSPActiveInputAuthority
+        if let authority {
+            active = authority
+        } else {
+            active = try activeInputAuthority()
+        }
+        return try LSPNativeHandoff(
+            active: transport,
+            activeConnectionGeneration: active.connectionGeneration,
+            activeInputGeneration: active.nativeConfiguration.inputGeneration
+        )
+    }
+
+    public func enroll(
+        in handoff: LSPNativeHandoff,
+        reason: LSPReconnectReason
+    ) throws {
+        guard let hello else { throw LSPTransportError.notAuthenticated }
+        try handoff.begin(
+            candidate: transport,
+            connectionGeneration: hello.connectionGeneration,
+            reason: reason == .plannedRekey ? .plannedRekey : .transportLoss
+        )
+        try handoff.authenticate(connectionGeneration: hello.connectionGeneration)
+    }
+
+    public func markActiveLost(in handoff: LSPNativeHandoff) throws {
+        try handoff.markActiveLost(transport)
+    }
+
+    /// Completes physical-capture transfer and only then retires the old association.
+    public func markCaptureTransferred() async {
+        guard state == .inputActive, pendingRetirementPrevious != nil else { return }
+        captureTransferred = true
+        setReconnectPhase(.captureTransferred)
+        await completePendingRetirementIfReady()
+    }
+
+    public func invalidateAuthorityAfterAmbiguousAttach() {
+        failSession(.invalidState)
     }
 
     /// Installs a coarse transport lifecycle observer.
@@ -827,9 +1055,23 @@ public actor LSPClientSession {
         let audioReady = installedAudioGeneration == authority.audioConfiguration.audioGeneration
         let microphoneReady = authority.microphoneConfiguration == nil || microphoneConfigurationTerminal
         let videoReady = installedVideoGeneration == authority.videoSelection.nativeConfiguration.videoGeneration
-        guard audioReady, microphoneReady, videoReady else { return }
+        guard audioReady, microphoneReady, videoReady, captureTransferred else { return }
+        let nativeHandoff = pendingNativeHandoff
+        if let nativeHandoff {
+            do {
+                try nativeHandoff.retire()
+                reconnectSnapshot.native = try nativeHandoff.snapshot()
+            } catch {
+                reconnectSnapshot.native = try? nativeHandoff.snapshot()
+                setReconnectPhase(.failed)
+                failSession((error as? LSPTransportError) ?? .internalFailure)
+                return
+            }
+        }
         pendingRetirementPrevious = nil
+        pendingNativeHandoff = nil
         await previous.retireAfterAttach()
+        setReconnectPhase(.oldRetired)
     }
 
     private func microphoneAttachSelectionIsValid(
@@ -839,11 +1081,51 @@ public actor LSPClientSession {
         guard let old = prior.microphoneConfiguration else { return replacement == nil }
         guard let replacement else { return !prior.microphoneRequired }
         return replacement.streamGeneration == old.streamGeneration &&
-               replacement.microphoneGeneration != old.microphoneGeneration &&
+               replacement.microphoneGeneration == advanced(old.microphoneGeneration) &&
                replacement.microphoneSSRC != old.microphoneSSRC &&
+               replacement.microphonePayloadType == old.microphonePayloadType &&
                replacement.bitrate == old.bitrate &&
                replacement.inbandFEC == old.inbandFEC &&
-               replacement.dtx == old.dtx
+               replacement.dtx == old.dtx &&
+               replacement.udpPayloadSize == old.udpPayloadSize
+    }
+
+    private func attachedInputSelection(
+        _ replacement: LSPNativeInputConfiguration,
+        retains old: LSPNativeInputConfiguration
+    ) -> Bool {
+        replacement.streamGeneration == old.streamGeneration &&
+            replacement.inputGeneration == advanced(old.inputGeneration) &&
+            replacement.inputSSRC != old.inputSSRC &&
+            replacement.inputSSRC != old.acknowledgementSSRC &&
+            replacement.acknowledgementSSRC != old.inputSSRC &&
+            replacement.acknowledgementSSRC != old.acknowledgementSSRC &&
+            replacement.inputPayloadType == old.inputPayloadType &&
+            replacement.pointerRate == old.pointerRate &&
+            replacement.controllerRate == old.controllerRate &&
+            replacement.sensorRate == old.sensorRate &&
+            replacement.reconciliationRate == old.reconciliationRate &&
+            replacement.reservedInputWireBitsPerSecond == old.reservedInputWireBitsPerSecond &&
+            replacement.baselineRequired
+    }
+
+    private func attachedAudioSelection(
+        _ replacement: LSPNativeAudioConfiguration,
+        retains old: LSPNativeAudioConfiguration
+    ) -> Bool {
+        replacement.streamGeneration == old.streamGeneration &&
+            replacement.audioGeneration == advanced(old.audioGeneration) &&
+            replacement.audioSSRC != old.audioSSRC &&
+            replacement.audioPayloadType == old.audioPayloadType &&
+            replacement.channels == old.channels &&
+            replacement.streams == old.streams &&
+            replacement.coupledStreams == old.coupledStreams &&
+            replacement.mapping == old.mapping &&
+            replacement.frameSamples == old.frameSamples &&
+            replacement.bitrate == old.bitrate &&
+            replacement.inbandFEC == old.inbandFEC &&
+            replacement.dtx == old.dtx &&
+            replacement.udpPayloadSize == old.udpPayloadSize
     }
 
     private func retireVideoAfterAttachAcknowledgement() {
@@ -992,6 +1274,35 @@ public actor LSPClientSession {
         microphoneUplink.stop(transport: transport)
         state = .failed(error)
         terminationObserver.emit(.failed(error))
+    }
+
+    private func setReconnectPhase(_ phase: LSPReconnectPhase, attemptID: UUID? = nil) {
+        reconnectSnapshot = .init(
+            phase: phase,
+            attemptID: attemptID ?? reconnectSnapshot.attemptID,
+            phaseStartedAtUptime: ProcessInfo.processInfo.systemUptime,
+            native: reconnectSnapshot.native
+        )
+    }
+
+    private func advanced(_ generation: UInt32) -> UInt32? {
+        generation == UInt32.max ? nil : generation + 1
+    }
+
+    private func resolveDefiniteRejection(
+        _ handoff: LSPNativeHandoff,
+        inputGeneration: UInt32
+    ) async throws {
+        do {
+            try handoff.cancelDefiniteRejection()
+        } catch LSPTransportError.rollbackPending {
+            // Expected after producer neutralization; the exact old generation
+            // remains closed until its new baseline is authenticated.
+        }
+        let snapshot = try handoff.snapshot()
+        if snapshot.baselineRequired {
+            try await handoff.waitForBaseline(inputGeneration: inputGeneration)
+        }
     }
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {

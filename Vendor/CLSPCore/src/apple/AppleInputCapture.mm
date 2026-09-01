@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <new>
 
 extern "C" bool clsp_core_register_apple_capture(clsp_core_t *, clsp_apple_input_capture_t *);
@@ -23,6 +24,8 @@ extern "C" void clsp_core_unregister_apple_capture(clsp_core_t *, clsp_apple_inp
 
 /** @brief Opaque native Apple capture owner declared by the public C ABI. */
 struct clsp_apple_input_capture {
+  std::atomic<std::uint32_t> references {1};  ///< External owner plus transient native quiesce leases.
+  std::mutex quiesce_mutex;  ///< Serializes native handoff drain with external owner teardown.
   clsp_core_t *core {};  ///< Retained LSP core receiving allocation-free records.
   IOHIDManagerRef manager {};  ///< Public IOHID device and value callback owner.
   dispatch_queue_t queue {};  ///< Dedicated serial native callback queue.
@@ -606,6 +609,7 @@ namespace {
 
   /** @brief Fully quiesce an initialized or partially initialized capture owner. */
   void quiesce(clsp_apple_input_capture &capture) noexcept {
+    std::lock_guard quiesce_lock(capture.quiesce_mutex);
     const auto was_active = capture.active.exchange(false, std::memory_order_acq_rel);
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     if (capture.connect_observer != nil) [center removeObserver:capture.connect_observer];
@@ -747,6 +751,24 @@ extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
   return status;
 }
 
+extern "C" void clsp_apple_input_capture_quiesce(clsp_apple_input_capture_t *capture) {
+  if (capture != nullptr) {
+    quiesce(*capture);
+  }
+}
+
+extern "C" void clsp_apple_input_capture_retain(clsp_apple_input_capture_t *capture) {
+  if (capture != nullptr) {
+    capture->references.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+extern "C" void clsp_apple_input_capture_release(clsp_apple_input_capture_t *capture) {
+  if (capture != nullptr && capture->references.fetch_sub(1, std::memory_order_acq_rel) == 1U) {
+    delete capture;
+  }
+}
+
 extern "C" void clsp_apple_input_capture_stop(clsp_apple_input_capture_t *capture) {
   if (capture == nullptr) {
     return;
@@ -754,5 +776,5 @@ extern "C" void clsp_apple_input_capture_stop(clsp_apple_input_capture_t *captur
   clsp_core_unregister_apple_capture(capture->core, capture);
   quiesce(*capture);
   clsp_core_release(capture->core);
-  delete capture;
+  clsp_apple_input_capture_release(capture);
 }

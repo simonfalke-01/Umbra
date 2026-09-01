@@ -17,13 +17,16 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(2)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "1aeb5b57f3812c957dd35877954b0a27edbcfeeb3555dc2853024e0257a55d41"
+#define CLSP_CORE_SOURCE_DIGEST "27c71a42a6613fa2b3c8c9f42c986231311371fd9ece62405b9426e66d2757f6"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
 
   /** @brief Opaque native protocol-core handle. */
   typedef struct clsp_core clsp_core_t;
+
+  /** @brief Opaque native fresh-association reconnect/rekey owner. */
+  typedef struct clsp_handoff clsp_handoff_t;
 
   /** @brief Opaque retained native byte-buffer handle. */
   typedef struct clsp_buffer clsp_buffer_t;
@@ -60,6 +63,7 @@ extern "C" {
     CLSP_STATUS_TIMEOUT = 18,  ///< A bounded handshake or control operation expired.
     CLSP_STATUS_INPUT_PERMISSION_DENIED = 19,  ///< macOS denied preferred raw HID capture.
     CLSP_STATUS_INPUT_UNAVAILABLE = 20,  ///< No supported native HID capture source is available.
+    CLSP_STATUS_ROLLBACK_PENDING = 21,  ///< Same-generation rollback awaits an authenticated fresh baseline ACK.
   } clsp_status_t;
 
   /** @brief Operator-selected congestion-control profile. */
@@ -76,6 +80,46 @@ extern "C" {
     CLSP_LIFECYCLE_STOPPED = 3,  ///< Transport workers are quiesced and may be restarted.
     CLSP_LIFECYCLE_FAILED = 4,  ///< Native transport failed and has quiesced.
   } clsp_lifecycle_state_t;
+
+  /** @brief Product reason for creating one fresh authenticated association. */
+  typedef enum clsp_handoff_reason {
+    CLSP_HANDOFF_REASON_TRANSPORT_LOSS = 1,  ///< The authoritative association was lost.
+    CLSP_HANDOFF_REASON_PLANNED_REKEY = 2,  ///< Rekey was initiated before a security lifetime expired.
+  } clsp_handoff_reason_t;
+
+  /** @brief Coarse native reconnect/rekey authority phase. */
+  typedef enum clsp_handoff_phase {
+    CLSP_HANDOFF_PHASE_AUTHORITATIVE = 1,  ///< The active association owns input authority.
+    CLSP_HANDOFF_PHASE_ACTIVE_LOST = 2,  ///< The old association is unavailable while a replacement is sought.
+    CLSP_HANDOFF_PHASE_CANDIDATE_HANDSHAKE = 3,  ///< A fresh association exists but is not application-authenticated.
+    CLSP_HANDOFF_PHASE_CANDIDATE_AUTHENTICATED = 4,  ///< The candidate is authenticated; old input still owns authority.
+    CLSP_HANDOFF_PHASE_OLD_INPUT_NEUTRALIZED = 5,  ///< Old producers are drained and ATTACH may commit.
+    CLSP_HANDOFF_PHASE_ATTACH_SUBMITTED = 6,  ///< Native ATTACH admission succeeded and its outcome may become ambiguous.
+    CLSP_HANDOFF_PHASE_ROLLBACK_PENDING = 7,  ///< Definite rollback awaits a fresh old-generation baseline ACK.
+    CLSP_HANDOFF_PHASE_COMMITTED_BASELINE = 8,  ///< ATTACH committed forward; fresh candidate baseline ACK is pending.
+    CLSP_HANDOFF_PHASE_TERMINAL = 9,  ///< No association may regain authority through this handoff.
+  } clsp_handoff_phase_t;
+
+  /** @brief Cancel outcome determining whether old authority may be restored. */
+  typedef enum clsp_handoff_cancel_kind {
+    CLSP_HANDOFF_CANCEL_DEFINITE_REJECTION = 1,  ///< Authenticated ATTACH rejection proves the host did not commit.
+    CLSP_HANDOFF_CANCEL_AMBIGUOUS = 2,  ///< Timeout or transport loss cannot prove whether ATTACH committed.
+  } clsp_handoff_cancel_kind_t;
+
+  /** @brief Coarse input-baseline event kind. */
+  typedef enum clsp_handoff_baseline_kind {
+    CLSP_HANDOFF_BASELINE_REQUIRED = 1,  ///< Product must configure and transmit a fresh neutral baseline.
+    CLSP_HANDOFF_BASELINE_ACKNOWLEDGED = 2,  ///< The host authenticated the exact required baseline.
+  } clsp_handoff_baseline_kind_t;
+
+  /** @brief Terminal fail-closed handoff reason. */
+  typedef enum clsp_handoff_terminal_reason {
+    CLSP_HANDOFF_TERMINAL_ACTIVE_LOST = 1,  ///< No usable replacement exists after active transport loss.
+    CLSP_HANDOFF_TERMINAL_CANDIDATE_LOST = 2,  ///< The only forward-authoritative candidate was lost.
+    CLSP_HANDOFF_TERMINAL_AMBIGUOUS_ATTACH = 3,  ///< ATTACH outcome was ambiguous and rollback is forbidden.
+    CLSP_HANDOFF_TERMINAL_COMMITTED_ASSOCIATION_LOST = 4,  ///< The committed association failed after authority moved.
+    CLSP_HANDOFF_TERMINAL_BASELINE_FAILED = 5,  ///< Required baseline recovery could not complete safely.
+  } clsp_handoff_terminal_reason_t;
 
   /** @brief Bit mask describing linked production security providers. */
   typedef enum clsp_provider_flag {
@@ -443,6 +487,98 @@ extern "C" {
     uint16_t reserved_zero;  ///< Reserved and zero.
   } clsp_telemetry_snapshot_t;
 
+  /** @brief Secret-free snapshot of one native reconnect/rekey owner. */
+  typedef struct clsp_handoff_snapshot {
+    uint32_t abi_version;  ///< Snapshot layout version.
+    uint32_t structure_size;  ///< Size of this snapshot structure.
+    uint32_t active_connection_generation;  ///< Current or last forward-authoritative connection generation.
+    uint32_t active_input_generation;  ///< Current or last authoritative input generation.
+    uint32_t input_authority_epoch;  ///< Local callback epoch preventing stale same-generation rollback work.
+    uint32_t connection_generation_high_watermark;  ///< Greatest connection generation ever consumed.
+    uint32_t candidate_connection_generation;  ///< Pending candidate generation, or zero.
+    uint32_t rollback_connection_generation;  ///< Definitely rejected generation binding rollback, or zero.
+    uint32_t retiring_connection_generation;  ///< Prior committed association awaiting retirement, or zero.
+    uint32_t phase;  ///< One `clsp_handoff_phase_t` value.
+    uint32_t reason;  ///< One `clsp_handoff_reason_t` value, or zero before the first handoff.
+    uint32_t active_lifecycle_state;  ///< Current active core `clsp_lifecycle_state_t` value.
+    uint32_t candidate_lifecycle_state;  ///< Candidate core lifecycle, or `CLSP_LIFECYCLE_STOPPED` when absent.
+    uint32_t retiring_lifecycle_state;  ///< Retiring core lifecycle, or `CLSP_LIFECYCLE_STOPPED` when absent.
+    uint64_t begun_count;  ///< Fresh-association attempts begun by this owner.
+    uint64_t committed_count;  ///< Authenticated ATTACH commits.
+    uint64_t definite_rollback_count;  ///< Definitely rejected ATTACH attempts safely rolled back.
+    uint64_t terminal_count;  ///< Fail-closed terminal transitions.
+    uint8_t active_lost;  ///< Boolean old/new active transport loss marker.
+    uint8_t candidate_authenticated;  ///< Boolean application-authenticated candidate marker.
+    uint8_t old_input_neutralized;  ///< Boolean producer-drain completion marker.
+    uint8_t baseline_required;  ///< Boolean baseline ACK gate.
+    uint8_t attach_committed;  ///< Boolean irreversible ATTACH commit marker.
+    uint8_t forward_only;  ///< Boolean prohibition on old-association rollback.
+    uint8_t has_candidate;  ///< Boolean retained candidate-core ownership marker.
+    uint8_t has_retiring;  ///< Boolean retained retiring-core ownership marker.
+  } clsp_handoff_snapshot_t;
+
+  /** @brief One coarse authority-phase transition. */
+  typedef struct clsp_handoff_phase_event {
+    uint32_t abi_version;  ///< Event layout version.
+    uint32_t structure_size;  ///< Size of this event structure.
+    uint32_t phase;  ///< One `clsp_handoff_phase_t` value.
+    uint32_t reason;  ///< One `clsp_handoff_reason_t` value, or zero.
+    uint32_t active_connection_generation;  ///< Current or last authoritative connection generation.
+    uint32_t active_input_generation;  ///< Current or last authoritative input generation.
+    uint32_t candidate_connection_generation;  ///< Pending candidate generation, or zero.
+    uint8_t baseline_required;  ///< Boolean baseline-ACK gate.
+    uint8_t forward_only;  ///< Boolean rollback prohibition.
+    uint8_t reserved_zero[2];  ///< Reserved and zero.
+  } clsp_handoff_phase_event_t;
+
+  /** @brief One coarse same-generation or committed-generation baseline event. */
+  typedef struct clsp_handoff_baseline_event {
+    uint32_t abi_version;  ///< Event layout version.
+    uint32_t structure_size;  ///< Size of this event structure.
+    uint32_t kind;  ///< One `clsp_handoff_baseline_kind_t` value.
+    uint32_t input_generation;  ///< Exact generation whose fresh neutral baseline is gated.
+    uint32_t input_authority_epoch;  ///< Local epoch that invalidates pre-neutralization callbacks.
+    uint32_t connection_generation;  ///< Association carrying the required or acknowledged baseline.
+    uint32_t rollback_connection_generation;  ///< Rejected candidate binding same-generation rollback, or zero.
+    uint32_t reserved_zero;  ///< Reserved and zero.
+  } clsp_handoff_baseline_event_t;
+
+  /** @brief One coarse fresh-association attempt event. */
+  typedef struct clsp_handoff_rekey_event {
+    uint32_t abi_version;  ///< Event layout version.
+    uint32_t structure_size;  ///< Size of this event structure.
+    uint32_t reason;  ///< One `clsp_handoff_reason_t` value.
+    uint32_t candidate_connection_generation;  ///< Strictly newer candidate generation.
+  } clsp_handoff_rekey_event_t;
+
+  /** @brief One latched fail-closed terminal handoff event. */
+  typedef struct clsp_handoff_terminal_event {
+    uint32_t abi_version;  ///< Event layout version.
+    uint32_t structure_size;  ///< Size of this event structure.
+    uint32_t reason;  ///< One `clsp_handoff_terminal_reason_t` value.
+    uint32_t last_connection_generation;  ///< Last forward-authoritative connection generation.
+  } clsp_handoff_terminal_event_t;
+
+  /** @brief Association-local baseline readiness without exclusive handoff observation. */
+  typedef struct clsp_input_baseline_snapshot {
+    uint32_t abi_version;  ///< Snapshot layout version.
+    uint32_t structure_size;  ///< Size of this snapshot structure.
+    uint32_t connection_generation;  ///< Authenticated association generation carrying the baseline.
+    uint32_t input_generation;  ///< Exact wire input generation.
+    uint32_t input_authority_epoch;  ///< Local callback de-staling epoch.
+    uint32_t reserved_zero;  ///< Reserved and zero.
+    uint64_t event_generation;  ///< Monotonic association-local readiness change counter.
+    uint8_t acknowledged;  ///< Boolean authenticated baseline-ACK state.
+    uint8_t reserved_tail[7];  ///< Reserved and zero.
+  } clsp_input_baseline_snapshot_t;
+
+  /** @brief Successful atomic native ATTACH queue admission. */
+  typedef struct clsp_control_submission {
+    uint32_t abi_version;  ///< Submission layout version.
+    uint32_t structure_size;  ///< Size of this submission structure.
+    uint64_t request_id;  ///< Exact caller-reserved control request identifier.
+  } clsp_control_submission_t;
+
   /**
    * @brief Coarse non-reentrant lifecycle callback.
    *
@@ -500,6 +636,30 @@ extern "C" {
    */
   typedef void (*clsp_context_release_t)(void *context);
 
+  /** @brief Coarse non-reentrant native handoff phase callback. */
+  typedef void (*clsp_handoff_phase_callback_t)(
+    void *context,
+    const clsp_handoff_phase_event_t *event
+  );
+
+  /** @brief Coarse non-reentrant baseline requirement/ACK callback. */
+  typedef void (*clsp_handoff_baseline_callback_t)(
+    void *context,
+    const clsp_handoff_baseline_event_t *event
+  );
+
+  /** @brief Coarse non-reentrant fresh-association attempt callback. */
+  typedef void (*clsp_handoff_rekey_callback_t)(
+    void *context,
+    const clsp_handoff_rekey_event_t *event
+  );
+
+  /** @brief Latched non-reentrant terminal handoff callback. */
+  typedef void (*clsp_handoff_terminal_callback_t)(
+    void *context,
+    const clsp_handoff_terminal_event_t *event
+  );
+
   /** @brief Callback table copied during core construction. */
   typedef struct clsp_callbacks {
     uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
@@ -517,6 +677,19 @@ extern "C" {
     };
     clsp_path_probe_callback_t path_probe;  ///< Optional coarse DPLPMTUD control callback.
   } clsp_callbacks_t;
+
+  /** @brief Callback table copied during native handoff construction. */
+  typedef struct clsp_handoff_callbacks {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_handoff_callbacks_t)`.
+    void *context;  ///< Explicitly retained callback context, or null.
+    clsp_context_retain_t retain_context;  ///< Required retain operation for nonnull context.
+    clsp_context_release_t release_context;  ///< Required release operation for nonnull context.
+    clsp_handoff_phase_callback_t phase;  ///< Optional phase transition callback.
+    clsp_handoff_baseline_callback_t baseline;  ///< Optional baseline requirement/ACK callback.
+    clsp_handoff_rekey_callback_t rekey;  ///< Optional fresh-association attempt callback.
+    clsp_handoff_terminal_callback_t terminal;  ///< Optional latched terminal callback.
+  } clsp_handoff_callbacks_t;
 
   /**
    * @brief Return the C ABI version without constructing a core.
@@ -566,6 +739,140 @@ extern "C" {
    * @param core Core handle, or null for no operation.
    */
   void clsp_core_release(clsp_core_t *core);
+
+  /**
+   * @brief Construct a native reconnect/rekey owner above one active association core.
+   *
+   * The handoff retains `active` and never exposes packet, key, certificate, endpoint,
+   * attach-token, or allocator ownership through its callbacks or snapshots.
+   *
+   * @param active Current association-specific core.
+   * @param active_connection_generation Nonzero authoritative connection generation.
+   * @param active_input_generation Nonzero authoritative input generation.
+   * @param callbacks Optional coarse callback table copied by the handoff.
+   * @param output Receives an owned handoff handle with retain count one.
+   * @return Typed construction status.
+   */
+  clsp_status_t clsp_handoff_create(
+    clsp_core_t *active,
+    uint32_t active_connection_generation,
+    uint32_t active_input_generation,
+    const clsp_handoff_callbacks_t *callbacks,
+    clsp_handoff_t **output
+  );
+
+  /** @brief Add one owning reference to a native handoff handle. */
+  void clsp_handoff_retain(clsp_handoff_t *handoff);
+
+  /** @brief Release one owning reference and its retained association cores. */
+  void clsp_handoff_release(clsp_handoff_t *handoff);
+
+  /**
+   * @brief Retain a fresh candidate association and begin reconnect/rekey.
+   *
+   * @param handoff Native handoff owner.
+   * @param candidate Distinct association-specific candidate core.
+   * @param candidate_connection_generation Strictly newer nonzero connection generation.
+   * @param reason One `clsp_handoff_reason_t` value.
+   * @return Typed transition status.
+   */
+  clsp_status_t clsp_handoff_begin(
+    clsp_handoff_t *handoff,
+    clsp_core_t *candidate,
+    uint32_t candidate_connection_generation,
+    uint32_t reason
+  );
+
+  /** @brief Mark the exact candidate identities and authorization authenticated. */
+  clsp_status_t clsp_handoff_authenticate(
+    clsp_handoff_t *handoff,
+    uint32_t candidate_connection_generation
+  );
+
+  /**
+   * @brief Report terminal transport loss for one retained association core.
+   *
+   * Pre-neutralization candidate loss may fall back only when the old association
+   * was never lost. Old loss and every post-neutralization/committed loss fail closed.
+   */
+  clsp_status_t clsp_handoff_lost(
+    clsp_handoff_t *handoff,
+    clsp_core_t *association
+  );
+
+  /** @brief Drain old producer leases, Apple callbacks, and held input before ATTACH. */
+  clsp_status_t clsp_handoff_neutralize(clsp_handoff_t *handoff);
+
+  /**
+   * @brief Atomically reserve, mark, and publish one immutable ATTACH request.
+   *
+   * Queue capacity is reserved while the request remains invisible. The handoff
+   * then enters `CLSP_HANDOFF_PHASE_ATTACH_SUBMITTED` before the candidate runtime
+   * publishes the request and wakes its worker. Any failure returns with request
+   * ID zero and leaves the handoff definitely not submitted.
+   */
+  clsp_status_t clsp_handoff_submit_attach(
+    clsp_handoff_t *handoff,
+    uint16_t message_type,
+    uint64_t request_id,
+    clsp_const_byte_span_t payload,
+    uint32_t deadline_milliseconds,
+    clsp_control_submission_t *output
+  );
+
+  /** @brief Irreversibly commit authenticated ATTACH to the candidate generation. */
+  clsp_status_t clsp_handoff_commit(
+    clsp_handoff_t *handoff,
+    uint32_t new_input_generation
+  );
+
+  /**
+   * @brief Cancel an uncommitted candidate using an explicit outcome classification.
+   *
+   * Definite rejection before neutralization restores the old core immediately.
+   * Definite rejection after neutralization keeps old producers closed until a fresh
+   * baseline ACK for the same old input generation. Ambiguous outcome is forward-only
+   * and terminal; it never restores the old association.
+   */
+  clsp_status_t clsp_handoff_cancel(
+    clsp_handoff_t *handoff,
+    uint32_t kind
+  );
+
+  /**
+   * @brief Accept one authenticated fresh-baseline ACK for the currently gated generation.
+   *
+   * This operation is normally completed automatically from native LSPI processing;
+   * the explicit API permits a coarse control-plane baseline proof without packet data.
+   */
+  clsp_status_t clsp_handoff_acknowledge_baseline(
+    clsp_handoff_t *handoff,
+    uint32_t input_generation,
+    uint64_t baseline_id
+  );
+
+  /** @brief Stop and release the retained prior association after committed handoff. */
+  clsp_status_t clsp_handoff_retire(clsp_handoff_t *handoff);
+
+  /** @brief Copy one secret-free native handoff telemetry snapshot. */
+  clsp_status_t clsp_handoff_copy_snapshot(
+    const clsp_handoff_t *handoff,
+    clsp_handoff_snapshot_t *output
+  );
+
+  /** @brief Copy association-local input-baseline readiness without claiming a handoff observer. */
+  clsp_status_t clsp_core_copy_input_baseline(
+    const clsp_core_t *core,
+    clsp_input_baseline_snapshot_t *output
+  );
+
+  /** @brief Wait for one exact input generation's authenticated baseline ACK. */
+  clsp_status_t clsp_core_wait_input_baseline(
+    const clsp_core_t *core,
+    uint32_t input_generation,
+    uint32_t timeout_milliseconds,
+    clsp_input_baseline_snapshot_t *output
+  );
 
   /**
    * @brief Start a pinned DTLS association on a nonblocking UDP/kqueue worker.

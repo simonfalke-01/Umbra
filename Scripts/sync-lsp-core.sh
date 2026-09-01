@@ -5,8 +5,8 @@ set -eu
 export LC_ALL=C
 
 expected_repository='git@github.com:simonfalke-01/Photon.git'
-expected_commit='82aca090343dad10bc9afec0af6a0783926659ae'
-expected_digest='1aeb5b57f3812c957dd35877954b0a27edbcfeeb3555dc2853024e0257a55d41'
+expected_commit='b32af9c516a81cf055b687b5aa88565b9927cec9'
+expected_digest='27c71a42a6613fa2b3c8c9f42c986231311371fd9ece62405b9426e66d2757f6'
 
 script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 umbra_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)

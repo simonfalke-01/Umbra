@@ -24,6 +24,15 @@ namespace umbra::lsp {
     /** @brief Apply one authenticated LSPG payload and return a terminal command status. */
     using ControllerOutput = std::uint8_t (*)(void *context, clsp_const_byte_span_t payload) noexcept;
 
+    /** @brief Publish one authenticated input-baseline ACK at control frequency. */
+    using InputBaseline = void (*)(
+      void *context,
+      bool acknowledged,
+      std::uint32_t connection_generation,
+      std::uint32_t input_generation,
+      std::uint64_t baseline_id
+    ) noexcept;
+
     /** @brief Deliver one authenticated complete Opus RTP payload. */
     using AudioPacket = void (*)(void *context, const clsp_audio_packet_event_t &event) noexcept;
     using AudioTiming = void (*)(void *context, const clsp_audio_timing_event_t &event) noexcept;
@@ -35,6 +44,7 @@ namespace umbra::lsp {
     Control control {};  ///< Optional authenticated-control callback.
     Counter counter {};  ///< Required telemetry callback.
     ControllerOutput controller_output {};  ///< Optional generation-checked GameController output callback.
+    InputBaseline input_baseline {};  ///< Optional authenticated baseline-ACK callback.
     AudioPacket audio_packet {};  ///< Optional complete Opus packet callback.
     AudioTiming audio_timing {};  ///< Optional authenticated sender-report callback.
     VideoFrame video_frame {};  ///< Optional retained complete access-unit callback.
@@ -106,6 +116,21 @@ namespace umbra::lsp {
       clsp_const_byte_span_t payload,
       std::uint32_t deadline_milliseconds
     ) noexcept;
+
+    /** @brief Reserve one invisible bounded control request and its queue capacity. */
+    [[nodiscard]] clsp_status_t reserve_control(
+      std::uint16_t message_type,
+      std::uint64_t request_id,
+      clsp_const_byte_span_t payload,
+      std::uint32_t deadline_milliseconds,
+      std::uint64_t &reservation_token
+    ) noexcept;
+
+    /** @brief Publish one exact reserved request and wake the native worker. */
+    [[nodiscard]] clsp_status_t commit_control_reservation(std::uint64_t reservation_token) noexcept;
+
+    /** @brief Release one invisible reserved request without transmission. */
+    void cancel_control_reservation(std::uint64_t reservation_token) noexcept;
 
     /** @brief Queue one semantic LSPC response for a retained authenticated request. */
     [[nodiscard]] clsp_status_t send_control_response(
@@ -211,6 +236,12 @@ namespace umbra::lsp {
 
     /** @brief Neutralize and stop the current native input authority. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept;
+
+    /** @brief Idempotently quiesce input from every runtime lifecycle state. */
+    [[nodiscard]] clsp_status_t quiesce_input() noexcept;
+
+    /** @brief Restart the unchanged input generation with one exact fresh neutral baseline. */
+    [[nodiscard]] clsp_status_t restart_input_baseline(std::uint64_t baseline_id) noexcept;
 
     /** @brief Return the authenticated confirmed UDP payload ceiling. */
     [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept;

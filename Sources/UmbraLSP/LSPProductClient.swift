@@ -5,10 +5,15 @@ import UmbraMedia
 
 /// Coarse product owner for LSP persistence, pairing, auth, and application browsing.
 public actor LSPProductClient {
+    private struct ReconnectAttempt {
+        var id: UUID
+        var task: Task<LSPClientSession, Error>
+    }
     private let trustStore: JSONFileStore<LSPTrustSnapshot>
     private let hostStore: JSONFileStore<LSPHostSnapshot>
     private let identityStore: JSONFileStore<LSPClientIdentitySnapshot>
     private var sessions: [UUID: LSPClientSession] = [:]
+    private var reconnectAttempts: [UUID: ReconnectAttempt] = [:]
     private let videoRenderer: (any MetalVideoRendering)?
 
     public init(
@@ -168,29 +173,218 @@ public actor LSPProductClient {
     /// Reconnects or rekeys through a fresh DTLS association and authenticated ATTACH.
     public func reconnectInput(
         hostID: UUID,
-        reason: LSPReconnectReason
+        reason: LSPReconnectReason,
+        quiesceOldCapture: (@Sendable () async throws -> Void)? = nil
     ) async throws -> LSPClientSession {
+        try Task.checkCancellation()
+        if let existing = reconnectAttempts[hostID] {
+            let value = try await existing.task.value
+            try Task.checkCancellation()
+            return value
+        }
+        let attemptID = UUID()
+        let task = Task { [self] in
+            try await performReconnect(
+                hostID: hostID,
+                reason: reason,
+                attemptID: attemptID,
+                quiesceOldCapture: quiesceOldCapture
+            )
+        }
+        reconnectAttempts[hostID] = .init(id: attemptID, task: task)
+        do {
+            let replacement = try await task.value
+            try Task.checkCancellation()
+            if reconnectAttempts[hostID]?.id == attemptID { reconnectAttempts.removeValue(forKey: hostID) }
+            return replacement
+        } catch {
+            if reconnectAttempts[hostID]?.id == attemptID { reconnectAttempts.removeValue(forKey: hostID) }
+            throw error
+        }
+    }
+
+    private func performReconnect(
+        hostID: UUID,
+        reason: LSPReconnectReason,
+        attemptID: UUID,
+        quiesceOldCapture: (@Sendable () async throws -> Void)?
+    ) async throws -> LSPClientSession {
+        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
         guard let previous = sessions[hostID] else {
             throw LSPTransportError.invalidState
         }
         let hosts = try await hostStore.load().records
+        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
         let trusts = try await trustStore.load().records
+        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
         guard let host = hosts.first(where: { $0.hostID == hostID }),
               let trust = trusts.first(where: { $0.hostID == hostID })
         else {
             throw LSPControlStatus.authenticationFailed
         }
-        let replacement = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
-        let updatedTrust = try await replacement.authenticate(host: host, trust: trust)
+        let prior = try await previous.activeInputAuthority()
+        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+        let nativeHandoff = try await previous.makeNativeHandoff()
+        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+        if reason == .transportLoss {
+            try await previous.markActiveLost(in: nativeHandoff)
+            try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+        }
+        do {
+            let replacement = try await authenticatedCandidate(
+                host: host,
+                trust: trust,
+                attemptID: attemptID
+            )
+            try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+            try await replacement.enroll(in: nativeHandoff, reason: reason)
+            try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+            try await quiesceOldCapture?()
+            try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+            do {
+                _ = try await replacement.attach(
+                    previous: previous,
+                    reason: reason,
+                    nativeHandoff: nativeHandoff
+                )
+                try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                sessions[hostID] = replacement
+                return replacement
+            } catch let ambiguous as LSPAmbiguousAttachFailure {
+                do {
+                    let presumed = try presumedCommittedAuthority(from: ambiguous)
+                    if ambiguous.outcome == .submittedNoAuthenticatedOutcome {
+                        try nativeHandoff.cancelAmbiguous()
+                    }
+                    nativeHandoff.releaseBindings()
+                    let forwardHandoff = try await replacement.makeNativeHandoff(authority: presumed)
+                    try await replacement.markActiveLost(in: forwardHandoff)
+                    let forward = try await authenticatedCandidate(
+                        host: host,
+                        trust: trust,
+                        attemptID: attemptID
+                    )
+                    try await forward.enroll(in: forwardHandoff, reason: .transportLoss)
+                    try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                    do {
+                        _ = try await forward.attach(
+                            previous: previous,
+                            reason: .transportLoss,
+                            presentedAuthority: presumed,
+                            neutralizePrevious: true,
+                            nativeHandoff: forwardHandoff
+                        )
+                        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        await replacement.invalidateAuthorityAfterAmbiguousAttach()
+                        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        sessions[hostID] = forward
+                        return forward
+                    } catch let status as LSPControlStatus
+                        where ambiguous.outcome == .submittedNoAuthenticatedOutcome &&
+                              status == .authenticationFailed {
+                        // Authenticated successor rejection proves the first ATTACH did not commit.
+                        // Continue forward on a fresh association with the predecessor token;
+                        // the prior local core remains terminal and is never restored.
+                        let fallback = try await authenticatedCandidate(
+                            host: host,
+                            trust: trust,
+                            attemptID: attemptID
+                        )
+                        try forwardHandoff.cancelAmbiguous()
+                        forwardHandoff.releaseBindings()
+                        let fallbackHandoff = try await previous.makeNativeHandoff(authority: prior)
+                        try await previous.markActiveLost(in: fallbackHandoff)
+                        try await fallback.enroll(in: fallbackHandoff, reason: .transportLoss)
+                        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        _ = try await fallback.attach(
+                            previous: previous,
+                            reason: .transportLoss,
+                            presentedAuthority: prior,
+                            neutralizePrevious: true,
+                            nativeHandoff: fallbackHandoff
+                        )
+                        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        await replacement.invalidateAuthorityAfterAmbiguousAttach()
+                        try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        sessions[hostID] = fallback
+                        return fallback
+                    }
+                } catch {
+                    await previous.invalidateAuthorityAfterAmbiguousAttach()
+                    throw error
+                }
+            }
+        }
+    }
+
+    private func authenticatedCandidate(
+        host: LSPHostRecord,
+        trust: LSPTrustRecord,
+        attemptID: UUID
+    ) async throws -> LSPClientSession {
+        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+        let candidate = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
+        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+        await candidate.beginReconnect(attemptID: attemptID)
+        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+        let updatedTrust = try await candidate.authenticate(host: host, trust: trust)
+        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+        await candidate.markCandidateAuthenticated()
+        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
         _ = try await trustStore.update { snapshot in
             var snapshot = snapshot
-            snapshot.records.removeAll { $0.hostID == hostID }
+            snapshot.records.removeAll { $0.hostID == trust.hostID }
             snapshot.records.append(updatedTrust)
             return snapshot
         }
-        _ = try await replacement.attach(previous: previous, reason: reason)
-        sessions[hostID] = replacement
-        return replacement
+        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+        return candidate
+    }
+
+    private func ensureAttemptCurrent(hostID: UUID, attemptID: UUID) throws {
+        try Task.checkCancellation()
+        guard reconnectAttempts[hostID]?.id == attemptID else { throw CancellationError() }
+    }
+
+    private func presumedCommittedAuthority(
+        from failure: LSPAmbiguousAttachFailure
+    ) throws -> LSPActiveInputAuthority {
+        var authority = failure.prior
+        guard authority.nativeConfiguration.inputGeneration < UInt32.max,
+              authority.audioConfiguration.audioGeneration < UInt32.max,
+              authority.videoSelection.nativeConfiguration.videoGeneration < UInt32.max else {
+            throw LSPTransportError.internalFailure
+        }
+        authority.attachToken = failure.successorAttachToken
+        authority.connectionGeneration = failure.candidateConnectionGeneration
+        authority.nativeConfiguration.inputGeneration += 1
+        authority.audioConfiguration.audioGeneration += 1
+        authority.videoSelection.nativeConfiguration.videoGeneration += 1
+        if authority.microphoneConfiguration != nil {
+            guard authority.microphoneConfiguration!.microphoneGeneration < UInt32.max else {
+                throw LSPTransportError.internalFailure
+            }
+            authority.microphoneConfiguration!.microphoneGeneration += 1
+        }
+        return authority
+    }
+
+    public func markCaptureTransferred(hostID: UUID, session: LSPClientSession) async {
+        guard sessions[hostID] === session else { return }
+        await session.markCaptureTransferred()
+    }
+
+    public func isCurrentSession(_ session: LSPClientSession, hostID: UUID) -> Bool {
+        sessions[hostID] === session
+    }
+
+    public func currentSession(hostID: UUID) -> LSPClientSession? {
+        sessions[hostID]
+    }
+
+    public func reconnectTelemetry(hostID: UUID) async -> LSPReconnectSnapshot? {
+        guard let session = sessions[hostID] else { return nil }
+        return await session.reconnectTelemetry()
     }
 
     /// Planned rekey is the same fresh-DTLS ATTACH path as reconnect.
@@ -199,12 +393,14 @@ public actor LSPProductClient {
     }
 
     public func stop(hostID: UUID) async {
+        reconnectAttempts.removeValue(forKey: hostID)?.task.cancel()
         guard let session = sessions[hostID], [.authenticated, .inputActive].contains(await session.state) else { return }
         try? await session.stop()
     }
 
     /// Removes only native LSP host/trust state and stops its session.
     public func remove(hostID: UUID) async throws {
+        reconnectAttempts.removeValue(forKey: hostID)?.task.cancel()
         if let session = sessions.removeValue(forKey: hostID), [.authenticated, .inputActive].contains(await session.state) {
             try await session.stop()
         }

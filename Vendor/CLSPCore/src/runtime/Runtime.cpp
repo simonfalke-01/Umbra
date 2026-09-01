@@ -1199,7 +1199,11 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t stop() noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (!worker_started_) {
-        return CLSP_STATUS_INVALID_STATE;
+        microphone_active_.store(false, std::memory_order_release);
+        microphone_prepared_.store(false, std::memory_order_release);
+        release_video_state();
+        cleanup_platform();
+        return CLSP_STATUS_OK;
       }
       microphone_active_.store(false, std::memory_order_release);
       microphone_prepared_.store(false, std::memory_order_release);
@@ -1233,7 +1237,7 @@ namespace umbra::lsp {
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
       pthread_mutex_lock(&mutex_);
-      if (queued_control_count_ == control_queue_capacity) {
+      if (control_queue_full_locked()) {
         pthread_mutex_unlock(&mutex_);
         increment(RuntimeCounter::dropped);
         return CLSP_STATUS_CONTROL_WINDOW_FULL;
@@ -1267,6 +1271,102 @@ namespace umbra::lsp {
 #endif
     }
 
+    /** @brief Reserve one invisible request plus exact queue capacity. */
+    [[nodiscard]] clsp_status_t reserve_control(
+      const std::uint16_t message_type,
+      const std::uint64_t request_id,
+      const clsp_const_byte_span_t payload,
+      const std::uint32_t deadline_milliseconds,
+      std::uint64_t &reservation_token
+    ) noexcept {
+      reservation_token = 0;
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      if (message_type == 0 || request_id == 0 || deadline_milliseconds < 20U ||
+          deadline_milliseconds > 30'000U || payload.length > maximum_control_payload ||
+          (payload.data == nullptr && payload.length != 0)) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      pthread_mutex_lock(&mutex_);
+      if (control_reservation_.occupied || control_queue_full_locked()) {
+        pthread_mutex_unlock(&mutex_);
+        increment(RuntimeCounter::dropped);
+        return CLSP_STATUS_CONTROL_WINDOW_FULL;
+      }
+      auto &command = control_reservation_.command;
+      command.message_type = message_type;
+      command.request_id = request_id;
+      command.flags = static_cast<std::uint8_t>(lumen::lsp::lspc_flag::acknowledgement_required);
+      command.response = false;
+      command.activate_microphone = false;
+      command.transmit_path_probe = false;
+      command.path_probe_id = 0;
+      command.path_probe_size = 0;
+      command.payload.assign(std::span<const std::uint8_t> {payload.data, payload.length});
+      const auto now = monotonic_microseconds();
+      const auto duration = static_cast<std::uint64_t>(deadline_milliseconds) * 1'000U;
+      command.deadline_microseconds = now > std::numeric_limits<std::uint64_t>::max() - duration ?
+                                         std::numeric_limits<std::uint64_t>::max() :
+                                         now + duration;
+      ++next_control_reservation_token_;
+      if (next_control_reservation_token_ == 0U) {
+        ++next_control_reservation_token_;
+      }
+      control_reservation_.token = next_control_reservation_token_;
+      control_reservation_.occupied = true;
+      reservation_token = control_reservation_.token;
+      pthread_mutex_unlock(&mutex_);
+      return CLSP_STATUS_OK;
+#else
+      (void)message_type;
+      (void)request_id;
+      (void)payload;
+      (void)deadline_milliseconds;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Publish one exact reserved request and wake the worker. */
+    [[nodiscard]] clsp_status_t commit_control_reservation(
+      const std::uint64_t reservation_token
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (reservation_token == 0U) return CLSP_STATUS_INVALID_ARGUMENT;
+      pthread_mutex_lock(&mutex_);
+      if (!control_reservation_.occupied || control_reservation_.token != reservation_token ||
+          queued_control_count_ >= control_queue_capacity) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      control_queue_[control_queue_tail_] = control_reservation_.command;
+      control_queue_tail_ = (control_queue_tail_ + 1U) % control_queue_capacity;
+      ++queued_control_count_;
+      control_reservation_ = {};
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void)reservation_token;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    /** @brief Release one invisible reserved request. */
+    void cancel_control_reservation(const std::uint64_t reservation_token) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (reservation_token == 0U) return;
+      pthread_mutex_lock(&mutex_);
+      if (control_reservation_.occupied && control_reservation_.token == reservation_token) {
+        control_reservation_ = {};
+      }
+      pthread_mutex_unlock(&mutex_);
+#else
+      (void)reservation_token;
+#endif
+    }
+
     [[nodiscard]] clsp_status_t send_control_response(
       const std::uint16_t message_type,
       const std::uint64_t request_id,
@@ -1281,7 +1381,7 @@ namespace umbra::lsp {
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
       pthread_mutex_lock(&mutex_);
-      if (queued_control_count_ == control_queue_capacity) {
+      if (control_queue_full_locked()) {
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_CONTROL_WINDOW_FULL;
       }
@@ -1748,7 +1848,7 @@ namespace umbra::lsp {
       pthread_mutex_lock(&mutex_);
       const auto emitted_probe_id = emitted_path_probe_id_.load(std::memory_order_acquire);
       const auto emitted_probe_size = emitted_path_probe_size_.load(std::memory_order_acquire);
-      const auto queue_full = queued_control_count_ == control_queue_capacity;
+      const auto queue_full = control_queue_full_locked();
       if (emitted_probe_id != probe_id || emitted_probe_size != udp_payload_size || queue_full) {
         pthread_mutex_unlock(&mutex_);
         return queue_full ? CLSP_STATUS_CONTROL_WINDOW_FULL : CLSP_STATUS_INVALID_STATE;
@@ -2037,6 +2137,7 @@ namespace umbra::lsp {
         return security_status;
       }
       pending_input_configuration_ = configuration;
+      pending_baseline_id_ = 0;
       const auto token = input_configuration_requested_.fetch_add(1, std::memory_order_acq_rel) + 1U;
       pending_input_configuration_token_ = token;
       input_configuration_pending_ = true;
@@ -2170,12 +2271,20 @@ namespace umbra::lsp {
     /** @brief Stop new capture while retaining release edges until acknowledged. */
     [[nodiscard]] clsp_status_t neutralize_input() noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
-      if (!authenticated_.load(std::memory_order_acquire)) {
-        return CLSP_STATUS_NOT_AUTHENTICATED;
+      if (!authenticated_.load(std::memory_order_acquire) ||
+          input_configuration_completed_.load(std::memory_order_acquire) == 0U) {
+        capture_accepting_ = false;
+        capture_read_.store(capture_write_.load(std::memory_order_acquire), std::memory_order_release);
+        return CLSP_STATUS_OK;
       }
       const auto token = neutralize_requested_.fetch_add(1, std::memory_order_acq_rel) + 1U;
       CaptureRecord record {.kind = CaptureKind::neutralize, .neutralize_token = token};
-      const auto queued = enqueue_capture(record);
+      auto queued = enqueue_capture(record);
+      for (std::uint32_t attempt = 0; queued == CLSP_STATUS_RESOURCE_EXHAUSTED && attempt < 1'000U; ++attempt) {
+        wake_worker();
+        usleep(100);
+        queued = enqueue_capture(record);
+      }
       if (queued != CLSP_STATUS_OK) return queued;
       timespec deadline {};
       if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
@@ -2194,6 +2303,51 @@ namespace umbra::lsp {
 #endif
     }
 
+    /** @brief Idempotently quiesce input from every runtime lifecycle state. */
+    [[nodiscard]] clsp_status_t quiesce_input() noexcept {
+      return neutralize_input();
+    }
+
+    /** @brief Restart the unchanged mapping with one exact fresh neutral baseline. */
+    [[nodiscard]] clsp_status_t restart_input_baseline(const std::uint64_t baseline_id) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (baseline_id == 0U) {
+        return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      if (!authenticated_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      pthread_mutex_lock(&mutex_);
+      if (!input_configured_ || input_configuration_pending_ || capture_accepting_.load(std::memory_order_acquire)) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      pending_input_configuration_ = input_configuration_;
+      pending_baseline_id_ = baseline_id;
+      const auto token = input_configuration_requested_.fetch_add(1, std::memory_order_acq_rel) + 1U;
+      pending_input_configuration_token_ = token;
+      input_configuration_pending_ = true;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+
+      timespec deadline {};
+      if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      deadline.tv_nsec += 100'000'000L;
+      if (deadline.tv_nsec >= 1'000'000'000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1'000'000'000L; }
+      pthread_mutex_lock(&mutex_);
+      while (input_configuration_completed_.load(std::memory_order_acquire) < token) {
+        const auto wait = pthread_cond_timedwait(&condition_, &mutex_, &deadline);
+        if (wait == ETIMEDOUT) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_TIMEOUT; }
+        if (wait != 0) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_INTERNAL_FAILURE; }
+      }
+      pthread_mutex_unlock(&mutex_);
+      return CLSP_STATUS_OK;
+#else
+      (void)baseline_id;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
   private:
     /** @brief One bounded deterministic-CBOR request waiting for message-ID assignment. */
     struct ControlCommand {
@@ -2208,6 +2362,19 @@ namespace umbra::lsp {
       std::uint64_t path_probe_id {};  ///< Logical LSPP probe ID.
       std::uint16_t path_probe_size {};  ///< Exact protected UDP probe size.
     };
+
+    /** @brief One invisible control queue reservation owned by an atomic handoff submit. */
+    struct ControlReservation {
+      ControlCommand command {};  ///< Immutable copied request awaiting publication.
+      std::uint64_t token {};  ///< Nonzero reservation incarnation.
+      bool occupied {};  ///< Whether one queue slot is reserved.
+    };
+
+    /** @brief Return whether published plus invisible commands exhaust bounded capacity. */
+    [[nodiscard]] bool control_queue_full_locked() const noexcept {
+      return queued_control_count_ + static_cast<std::size_t>(control_reservation_.occupied) >=
+             control_queue_capacity;
+    }
 
     /** @brief One retained authenticated host request awaiting a semantic response. */
     struct PendingInboundRequest {
@@ -3589,6 +3756,8 @@ namespace umbra::lsp {
         return CLSP_STATUS_OK;
       }
       selected = pending_input_configuration_;
+      const auto selected_baseline_id = pending_baseline_id_;
+      pending_baseline_id_ = 0;
       token = pending_input_configuration_token_;
       input_configuration_pending_ = false;
       pthread_mutex_unlock(&mutex_);
@@ -3606,9 +3775,19 @@ namespace umbra::lsp {
       input_configured_ = true;
       capture_accepting_ = true;
       baseline_acknowledged_ = false;
-      baseline_id_ = (static_cast<std::uint64_t>(arc4random()) << 32U) | arc4random();
+      baseline_id_ = selected_baseline_id != 0U ? selected_baseline_id :
+        (static_cast<std::uint64_t>(arc4random()) << 32U) | arc4random();
       if (baseline_id_ == 0) {
         baseline_id_ = 1;
+      }
+      if (callbacks_.input_baseline != nullptr) {
+        callbacks_.input_baseline(
+          callbacks_.context,
+          false,
+          connection_generation_,
+          selected.input_generation,
+          baseline_id_
+        );
       }
       baseline_last_sent_us_ = 0;
       pointer_dirty_ = false;
@@ -6668,8 +6847,19 @@ namespace umbra::lsp {
       if (!ack) {
         return false;
       }
-      if (ack.value.accepted_baseline_id == baseline_id_) {
+      const auto baseline_became_acknowledged =
+        !baseline_acknowledged_ && ack.value.accepted_baseline_id == baseline_id_;
+      if (baseline_became_acknowledged) {
         baseline_acknowledged_ = true;
+        if (callbacks_.input_baseline != nullptr) {
+          callbacks_.input_baseline(
+            callbacks_.context,
+            true,
+            connection_generation_,
+            input_configuration_.input_generation,
+            baseline_id_
+          );
+        }
       }
       edge_sender_.acknowledge(ack.value.contiguous_edge_id, ack.value.edge_reception_bitmap);
       if ((ack.value.flags & static_cast<std::uint8_t>(lumen::lsp::input_plane::lspi_flag::baseline_requested)) != 0) {
@@ -7094,6 +7284,7 @@ namespace umbra::lsp {
     lumen::lsp::response_cache<maximum_control_frame, maximum_control_frame> inbound_response_cache_;  ///< Host request response replay.
     lumen::lsp::control_rto rto_;  ///< Local-path bounded RTO estimator.
     std::array<ControlCommand, control_queue_capacity> control_queue_ {};  ///< Pre-wire bounded queue.
+    ControlReservation control_reservation_ {};  ///< Sole invisible atomic-handoff queue reservation.
     std::array<PendingInboundRequest, 64> pending_inbound_requests_ {};  ///< Authenticated requests awaiting semantic response.
     std::array<CaptureRecord, capture_queue_capacity> capture_queue_ {};  ///< Allocation-free captured-input ring.
     clsp_input_configuration_t pending_input_configuration_ {};  ///< Producer-copied pending input mapping.
@@ -7175,6 +7366,7 @@ namespace umbra::lsp {
     std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
     std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
+    std::uint64_t next_control_reservation_token_ {};  ///< Next invisible request reservation incarnation.
     std::uint64_t next_inbound_security_install_token_ {1};  ///< Next provider-install request token.
     std::uint64_t completed_inbound_security_install_token_ {};  ///< Last provider-install completion token.
     std::uint64_t video_next_metadata_order_ {1};  ///< Oldest-frame eviction ordering.
@@ -7217,6 +7409,7 @@ namespace umbra::lsp {
     UnmatchedPathProbe unmatched_path_probe_ {};  ///< One authenticated reordered LSPP.
     OutboundPathProbePacket outbound_path_probe_ {};  ///< Client probe send/timer state.
     std::uint64_t pending_input_configuration_token_ {};  ///< Token paired with pending START/ATTACH mapping.
+    std::uint64_t pending_baseline_id_ {};  ///< Exact handoff rollback baseline ID, or zero for native generation.
     std::uint32_t connection_generation_ {};  ///< Zero through CLIENT_HELLO, then host-assigned generation.
     std::uint64_t baseline_id_ {};  ///< Current random neutral-baseline identifier.
     std::uint64_t baseline_last_sent_us_ {};  ///< Most recent baseline submission time.
@@ -7248,7 +7441,7 @@ namespace umbra::lsp {
     bool path_probe_notification_pending_ {};  ///< Swift has not queued the emitted client intent.
     bool compound_rtcp_sent_ {};  ///< RFC 5506 reduced-size feedback is unlocked.
     bool input_configured_ {};  ///< Worker has an active input mapping.
-    bool capture_accepting_ {};  ///< New physical capture is authorized.
+    std::atomic<bool> capture_accepting_ {false};  ///< New physical capture is authorized.
     bool baseline_acknowledged_ {};  ///< LSPI accepted the current baseline.
     bool pointer_dirty_ {};  ///< Cumulative pointer state has unsent reports.
   };
@@ -7277,6 +7470,34 @@ namespace umbra::lsp {
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
                               impl_->send_control(message_type, request_id, payload, deadline_milliseconds);
+  }
+
+  clsp_status_t Runtime::reserve_control(
+    const std::uint16_t message_type,
+    const std::uint64_t request_id,
+    const clsp_const_byte_span_t payload,
+    const std::uint32_t deadline_milliseconds,
+    std::uint64_t &reservation_token
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->reserve_control(
+                                message_type,
+                                request_id,
+                                payload,
+                                deadline_milliseconds,
+                                reservation_token
+                              );
+  }
+
+  clsp_status_t Runtime::commit_control_reservation(const std::uint64_t reservation_token) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
+                              impl_->commit_control_reservation(reservation_token);
+  }
+
+  void Runtime::cancel_control_reservation(const std::uint64_t reservation_token) noexcept {
+    if (impl_ != nullptr) {
+      impl_->cancel_control_reservation(reservation_token);
+    }
   }
 
   clsp_status_t Runtime::send_control_response(
@@ -7429,5 +7650,13 @@ namespace umbra::lsp {
 
   clsp_status_t Runtime::neutralize_input() noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->neutralize_input();
+  }
+
+  clsp_status_t Runtime::quiesce_input() noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->quiesce_input();
+  }
+
+  clsp_status_t Runtime::restart_input_baseline(const std::uint64_t baseline_id) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->restart_input_baseline(baseline_id);
   }
 }  // namespace umbra::lsp

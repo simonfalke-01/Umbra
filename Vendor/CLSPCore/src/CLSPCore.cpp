@@ -8,11 +8,15 @@
 #include "core/core.h"
 #include "runtime/BufferInternal.h"
 #include "runtime/Runtime.h"
+#include "transport/generation_fence.h"
 
 #include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -22,6 +26,18 @@
 extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
   clsp_apple_input_capture_t *capture,
   clsp_const_byte_span_t payload
+);
+
+extern "C" void clsp_apple_input_capture_quiesce(
+  clsp_apple_input_capture_t *capture
+);
+
+extern "C" void clsp_apple_input_capture_retain(
+  clsp_apple_input_capture_t *capture
+);
+
+extern "C" void clsp_apple_input_capture_release(
+  clsp_apple_input_capture_t *capture
 );
 
 #ifndef CLSP_CORE_HAS_WOLFSSL
@@ -38,6 +54,9 @@ extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
 
 static_assert(lumen::lsp::core_api_version == 1U);
 
+/** @brief Lifetime-safe internal observation binding shared by association cores. */
+struct clsp_handoff_observer_binding;
+
 /** @brief Native core object hidden behind `clsp_core_t`. */
 struct clsp_core {
   std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
@@ -46,7 +65,20 @@ struct clsp_core {
   std::atomic<bool> audio_callback_active {false};  ///< Prevents recursive complete-audio delivery.
   std::atomic<bool> video_callback_active {false};  ///< Prevents recursive complete-frame delivery.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
+  std::mutex handoff_observer_mutex;  ///< Serializes handoff observation binding replacement.
+  std::mutex producer_wait_mutex;  ///< Wait owner for native producer-lease drain.
+  std::condition_variable producer_wait_condition;  ///< Producer-lease drain notification.
+  mutable std::mutex baseline_mutex;  ///< Serializes association-local baseline readiness.
+  mutable std::condition_variable baseline_condition;  ///< Baseline readiness wait notification.
   mutable std::shared_mutex runtime_mutex;  ///< Prevents runtime reclamation during ABI calls.
+  std::atomic<std::uint32_t> producer_leases {0};  ///< In-flight input producer operations.
+  std::atomic<bool> producers_accepting {true};  ///< Input producer admission gate.
+  clsp_handoff_observer_binding *handoff_observer {};  ///< Non-owning-by-contract ref-counted observer binding.
+  std::uint32_t baseline_connection_generation {};  ///< Last configured association generation.
+  std::uint32_t baseline_input_generation {};  ///< Last configured input generation.
+  std::uint32_t baseline_authority_epoch {};  ///< Last handoff-derived local authority epoch.
+  std::uint64_t baseline_event_generation {};  ///< Monotonic readiness transition generation.
+  bool baseline_acknowledged {};  ///< Whether the exact current baseline is authenticated.
   clsp_apple_input_capture_t *apple_capture {};  ///< Active native controller-output owner.
   umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
   clsp_configuration_t configuration {};  ///< Caller configuration copied at creation.
@@ -83,6 +115,48 @@ struct clsp_buffer {
   std::size_t length = 0;  ///< Immutable byte count.
   void *context = nullptr;  ///< Private storage owner or slot context.
   void (*destroy)(clsp_buffer_t *) = nullptr;  ///< Native storage destruction function.
+};
+
+/** @brief Lifetime-safe bridge from an association runtime into one handoff owner. */
+struct clsp_handoff_observer_binding {
+  std::atomic<std::uint32_t> references {1};  ///< Handoff owner plus bound-core references.
+  std::mutex mutex;  ///< Serializes owner detachment with active observation calls.
+  std::condition_variable condition;  ///< Detachment wait for active observation calls.
+  clsp_handoff_t *owner {};  ///< Valid only while `active_calls` protects it.
+  std::uint32_t active_calls {};  ///< Observation calls currently using `owner`.
+};
+
+/** @brief Native fresh-association authority owner hidden behind `clsp_handoff_t`. */
+struct clsp_handoff {
+  std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
+  mutable std::mutex mutex;  ///< Serializes every authority transition and snapshot.
+  std::mutex callback_mutex;  ///< Preserves callback ordering without holding core locks.
+  clsp_handoff_callbacks_t callbacks {};  ///< Explicitly retained coarse callback table.
+  clsp_handoff_observer_binding *observer {};  ///< Shared runtime observation bridge.
+  clsp_core_t *active {};  ///< Retained forward-authoritative association core.
+  clsp_core_t *candidate {};  ///< Retained uncommitted candidate association core.
+  clsp_core_t *retiring {};  ///< Retained prior association after committed handoff.
+  lumen::lsp::transport::reconnect_generation_fence fence;  ///< Canonical Photon authority fence.
+  std::uint32_t phase {CLSP_HANDOFF_PHASE_AUTHORITATIVE};  ///< Current `clsp_handoff_phase_t`.
+  std::uint32_t reason {};  ///< Current `clsp_handoff_reason_t`, or zero.
+  std::uint32_t baseline_generation {};  ///< Exact generation gated on a fresh baseline ACK.
+  std::uint32_t baseline_authority_epoch {};  ///< Epoch installed when the gated baseline is acknowledged.
+  std::uint32_t baseline_connection_generation {};  ///< Association carrying the gated baseline.
+  std::uint32_t baseline_rollback_generation {};  ///< Rejected candidate binding same-generation rollback.
+  std::uint32_t terminal_reason {};  ///< Latched `clsp_handoff_terminal_reason_t`, or zero.
+  bool active_lost {};  ///< Current active transport is no longer usable.
+  bool candidate_authenticated {};  ///< Candidate application identity is authenticated.
+  bool candidate_lost {};  ///< Candidate transport failed during an in-progress producer drain.
+  bool old_input_neutralized {};  ///< Old producer/callback drain completed.
+  bool baseline_required {};  ///< Fresh baseline ACK blocks input admission.
+  bool attach_committed {};  ///< ATTACH moved authority irreversibly forward.
+  bool attach_submitted {};  ///< Native ATTACH send admission succeeded.
+  bool forward_only {};  ///< Old association can never regain authority.
+  bool transition_in_progress {};  ///< One blocking producer-drain transition is outside the mutex.
+  std::uint64_t begun_count {};  ///< Fresh-association attempts begun.
+  std::uint64_t committed_count {};  ///< Irreversible ATTACH commits.
+  std::uint64_t definite_rollback_count {};  ///< Definitely rejected safe rollbacks.
+  std::uint64_t terminal_count {};  ///< Terminal fail-closed transitions.
 };
 
 namespace umbra::lsp {
@@ -228,7 +302,7 @@ namespace {
   class callback_core_scope {
   public:
     explicit callback_core_scope(const clsp_core_t *core) noexcept:
-        active_ {active_callback_depth < active_callback_cores.size()} {
+        active_ {core != nullptr && active_callback_depth < active_callback_cores.size()} {
       if (active_) {
         active_callback_cores[active_callback_depth++] = core;
       }
@@ -250,6 +324,567 @@ namespace {
   private:
     bool active_ {};  ///< Whether this scope owns one stack entry.
   };
+
+  thread_local std::array<const clsp_handoff_t *, maximum_callback_stack_depth> active_handoff_callbacks {};
+  thread_local std::size_t active_handoff_callback_depth {};
+
+  /** @brief Return whether this thread is executing a callback from `handoff`. */
+  [[nodiscard]] bool handoff_callback_stack_contains(const clsp_handoff_t *handoff) noexcept {
+    for (std::size_t index = 0; index < active_handoff_callback_depth; ++index) {
+      if (active_handoff_callbacks[index] == handoff) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** @brief Bounded callback-stack marker enabling same-handoff reentry rejection. */
+  class handoff_callback_scope {
+  public:
+    explicit handoff_callback_scope(const clsp_handoff_t *handoff) noexcept:
+        active_ {active_handoff_callback_depth < active_handoff_callbacks.size()} {
+      if (active_) {
+        active_handoff_callbacks[active_handoff_callback_depth++] = handoff;
+      }
+    }
+
+    handoff_callback_scope(const handoff_callback_scope &) = delete;
+    handoff_callback_scope &operator=(const handoff_callback_scope &) = delete;
+
+    ~handoff_callback_scope() {
+      if (active_) {
+        active_handoff_callbacks[--active_handoff_callback_depth] = nullptr;
+      }
+    }
+
+    [[nodiscard]] bool active() const noexcept {
+      return active_;
+    }
+
+  private:
+    bool active_ {};  ///< Whether this scope owns one stack entry.
+  };
+
+  /** @brief Mark every retained association as a callback owner for core reentry checks. */
+  class handoff_core_callback_scope {
+  public:
+    explicit handoff_core_callback_scope(const clsp_handoff_t &handoff) noexcept {
+      const std::array<const clsp_core_t *, 3> cores {
+        handoff.active,
+        handoff.candidate,
+        handoff.retiring,
+      };
+      for (const auto *core : cores) {
+        if (core == nullptr || callback_stack_contains(core)) {
+          continue;
+        }
+        if (active_callback_depth >= active_callback_cores.size()) {
+          while (added_ != 0U) {
+            active_callback_cores[--active_callback_depth] = nullptr;
+            --added_;
+          }
+          return;
+        }
+        active_callback_cores[active_callback_depth++] = core;
+        ++added_;
+      }
+      active_ = true;
+    }
+
+    handoff_core_callback_scope(const handoff_core_callback_scope &) = delete;
+    handoff_core_callback_scope &operator=(const handoff_core_callback_scope &) = delete;
+
+    ~handoff_core_callback_scope() {
+      while (added_ != 0U) {
+        active_callback_cores[--active_callback_depth] = nullptr;
+        --added_;
+      }
+    }
+
+    [[nodiscard]] bool active() const noexcept {
+      return active_;
+    }
+
+  private:
+    std::size_t added_ {};  ///< Number of association markers owned by this scope.
+    bool active_ {};  ///< Whether every distinct association marker fit.
+  };
+
+  /** @brief One input-producer call protected against concurrent handoff quiescence. */
+  class core_producer_lease {
+  public:
+    explicit core_producer_lease(clsp_core_t *core) noexcept:
+        core_ {core} {
+      if (core_ == nullptr || !core_->producers_accepting.load(std::memory_order_acquire)) {
+        return;
+      }
+      core_->producer_leases.fetch_add(1, std::memory_order_acq_rel);
+      if (!core_->producers_accepting.load(std::memory_order_acquire)) {
+        release();
+        return;
+      }
+      active_ = true;
+    }
+
+    core_producer_lease(const core_producer_lease &) = delete;
+    core_producer_lease &operator=(const core_producer_lease &) = delete;
+
+    ~core_producer_lease() {
+      if (active_) {
+        release();
+      }
+    }
+
+    [[nodiscard]] bool active() const noexcept {
+      return active_;
+    }
+
+  private:
+    void release() noexcept {
+      active_ = false;
+      if (core_->producer_leases.fetch_sub(1, std::memory_order_acq_rel) == 1U) {
+        std::lock_guard lock(core_->producer_wait_mutex);
+        core_->producer_wait_condition.notify_all();
+      }
+    }
+
+    clsp_core_t *core_ {};  ///< Borrowed core protected by the ABI caller.
+    bool active_ {};  ///< Whether one producer lease is held.
+  };
+
+  /** @brief Keep a handoff alive across one ABI call and its callbacks. */
+  class handoff_call_reference {
+  public:
+    explicit handoff_call_reference(clsp_handoff_t *handoff) noexcept:
+        handoff_ {handoff} {
+      clsp_handoff_retain(handoff_);
+    }
+
+    handoff_call_reference(const handoff_call_reference &) = delete;
+    handoff_call_reference &operator=(const handoff_call_reference &) = delete;
+
+    ~handoff_call_reference() {
+      clsp_handoff_release(handoff_);
+    }
+
+  private:
+    clsp_handoff_t *handoff_ {};  ///< Retained handoff for the current ABI call.
+  };
+
+  /** @brief Return one nonzero cryptographically seeded platform baseline identifier. */
+  [[nodiscard]] std::uint64_t fresh_baseline_id() noexcept {
+#if defined(__APPLE__)
+    auto value = (static_cast<std::uint64_t>(arc4random()) << 32U) | arc4random();
+    return value == 0U ? std::uint64_t {1} : value;
+#else
+    static std::atomic<std::uint64_t> fallback {1};
+    return fallback.fetch_add(1, std::memory_order_relaxed);
+#endif
+  }
+
+  /** @brief Add one owning reference to an internal observer binding. */
+  void retain_observer_binding(clsp_handoff_observer_binding *binding) noexcept {
+    if (binding != nullptr) {
+      binding->references.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  /** @brief Release one internal observer binding reference. */
+  void release_observer_binding(clsp_handoff_observer_binding *binding) noexcept {
+    if (binding != nullptr && binding->references.fetch_sub(1, std::memory_order_acq_rel) == 1U) {
+      delete binding;
+    }
+  }
+
+  /** @brief Bind one association core to a lifetime-safe handoff observer. */
+  [[nodiscard]] bool bind_handoff_observer(
+    clsp_core_t *core,
+    clsp_handoff_observer_binding *binding
+  ) noexcept {
+    if (core == nullptr || binding == nullptr) {
+      return false;
+    }
+    std::lock_guard lock(core->handoff_observer_mutex);
+    if (core->handoff_observer != nullptr) {
+      return false;
+    }
+    retain_observer_binding(binding);
+    core->handoff_observer = binding;
+    return true;
+  }
+
+  /** @brief Remove one exact association-to-handoff observation binding. */
+  void unbind_handoff_observer(
+    clsp_core_t *core,
+    clsp_handoff_observer_binding *binding
+  ) noexcept {
+    if (core == nullptr || binding == nullptr) {
+      return;
+    }
+    clsp_handoff_observer_binding *released = nullptr;
+    {
+      std::lock_guard lock(core->handoff_observer_mutex);
+      if (core->handoff_observer == binding) {
+        released = core->handoff_observer;
+        core->handoff_observer = nullptr;
+      }
+    }
+    release_observer_binding(released);
+  }
+
+  /** @brief Invoke one lifetime-safe internal handoff observation. */
+  template<typename Operation>
+  void with_handoff_observer(clsp_core_t *core, Operation &&operation) noexcept {
+    clsp_handoff_observer_binding *binding = nullptr;
+    {
+      std::lock_guard lock(core->handoff_observer_mutex);
+      binding = core->handoff_observer;
+      retain_observer_binding(binding);
+    }
+    if (binding == nullptr) {
+      return;
+    }
+    clsp_handoff_t *owner = nullptr;
+    {
+      std::lock_guard lock(binding->mutex);
+      if (binding->owner != nullptr) {
+        ++binding->active_calls;
+        owner = binding->owner;
+        clsp_handoff_retain(owner);
+      }
+    }
+    if (owner != nullptr) {
+      operation(owner);
+      {
+        std::lock_guard lock(binding->mutex);
+        if (--binding->active_calls == 0U) {
+          binding->condition.notify_all();
+        }
+      }
+      clsp_handoff_release(owner);
+    }
+    release_observer_binding(binding);
+  }
+
+  /** @brief Close producer admission and wait until all high-rate calls have returned. */
+  [[nodiscard]] clsp_status_t quiesce_core_producers(clsp_core_t *core) noexcept {
+    if (core == nullptr) {
+      return CLSP_STATUS_INVALID_ARGUMENT;
+    }
+    clsp_apple_input_capture_t *capture = nullptr;
+    {
+      std::lock_guard capture_lock(core->apple_capture_mutex);
+      capture = core->apple_capture;
+      if (capture != nullptr) {
+        clsp_apple_input_capture_retain(capture);
+        core->apple_capture = nullptr;
+      }
+    }
+    if (capture != nullptr) {
+      clsp_apple_input_capture_quiesce(capture);
+      clsp_apple_input_capture_release(capture);
+    }
+    core->producers_accepting.store(false, std::memory_order_release);
+    {
+      std::unique_lock wait_lock(core->producer_wait_mutex);
+      core->producer_wait_condition.wait(wait_lock, [&] {
+        return core->producer_leases.load(std::memory_order_acquire) == 0U;
+      });
+    }
+    std::shared_lock runtime_lock(core->runtime_mutex);
+    return core->runtime == nullptr ? CLSP_STATUS_OK : core->runtime->quiesce_input();
+  }
+
+  /** @brief Reopen high-rate producer admission after an exact fresh baseline ACK. */
+  void resume_core_producers(clsp_core_t *core) noexcept {
+    if (core != nullptr) {
+      core->producers_accepting.store(true, std::memory_order_release);
+    }
+  }
+
+  /** @brief Install one association-local callback epoch for baseline readiness. */
+  void set_core_baseline_authority_epoch(
+    clsp_core_t *core,
+    const std::uint32_t input_authority_epoch
+  ) noexcept {
+    if (core == nullptr || input_authority_epoch == 0U) {
+      return;
+    }
+    std::lock_guard baseline_lock(core->baseline_mutex);
+    core->baseline_authority_epoch = input_authority_epoch;
+  }
+
+  /** @brief Map a canonical generation-fence rejection onto the narrow ABI status set. */
+  [[nodiscard]] constexpr clsp_status_t fence_status(
+    const lumen::lsp::transport::generation_fence_result result
+  ) noexcept {
+    using Result = lumen::lsp::transport::generation_fence_result;
+    switch (result) {
+      case Result::accepted:
+        return CLSP_STATUS_OK;
+      case Result::invalid_generation:
+      case Result::candidate_mismatch:
+      case Result::active_authority_mismatch:
+      case Result::baseline_mismatch:
+      case Result::retiring_mismatch:
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      case Result::wrong_phase:
+      case Result::input_not_neutralized:
+        return CLSP_STATUS_INVALID_STATE;
+    }
+    return CLSP_STATUS_INTERNAL_FAILURE;
+  }
+
+  /** @brief Return one association lifecycle without exposing runtime details. */
+  [[nodiscard]] std::uint32_t core_lifecycle(const clsp_core_t *core) noexcept {
+    return core == nullptr ? CLSP_LIFECYCLE_STOPPED : core->state.load(std::memory_order_acquire);
+  }
+
+  /** @brief Fill a secret-free handoff snapshot while its state mutex is held. */
+  void fill_handoff_snapshot_locked(
+    const clsp_handoff_t &handoff,
+    clsp_handoff_snapshot_t &output
+  ) noexcept {
+    const auto fence = handoff.fence.snapshot();
+    output = {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_handoff_snapshot_t),
+      .active_connection_generation = fence.active_connection_generation,
+      .active_input_generation = fence.active_input_generation,
+      .input_authority_epoch = fence.input_authority_epoch,
+      .connection_generation_high_watermark = fence.connection_generation_high_watermark,
+      .candidate_connection_generation = fence.candidate_connection_generation,
+      .rollback_connection_generation = fence.rollback_connection_generation,
+      .retiring_connection_generation = fence.retiring_connection_generation,
+      .phase = handoff.phase,
+      .reason = handoff.reason,
+      .active_lifecycle_state = core_lifecycle(handoff.active),
+      .candidate_lifecycle_state = core_lifecycle(handoff.candidate),
+      .retiring_lifecycle_state = core_lifecycle(handoff.retiring),
+      .begun_count = handoff.begun_count,
+      .committed_count = handoff.committed_count,
+      .definite_rollback_count = handoff.definite_rollback_count,
+      .terminal_count = handoff.terminal_count,
+      .active_lost = static_cast<std::uint8_t>(handoff.active_lost),
+      .candidate_authenticated = static_cast<std::uint8_t>(handoff.candidate_authenticated),
+      .old_input_neutralized = static_cast<std::uint8_t>(handoff.old_input_neutralized),
+      .baseline_required = static_cast<std::uint8_t>(handoff.baseline_required),
+      .attach_committed = static_cast<std::uint8_t>(handoff.attach_committed),
+      .forward_only = static_cast<std::uint8_t>(handoff.forward_only),
+      .has_candidate = static_cast<std::uint8_t>(handoff.candidate != nullptr),
+      .has_retiring = static_cast<std::uint8_t>(handoff.retiring != nullptr),
+    };
+  }
+
+  /** @brief Fill one association-local baseline snapshot while its mutex is held. */
+  void fill_input_baseline_snapshot_locked(
+    const clsp_core_t &core,
+    clsp_input_baseline_snapshot_t &output
+  ) noexcept {
+    output = {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_input_baseline_snapshot_t),
+      .connection_generation = core.baseline_connection_generation,
+      .input_generation = core.baseline_input_generation,
+      .input_authority_epoch = core.baseline_authority_epoch,
+      .reserved_zero = 0,
+      .event_generation = core.baseline_event_generation,
+      .acknowledged = static_cast<std::uint8_t>(core.baseline_acknowledged),
+      .reserved_tail = {},
+    };
+  }
+
+  /** @brief Publish one ordered non-reentrant phase callback with the state mutex held. */
+  void publish_handoff_phase_locked(clsp_handoff_t *handoff) noexcept {
+    if (handoff->callbacks.phase == nullptr) {
+      return;
+    }
+    std::lock_guard callback_lock(handoff->callback_mutex);
+    handoff_callback_scope callback_scope {handoff};
+    handoff_core_callback_scope core_callback_scope {*handoff};
+    if (!callback_scope.active() || !core_callback_scope.active()) {
+      return;
+    }
+    const auto fence = handoff->fence.snapshot();
+    const clsp_handoff_phase_event_t event {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_handoff_phase_event_t),
+      .phase = handoff->phase,
+      .reason = handoff->reason,
+      .active_connection_generation = fence.active_connection_generation,
+      .active_input_generation = fence.active_input_generation,
+      .candidate_connection_generation = fence.candidate_connection_generation,
+      .baseline_required = static_cast<std::uint8_t>(handoff->baseline_required),
+      .forward_only = static_cast<std::uint8_t>(handoff->forward_only),
+      .reserved_zero = {},
+    };
+    handoff->callbacks.phase(handoff->callbacks.context, &event);
+  }
+
+  /** @brief Publish one ordered non-reentrant baseline callback with the state mutex held. */
+  void publish_handoff_baseline_locked(
+    clsp_handoff_t *handoff,
+    const std::uint32_t kind,
+    const std::uint32_t input_generation
+  ) noexcept {
+    if (handoff->callbacks.baseline == nullptr) {
+      return;
+    }
+    std::lock_guard callback_lock(handoff->callback_mutex);
+    handoff_callback_scope callback_scope {handoff};
+    handoff_core_callback_scope core_callback_scope {*handoff};
+    if (!callback_scope.active() || !core_callback_scope.active()) {
+      return;
+    }
+    const clsp_handoff_baseline_event_t event {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_handoff_baseline_event_t),
+      .kind = kind,
+      .input_generation = input_generation,
+      .input_authority_epoch = handoff->baseline_authority_epoch,
+      .connection_generation = handoff->baseline_connection_generation,
+      .rollback_connection_generation = handoff->baseline_rollback_generation,
+      .reserved_zero = 0,
+    };
+    handoff->callbacks.baseline(handoff->callbacks.context, &event);
+  }
+
+  /** @brief Publish one ordered non-reentrant reconnect/rekey callback. */
+  void publish_handoff_rekey_locked(clsp_handoff_t *handoff) noexcept {
+    if (handoff->callbacks.rekey == nullptr) {
+      return;
+    }
+    std::lock_guard callback_lock(handoff->callback_mutex);
+    handoff_callback_scope callback_scope {handoff};
+    handoff_core_callback_scope core_callback_scope {*handoff};
+    if (!callback_scope.active() || !core_callback_scope.active()) {
+      return;
+    }
+    const auto fence = handoff->fence.snapshot();
+    const clsp_handoff_rekey_event_t event {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_handoff_rekey_event_t),
+      .reason = handoff->reason,
+      .candidate_connection_generation = fence.candidate_connection_generation,
+    };
+    handoff->callbacks.rekey(handoff->callbacks.context, &event);
+  }
+
+  /** @brief Publish one ordered latched terminal callback with the state mutex held. */
+  void publish_handoff_terminal_locked(clsp_handoff_t *handoff) noexcept {
+    if (handoff->callbacks.terminal == nullptr || handoff->terminal_reason == 0U) {
+      return;
+    }
+    std::lock_guard callback_lock(handoff->callback_mutex);
+    handoff_callback_scope callback_scope {handoff};
+    handoff_core_callback_scope core_callback_scope {*handoff};
+    if (!callback_scope.active() || !core_callback_scope.active()) {
+      return;
+    }
+    const clsp_handoff_terminal_event_t event {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_handoff_terminal_event_t),
+      .reason = handoff->terminal_reason,
+      .last_connection_generation = handoff->fence.snapshot().active_connection_generation,
+    };
+    handoff->callbacks.terminal(handoff->callbacks.context, &event);
+  }
+
+  /** @brief Enter the terminal forward-only state exactly once. */
+  void enter_handoff_terminal_locked(
+    clsp_handoff_t *handoff,
+    const std::uint32_t terminal_reason
+  ) noexcept {
+    if (handoff->phase == CLSP_HANDOFF_PHASE_TERMINAL) {
+      return;
+    }
+    handoff->phase = CLSP_HANDOFF_PHASE_TERMINAL;
+    handoff->terminal_reason = terminal_reason;
+    handoff->forward_only = true;
+    handoff->baseline_required = false;
+    ++handoff->terminal_count;
+    publish_handoff_phase_locked(handoff);
+    publish_handoff_terminal_locked(handoff);
+  }
+
+  /** @brief Association ownership released and baseline work started by definite rollback. */
+  struct handoff_rollback_work {
+    clsp_core_t *candidate {};  ///< Candidate removed from handoff ownership.
+    clsp_core_t *active {};  ///< Retained old association receiving the fresh baseline.
+    std::uint64_t baseline_id {};  ///< Exact fresh neutral baseline identifier.
+  };
+
+  /** @brief Enter same-wire-generation rollback after old input has been neutralized. */
+  [[nodiscard]] clsp_status_t begin_handoff_rollback_locked(
+    clsp_handoff_t *handoff,
+    handoff_rollback_work &work
+  ) noexcept {
+    if (handoff->candidate == nullptr || !handoff->old_input_neutralized || handoff->active_lost) {
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    const auto before = handoff->fence.snapshot();
+    work.baseline_id = fresh_baseline_id();
+    const auto status = fence_status(handoff->fence.reject_attach(
+      before.candidate_connection_generation,
+      work.baseline_id
+    ));
+    if (status != CLSP_STATUS_OK) {
+      return status;
+    }
+    const auto rollback = handoff->fence.snapshot();
+    work.candidate = handoff->candidate;
+    work.active = handoff->active;
+    clsp_core_retain(work.active);
+    set_core_baseline_authority_epoch(work.active, rollback.rollback_connection_generation);
+    handoff->candidate = nullptr;
+    handoff->candidate_authenticated = false;
+    handoff->candidate_lost = false;
+    handoff->attach_submitted = false;
+    handoff->baseline_required = true;
+    handoff->baseline_generation = rollback.active_input_generation;
+    handoff->baseline_authority_epoch = rollback.rollback_connection_generation;
+    handoff->baseline_connection_generation = rollback.active_connection_generation;
+    handoff->baseline_rollback_generation = rollback.rollback_connection_generation;
+    handoff->phase = CLSP_HANDOFF_PHASE_ROLLBACK_PENDING;
+    publish_handoff_phase_locked(handoff);
+    publish_handoff_baseline_locked(
+      handoff,
+      CLSP_HANDOFF_BASELINE_REQUIRED,
+      handoff->baseline_generation
+    );
+    return CLSP_STATUS_OK;
+  }
+
+  /** @brief Release a rejected candidate and install its exact old-association baseline. */
+  [[nodiscard]] clsp_status_t complete_handoff_rollback(
+    clsp_handoff_t *handoff,
+    const handoff_rollback_work &work,
+    const bool stop_candidate
+  ) noexcept {
+    if (work.candidate != nullptr) {
+      unbind_handoff_observer(work.candidate, handoff->observer);
+      if (stop_candidate) {
+        (void)clsp_core_stop(work.candidate);
+      }
+      clsp_core_release(work.candidate);
+    }
+    if (work.active == nullptr) {
+      return CLSP_STATUS_INTERNAL_FAILURE;
+    }
+    clsp_status_t restart_status = CLSP_STATUS_NOT_AUTHENTICATED;
+    {
+      std::shared_lock runtime_lock(work.active->runtime_mutex);
+      if (work.active->runtime != nullptr) {
+        restart_status = work.active->runtime->restart_input_baseline(work.baseline_id);
+      }
+    }
+    clsp_core_release(work.active);
+    if (restart_status != CLSP_STATUS_OK) {
+      std::lock_guard lock(handoff->mutex);
+      enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_BASELINE_FAILED);
+    }
+    return restart_status;
+  }
 
   /** @brief Invoke one ABI operation while preventing runtime reclamation. */
   template<typename Operation>
@@ -410,12 +1045,56 @@ namespace {
 
   /** @brief Receive one native runtime lifecycle transition. */
   void runtime_lifecycle(void *context, const std::uint32_t state) noexcept {
-    publish_lifecycle(static_cast<clsp_core_t *>(context), state);
+    auto *core = static_cast<clsp_core_t *>(context);
+    publish_lifecycle(core, state);
+    if (state == CLSP_LIFECYCLE_FAILED) {
+      with_handoff_observer(core, [&](clsp_handoff_t *handoff) {
+        (void)clsp_handoff_lost(handoff, core);
+      });
+    }
   }
 
   /** @brief Receive one native authenticated LSPC frame. */
   void runtime_control(void *context, const clsp_control_event_t &event) noexcept {
     publish_control(static_cast<clsp_core_t *>(context), event);
+  }
+
+  /** @brief Receive one authenticated native input-baseline ACK. */
+  void runtime_input_baseline(
+    void *context,
+    const bool acknowledged,
+    const std::uint32_t connection_generation,
+    const std::uint32_t input_generation,
+    const std::uint64_t baseline_id
+  ) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    bool handoff_bound = false;
+    {
+      std::lock_guard observer_lock(core->handoff_observer_mutex);
+      handoff_bound = core->handoff_observer != nullptr;
+    }
+    if (acknowledged) {
+      with_handoff_observer(core, [&](clsp_handoff_t *handoff) {
+        (void)clsp_handoff_acknowledge_baseline(handoff, input_generation, baseline_id);
+      });
+    }
+    {
+      std::lock_guard baseline_lock(core->baseline_mutex);
+      core->baseline_connection_generation = connection_generation;
+      core->baseline_input_generation = input_generation;
+      if (!handoff_bound || core->baseline_authority_epoch == 0U) {
+        core->baseline_authority_epoch = connection_generation;
+      }
+      core->baseline_acknowledged = acknowledged;
+      ++core->baseline_event_generation;
+      if (core->baseline_event_generation == 0U) {
+        ++core->baseline_event_generation;
+      }
+      core->baseline_condition.notify_all();
+    }
+    if (!acknowledged) {
+      return;
+    }
   }
 
   /** @brief Publish one authenticated complete Opus packet. */
@@ -661,6 +1340,631 @@ extern "C" void clsp_core_release(clsp_core_t *core) {
   }
 }
 
+extern "C" clsp_status_t clsp_handoff_create(
+  clsp_core_t *active,
+  const std::uint32_t active_connection_generation,
+  const std::uint32_t active_input_generation,
+  const clsp_handoff_callbacks_t *callbacks,
+  clsp_handoff_t **output
+) {
+  if (active == nullptr || output == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  *output = nullptr;
+  if (callbacks != nullptr &&
+      (callbacks->abi_version != CLSP_CORE_ABI_VERSION ||
+       callbacks->structure_size != sizeof(clsp_handoff_callbacks_t))) {
+    return CLSP_STATUS_ABI_MISMATCH;
+  }
+  if (callbacks != nullptr &&
+      ((callbacks->context == nullptr) !=
+       (callbacks->retain_context == nullptr && callbacks->release_context == nullptr))) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (callbacks != nullptr && callbacks->context != nullptr &&
+      (callbacks->retain_context == nullptr || callbacks->release_context == nullptr)) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+
+  auto *handoff = new (std::nothrow) clsp_handoff_t;
+  auto *observer = new (std::nothrow) clsp_handoff_observer_binding;
+  if (handoff == nullptr || observer == nullptr) {
+    delete observer;
+    delete handoff;
+    return CLSP_STATUS_RESOURCE_EXHAUSTED;
+  }
+  if (const auto status = fence_status(handoff->fence.initialize(
+        active_connection_generation,
+        active_input_generation
+      )); status != CLSP_STATUS_OK) {
+    delete observer;
+    delete handoff;
+    return status;
+  }
+  observer->owner = handoff;
+  handoff->observer = observer;
+  clsp_core_retain(active);
+  {
+    std::lock_guard lock(handoff->mutex);
+    handoff->active = active;
+  }
+  set_core_baseline_authority_epoch(active, handoff->fence.snapshot().input_authority_epoch);
+  if (!bind_handoff_observer(active, observer)) {
+    {
+      std::lock_guard lock(handoff->mutex);
+      handoff->active = nullptr;
+    }
+    clsp_core_release(active);
+    delete observer;
+    delete handoff;
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  if (callbacks != nullptr) {
+    handoff->callbacks = *callbacks;
+    if (handoff->callbacks.context != nullptr) {
+      handoff->callbacks.retain_context(handoff->callbacks.context);
+    }
+  } else {
+    handoff->callbacks.abi_version = CLSP_CORE_ABI_VERSION;
+    handoff->callbacks.structure_size = sizeof(clsp_handoff_callbacks_t);
+  }
+  *output = handoff;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" void clsp_handoff_retain(clsp_handoff_t *handoff) {
+  if (handoff != nullptr) {
+    handoff->references.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+extern "C" void clsp_handoff_release(clsp_handoff_t *handoff) {
+  if (handoff == nullptr) {
+    return;
+  }
+
+  auto *observer = handoff->observer;
+  std::unique_lock observer_lock(observer->mutex);
+  if (handoff->references.fetch_sub(1, std::memory_order_acq_rel) != 1U) {
+    return;
+  }
+  if (observer != nullptr) {
+    observer->owner = nullptr;
+    observer->condition.wait(observer_lock, [&] { return observer->active_calls == 0U; });
+  }
+  observer_lock.unlock();
+
+  clsp_core_t *active = nullptr;
+  clsp_core_t *candidate = nullptr;
+  clsp_core_t *retiring = nullptr;
+  {
+    std::lock_guard lock(handoff->mutex);
+    active = handoff->active;
+    candidate = handoff->candidate;
+    retiring = handoff->retiring;
+    handoff->active = nullptr;
+    handoff->candidate = nullptr;
+    handoff->retiring = nullptr;
+  }
+  unbind_handoff_observer(active, observer);
+  unbind_handoff_observer(candidate, observer);
+  unbind_handoff_observer(retiring, observer);
+  if (handoff->callbacks.context != nullptr) {
+    handoff->callbacks.release_context(handoff->callbacks.context);
+  }
+  clsp_core_release(active);
+  clsp_core_release(candidate);
+  clsp_core_release(retiring);
+  release_observer_binding(observer);
+  delete handoff;
+}
+
+extern "C" clsp_status_t clsp_handoff_begin(
+  clsp_handoff_t *handoff,
+  clsp_core_t *candidate,
+  const std::uint32_t candidate_connection_generation,
+  const std::uint32_t reason
+) {
+  if (handoff == nullptr || candidate == nullptr ||
+      (reason != CLSP_HANDOFF_REASON_TRANSPORT_LOSS && reason != CLSP_HANDOFF_REASON_PLANNED_REKEY)) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (handoff_callback_stack_contains(handoff)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  handoff_call_reference call_reference {handoff};
+  clsp_status_t status = CLSP_STATUS_OK;
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->transition_in_progress || handoff->phase == CLSP_HANDOFF_PHASE_TERMINAL ||
+        handoff->candidate != nullptr || handoff->retiring != nullptr ||
+        candidate == handoff->active) {
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    status = fence_status(handoff->fence.begin_fresh_association(candidate_connection_generation));
+    if (status != CLSP_STATUS_OK) {
+      return status;
+    }
+    clsp_core_retain(candidate);
+    handoff->candidate = candidate;
+    handoff->candidate_authenticated = false;
+    handoff->candidate_lost = false;
+    handoff->old_input_neutralized = false;
+    handoff->baseline_required = false;
+    handoff->attach_committed = false;
+    handoff->attach_submitted = false;
+    handoff->forward_only = false;
+    handoff->reason = reason;
+    handoff->transition_in_progress = true;
+  }
+
+  if (!bind_handoff_observer(candidate, handoff->observer)) {
+    status = CLSP_STATUS_INVALID_STATE;
+  } else {
+    status = quiesce_core_producers(candidate);
+  }
+
+  bool staged = false;
+  {
+    std::lock_guard lock(handoff->mutex);
+    handoff->transition_in_progress = false;
+    if (status == CLSP_STATUS_OK && !handoff->candidate_lost && handoff->candidate == candidate) {
+      handoff->phase = CLSP_HANDOFF_PHASE_CANDIDATE_HANDSHAKE;
+      ++handoff->begun_count;
+      staged = true;
+      publish_handoff_rekey_locked(handoff);
+      publish_handoff_phase_locked(handoff);
+    } else {
+      const auto candidate_generation = handoff->fence.snapshot().candidate_connection_generation;
+      const auto rollback_status = fence_status(handoff->fence.cancel_candidate(candidate_generation));
+      if (status == CLSP_STATUS_OK) {
+        status = rollback_status == CLSP_STATUS_OK ? CLSP_STATUS_INVALID_STATE : rollback_status;
+      }
+      handoff->candidate = nullptr;
+      handoff->candidate_authenticated = false;
+      handoff->candidate_lost = false;
+    }
+  }
+  if (!staged) {
+    unbind_handoff_observer(candidate, handoff->observer);
+    resume_core_producers(candidate);
+    clsp_core_release(candidate);
+  }
+  return status;
+}
+
+extern "C" clsp_status_t clsp_handoff_authenticate(
+  clsp_handoff_t *handoff,
+  const std::uint32_t candidate_connection_generation
+) {
+  if (handoff == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  std::lock_guard lock(handoff->mutex);
+  if (handoff->transition_in_progress || handoff->candidate == nullptr ||
+      handoff->phase != CLSP_HANDOFF_PHASE_CANDIDATE_HANDSHAKE) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  const auto status = fence_status(handoff->fence.mark_candidate_authenticated(candidate_connection_generation));
+  if (status != CLSP_STATUS_OK) return status;
+  handoff->candidate_authenticated = true;
+  handoff->phase = CLSP_HANDOFF_PHASE_CANDIDATE_AUTHENTICATED;
+  publish_handoff_phase_locked(handoff);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_handoff_lost(
+  clsp_handoff_t *handoff,
+  clsp_core_t *association
+) {
+  if (handoff == nullptr || association == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  clsp_core_t *released_candidate = nullptr;
+  handoff_rollback_work rollback_work;
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->phase == CLSP_HANDOFF_PHASE_TERMINAL) return CLSP_STATUS_OK;
+    if (association == handoff->retiring) {
+      return CLSP_STATUS_OK;
+    }
+    if (association == handoff->active) {
+      if (handoff->active_lost) return CLSP_STATUS_OK;
+      handoff->active_lost = true;
+      association->producers_accepting.store(false, std::memory_order_release);
+      if (handoff->attach_committed) {
+        enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_COMMITTED_ASSOCIATION_LOST);
+      } else if (handoff->candidate == nullptr || handoff->phase == CLSP_HANDOFF_PHASE_AUTHORITATIVE) {
+        handoff->phase = CLSP_HANDOFF_PHASE_ACTIVE_LOST;
+        publish_handoff_phase_locked(handoff);
+      } else {
+        publish_handoff_phase_locked(handoff);
+      }
+      return CLSP_STATUS_OK;
+    }
+    if (association != handoff->candidate) return CLSP_STATUS_INVALID_ARGUMENT;
+    if (handoff->transition_in_progress) {
+      handoff->candidate_lost = true;
+      return CLSP_STATUS_OK;
+    }
+    const auto fence = handoff->fence.snapshot();
+    if (!handoff->old_input_neutralized && !handoff->active_lost) {
+      const auto status = fence_status(handoff->fence.cancel_candidate(fence.candidate_connection_generation));
+      if (status != CLSP_STATUS_OK) return status;
+      released_candidate = handoff->candidate;
+      handoff->candidate = nullptr;
+      handoff->candidate_authenticated = false;
+      handoff->phase = CLSP_HANDOFF_PHASE_AUTHORITATIVE;
+      publish_handoff_phase_locked(handoff);
+    } else if (handoff->old_input_neutralized && !handoff->attach_submitted && !handoff->active_lost) {
+      const auto status = begin_handoff_rollback_locked(handoff, rollback_work);
+      if (status != CLSP_STATUS_OK) {
+        enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_BASELINE_FAILED);
+        return status;
+      }
+    } else {
+      if (handoff->old_input_neutralized && handoff->attach_submitted && !handoff->attach_committed) {
+        (void)handoff->fence.mark_attach_outcome_ambiguous(fence.candidate_connection_generation);
+      }
+      enter_handoff_terminal_locked(
+        handoff,
+        handoff->attach_submitted ? CLSP_HANDOFF_TERMINAL_AMBIGUOUS_ATTACH :
+                                    CLSP_HANDOFF_TERMINAL_CANDIDATE_LOST
+      );
+    }
+  }
+  if (released_candidate != nullptr) {
+    unbind_handoff_observer(released_candidate, handoff->observer);
+    clsp_core_release(released_candidate);
+  }
+  if (rollback_work.active == nullptr) return CLSP_STATUS_OK;
+  const auto rollback_status = complete_handoff_rollback(handoff, rollback_work, false);
+  return rollback_status == CLSP_STATUS_OK ? CLSP_STATUS_ROLLBACK_PENDING : rollback_status;
+}
+
+extern "C" clsp_status_t clsp_handoff_neutralize(clsp_handoff_t *handoff) {
+  if (handoff == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  clsp_core_t *active = nullptr;
+  std::uint32_t candidate_generation = 0;
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->transition_in_progress || handoff->candidate == nullptr ||
+        !handoff->candidate_authenticated || handoff->phase != CLSP_HANDOFF_PHASE_CANDIDATE_AUTHENTICATED) {
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    handoff->transition_in_progress = true;
+    active = handoff->active;
+    clsp_core_retain(active);
+    candidate_generation = handoff->fence.snapshot().candidate_connection_generation;
+  }
+
+  const auto quiesce_status = quiesce_core_producers(active);
+  clsp_core_release(active);
+  handoff_rollback_work rollback_work;
+  {
+    std::lock_guard lock(handoff->mutex);
+    handoff->transition_in_progress = false;
+    if (quiesce_status != CLSP_STATUS_OK) {
+      enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_BASELINE_FAILED);
+      return quiesce_status;
+    }
+    if (handoff->candidate == nullptr || handoff->phase != CLSP_HANDOFF_PHASE_CANDIDATE_AUTHENTICATED) {
+      enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_CANDIDATE_LOST);
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    const auto status = fence_status(handoff->fence.neutralize_old_input(candidate_generation));
+    if (status != CLSP_STATUS_OK) {
+      enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_BASELINE_FAILED);
+      return status;
+    }
+    handoff->old_input_neutralized = true;
+    if (handoff->candidate_lost) {
+      if (handoff->active_lost) {
+        enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_CANDIDATE_LOST);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      const auto rollback_status = begin_handoff_rollback_locked(handoff, rollback_work);
+      if (rollback_status != CLSP_STATUS_OK) {
+        enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_BASELINE_FAILED);
+        return rollback_status;
+      }
+    } else {
+      handoff->phase = CLSP_HANDOFF_PHASE_OLD_INPUT_NEUTRALIZED;
+      publish_handoff_phase_locked(handoff);
+      return CLSP_STATUS_OK;
+    }
+  }
+  const auto rollback_status = complete_handoff_rollback(handoff, rollback_work, false);
+  return rollback_status == CLSP_STATUS_OK ? CLSP_STATUS_ROLLBACK_PENDING : rollback_status;
+}
+
+extern "C" clsp_status_t clsp_handoff_submit_attach(
+  clsp_handoff_t *handoff,
+  const std::uint16_t message_type,
+  const std::uint64_t request_id,
+  const clsp_const_byte_span_t payload,
+  const std::uint32_t deadline_milliseconds,
+  clsp_control_submission_t *output
+) {
+  if (output == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  *output = {
+    .abi_version = CLSP_CORE_ABI_VERSION,
+    .structure_size = sizeof(clsp_control_submission_t),
+    .request_id = 0,
+  };
+  if (handoff == nullptr || message_type != 0x0202U || request_id == 0U) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  clsp_core_t *candidate = nullptr;
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->transition_in_progress || handoff->candidate == nullptr || handoff->candidate_lost ||
+        handoff->attach_submitted || handoff->phase != CLSP_HANDOFF_PHASE_OLD_INPUT_NEUTRALIZED) {
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    candidate = handoff->candidate;
+    clsp_core_retain(candidate);
+  }
+
+  clsp_status_t status = CLSP_STATUS_NOT_AUTHENTICATED;
+  std::shared_lock runtime_lock(candidate->runtime_mutex);
+  std::uint64_t reservation_token = 0;
+  if (candidate->runtime != nullptr) {
+    status = candidate->runtime->reserve_control(
+      message_type,
+      request_id,
+      payload,
+      deadline_milliseconds,
+      reservation_token
+    );
+  }
+  if (status != CLSP_STATUS_OK) {
+    runtime_lock.unlock();
+    clsp_core_release(candidate);
+    return status;
+  }
+
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->candidate != candidate || handoff->candidate_lost || handoff->attach_submitted ||
+        handoff->phase != CLSP_HANDOFF_PHASE_OLD_INPUT_NEUTRALIZED) {
+      candidate->runtime->cancel_control_reservation(reservation_token);
+      status = CLSP_STATUS_INVALID_STATE;
+    } else {
+      handoff->attach_submitted = true;
+      handoff->phase = CLSP_HANDOFF_PHASE_ATTACH_SUBMITTED;
+      status = candidate->runtime->commit_control_reservation(reservation_token);
+      if (status == CLSP_STATUS_OK) {
+        output->request_id = request_id;
+        publish_handoff_phase_locked(handoff);
+      } else {
+        handoff->attach_submitted = false;
+        handoff->phase = CLSP_HANDOFF_PHASE_OLD_INPUT_NEUTRALIZED;
+        candidate->runtime->cancel_control_reservation(reservation_token);
+      }
+    }
+  }
+  runtime_lock.unlock();
+  clsp_core_release(candidate);
+  return status;
+}
+
+extern "C" clsp_status_t clsp_handoff_commit(
+  clsp_handoff_t *handoff,
+  const std::uint32_t new_input_generation
+) {
+  if (handoff == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  std::lock_guard lock(handoff->mutex);
+  if (handoff->transition_in_progress || handoff->candidate == nullptr ||
+      handoff->candidate_lost || !handoff->attach_submitted ||
+      handoff->phase != CLSP_HANDOFF_PHASE_ATTACH_SUBMITTED ||
+      handoff->retiring != nullptr) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  const auto candidate_generation = handoff->fence.snapshot().candidate_connection_generation;
+  const auto status = fence_status(handoff->fence.commit_attach(candidate_generation, new_input_generation));
+  if (status != CLSP_STATUS_OK) return status;
+  const auto committed = handoff->fence.snapshot();
+  handoff->retiring = handoff->active;
+  handoff->active = handoff->candidate;
+  set_core_baseline_authority_epoch(handoff->active, committed.input_authority_epoch);
+  handoff->candidate = nullptr;
+  handoff->active_lost = false;
+  handoff->candidate_authenticated = false;
+  handoff->old_input_neutralized = false;
+  handoff->attach_committed = true;
+  handoff->forward_only = true;
+  handoff->baseline_required = true;
+  handoff->baseline_generation = new_input_generation;
+  handoff->baseline_authority_epoch = committed.input_authority_epoch;
+  handoff->baseline_connection_generation = committed.active_connection_generation;
+  handoff->baseline_rollback_generation = 0;
+  handoff->phase = CLSP_HANDOFF_PHASE_COMMITTED_BASELINE;
+  ++handoff->committed_count;
+  publish_handoff_phase_locked(handoff);
+  publish_handoff_baseline_locked(handoff, CLSP_HANDOFF_BASELINE_REQUIRED, new_input_generation);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_handoff_cancel(
+  clsp_handoff_t *handoff,
+  const std::uint32_t kind
+) {
+  if (handoff == nullptr ||
+      (kind != CLSP_HANDOFF_CANCEL_DEFINITE_REJECTION && kind != CLSP_HANDOFF_CANCEL_AMBIGUOUS)) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  clsp_core_t *released_candidate = nullptr;
+  handoff_rollback_work rollback_work;
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->transition_in_progress || handoff->candidate == nullptr || handoff->attach_committed ||
+        handoff->phase == CLSP_HANDOFF_PHASE_TERMINAL) {
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    const auto fence = handoff->fence.snapshot();
+    if (kind == CLSP_HANDOFF_CANCEL_AMBIGUOUS) {
+      if (!handoff->attach_submitted || handoff->phase != CLSP_HANDOFF_PHASE_ATTACH_SUBMITTED) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      const auto status = fence_status(
+        handoff->fence.mark_attach_outcome_ambiguous(fence.candidate_connection_generation)
+      );
+      if (status != CLSP_STATUS_OK) return status;
+      enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_AMBIGUOUS_ATTACH);
+      return CLSP_STATUS_OK;
+    }
+    if (!handoff->old_input_neutralized) {
+      const auto status = fence_status(handoff->fence.cancel_candidate(fence.candidate_connection_generation));
+      if (status != CLSP_STATUS_OK) return status;
+      released_candidate = handoff->candidate;
+      handoff->candidate = nullptr;
+      handoff->candidate_authenticated = false;
+      if (handoff->active_lost) {
+        enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_ACTIVE_LOST);
+      } else {
+        handoff->phase = CLSP_HANDOFF_PHASE_AUTHORITATIVE;
+        resume_core_producers(handoff->active);
+        publish_handoff_phase_locked(handoff);
+      }
+    } else {
+      if (handoff->active_lost) {
+        enter_handoff_terminal_locked(handoff, CLSP_HANDOFF_TERMINAL_BASELINE_FAILED);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      const auto status = begin_handoff_rollback_locked(handoff, rollback_work);
+      if (status != CLSP_STATUS_OK) return status;
+    }
+  }
+
+  if (released_candidate != nullptr) {
+    unbind_handoff_observer(released_candidate, handoff->observer);
+    (void)clsp_core_stop(released_candidate);
+    clsp_core_release(released_candidate);
+  }
+  if (rollback_work.active == nullptr) return CLSP_STATUS_OK;
+  const auto rollback_status = complete_handoff_rollback(handoff, rollback_work, true);
+  return rollback_status == CLSP_STATUS_OK ? CLSP_STATUS_ROLLBACK_PENDING : rollback_status;
+}
+
+extern "C" clsp_status_t clsp_handoff_acknowledge_baseline(
+  clsp_handoff_t *handoff,
+  const std::uint32_t input_generation,
+  const std::uint64_t baseline_id
+) {
+  if (handoff == nullptr || input_generation == 0U || baseline_id == 0U) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  std::lock_guard lock(handoff->mutex);
+  if (!handoff->baseline_required || input_generation != handoff->baseline_generation) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  if (handoff->phase == CLSP_HANDOFF_PHASE_ROLLBACK_PENDING) {
+    const auto fence = handoff->fence.snapshot();
+    const auto status = fence_status(handoff->fence.acknowledge_old_neutral_baseline(
+      fence.active_connection_generation,
+      input_generation,
+      baseline_id
+    ));
+    if (status != CLSP_STATUS_OK) return status;
+    ++handoff->definite_rollback_count;
+    handoff->forward_only = false;
+  } else if (handoff->phase != CLSP_HANDOFF_PHASE_COMMITTED_BASELINE) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  handoff->baseline_required = false;
+  handoff->baseline_generation = 0;
+  handoff->phase = CLSP_HANDOFF_PHASE_AUTHORITATIVE;
+  resume_core_producers(handoff->active);
+  publish_handoff_baseline_locked(handoff, CLSP_HANDOFF_BASELINE_ACKNOWLEDGED, input_generation);
+  publish_handoff_phase_locked(handoff);
+  handoff->baseline_authority_epoch = 0;
+  handoff->baseline_connection_generation = 0;
+  handoff->baseline_rollback_generation = 0;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_handoff_retire(clsp_handoff_t *handoff) {
+  if (handoff == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  handoff_call_reference call_reference {handoff};
+  clsp_core_t *retiring = nullptr;
+  {
+    std::lock_guard lock(handoff->mutex);
+    if (handoff->transition_in_progress || handoff->retiring == nullptr || handoff->baseline_required ||
+        handoff->phase == CLSP_HANDOFF_PHASE_TERMINAL) {
+      return CLSP_STATUS_INVALID_STATE;
+    }
+    const auto retiring_generation = handoff->fence.snapshot().retiring_connection_generation;
+    const auto status = fence_status(handoff->fence.retire_old_association(retiring_generation));
+    if (status != CLSP_STATUS_OK) return status;
+    retiring = handoff->retiring;
+    handoff->retiring = nullptr;
+    publish_handoff_phase_locked(handoff);
+  }
+  unbind_handoff_observer(retiring, handoff->observer);
+  (void)clsp_core_stop(retiring);
+  clsp_core_release(retiring);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_handoff_copy_snapshot(
+  const clsp_handoff_t *handoff,
+  clsp_handoff_snapshot_t *output
+) {
+  if (handoff == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (handoff_callback_stack_contains(handoff)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard lock(handoff->mutex);
+  fill_handoff_snapshot_locked(*handoff, *output);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_core_copy_input_baseline(
+  const clsp_core_t *core,
+  clsp_input_baseline_snapshot_t *output
+) {
+  if (core == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard baseline_lock(core->baseline_mutex);
+  fill_input_baseline_snapshot_locked(*core, *output);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_core_wait_input_baseline(
+  const clsp_core_t *core,
+  const std::uint32_t input_generation,
+  const std::uint32_t timeout_milliseconds,
+  clsp_input_baseline_snapshot_t *output
+) {
+  if (core == nullptr || output == nullptr || input_generation == 0U ||
+      timeout_milliseconds == 0U || timeout_milliseconds > 30'000U) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::unique_lock baseline_lock(core->baseline_mutex);
+  const auto ready = core->baseline_condition.wait_for(
+    baseline_lock,
+    std::chrono::milliseconds {timeout_milliseconds},
+    [&] {
+      return core->baseline_acknowledged && core->baseline_input_generation == input_generation;
+    }
+  );
+  fill_input_baseline_snapshot_locked(*core, *output);
+  return ready ? CLSP_STATUS_OK : CLSP_STATUS_TIMEOUT;
+}
+
 extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_t *endpoint) {
   if (core == nullptr || endpoint == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
@@ -698,6 +2002,7 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
       .control = runtime_control,
       .counter = runtime_counter,
       .controller_output = runtime_controller_output,
+      .input_baseline = runtime_input_baseline,
       .audio_packet = runtime_audio_packet,
       .audio_timing = runtime_audio_timing,
       .video_frame = runtime_video_frame,
@@ -713,6 +2018,11 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
     delete core->runtime;
     core->runtime = nullptr;
     core->state.store(CLSP_LIFECYCLE_FAILED, std::memory_order_release);
+  } else {
+    std::lock_guard observer_lock(core->handoff_observer_mutex);
+    if (core->handoff_observer == nullptr) {
+      resume_core_producers(core);
+    }
   }
   return status;
 }
@@ -724,23 +2034,23 @@ extern "C" clsp_status_t clsp_core_stop(clsp_core_t *core) {
   if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
+  const auto quiesce_status = quiesce_core_producers(core);
   std::unique_lock runtime_lock(core->runtime_mutex);
   const auto prior_state = core->state.load(std::memory_order_acquire);
   if (core->runtime == nullptr) {
-    return prior_state == CLSP_LIFECYCLE_STOPPED || prior_state == CLSP_LIFECYCLE_FAILED ?
-             CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
-  }
-  if (prior_state != CLSP_LIFECYCLE_AUTHENTICATED && prior_state != CLSP_LIFECYCLE_FAILED) {
-    return CLSP_STATUS_INVALID_STATE;
+    if (prior_state != CLSP_LIFECYCLE_FAILED) {
+      core->state.store(CLSP_LIFECYCLE_STOPPED, std::memory_order_release);
+    }
+    return quiesce_status;
   }
   const auto status = core->runtime->stop();
   delete core->runtime;
   core->runtime = nullptr;
   if (prior_state == CLSP_LIFECYCLE_FAILED) {
     core->state.store(CLSP_LIFECYCLE_FAILED, std::memory_order_release);
-    return CLSP_STATUS_OK;
+    return quiesce_status == CLSP_STATUS_OK ? CLSP_STATUS_OK : quiesce_status;
   }
-  return status;
+  return quiesce_status == CLSP_STATUS_OK ? status : quiesce_status;
 }
 
 extern "C" clsp_status_t clsp_core_send_control(
@@ -988,9 +2298,11 @@ extern "C" clsp_status_t clsp_core_submit_pointer(
   if (core == nullptr || sample == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_pointer(*sample); });
 }
 
@@ -1001,9 +2313,11 @@ extern "C" clsp_status_t clsp_core_submit_input_edge(
   if (core == nullptr || edge == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_input_edge(*edge); });
 }
 
@@ -1022,6 +2336,9 @@ extern "C" clsp_status_t clsp_core_submit_controller_edge(
   const clsp_controller_edge_t *edge
 ) {
   if (core == nullptr || edge == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_edge(*edge); });
 }
 
@@ -1030,6 +2347,9 @@ extern "C" clsp_status_t clsp_core_submit_controller_state(
   const clsp_controller_state_t *state
 ) {
   if (core == nullptr || state == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_state(*state); });
 }
 
@@ -1038,6 +2358,9 @@ extern "C" clsp_status_t clsp_core_submit_controller_sensor(
   const clsp_controller_sensor_t *sensor
 ) {
   if (core == nullptr || sensor == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_sensor(*sensor); });
 }
 
@@ -1046,6 +2369,9 @@ extern "C" clsp_status_t clsp_core_submit_controller_touch_edge(
   const clsp_controller_touch_edge_t *edge
 ) {
   if (core == nullptr || edge == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_touch_edge(*edge); });
 }
 
@@ -1054,6 +2380,9 @@ extern "C" clsp_status_t clsp_core_submit_controller_touch_state(
   const clsp_controller_touch_state_t *state
 ) {
   if (core == nullptr || state == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_controller_touch_state(*state); });
 }
 
@@ -1063,7 +2392,7 @@ extern "C" bool clsp_core_register_apple_capture(
 ) {
   if (core == nullptr || capture == nullptr) return false;
   std::lock_guard lock(core->apple_capture_mutex);
-  if (core->apple_capture != nullptr) return false;
+  if (core->apple_capture != nullptr || !core->producers_accepting.load(std::memory_order_acquire)) return false;
   core->apple_capture = capture;
   return true;
 }
@@ -1183,6 +2512,8 @@ extern "C" const char *clsp_status_description(const clsp_status_t status) {
       return "macOS denied native LSP input capture";
     case CLSP_STATUS_INPUT_UNAVAILABLE:
       return "native LSP input capture is unavailable";
+    case CLSP_STATUS_ROLLBACK_PENDING:
+      return "input rollback baseline acknowledgement is pending";
   }
   return "unknown LSP status";
 }

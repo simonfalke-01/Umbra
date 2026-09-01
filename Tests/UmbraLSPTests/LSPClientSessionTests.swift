@@ -364,6 +364,27 @@ final class LSPClientSessionTests: XCTestCase {
         XCTAssertThrowsError(try LSPControlWire.streamEnded(from: invalid))
     }
 
+    func testAttachUsesClientSelectedSuccessorTokenInExactFiveKeyMap() throws {
+        let current = Data(repeating: 0x11, count: 32)
+        let successor = Data(repeating: 0x22, count: 32)
+        let encoded = try LSPControlWire.attach(.init(
+            sessionID: UUID(),
+            attachToken: current,
+            intentID: UUID(),
+            successorAttachToken: successor
+        ))
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(encoded), count: 5)
+        XCTAssertEqual(values[0], .unsigned(1))
+        XCTAssertEqual(values[2], .bytes(current))
+        XCTAssertEqual(values[4], .bytes(successor))
+        XCTAssertThrowsError(try LSPControlWire.attach(.init(
+            sessionID: UUID(),
+            attachToken: current,
+            intentID: UUID(),
+            successorAttachToken: current
+        )))
+    }
+
     private static func videoSelection(
         codec: UInt64,
         profile: UInt64,

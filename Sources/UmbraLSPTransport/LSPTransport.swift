@@ -87,6 +87,64 @@ public enum LSPTransportLifecycle: UInt32, Sendable {
     case failed = 4
 }
 
+/// Native handoff reason mirrored from the versioned C ABI.
+public enum LSPNativeHandoffReason: UInt32, Sendable {
+    case transportLoss = 1
+    case plannedRekey = 2
+}
+
+/// Native reconnect authority phase copied at telemetry frequency.
+public enum LSPNativeHandoffPhase: UInt32, Sendable {
+    case authoritative = 1
+    case activeLost = 2
+    case candidateHandshake = 3
+    case candidateAuthenticated = 4
+    case oldInputNeutralized = 5
+    case attachSubmitted = 6
+    case rollbackPending = 7
+    case committedBaseline = 8
+    case terminal = 9
+}
+
+/// Secret-free native handoff snapshot.
+public struct LSPNativeHandoffSnapshot: Sendable, Equatable {
+    public var phase: LSPNativeHandoffPhase
+    public var activeConnectionGeneration: UInt32
+    public var activeInputGeneration: UInt32
+    public var candidateConnectionGeneration: UInt32
+    public var inputAuthorityEpoch: UInt32
+    public var connectionGenerationHighWatermark: UInt32
+    public var rollbackConnectionGeneration: UInt32
+    public var retiringConnectionGeneration: UInt32
+    public var baselineRequired: Bool
+    public var forwardOnly: Bool
+    public var committedCount: UInt64
+    public var rollbackCount: UInt64
+    public var terminalCount: UInt64
+}
+
+public enum LSPNativeBaselineEventKind: UInt32, Sendable {
+    case required = 1
+    case acknowledged = 2
+}
+
+public struct LSPNativeBaselineEvent: Sendable, Equatable {
+    public var kind: LSPNativeBaselineEventKind
+    public var inputGeneration: UInt32
+    public var inputAuthorityEpoch: UInt32
+    public var connectionGeneration: UInt32
+    public var rollbackConnectionGeneration: UInt32
+}
+
+/// Association-local baseline readiness that does not claim a handoff observer.
+public struct LSPNativeInputBaselineSnapshot: Sendable, Equatable {
+    public var connectionGeneration: UInt32
+    public var inputGeneration: UInt32
+    public var inputAuthorityEpoch: UInt32
+    public var eventGeneration: UInt64
+    public var acknowledged: Bool
+}
+
 /// Authenticated version-one LSPC flags.
 public struct LSPControlFlags: OptionSet, Equatable, Sendable {
     public let rawValue: UInt8
@@ -440,6 +498,7 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
     case timeout
     case inputPermissionDenied
     case inputUnavailable
+    case rollbackPending
     case unknownStatus(Int32)
 
     public var errorDescription: String? {
@@ -484,6 +543,8 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
             "macOS denied preferred raw HID input capture."
         case .inputUnavailable:
             "Preferred native input capture is unavailable."
+        case .rollbackPending:
+            "Native input rollback is waiting for the fresh baseline acknowledgement."
         case .unknownStatus(let status):
             "The LSP native core returned unknown status \(status)."
         }
@@ -499,14 +560,14 @@ public final class LSPTransport: @unchecked Sendable {
     public static let abiVersion: UInt32 = 2
 
     /// Expected source digest for the pinned Photon portable protocol core.
-    public static let sourceDigest = "1aeb5b57f3812c957dd35877954b0a27edbcfeeb3555dc2853024e0257a55d41"
+    public static let sourceDigest = "27c71a42a6613fa2b3c8c9f42c986231311371fd9ece62405b9426e66d2757f6"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {
         LSPTransportProviders(rawValue: clsp_core_provider_flags())
     }
 
-    private let core: OpaquePointer
+    fileprivate let core: OpaquePointer
     private let callbackState: LSPNativeCallbackState
 
     /// Validates ABI and source identity, then creates an inactive native handle.
@@ -616,11 +677,55 @@ public final class LSPTransport: @unchecked Sendable {
         )
     }
 
+    /// Copies association-local baseline readiness without claiming an exclusive handoff observer.
+    public func inputBaselineSnapshot() throws -> LSPNativeInputBaselineSnapshot {
+        var native = clsp_input_baseline_snapshot_t()
+        try Self.requireSuccess(clsp_core_copy_input_baseline(core, &native))
+        return try Self.inputBaselineSnapshot(from: native)
+    }
+
+    /// Waits off-actor for one exact input generation's authenticated baseline ACK.
+    public func waitForInputBaseline(
+        inputGeneration: UInt32,
+        timeout: Duration = .seconds(2)
+    ) async throws -> LSPNativeInputBaselineSnapshot {
+        let timeoutMilliseconds = try Self.milliseconds(timeout, minimum: 1, maximum: 30_000)
+        return try await Task.detached(priority: .userInitiated) { [self] in
+            var native = clsp_input_baseline_snapshot_t()
+            try Self.requireSuccess(clsp_core_wait_input_baseline(
+                core,
+                inputGeneration,
+                timeoutMilliseconds,
+                &native
+            ))
+            return try Self.inputBaselineSnapshot(from: native)
+        }.value
+    }
+
+    private static func inputBaselineSnapshot(
+        from native: clsp_input_baseline_snapshot_t
+    ) throws -> LSPNativeInputBaselineSnapshot {
+        guard native.abi_version == abiVersion,
+              native.structure_size == MemoryLayout<clsp_input_baseline_snapshot_t>.size,
+              native.reserved_zero == 0,
+              withUnsafeBytes(of: native.reserved_tail, { $0.allSatisfy { $0 == 0 } }) else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            connectionGeneration: native.connection_generation,
+            inputGeneration: native.input_generation,
+            inputAuthorityEpoch: native.input_authority_epoch,
+            eventGeneration: native.event_generation,
+            acknowledged: native.acknowledged != 0
+        )
+    }
+
     /// Sends one deterministic-CBOR LSP request and awaits its authenticated response.
     public func request(
         messageType: UInt16,
         payload: Data,
-        timeout: Duration = .seconds(2)
+        timeout: Duration = .seconds(2),
+        onSubmissionAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> LSPControlEvent {
         guard messageType != 0, payload.count <= 1_100 else {
             throw LSPTransportError.invalidConfiguration
@@ -649,8 +754,46 @@ public final class LSPTransport: @unchecked Sendable {
             }
             do {
                 try Self.requireSuccess(status)
+                try onSubmissionAccepted?()
             } catch {
                 callbackState.fail(requestID: requestID, error: error as? LSPTransportError ?? .internalFailure)
+                return
+            }
+            Task.detached { [callbackState] in
+                try? await Task.sleep(for: timeout)
+                callbackState.fail(requestID: requestID, error: .timeout)
+            }
+        }
+    }
+
+    /// Atomically admits one ATTACH through its native handoff and awaits the authenticated response.
+    public func requestAttach(
+        handoff: LSPNativeHandoff,
+        messageType: UInt16,
+        payload: Data,
+        timeout: Duration = .seconds(2),
+        onSubmissionAccepted: (@Sendable () -> Void)? = nil
+    ) async throws -> LSPControlEvent {
+        guard messageType == 0x0202, payload.count <= 1_100 else {
+            throw LSPTransportError.invalidConfiguration
+        }
+        let deadlineMilliseconds = try Self.milliseconds(timeout, minimum: 20, maximum: 30_000)
+        let requestID = callbackState.reserveRequestID()
+        return try await withCheckedThrowingContinuation { continuation in
+            callbackState.install(requestID: requestID) { result in continuation.resume(with: result) }
+            do {
+                try handoff.submitAttach(
+                    messageType: messageType,
+                    requestID: requestID,
+                    payload: payload,
+                    deadlineMilliseconds: deadlineMilliseconds
+                )
+                onSubmissionAccepted?()
+            } catch {
+                callbackState.fail(
+                    requestID: requestID,
+                    error: error as? LSPTransportError ?? .internalFailure
+                )
                 return
             }
             Task.detached { [callbackState] in
@@ -1057,7 +1200,7 @@ public final class LSPTransport: @unchecked Sendable {
         return UInt32(total.partialValue)
     }
 
-    private static func requireSuccess(_ status: clsp_status_t) throws {
+    fileprivate static func requireSuccess(_ status: clsp_status_t) throws {
         switch status {
         case CLSP_STATUS_OK:
             return
@@ -1099,9 +1242,263 @@ public final class LSPTransport: @unchecked Sendable {
             throw LSPTransportError.inputPermissionDenied
         case CLSP_STATUS_INPUT_UNAVAILABLE:
             throw LSPTransportError.inputUnavailable
+        case CLSP_STATUS_ROLLBACK_PENDING:
+            throw LSPTransportError.rollbackPending
         default:
             throw LSPTransportError.unknownStatus(Int32(status.rawValue))
         }
+    }
+}
+
+private final class LSPNativeHandoffCallbackState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var baseline: LSPNativeBaselineEvent?
+
+    func receive(_ event: LSPNativeBaselineEvent) {
+        lock.withLock { baseline = event }
+    }
+
+    func latestBaseline() -> LSPNativeBaselineEvent? {
+        lock.withLock { baseline }
+    }
+}
+
+private let lspRetainHandoffCallbackContext: @convention(c) (UnsafeMutableRawPointer?) -> Void = { context in
+    guard let context else { return }
+    _ = Unmanaged<LSPNativeHandoffCallbackState>.fromOpaque(context).retain()
+}
+
+private let lspReleaseHandoffCallbackContext: @convention(c) (UnsafeMutableRawPointer?) -> Void = { context in
+    guard let context else { return }
+    Unmanaged<LSPNativeHandoffCallbackState>.fromOpaque(context).release()
+}
+
+private let lspHandoffBaselineCallback: @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<clsp_handoff_baseline_event_t>?
+) -> Void = { context, nativeEvent in
+    guard let context, let nativeEvent else { return }
+    let native = nativeEvent.pointee
+    guard native.abi_version == LSPTransport.abiVersion,
+          native.structure_size == MemoryLayout<clsp_handoff_baseline_event_t>.size,
+          native.reserved_zero == 0,
+          let kind = LSPNativeBaselineEventKind(rawValue: native.kind) else { return }
+    Unmanaged<LSPNativeHandoffCallbackState>.fromOpaque(context).takeUnretainedValue().receive(.init(
+        kind: kind,
+        inputGeneration: native.input_generation,
+        inputAuthorityEpoch: native.input_authority_epoch,
+        connectionGeneration: native.connection_generation,
+        rollbackConnectionGeneration: native.rollback_connection_generation
+    ))
+}
+
+/// Swift owner for one native reconnect/rekey authority transaction.
+public final class LSPNativeHandoff: @unchecked Sendable {
+    private let handleLock = NSLock()
+    private var handle: OpaquePointer?
+    private let callbackState = LSPNativeHandoffCallbackState()
+
+    public init(
+        active: LSPTransport,
+        activeConnectionGeneration: UInt32,
+        activeInputGeneration: UInt32
+    ) throws {
+        var callbacks = clsp_handoff_callbacks_t()
+        callbacks.abi_version = LSPTransport.abiVersion
+        callbacks.structure_size = UInt32(MemoryLayout<clsp_handoff_callbacks_t>.size)
+        callbacks.context = Unmanaged.passUnretained(callbackState).toOpaque()
+        callbacks.retain_context = lspRetainHandoffCallbackContext
+        callbacks.release_context = lspReleaseHandoffCallbackContext
+        callbacks.baseline = lspHandoffBaselineCallback
+        var output: OpaquePointer?
+        try LSPTransport.requireSuccess(clsp_handoff_create(
+            active.core,
+            activeConnectionGeneration,
+            activeInputGeneration,
+            &callbacks,
+            &output
+        ))
+        guard let output else { throw LSPTransportError.internalFailure }
+        handle = output
+    }
+
+    deinit { releaseBindings() }
+
+    public func releaseBindings() {
+        let released = handleLock.withLock { () -> OpaquePointer? in
+            defer { handle = nil }
+            return handle
+        }
+        if let released { clsp_handoff_release(released) }
+    }
+
+    private func withHandle<Result>(
+        _ operation: (OpaquePointer) throws -> Result
+    ) throws -> Result {
+        try handleLock.withLock {
+            guard let handle else { throw LSPTransportError.invalidState }
+            return try operation(handle)
+        }
+    }
+
+    public func begin(
+        candidate: LSPTransport,
+        connectionGeneration: UInt32,
+        reason: LSPNativeHandoffReason
+    ) throws {
+        try withHandle { handle in
+            try LSPTransport.requireSuccess(clsp_handoff_begin(
+                handle,
+                candidate.core,
+                connectionGeneration,
+                reason.rawValue
+            ))
+        }
+    }
+
+    public func authenticate(connectionGeneration: UInt32) throws {
+        try withHandle { handle in
+            try LSPTransport.requireSuccess(clsp_handoff_authenticate(handle, connectionGeneration))
+        }
+    }
+
+    public func markActiveLost(_ active: LSPTransport) throws {
+        try withHandle { handle in
+            try LSPTransport.requireSuccess(clsp_handoff_lost(handle, active.core))
+        }
+    }
+
+    public func neutralize() throws {
+        try withHandle { handle in try LSPTransport.requireSuccess(clsp_handoff_neutralize(handle)) }
+    }
+
+    /// Marks accepted native ATTACH admission before awaiting its response.
+    fileprivate func submitAttach(
+        messageType: UInt16,
+        requestID: UInt64,
+        payload: Data,
+        deadlineMilliseconds: UInt32
+    ) throws {
+        try payload.withUnsafeBytes { bytes in
+            var output = clsp_control_submission_t()
+            try withHandle { handle in
+                try LSPTransport.requireSuccess(clsp_handoff_submit_attach(
+                    handle,
+                    messageType,
+                    requestID,
+                    clsp_const_byte_span_t(
+                        data: bytes.bindMemory(to: UInt8.self).baseAddress,
+                        length: bytes.count
+                    ),
+                    deadlineMilliseconds,
+                    &output
+                ))
+            }
+            guard output.abi_version == LSPTransport.abiVersion,
+                  output.structure_size == MemoryLayout<clsp_control_submission_t>.size,
+                  output.request_id == requestID else {
+                throw LSPTransportError.internalFailure
+            }
+        }
+    }
+
+    public func commit(inputGeneration: UInt32) throws {
+        try withHandle { handle in try LSPTransport.requireSuccess(clsp_handoff_commit(handle, inputGeneration)) }
+    }
+
+    public func cancelDefiniteRejection() throws {
+        try withHandle { handle in
+            try LSPTransport.requireSuccess(clsp_handoff_cancel(
+                handle,
+                UInt32(CLSP_HANDOFF_CANCEL_DEFINITE_REJECTION.rawValue)
+            ))
+        }
+    }
+
+    public func cancelAmbiguous() throws {
+        try withHandle { handle in
+            try LSPTransport.requireSuccess(clsp_handoff_cancel(
+                handle,
+                UInt32(CLSP_HANDOFF_CANCEL_AMBIGUOUS.rawValue)
+            ))
+        }
+    }
+
+    public func retire() throws {
+        try withHandle { handle in try LSPTransport.requireSuccess(clsp_handoff_retire(handle)) }
+    }
+
+    public func snapshot() throws -> LSPNativeHandoffSnapshot {
+        var native = clsp_handoff_snapshot_t()
+        try withHandle { handle in
+            try LSPTransport.requireSuccess(clsp_handoff_copy_snapshot(handle, &native))
+        }
+        guard native.abi_version == LSPTransport.abiVersion,
+              native.structure_size == MemoryLayout<clsp_handoff_snapshot_t>.size,
+              let phase = LSPNativeHandoffPhase(rawValue: native.phase) else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            phase: phase,
+            activeConnectionGeneration: native.active_connection_generation,
+            activeInputGeneration: native.active_input_generation,
+            candidateConnectionGeneration: native.candidate_connection_generation,
+            inputAuthorityEpoch: native.input_authority_epoch,
+            connectionGenerationHighWatermark: native.connection_generation_high_watermark,
+            rollbackConnectionGeneration: native.rollback_connection_generation,
+            retiringConnectionGeneration: native.retiring_connection_generation,
+            baselineRequired: native.baseline_required != 0,
+            forwardOnly: native.forward_only != 0,
+            committedCount: native.committed_count,
+            rollbackCount: native.definite_rollback_count,
+            terminalCount: native.terminal_count
+        )
+    }
+
+    public func latestBaselineEvent() -> LSPNativeBaselineEvent? {
+        callbackState.latestBaseline()
+    }
+
+    public func waitForBaseline(
+        inputGeneration: UInt32,
+        timeout: Duration = .seconds(2)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            let value = try snapshot()
+            let baseline = latestBaselineEvent()
+            if Self.completedBaselineMatches(
+                event: baseline,
+                snapshot: value,
+                inputGeneration: inputGeneration
+            ) {
+                return
+            }
+            guard value.phase != .terminal else { throw LSPTransportError.invalidState }
+            guard clock.now < deadline else { throw LSPTransportError.timeout }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    static func completedBaselineMatches(
+        event: LSPNativeBaselineEvent?,
+        snapshot: LSPNativeHandoffSnapshot,
+        inputGeneration: UInt32
+    ) -> Bool {
+        guard let event,
+              !snapshot.baselineRequired,
+              snapshot.activeInputGeneration == inputGeneration,
+              event.kind == .acknowledged,
+              event.inputGeneration == inputGeneration,
+              event.inputAuthorityEpoch == snapshot.inputAuthorityEpoch,
+              event.connectionGeneration == snapshot.activeConnectionGeneration,
+              snapshot.phase == .authoritative else { return false }
+        if event.rollbackConnectionGeneration == 0 {
+            return snapshot.rollbackConnectionGeneration == 0
+        }
+        return snapshot.rollbackConnectionGeneration == 0 &&
+            event.rollbackConnectionGeneration == snapshot.inputAuthorityEpoch
     }
 }
 
