@@ -74,19 +74,25 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
     public var address: String
     public var port: UInt16
     public var lastSeen: Date
+    public var discoveryDomain: String?
+    public var interfaceName: String?
 
     public init(
         hostID: UUID,
         name: String,
         address: String,
         port: UInt16 = 48_030,
-        lastSeen: Date
+        lastSeen: Date,
+        discoveryDomain: String? = nil,
+        interfaceName: String? = nil
     ) {
         self.hostID = hostID
         self.name = name
         self.address = address
         self.port = port
         self.lastSeen = lastSeen
+        self.discoveryDomain = discoveryDomain
+        self.interfaceName = interfaceName
     }
 
     public func validate() throws {
@@ -98,6 +104,16 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
         }
         guard port != 0 else {
             throw ModelValidationError(field: "lspHost.port", reason: "must be nonzero")
+        }
+        if let discoveryDomain {
+            guard !discoveryDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ModelValidationError(field: "lspHost.discoveryDomain", reason: "must not be empty")
+            }
+        }
+        if let interfaceName {
+            guard !interfaceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ModelValidationError(field: "lspHost.interfaceName", reason: "must not be empty")
+            }
         }
     }
 }
@@ -252,5 +268,48 @@ public enum LSPPersistence {
         let generated = LSPClientIdentity.generate()
         try await store.save(LSPClientIdentitySnapshot(identity: generated))
         return generated
+    }
+}
+
+enum LSPPairingPersistenceTransactionError: Error {
+    case rollbackFailed
+}
+
+enum LSPPairingPersistenceTransaction {
+    static func commit(
+        trust: LSPTrustRecord,
+        host: LSPHostRecord,
+        trustStore: JSONFileStore<LSPTrustSnapshot>,
+        hostStore: JSONFileStore<LSPHostSnapshot>,
+        afterTrustWrite: @Sendable () throws -> Void = {}
+    ) async throws {
+        let originalTrust = try await trustStore.load()
+        let originalHosts = try await hostStore.load()
+        var updatedTrust = originalTrust
+        updatedTrust.records.removeAll { $0.hostID == trust.hostID }
+        updatedTrust.records.append(trust)
+        var updatedHosts = originalHosts
+        updatedHosts.records.removeAll { $0.hostID == host.hostID }
+        updatedHosts.records.append(host)
+
+        try await trustStore.save(updatedTrust)
+        do {
+            try afterTrustWrite()
+            try await hostStore.save(updatedHosts)
+        } catch {
+            do {
+                _ = try await trustStore.update { current in
+                    var restored = current
+                    restored.records.removeAll { $0.hostID == trust.hostID }
+                    if let prior = originalTrust.records.first(where: { $0.hostID == trust.hostID }) {
+                        restored.records.append(prior)
+                    }
+                    return restored
+                }
+            } catch {
+                throw LSPPairingPersistenceTransactionError.rollbackFailed
+            }
+            throw error
+        }
     }
 }

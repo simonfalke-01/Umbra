@@ -22,7 +22,7 @@ UmbraApp
             +-- UmbraMedia -> VideoToolbox + Metal + AudioQueue
             +-- UmbraOpus / UmbraMicrophone
     +-- UmbraLSP -> UmbraLSPTransport -> CLSPCore
-          native discovery, invitation pairing, auth, and app browsing
+          native discovery, six-digit PIN pairing, auth, and app browsing
           over raw UDP + kqueue + wolfSSL DTLS 1.3 + libSRTP
 ```
 
@@ -38,8 +38,9 @@ textures without a CPU pixel copy. AudioQueue is the production PCM output
 path.
 
 The separate native LSP path owns `_lumen-stream._udp` discovery, strict
-invitation import, a stable owner-private LSP-only Ed25519 identity, fresh LSP
-trust, a nonblocking UDP/kqueue worker, exact-policy wolfSSL 5.9.2 DTLS 1.3,
+`pair=pin1` metadata validation, a stable owner-private LSP-only Ed25519
+identity, fresh LSP trust, a nonblocking UDP/kqueue worker, exact-policy
+wolfSSL 5.9.2 DTLS 1.3,
 SPKI pinning, DTLS-SRTP export, libSRTP 2.8.0 replay/authentication contexts,
 reliable LSPC control, and the input-only START slice. Swift receives
 authenticated control responses, not UDP packets. Pairing, reconnect
@@ -54,6 +55,16 @@ lifecycle/coordinates use the same controller generation. Authenticated LSPG
 applies LED, reusable CoreHaptics intensity, DualSense adaptive triggers,
 motion-sensor state, and player slot on the native controller queue; unsupported
 primitives return an explicit retry-safe terminal ACK.
+
+LSP discovery resolves each Bonjour service through Network.framework and uses
+the selected SRV target, port, domain, and interface scope. TXT data never
+supplies or overrides the transport port. Pairing snapshots that resolved
+endpoint and provisional SPKI; identity, SPKI, or endpoint changes are
+quarantined until the attempt ends, then published immediately as a registry
+replacement or removal. Each attempt owns its absolute-expiry cleanup, which
+cancels the session and zeroizes abandoned native PIN/PAKE state. The UI labels
+the mDNS service name as unverified and shows a grouped provisional SPKI
+fingerprint beside the PIN.
 
 Transport loss and planned rekey share one product reconnect path. Umbra first
 establishes and authenticates a fresh UDP/DTLS association, synchronously
@@ -144,8 +155,15 @@ certificates are pinned.
 
 LSP uses separate `lsp-client-identity-v1.json`, `lsp-trust-v1.json`, and
 `lsp-hosts-v1.json` owner-private atomic files. It never reuses legacy identity
-or trust. The invitation/stored leaf SubjectPublicKeyInfo digest is checked
-before control or SRTP authority is exposed.
+or trust. A discovered provisional leaf SubjectPublicKeyInfo digest is checked
+before pairing control is exposed, and the native six-digit PIN transaction
+binds the authenticated host identity, DTLS association, requested and effective
+permissions, 120-second approval, and PAKE confirmations before trust is saved.
+The PIN is displayed locally, preserves leading zeroes, and is never logged,
+accepted in a URL or command argument, or persisted.
+Trust and host records commit as one recoverable product transaction: a failed
+second write rolls back the first, while the already verified pairing result is
+retained for a persistence-only retry.
 
 ## Measurement boundaries
 

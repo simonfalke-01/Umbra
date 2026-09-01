@@ -1,10 +1,123 @@
 import XCTest
 import UmbraCore
 import UmbraMedia
+import UmbraNetworking
 @testable import UmbraLSP
 @testable import UmbraLSPTransport
 
 final class LSPClientSessionTests: XCTestCase {
+    func testPINPairingWireUsesExactFrozenMaps() throws {
+        let clientID = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        let sessionID = UUID(uuidString: "ffeeddcc-bbaa-9988-7766-554433221100")!
+        let permissions: LSPPermission = [.browseApplications, .input, .controllerOutput]
+        let begin = try LSPControlWire.pairBegin(
+            clientID: clientID,
+            clientIdentityKey: Data(repeating: 0x11, count: 32),
+            clientName: "Umbra",
+            clientPairingNonce: Data(repeating: 0x22, count: 16),
+            scryptSalt: Data(repeating: 0x33, count: 16),
+            clientPublicValue: Data([0x04]) + Data(repeating: 0x44, count: 64),
+            requestedPermissions: permissions
+        )
+        let beginValues = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(begin), count: 9)
+        XCTAssertEqual(beginValues[0], .unsigned(1))
+        XCTAssertEqual(beginValues[1], .unsigned(1))
+        XCTAssertEqual(beginValues[2], .bytes(LSPControlWire.uuidBytes(clientID)))
+        XCTAssertEqual(beginValues[4], .text("Umbra"))
+        XCTAssertEqual(beginValues[8], .unsigned(UInt64(permissions.rawValue)))
+
+        let pollValues = try DeterministicCBOR.exactMap(
+            DeterministicCBOR.decode(try LSPControlWire.pairPoll(sessionID: sessionID)),
+            count: 3
+        )
+        XCTAssertEqual(pollValues, [
+            .unsigned(1),
+            .unsigned(1),
+            .bytes(LSPControlWire.uuidBytes(sessionID)),
+        ])
+
+        let finishValues = try DeterministicCBOR.exactMap(
+            DeterministicCBOR.decode(try LSPControlWire.pairFinish(
+                sessionID: sessionID,
+                approvalGeneration: 7,
+                clientConfirmation: Data(repeating: 0x55, count: 32),
+                clientSignature: Data(repeating: 0x66, count: 64)
+            )),
+            count: 6
+        )
+        XCTAssertEqual(finishValues[3], .unsigned(7))
+        XCTAssertEqual(finishValues[4], .bytes(Data(repeating: 0x55, count: 32)))
+        XCTAssertEqual(finishValues[5], .bytes(Data(repeating: 0x66, count: 64)))
+
+        let errorPayload = try DeterministicCBOR.encode(.map([
+            .init(key: 1, value: .unsigned(1)),
+            .init(key: 2, value: .unsigned(UInt64(LSPControlStatus.busy.rawValue))),
+        ]))
+        let errorEvent = LSPControlEvent(
+            messageType: LSPControlMessageType.pairPending.rawValue,
+            flags: [.response, .errorResponse],
+            connectionGeneration: 1,
+            messageID: 1,
+            requestID: 1,
+            payload: errorPayload
+        )
+        XCTAssertEqual(
+            try LSPControlWire.controlError(from: errorEvent, expectedType: .pairPending),
+            .busy
+        )
+        XCTAssertThrowsError(try LSPControlWire.controlError(from: errorEvent, expectedType: .pairResult))
+    }
+
+    func testPINPairingDiscoveryRequiresExactLowercaseIdentityAndSPKI() throws {
+        let hostID = "00112233445566778899aabbccddeeff"
+        let spki = String(repeating: "ab", count: 32)
+        let valid = DiscoveredHostService(
+            name: "Gaming PC",
+            type: "_lumen-stream._udp",
+            domain: "local.",
+            txtRecord: [
+                "v": "1",
+                "pair": "pin1",
+                "id": hostID,
+                "spki": spki,
+                "caps": "input,video",
+                "port": "1",
+            ]
+        )
+        let resolved = ResolvedBonjourServiceEndpoint(
+            targetHost: "actual-srv-target.local",
+            port: 49_999,
+            serviceName: valid.name,
+            serviceType: valid.type,
+            domain: valid.domain,
+            changeToken: valid.changeToken
+        )
+        let candidate = try XCTUnwrap(LSPDiscovery.pairingHost(
+            from: valid,
+            resolvedEndpoint: resolved
+        ))
+        XCTAssertEqual(candidate.host, "actual-srv-target.local")
+        XCTAssertEqual(candidate.port, 49_999)
+        XCTAssertEqual(candidate.serverSPKISHA256, Data(repeating: 0xab, count: 32))
+        XCTAssertEqual(
+            candidate.provisionalSPKIFingerprint,
+            String(repeating: "ABABABAB ", count: 7) + "ABABABAB"
+        )
+
+        var uppercase = valid
+        uppercase.txtRecord["spki"] = spki.uppercased()
+        XCTAssertNil(LSPDiscovery.pairingHost(from: uppercase, resolvedEndpoint: resolved))
+        var invitationMode = valid
+        invitationMode.txtRecord["pair"] = "invite1"
+        XCTAssertNil(LSPDiscovery.pairingHost(from: invitationMode, resolvedEndpoint: resolved))
+        var missingVersion = valid
+        missingVersion.txtRecord.removeValue(forKey: "v")
+        XCTAssertNil(LSPDiscovery.pairingHost(from: missingVersion, resolvedEndpoint: resolved))
+        var staleResolution = resolved
+        staleResolution.changeToken = 999
+        XCTAssertNil(LSPDiscovery.pairingHost(from: valid, resolvedEndpoint: staleResolution))
+    }
+
     func testTerminationObserverLatchesFirstEventAndDeliversItToLateHandlers() {
         let observer = LSPTerminationObserver()
         XCTAssertTrue(observer.emit(.streamEnded(reason: 7)))

@@ -279,6 +279,47 @@ final class LSPTransportTests: XCTestCase {
         )
     }
 
+    func testNativePINPairingABIRequiresAuthenticatedBoundAssociation() throws {
+        let core = try makeInactiveNativeCore()
+        defer { clsp_core_release(core) }
+        var hello = clsp_host_hello_identity_t()
+        hello.abi_version = clsp_core_abi_version()
+        hello.structure_size = UInt32(MemoryLayout<clsp_host_hello_identity_t>.size)
+        hello.connection_generation = 1
+        _ = withUnsafeMutableBytes(of: &hello.host_id) { $0.initializeMemory(as: UInt8.self, repeating: 1) }
+        _ = withUnsafeMutableBytes(of: &hello.host_identity_key) { $0.initializeMemory(as: UInt8.self, repeating: 2) }
+        _ = withUnsafeMutableBytes(of: &hello.server_spki_sha256) { $0.initializeMemory(as: UInt8.self, repeating: 3) }
+        _ = withUnsafeMutableBytes(of: &hello.client_nonce) { $0.initializeMemory(as: UInt8.self, repeating: 4) }
+        _ = withUnsafeMutableBytes(of: &hello.server_nonce) { $0.initializeMemory(as: UInt8.self, repeating: 5) }
+        XCTAssertEqual(clsp_core_bind_host_hello(core, &hello), CLSP_STATUS_NOT_AUTHENTICATED)
+
+        let name = Data("Umbra".utf8)
+        var pairing: OpaquePointer?
+        let status = name.withUnsafeBytes { bytes in
+            var configuration = clsp_pairing_configuration_t()
+            configuration.abi_version = clsp_core_abi_version()
+            configuration.structure_size = UInt32(MemoryLayout<clsp_pairing_configuration_t>.size)
+            _ = withUnsafeMutableBytes(of: &configuration.client_id) {
+                $0.initializeMemory(as: UInt8.self, repeating: 6)
+            }
+            _ = withUnsafeMutableBytes(of: &configuration.client_identity_key) {
+                $0.initializeMemory(as: UInt8.self, repeating: 7)
+            }
+            configuration.client_name = .init(
+                data: bytes.bindMemory(to: UInt8.self).baseAddress,
+                length: bytes.count
+            )
+            configuration.requested_permissions = 0x7F
+            return clsp_pairing_create(core, &configuration, &pairing)
+        }
+        XCTAssertEqual(status, CLSP_STATUS_NOT_AUTHENTICATED)
+        XCTAssertNil(pairing)
+        XCTAssertEqual(
+            String(cString: clsp_status_description(CLSP_STATUS_PAIRING_CONFIRMATION_FAILED)),
+            "native PIN pairing confirmation failed"
+        )
+    }
+
     func testRollbackBaselineCompletionUsesLatchedEpochAfterSnapshotClearsRollbackGeneration() {
         let snapshot = LSPNativeHandoffSnapshot(
             phase: .authoritative,

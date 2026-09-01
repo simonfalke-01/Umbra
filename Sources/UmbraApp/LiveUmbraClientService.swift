@@ -223,9 +223,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let handlerInstallationTask: Task<Void, Never>
     private var serviceEventTask: Task<Void, Never>?
     private var discoveryPreferenceTask: Task<Void, Never>?
+    private var lspPairingDiscoveryHandlerTask: Task<Void, Never>?
     private var lastLegacyHosts: [HostDisplayModel] = []
     private var lastLSPHosts: [HostDisplayModel] = []
     private var discoveredLSPHosts: [UUID: HostDisplayModel] = [:]
+    private var latestLSPDiscoveryTokens: [String: UInt64] = [:]
     private var lspApplicationIDs: [HostID: [Int: String]] = [:]
 
     init(
@@ -258,6 +260,13 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 continuation.yield(event)
             }
         }
+        lspPairingDiscoveryHandlerTask = Task { [weak self, lspProduct] in
+            await lspProduct?.setPairingDiscoveryMutationHandler { [weak self] mutation in
+                Task { @MainActor [weak self] in
+                    self?.handleLSPPairingDiscoveryMutation(mutation)
+                }
+            }
+        }
         serviceEventTask = Task { @MainActor [weak self, events] in
             for await event in events {
                 guard let self else { return }
@@ -274,7 +283,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 if settings.enableMDNS {
                     lspDiscovery.start { [weak self] event in
                         Task { @MainActor [weak self] in
-                            self?.handleLSPDiscovery(event)
+                            await self?.handleLSPDiscovery(event)
                         }
                     }
                 } else {
@@ -291,12 +300,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
         handlerInstallationTask.cancel()
         serviceEventTask?.cancel()
         discoveryPreferenceTask?.cancel()
+        lspPairingDiscoveryHandlerTask?.cancel()
         lspDiscovery.stop()
         for task in artworkLoadingTasks.values { task.cancel() }
     }
 
     func waitUntilReady() async {
         await handlerInstallationTask.value
+        await lspPairingDiscoveryHandlerTask?.value
     }
 
     func setEventHandler(_ handler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?) {
@@ -312,32 +323,46 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel {
-        if endpoint.address.hasPrefix("umbra://pair/lsp1#") {
-            guard endpoint.port == nil, let lspProduct else {
-                throw UmbraClientServiceError.invalidInput(
-                    "LSP invitations contain their own authenticated host and port. Leave the port field empty."
-                )
+        let port = endpoint.port.flatMap(UInt16.init(exactly:))
+        return displayHost(try await service.addHost(address: endpoint.address, port: port))
+    }
+
+    func preparePairing(hostID: HostID) async throws -> PairingPreparation {
+        guard let nativeHostID = lspHostID(hostID) else {
+            return .init(
+                pin: String(format: "%04d", Int.random(in: 0...9_999)),
+                provisionalSPKIFingerprint: nil
+            )
+        }
+        guard let lspProduct else {
+            throw UmbraClientServiceError.unavailable("Native LSP pairing is unavailable in this build.")
+        }
+        let prompt = try await lspProduct.beginPairing(hostID: nativeHostID)
+        return .init(
+            pin: prompt.pin,
+            provisionalSPKIFingerprint: prompt.host.provisionalSPKIFingerprint
+        )
+    }
+
+    func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
+        if let nativeHostID = lspHostID(request.hostID) {
+            guard let lspProduct else {
+                throw UmbraClientServiceError.unavailable("Native LSP pairing is unavailable in this build.")
             }
-            let host = try await lspProduct.pair(invitationURI: endpoint.address)
+            let host = try await lspProduct.completePairing(hostID: nativeHostID)
             let display = displayLSPHost(host, paired: true, online: true)
             upsertLSPHost(display)
             eventHandler?(.hosts(combinedHosts()))
             return display
         }
-        let port = endpoint.port.flatMap(UInt16.init(exactly:))
-        return displayHost(try await service.addHost(address: endpoint.address, port: port))
-    }
-
-    func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
-        if lspHostID(request.hostID) != nil {
-            throw UmbraClientServiceError.invalidInput(
-                "Native LSP pairing requires a single-use umbra://pair/lsp1 invitation. Import it with Add Host."
-            )
-        }
         return displayHost(try await service.pairHost(id: request.hostID.rawValue, pin: request.pin))
     }
 
     func cancelPairing(hostID: HostID) async {
+        if let nativeHostID = lspHostID(hostID), let lspProduct {
+            await lspProduct.cancelPairing(hostID: nativeHostID)
+            return
+        }
         await service.cancelPairing(hostID: hostID.rawValue)
     }
 
@@ -789,9 +814,28 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private func displayLSPHost(
         _ host: LSPHostRecord,
         paired: Bool,
-        online: Bool
+        online: Bool,
+        provisionalSPKIFingerprint: String? = nil,
+        nameIsUnverified: Bool = false
     ) -> HostDisplayModel {
-        HostDisplayModel(
+        var details = [
+            "Protocol: Lumen Streaming Protocol",
+            "Address: \(host.address):\(host.port)",
+            "Trust: \(paired ? "Paired" : "PIN pairing required")",
+        ]
+        if nameIsUnverified {
+            details.append("Discovery name (unverified): \(host.name)")
+        }
+        if let provisionalSPKIFingerprint {
+            details.append("Provisional SPKI: \(provisionalSPKIFingerprint)")
+        }
+        if let domain = host.discoveryDomain {
+            details.append("Bonjour domain: \(domain)")
+        }
+        if let interfaceName = host.interfaceName {
+            details.append("Network interface: \(interfaceName)")
+        }
+        return HostDisplayModel(
             id: HostID("lsp:\(host.hostID.uuidString.lowercased())"),
             name: host.name,
             status: online ? .online : .unknown,
@@ -799,7 +843,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             hasActiveSession: false,
             canWake: false,
             isServerSupported: true,
-            details: "Protocol: Lumen Streaming Protocol\nAddress: \(host.address):\(host.port)\nTrust: \(paired ? "Paired" : "Invitation required")"
+            details: details.joined(separator: "\n")
         )
     }
 
@@ -1058,29 +1102,85 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lastLSPHosts.append(host)
     }
 
-    private func handleLSPDiscovery(_ event: DiscoveryEvent) {
+    private func handleLSPDiscovery(_ event: DiscoveryEvent) async {
         switch event {
         case .added(let service), .updated(_, let service):
-            guard service.txtRecord["v"] == "1",
-                  let encodedID = service.txtRecord["id"],
-                  let hostID = Self.uuid(fromLowercaseHex: encodedID)
-            else { return }
+            latestLSPDiscoveryTokens[service.id] = service.changeToken
+            guard let resolved = try? await lspDiscovery.resolveEndpoint(for: service),
+                  latestLSPDiscoveryTokens[service.id] == service.changeToken,
+                  let candidate = LSPDiscovery.pairingHost(
+                    from: service,
+                    resolvedEndpoint: resolved
+                  ) else { return }
+            let displayedCandidate: LSPDiscoveredPairingHost
+            if let lspProduct {
+                displayedCandidate = await lspProduct.registerDiscoveredPairingHost(candidate)
+            } else {
+                displayedCandidate = candidate
+            }
             let record = LSPHostRecord(
-                hostID: hostID,
-                name: service.name,
-                address: "\(service.name).local",
-                lastSeen: Date()
+                hostID: displayedCandidate.hostID,
+                name: displayedCandidate.name,
+                address: displayedCandidate.host,
+                port: displayedCandidate.port,
+                lastSeen: Date(),
+                discoveryDomain: displayedCandidate.domain,
+                interfaceName: displayedCandidate.interfaceName
             )
-            discoveredLSPHosts[hostID] = displayLSPHost(record, paired: false, online: true)
+            discoveredLSPHosts[displayedCandidate.hostID] = displayLSPHost(
+                record,
+                paired: false,
+                online: true,
+                provisionalSPKIFingerprint: displayedCandidate.provisionalSPKIFingerprint,
+                nameIsUnverified: true
+            )
             eventHandler?(.hosts(combinedHosts()))
         case .removed(let service):
+            latestLSPDiscoveryTokens.removeValue(forKey: service.id)
             if let encodedID = service.txtRecord["id"], let hostID = Self.uuid(fromLowercaseHex: encodedID) {
-                discoveredLSPHosts.removeValue(forKey: hostID)
+                let canRemove: Bool
+                if let lspProduct {
+                    canRemove = await lspProduct.unregisterDiscoveredPairingHost(
+                        hostID: hostID,
+                        discoveryServiceID: service.id
+                    )
+                } else {
+                    canRemove = true
+                }
+                if canRemove {
+                    discoveredLSPHosts.removeValue(forKey: hostID)
+                }
                 eventHandler?(.hosts(combinedHosts()))
             }
         case .failed:
             break
         }
+    }
+
+    func handleLSPPairingDiscoveryMutation(_ mutation: LSPPairingDiscoveryMutation) {
+        switch mutation {
+        case .replaced(let oldHostID, let host):
+            discoveredLSPHosts.removeValue(forKey: oldHostID)
+            let record = LSPHostRecord(
+                hostID: host.hostID,
+                name: host.name,
+                address: host.host,
+                port: host.port,
+                lastSeen: Date(),
+                discoveryDomain: host.domain,
+                interfaceName: host.interfaceName
+            )
+            discoveredLSPHosts[host.hostID] = displayLSPHost(
+                record,
+                paired: false,
+                online: true,
+                provisionalSPKIFingerprint: host.provisionalSPKIFingerprint,
+                nameIsUnverified: true
+            )
+        case .removed(let hostID):
+            discoveredLSPHosts.removeValue(forKey: hostID)
+        }
+        eventHandler?(.hosts(combinedHosts()))
     }
 
     private func lspHostID(_ id: HostID) -> UUID? {

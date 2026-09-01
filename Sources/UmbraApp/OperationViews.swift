@@ -54,7 +54,7 @@ struct AddHostSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space6) {
-            Text("Add Host or LSP Invitation")
+            Text("Add GameStream Host")
                 .font(.title2.weight(.semibold))
 
             legacyFields
@@ -82,15 +82,15 @@ struct AddHostSheet: View {
     private var legacyFields: some View {
         Form {
             TextField(
-                "Host name, IP address, or LSP invitation",
+                "Host name or IP address",
                 text: $address,
-                prompt: Text("gaming-pc.local or umbra://pair/lsp1#…")
+                prompt: Text("gaming-pc.local or 192.168.1.20")
             )
             .focused($focusedField, equals: .address)
             .textContentType(.URL)
             TextField("Port (optional)", text: $port, prompt: Text("Default"))
                 .frame(maxWidth: 160)
-            Text("LSP invitations authenticate the host and include their own port. They never fall back to GameStream.")
+            Text("LSP hosts appear automatically when discovered on the local network.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -112,9 +112,9 @@ struct PairHostSheet: View {
                 .symbolRenderingMode(.hierarchical)
 
             VStack(spacing: UmbraLayout.space2) {
-                Text("Pair with \(host.name)")
+                Text(pairingTitle)
                     .font(.title2.weight(.semibold))
-                Text("Enter this PIN on the host. If the host runs Sunshine, enter it in the Sunshine web interface.")
+                Text(instructions)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
@@ -125,6 +125,21 @@ struct PairHostSheet: View {
                 .monospacedDigit()
                 .textSelection(.enabled)
                 .accessibilityLabel("Pairing PIN \(pin.map(String.init).joined(separator: " "))")
+
+            if let fingerprint = store.pairingPreparations[host.id]?.provisionalSPKIFingerprint {
+                VStack(spacing: UmbraLayout.space1) {
+                    Text("Provisional host key fingerprint")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(fingerprint)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .multilineTextAlignment(.center)
+                    Text("Compare this value with Lumen before approving the PIN.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             if store.operation?.kind == .pairing {
                 ProgressView("Waiting for host confirmation…")
@@ -145,7 +160,12 @@ struct PairHostSheet: View {
                         Button("Cancel") { dismiss() }
                             .keyboardShortcut(.cancelAction)
                         Button("Try Again") {
-                            store.performPairing(hostID: host.id, pin: pin)
+                            if host.id.rawValue.hasPrefix("lsp:") {
+                                dismiss()
+                                store.beginPairing(host)
+                            } else {
+                                store.performPairing(hostID: host.id, pin: pin)
+                            }
                         }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
@@ -160,6 +180,17 @@ struct PairHostSheet: View {
             started = true
             store.performPairing(hostID: host.id, pin: pin)
         }
+    }
+
+    private var instructions: String {
+        if host.id.rawValue.hasPrefix("lsp:") {
+            return "Discovery name (unverified): \(host.name)\nEnter this six-digit PIN in the Lumen admin panel. The PIN expires after two minutes."
+        }
+        return "Enter this PIN in the Sunshine web interface."
+    }
+
+    private var pairingTitle: String {
+        host.id.rawValue.hasPrefix("lsp:") ? "Pair with discovered Lumen host" : "Pair with \(host.name)"
     }
 }
 

@@ -23,6 +23,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var applicationCatalogWarning: String?
     @Published private(set) var sessionDegradation: String?
     @Published private(set) var operation: OperationPresentation?
+    @Published private(set) var pairingPreparations: [HostID: PairingPreparation] = [:]
 
     let preferences: PreferencesStore
 
@@ -41,6 +42,7 @@ final class AppStore: ObservableObject {
     private var activationInFlight: ApplicationActivationReservation?
     private var hasObservedSessionLifecycleEvent = false
     private var hasReachedStreamingState = false
+    private var pairingPreparationReservation: (id: UUID, hostID: HostID)?
 
     init(
         service: UmbraClientServicing,
@@ -199,15 +201,60 @@ final class AppStore: ObservableObject {
     }
 
     func beginPairing(_ host: HostDisplayModel) {
-        let pin = String(format: "%04d", Int.random(in: 0...9_999))
-        presentedSheet = .pair(host.id, pin: pin)
+        if !host.id.rawValue.hasPrefix("lsp:") {
+            let prior = pairingPreparationReservation
+            pairingPreparationReservation = nil
+            activeTask?.cancel()
+            if let prior {
+                Task { await service.cancelPairing(hostID: prior.hostID) }
+            }
+            let pin = String(format: "%04d", Int.random(in: 0...9_999))
+            pairingPreparations[host.id] = .init(pin: pin, provisionalSPKIFingerprint: nil)
+            presentedSheet = .pair(host.id, pin: pin)
+            return
+        }
+        let prior = pairingPreparationReservation
+        let reservationID = UUID()
+        pairingPreparationReservation = (reservationID, host.id)
+        activeTask?.cancel()
+        activeTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                if let prior {
+                    await service.cancelPairing(hostID: prior.hostID)
+                }
+                let preparation = try await service.preparePairing(hostID: host.id)
+                try Task.checkCancellation()
+                guard pairingPreparationReservation?.id == reservationID else {
+                    throw CancellationError()
+                }
+                guard preparation.pin.count == 6, preparation.pin.allSatisfy(\.isNumber),
+                      preparation.provisionalSPKIFingerprint?.isEmpty == false else {
+                    throw UmbraClientServiceError.unavailable("The native LSP core returned an invalid pairing PIN.")
+                }
+                pairingPreparationReservation = nil
+                pairingPreparations[host.id] = preparation
+                presentedSheet = .pair(host.id, pin: preparation.pin)
+            } catch {
+                let ownsReservation = pairingPreparationReservation?.id == reservationID
+                if ownsReservation {
+                    pairingPreparationReservation = nil
+                    await service.cancelPairing(hostID: host.id)
+                }
+                guard !(error is CancellationError), !Task.isCancelled else { return }
+                presentFailure(title: "Pairing Failed", error: error)
+            }
+        }
     }
 
     func performPairing(hostID: HostID, pin: String) {
+        let isLSP = hostID.rawValue.hasPrefix("lsp:")
         let operationToken = beginOperation(OperationPresentation(
             kind: .pairing,
             title: "Pairing with Host",
-            message: "Enter \(pin) on the host. This window closes after the host confirms pairing.",
+            message: isLSP
+                ? "Enter \(pin) in the Lumen admin panel. This window closes after Lumen confirms pairing."
+                : "Enter \(pin) on the host. This window closes after the host confirms pairing.",
             progress: nil,
             isCancellable: true
         ))
@@ -219,6 +266,7 @@ final class AppStore: ObservableObject {
                 let host = try await service.pairHost(.init(hostID: hostID, pin: pin))
                 try Task.checkCancellation()
                 upsert(host)
+                pairingPreparations.removeValue(forKey: hostID)
                 presentedSheet = nil
             } catch {
                 if error is CancellationError
@@ -236,8 +284,9 @@ final class AppStore: ObservableObject {
         if case let .pair(hostID, _) = presentedSheet {
             pairingHostID = hostID
         } else {
-            pairingHostID = nil
+            pairingHostID = pairingPreparationReservation?.hostID
         }
+        pairingPreparationReservation = nil
         let wasActivatingApplication = activationInFlight != nil
         activeTask?.cancel()
         activeTask = nil
@@ -248,6 +297,7 @@ final class AppStore: ObservableObject {
             sessionDisconnectTask = Task { await service.disconnectSession() }
         }
         if let pairingHostID {
+            pairingPreparations.removeValue(forKey: pairingHostID)
             Task { await service.cancelPairing(hostID: pairingHostID) }
         }
     }

@@ -41,6 +41,42 @@ public struct DiscoveredHostService: Hashable, Sendable, Identifiable {
     }
 }
 
+/// Exact host/port selected by Network.framework for one Bonjour SRV service.
+public struct ResolvedBonjourServiceEndpoint: Hashable, Sendable {
+    public var targetHost: String
+    public var port: UInt16
+    public var serviceName: String
+    public var serviceType: String
+    public var domain: String
+    public var interfaceName: String?
+    public var changeToken: UInt64
+
+    public init(
+        targetHost: String,
+        port: UInt16,
+        serviceName: String,
+        serviceType: String,
+        domain: String,
+        interfaceName: String? = nil,
+        changeToken: UInt64 = 0
+    ) {
+        self.targetHost = targetHost
+        self.port = port
+        self.serviceName = serviceName
+        self.serviceType = serviceType
+        self.domain = domain
+        self.interfaceName = interfaceName
+        self.changeToken = changeToken
+    }
+}
+
+/// Bounded Bonjour endpoint-resolution failures.
+public enum BonjourEndpointResolutionError: Error, Equatable, Sendable {
+    case unavailable
+    case invalidEndpoint
+    case timeout
+}
+
 public enum DiscoveryEvent: Equatable, Sendable {
     case added(DiscoveredHostService)
     case updated(old: DiscoveredHostService, new: DiscoveredHostService)
@@ -257,6 +293,50 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
         )
     }
 
+    /// Resolves one discovered SRV service to Network.framework's selected remote host and port.
+    public func resolveEndpoint(
+        for service: DiscoveredHostService,
+        timeout: Duration = .seconds(3)
+    ) async throws -> ResolvedBonjourServiceEndpoint {
+        guard let endpoint = service.networkEndpoint else {
+            throw BonjourEndpointResolutionError.unavailable
+        }
+        return try await NWBonjourEndpointResolution(
+            endpoint: endpoint,
+            service: service,
+            queue: queue
+        ).resolve(timeout: timeout)
+    }
+
+    static func resolvedEndpoint(
+        from endpoint: NWEndpoint,
+        service: DiscoveredHostService
+    ) throws -> ResolvedBonjourServiceEndpoint {
+        guard case let .hostPort(host, port) = endpoint, port.rawValue != 0 else {
+            throw BonjourEndpointResolutionError.invalidEndpoint
+        }
+        let hostValue: String
+        switch host {
+        case .name(let name, _):
+            hostValue = name
+        case .ipv4, .ipv6:
+            hostValue = host.debugDescription
+        @unknown default:
+            throw BonjourEndpointResolutionError.invalidEndpoint
+        }
+        let trimmedHost = hostValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else { throw BonjourEndpointResolutionError.invalidEndpoint }
+        return .init(
+            targetHost: trimmedHost,
+            port: port.rawValue,
+            serviceName: service.name,
+            serviceType: service.type,
+            domain: service.domain,
+            interfaceName: host.interface?.name ?? service.interfaceName,
+            changeToken: service.changeToken
+        )
+    }
+
     convenience init(
         serviceKind: BonjourServiceKind,
         queue: DispatchQueue = DispatchQueue(label: "app.umbra.bonjour-discovery")
@@ -447,5 +527,89 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
 
     private func isCurrentBrowser(generation: UInt64, browserToken: UInt64) -> Bool {
         isRunning && self.generation == generation && self.browserToken == browserToken && browser != nil
+    }
+}
+
+private final class NWBonjourEndpointResolution: @unchecked Sendable {
+    private let connection: NWConnection
+    private let service: DiscoveredHostService
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<ResolvedBonjourServiceEndpoint, Error>?
+    private var timeoutWorkItem: DispatchWorkItem?
+    private var finished = false
+
+    init(endpoint: NWEndpoint, service: DiscoveredHostService, queue: DispatchQueue) {
+        let parameters = NWParameters.udp
+        parameters.includePeerToPeer = true
+        connection = NWConnection(to: endpoint, using: parameters)
+        self.service = service
+        self.queue = queue
+    }
+
+    func resolve(timeout: Duration) async throws -> ResolvedBonjourServiceEndpoint {
+        let timeoutSeconds = max(0.1, Self.seconds(timeout))
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let shouldStart = lock.withLock { () -> Bool in
+                    guard !finished else { return false }
+                    self.continuation = continuation
+                    return true
+                }
+                guard shouldStart else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                connection.stateUpdateHandler = { [self] state in
+                    switch state {
+                    case .ready:
+                        guard let endpoint = connection.currentPath?.remoteEndpoint else {
+                            finish(.failure(BonjourEndpointResolutionError.invalidEndpoint))
+                            return
+                        }
+                        do {
+                            finish(.success(try NetworkBonjourDiscovery.resolvedEndpoint(
+                                from: endpoint,
+                                service: service
+                            )))
+                        } catch {
+                            finish(.failure(error))
+                        }
+                    case .failed, .cancelled:
+                        finish(.failure(BonjourEndpointResolutionError.unavailable))
+                    default:
+                        break
+                    }
+                }
+                let timeoutWorkItem = DispatchWorkItem { [self] in
+                    finish(.failure(BonjourEndpointResolutionError.timeout))
+                }
+                lock.withLock { self.timeoutWorkItem = timeoutWorkItem }
+                queue.asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+                connection.start(queue: queue)
+            }
+        } onCancel: {
+            self.finish(.failure(CancellationError()))
+        }
+    }
+
+    private func finish(_ result: Result<ResolvedBonjourServiceEndpoint, Error>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<ResolvedBonjourServiceEndpoint, Error>? in
+            guard !finished else { return nil }
+            finished = true
+            timeoutWorkItem?.cancel()
+            timeoutWorkItem = nil
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        guard let continuation else { return }
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+        continuation.resume(with: result)
+    }
+
+    private static func seconds(_ duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1e18
     }
 }

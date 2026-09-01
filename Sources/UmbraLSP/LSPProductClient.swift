@@ -3,18 +3,60 @@ import UmbraCore
 import UmbraLSPTransport
 import UmbraMedia
 
+struct LSPProductPairingStart: Sendable {
+    var session: LSPClientSession
+    var prompt: LSPPairingPrompt
+}
+
+struct LSPProductPairingOperations: Sendable {
+    var begin: @Sendable (LSPDiscoveredPairingHost) async throws -> LSPProductPairingStart
+    var verify: @Sendable (LSPProductPairingStart) async throws -> LSPTrustRecord
+    var cancel: @Sendable (LSPProductPairingStart) async -> Void
+}
+
+/// Discovery-registry change released after an in-flight pairing snapshot becomes terminal.
+public enum LSPPairingDiscoveryMutation: Equatable, Sendable {
+    case replaced(oldHostID: UUID, host: LSPDiscoveredPairingHost)
+    case removed(hostID: UUID)
+}
+
 /// Coarse product owner for LSP persistence, pairing, auth, and application browsing.
 public actor LSPProductClient {
     private struct ReconnectAttempt {
         var id: UUID
         var task: Task<LSPClientSession, Error>
     }
+    private struct VerifiedPairing: Sendable {
+        var start: LSPProductPairingStart
+        var trust: LSPTrustRecord
+        var host: LSPHostRecord
+    }
+    private struct PairingAttempt {
+        var id: UUID
+        var candidate: LSPDiscoveredPairingHost
+        var beginTask: Task<LSPProductPairingStart, Error>
+        var verificationTask: Task<VerifiedPairing, Error>?
+        var verified: VerifiedPairing?
+        var persistenceTask: Task<LSPHostRecord, Error>?
+        var expiryTask: Task<Void, Never>?
+        var cancelling: Bool
+    }
+    private enum QuarantinedPairingDiscovery {
+        case updated(LSPDiscoveredPairingHost)
+        case removed
+    }
     private let trustStore: JSONFileStore<LSPTrustSnapshot>
     private let hostStore: JSONFileStore<LSPHostSnapshot>
     private let identityStore: JSONFileStore<LSPClientIdentitySnapshot>
     private var sessions: [UUID: LSPClientSession] = [:]
     private var reconnectAttempts: [UUID: ReconnectAttempt] = [:]
+    private var discoveredPairingHosts: [UUID: LSPDiscoveredPairingHost] = [:]
+    private var pairingAttempts: [UUID: PairingAttempt] = [:]
+    private var quarantinedPairingDiscovery: [UUID: QuarantinedPairingDiscovery] = [:]
     private let videoRenderer: (any MetalVideoRendering)?
+    private let pairingOperations: LSPProductPairingOperations
+    private let afterPairingTrustWrite: @Sendable () throws -> Void
+    private var pairingDiscoveryMutationHandler: (@Sendable (LSPPairingDiscoveryMutation) -> Void)?
 
     public init(
         trustStore: JSONFileStore<LSPTrustSnapshot>,
@@ -26,6 +68,27 @@ public actor LSPProductClient {
         self.hostStore = hostStore
         self.identityStore = identityStore
         self.videoRenderer = videoRenderer
+        pairingOperations = Self.livePairingOperations(
+            identityStore: identityStore,
+            videoRenderer: videoRenderer
+        )
+        afterPairingTrustWrite = {}
+    }
+
+    init(
+        trustStore: JSONFileStore<LSPTrustSnapshot>,
+        hostStore: JSONFileStore<LSPHostSnapshot>,
+        identityStore: JSONFileStore<LSPClientIdentitySnapshot>,
+        videoRenderer: (any MetalVideoRendering)? = nil,
+        pairingOperations: LSPProductPairingOperations,
+        afterPairingTrustWrite: @escaping @Sendable () throws -> Void = {}
+    ) {
+        self.trustStore = trustStore
+        self.hostStore = hostStore
+        self.identityStore = identityStore
+        self.videoRenderer = videoRenderer
+        self.pairingOperations = pairingOperations
+        self.afterPairingTrustWrite = afterPairingTrustWrite
     }
 
     /// Creates a product client using Umbra's normal owner-private Application Support files.
@@ -44,32 +107,328 @@ public actor LSPProductClient {
         try await hostStore.load().records
     }
 
-    /// Imports a single-use invitation, performs real pairing, and persists fresh LSP trust.
-    public func pair(invitationURI: String) async throws -> LSPHostRecord {
-        let invitation = try LSPPairingInvitation.decode(uri: invitationURI)
-        let session = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
-        let trust = try await session.pair(invitation: invitation)
-        let host = LSPHostRecord(
-            hostID: invitation.hostID,
-            name: invitation.host,
-            address: invitation.host,
-            port: invitation.port,
-            lastSeen: Date()
-        )
-        _ = try await trustStore.update { snapshot in
-            var snapshot = snapshot
-            snapshot.records.removeAll { $0.hostID == trust.hostID }
-            snapshot.records.append(trust)
-            return snapshot
+    /// Installs the coarse product callback for quarantined discovery changes released at terminal state.
+    public func setPairingDiscoveryMutationHandler(
+        _ handler: (@Sendable (LSPPairingDiscoveryMutation) -> Void)?
+    ) {
+        pairingDiscoveryMutationHandler = handler
+    }
+
+    /// Adds or refreshes one PIN-capable LSP host from validated discovery metadata.
+    @discardableResult
+    public func registerDiscoveredPairingHost(
+        _ host: LSPDiscoveredPairingHost
+    ) -> LSPDiscoveredPairingHost {
+        let active = pairingAttempts.first { activeHostID, attempt in
+            activeHostID == host.hostID || attempt.candidate.discoveryServiceID == host.discoveryServiceID
         }
-        _ = try await hostStore.update { snapshot in
-            var snapshot = snapshot
-            snapshot.records.removeAll { $0.hostID == host.hostID }
-            snapshot.records.append(host)
-            return snapshot
+        if let (activeHostID, attempt) = active {
+            if attempt.candidate != host {
+                quarantinedPairingDiscovery[activeHostID] = .updated(host)
+            }
+            return attempt.candidate
         }
-        sessions[host.hostID] = session
+        let replacedHostIDs = discoveredPairingHosts.compactMap { existingHostID, existing in
+            existing.discoveryServiceID == host.discoveryServiceID && existingHostID != host.hostID
+                ? existingHostID : nil
+        }
+        for existingHostID in replacedHostIDs {
+            discoveredPairingHosts.removeValue(forKey: existingHostID)
+        }
+        discoveredPairingHosts[host.hostID] = host
         return host
+    }
+
+    /// Removes one vanished discovery candidate unless its pairing is already active.
+    @discardableResult
+    public func unregisterDiscoveredPairingHost(
+        hostID: UUID,
+        discoveryServiceID: String
+    ) -> Bool {
+        if let (activeHostID, _) = pairingAttempts.first(where: { activeHostID, attempt in
+            activeHostID == hostID || attempt.candidate.discoveryServiceID == discoveryServiceID
+        }) {
+            quarantinedPairingDiscovery[activeHostID] = .removed
+            return false
+        }
+        discoveredPairingHosts.removeValue(forKey: hostID)
+        return true
+    }
+
+    /// Starts one discovered-host PIN transaction and returns its six digits for local display.
+    public func beginPairing(hostID: UUID) async throws -> LSPPairingPrompt {
+        if let existing = pairingAttempts[hostID] {
+            guard !existing.cancelling else { throw CancellationError() }
+            return try await resolvePairingBegin(
+                hostID: hostID,
+                attemptID: existing.id,
+                task: existing.beginTask
+            )
+        }
+        guard let host = discoveredPairingHosts[hostID] else {
+            throw LSPTransportError.invalidEndpoint
+        }
+        let attemptID = UUID()
+        let operation = pairingOperations.begin
+        let task = Task { try await operation(host) }
+        pairingAttempts[hostID] = .init(
+            id: attemptID,
+            candidate: host,
+            beginTask: task,
+            verificationTask: nil,
+            verified: nil,
+            persistenceTask: nil,
+            expiryTask: nil,
+            cancelling: false
+        )
+        return try await resolvePairingBegin(hostID: hostID, attemptID: attemptID, task: task)
+    }
+
+    /// Completes one approved PIN transaction and only then persists LSP trust and host state.
+    public func completePairing(hostID: UUID) async throws -> LSPHostRecord {
+        guard var attempt = pairingAttempts[hostID], !attempt.cancelling else {
+            throw LSPTransportError.invalidState
+        }
+        let verified: VerifiedPairing
+        if let existing = attempt.verified {
+            verified = existing
+        } else {
+            let verificationTask: Task<VerifiedPairing, Error>
+            if let existing = attempt.verificationTask {
+                verificationTask = existing
+            } else {
+                let beginTask = attempt.beginTask
+                let candidate = attempt.candidate
+                let verify = pairingOperations.verify
+                let attemptID = attempt.id
+                verificationTask = Task { [weak self] in
+                    let start = try await beginTask.value
+                    let trust = try await verify(start)
+                    let verified = VerifiedPairing(
+                        start: start,
+                        trust: trust,
+                        host: LSPHostRecord(
+                            hostID: candidate.hostID,
+                            name: candidate.name,
+                            address: candidate.host,
+                            port: candidate.port,
+                            lastSeen: Date(),
+                            discoveryDomain: candidate.domain,
+                            interfaceName: candidate.interfaceName
+                        )
+                    )
+                    await self?.recordVerifiedPairing(
+                        verified,
+                        hostID: candidate.hostID,
+                        attemptID: attemptID
+                    )
+                    return verified
+                }
+                attempt.verificationTask = verificationTask
+                pairingAttempts[hostID] = attempt
+            }
+            do {
+                verified = try await verificationTask.value
+                guard var current = pairingAttempts[hostID], current.id == attempt.id else {
+                    throw CancellationError()
+                }
+                current.verified = verified
+                current.expiryTask?.cancel()
+                current.expiryTask = nil
+                pairingAttempts[hostID] = current
+                attempt = current
+            } catch {
+                finishPairingAttempt(hostID: hostID, attemptID: attempt.id)
+                throw error
+            }
+        }
+
+        let persistenceTask: Task<LSPHostRecord, Error>
+        if let existing = attempt.persistenceTask {
+            persistenceTask = existing
+        } else {
+            let trustStore = self.trustStore
+            let hostStore = self.hostStore
+            let afterTrustWrite = afterPairingTrustWrite
+            persistenceTask = Task {
+                try await LSPPairingPersistenceTransaction.commit(
+                    trust: verified.trust,
+                    host: verified.host,
+                    trustStore: trustStore,
+                    hostStore: hostStore,
+                    afterTrustWrite: afterTrustWrite
+                )
+                return verified.host
+            }
+            guard var current = pairingAttempts[hostID], current.id == attempt.id else {
+                throw CancellationError()
+            }
+            current.persistenceTask = persistenceTask
+            current.verified = verified
+            pairingAttempts[hostID] = current
+        }
+        do {
+            let host = try await persistenceTask.value
+            sessions[host.hostID] = verified.start.session
+            finishPairingAttempt(hostID: hostID, attemptID: attempt.id)
+            return host
+        } catch {
+            if var current = pairingAttempts[hostID], current.id == attempt.id {
+                current.verified = verified
+                current.persistenceTask = nil
+                pairingAttempts[hostID] = current
+            }
+            throw error
+        }
+    }
+
+    /// Cancels and zeroizes one incomplete PIN transaction without persistence.
+    public func cancelPairing(hostID: UUID) async {
+        guard var attempt = pairingAttempts[hostID], !attempt.cancelling else { return }
+        guard attempt.verified == nil, attempt.persistenceTask == nil else { return }
+        attempt.cancelling = true
+        pairingAttempts[hostID] = attempt
+        attempt.beginTask.cancel()
+        attempt.verificationTask?.cancel()
+        if let start = try? await attempt.beginTask.value,
+           pairingAttempts[hostID]?.id == attempt.id {
+            await pairingOperations.cancel(start)
+            finishPairingAttempt(hostID: hostID, attemptID: attempt.id)
+        }
+    }
+
+    private func resolvePairingBegin(
+        hostID: UUID,
+        attemptID: UUID,
+        task: Task<LSPProductPairingStart, Error>
+    ) async throws -> LSPPairingPrompt {
+        let start: LSPProductPairingStart
+        do {
+            start = try await task.value
+        } catch {
+            finishPairingAttempt(hostID: hostID, attemptID: attemptID)
+            throw error
+        }
+        do {
+            try Task.checkCancellation()
+            guard var current = pairingAttempts[hostID],
+                  current.id == attemptID,
+                  !current.cancelling else {
+                throw CancellationError()
+            }
+            if current.expiryTask == nil {
+                current.expiryTask = makePairingExpiryTask(
+                    hostID: hostID,
+                    attemptID: attemptID,
+                    expiresAtUTCSeconds: start.prompt.expiresAtUTCSeconds
+                )
+                pairingAttempts[hostID] = current
+            }
+            return start.prompt
+        } catch {
+            await tearDownStalePairingStart(start, hostID: hostID, attemptID: attemptID)
+            throw error
+        }
+    }
+
+    private func recordVerifiedPairing(
+        _ verified: VerifiedPairing,
+        hostID: UUID,
+        attemptID: UUID
+    ) {
+        guard var current = pairingAttempts[hostID],
+              current.id == attemptID,
+              !current.cancelling else { return }
+        current.verified = verified
+        current.expiryTask?.cancel()
+        current.expiryTask = nil
+        pairingAttempts[hostID] = current
+    }
+
+    private func makePairingExpiryTask(
+        hostID: UUID,
+        attemptID: UUID,
+        expiresAtUTCSeconds: UInt64
+    ) -> Task<Void, Never> {
+        Task { [weak self] in
+            let delay = max(0, TimeInterval(expiresAtUTCSeconds) - Date().timeIntervalSince1970)
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+            }
+            guard !Task.isCancelled else { return }
+            await self?.expirePairingAttempt(hostID: hostID, attemptID: attemptID)
+        }
+    }
+
+    private func expirePairingAttempt(hostID: UUID, attemptID: UUID) async {
+        guard var attempt = pairingAttempts[hostID],
+              attempt.id == attemptID,
+              attempt.verified == nil,
+              !attempt.cancelling else { return }
+        attempt.cancelling = true
+        pairingAttempts[hostID] = attempt
+        attempt.beginTask.cancel()
+        attempt.verificationTask?.cancel()
+        if let start = try? await attempt.beginTask.value {
+            await pairingOperations.cancel(start)
+        }
+        finishPairingAttempt(hostID: hostID, attemptID: attemptID)
+    }
+
+    private func tearDownStalePairingStart(
+        _ start: LSPProductPairingStart,
+        hostID: UUID,
+        attemptID: UUID
+    ) async {
+        if sessions[hostID] === start.session { return }
+        if var attempt = pairingAttempts[hostID], attempt.id == attemptID {
+            attempt.cancelling = true
+            attempt.expiryTask?.cancel()
+            pairingAttempts[hostID] = attempt
+            attempt.verificationTask?.cancel()
+            await pairingOperations.cancel(start)
+            finishPairingAttempt(hostID: hostID, attemptID: attemptID)
+            return
+        }
+        return
+    }
+
+    private func finishPairingAttempt(hostID: UUID, attemptID: UUID) {
+        guard pairingAttempts[hostID]?.id == attemptID else { return }
+        pairingAttempts[hostID]?.expiryTask?.cancel()
+        pairingAttempts.removeValue(forKey: hostID)
+        if let quarantined = quarantinedPairingDiscovery.removeValue(forKey: hostID) {
+            switch quarantined {
+            case .updated(let host):
+                discoveredPairingHosts.removeValue(forKey: hostID)
+                discoveredPairingHosts[host.hostID] = host
+                pairingDiscoveryMutationHandler?(.replaced(oldHostID: hostID, host: host))
+            case .removed:
+                discoveredPairingHosts.removeValue(forKey: hostID)
+                pairingDiscoveryMutationHandler?(.removed(hostID: hostID))
+            }
+        }
+    }
+
+    private static func livePairingOperations(
+        identityStore: JSONFileStore<LSPClientIdentitySnapshot>,
+        videoRenderer: (any MetalVideoRendering)?
+    ) -> LSPProductPairingOperations {
+        .init(
+            begin: { host in
+                let session = try await LSPClientSession.persistent(
+                    identityStore: identityStore,
+                    videoRenderer: videoRenderer
+                )
+                return .init(session: session, prompt: try await session.beginPairing(host: host))
+            },
+            verify: { start in
+                try await start.session.completePairing()
+            },
+            cancel: { start in
+                await start.session.cancelPairing()
+            }
+        )
     }
 
     /// Authenticates stored trust and returns the exact host application snapshot.

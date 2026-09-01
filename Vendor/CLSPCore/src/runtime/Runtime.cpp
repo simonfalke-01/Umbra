@@ -1958,6 +1958,22 @@ namespace umbra::lsp {
       return current_udp_payload_size_.load(std::memory_order_acquire);
     }
 
+    /** @brief Copy the exact authenticated exporter for native pairing transcript binding. */
+    [[nodiscard]] clsp_status_t copy_pairing_exporter(
+      const std::span<std::uint8_t, 32> output
+    ) const noexcept {
+      if (!authenticated_.load(std::memory_order_acquire) || !dtls_.authenticated()) {
+        return CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      std::copy(dtls_.pairing_exporter().begin(), dtls_.pairing_exporter().end(), output.begin());
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Return the published authenticated SERVER_HELLO generation. */
+    [[nodiscard]] std::uint32_t current_connection_generation() const noexcept {
+      return authenticated_connection_generation_.load(std::memory_order_acquire);
+    }
+
     /** @brief Record one terminal hardware decode outcome for bounded credit and
      * LSPV. */
     [[nodiscard]] clsp_status_t report_video_decode(
@@ -7000,6 +7016,7 @@ namespace umbra::lsp {
       if (semantic_request && !retain_inbound_request(parsed.header.request_id, plaintext)) return false;
       if (parsed.header.message_type == 0x0002U && parsed.header.connection_generation != 0) {
         connection_generation_ = parsed.header.connection_generation;
+        authenticated_connection_generation_.store(connection_generation_, std::memory_order_release);
       }
       if (callbacks_.control != nullptr) {
         const clsp_control_event_t event {
@@ -7246,6 +7263,7 @@ namespace umbra::lsp {
     /** @brief Close kqueue/socket descriptors and reset non-secret platform state. */
     void cleanup_platform() noexcept {
       authenticated_.store(false, std::memory_order_release);
+      authenticated_connection_generation_.store(0U, std::memory_order_release);
       if (kqueue_ >= 0) {
         ::close(kqueue_);
         kqueue_ = -1;
@@ -7302,6 +7320,7 @@ namespace umbra::lsp {
     std::atomic<bool> video_delivery_active_ {false};  ///< ACK-gated complete-frame publication.
     std::atomic<bool> path_discovery_enabled_ {false};  ///< Native PMTU search activation.
     std::atomic<std::uint16_t> current_udp_payload_size_ {1'200};  ///< Authenticated confirmed ceiling.
+    std::atomic<std::uint32_t> authenticated_connection_generation_ {0};  ///< Published SERVER_HELLO generation.
     std::atomic<std::uint64_t> emitted_path_probe_id_ {0};  ///< Native probe offered to Swift.
     std::atomic<std::uint16_t> emitted_path_probe_size_ {0};  ///< Offered protected payload size.
     std::atomic<std::uint64_t> pending_path_ack_id_ {0};  ///< Swift-confirmed ACK awaiting worker commit.
@@ -7595,6 +7614,16 @@ namespace umbra::lsp {
 
   std::uint16_t Runtime::current_udp_payload_size() const noexcept {
     return impl_ == nullptr ? std::uint16_t {1'200} : impl_->current_udp_payload_size();
+  }
+
+  clsp_status_t Runtime::copy_pairing_exporter(
+    const std::span<std::uint8_t, 32> output
+  ) const noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->copy_pairing_exporter(output);
+  }
+
+  std::uint32_t Runtime::current_connection_generation() const noexcept {
+    return impl_ == nullptr ? 0U : impl_->current_connection_generation();
   }
 
   clsp_status_t Runtime::report_video_decode(

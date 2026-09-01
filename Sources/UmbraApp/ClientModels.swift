@@ -78,6 +78,11 @@ struct PairingRequest: Hashable, Sendable {
     let pin: String
 }
 
+struct PairingPreparation: Hashable, Sendable {
+    let pin: String
+    let provisionalSPKIFingerprint: String?
+}
+
 enum NetworkTestOutcome: Hashable, Sendable {
     case clear
     case blocked(ports: [String])

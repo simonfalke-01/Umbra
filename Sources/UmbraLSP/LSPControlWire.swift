@@ -7,8 +7,12 @@ import UmbraMedia
 public enum LSPControlMessageType: UInt16, Sendable {
     case clientHello = 0x0001
     case serverHello = 0x0002
-    case pairRequest = 0x0010
-    case pairResponse = 0x0011
+    case pairBegin = 0x0010
+    case pairPending = 0x0011
+    case pairPoll = 0x0012
+    case pairChallenge = 0x0013
+    case pairFinish = 0x0014
+    case pairResult = 0x0015
     case authRequest = 0x0020
     case authResponse = 0x0021
     case listApplications = 0x0100
@@ -54,11 +58,30 @@ public struct LSPServerHello: Equatable, Sendable {
     public var serverNonce: Data
 }
 
-/// A validated PAIR_RESPONSE.
-public struct LSPPairingResponse: Equatable, Sendable {
+/// A validated PIN-pairing pending response.
+public struct LSPPairingPending: Equatable, Sendable {
+    public var sessionID: UUID
+    public var expiresAtUTCSeconds: UInt64
+    public var permissions: LSPPermission
+}
+
+/// A validated host PAKE challenge after admin PIN approval.
+public struct LSPPairingChallenge: Equatable, Sendable {
+    public var sessionID: UUID
+    public var approvalGeneration: UInt32
+    public var serverPublicValue: Data
+    public var permissions: LSPPermission
+    public var expiresAtUTCSeconds: UInt64
+}
+
+/// A verified PIN-pairing result ready for persistence.
+public struct LSPPairingResult: Equatable, Sendable {
+    public var sessionID: UUID
+    public var approvalGeneration: UInt32
     public var permissions: LSPPermission
     public var revocationGeneration: UInt32
-    public var serverSignature: Data
+    public var serverConfirmation: Data
+    public var hostSignature: Data
 }
 
 /// A validated AUTH_RESPONSE.
@@ -543,58 +566,138 @@ public enum LSPControlWire {
         )
     }
 
-    public static func pairingTranscript(
-        hostID: UUID,
-        clientID: UUID,
-        invitationID: UUID,
-        clientNonce: Data,
-        serverNonce: Data,
-        permissions: LSPPermission
-    ) throws -> Data {
-        try fixed(clientNonce, count: 32)
-        try fixed(serverNonce, count: 32)
-        try knownPermissions(permissions)
-        return try encodeMap([
-            .text("lumen-stream/1 pair"),
-            .bytes(uuidBytes(hostID)),
-            .bytes(uuidBytes(clientID)),
-            .bytes(uuidBytes(invitationID)),
-            .bytes(clientNonce),
-            .bytes(serverNonce),
-            .unsigned(UInt64(permissions.rawValue)),
-        ])
-    }
-
-    public static func pairRequest(
+    public static func pairBegin(
         clientID: UUID,
         clientIdentityKey: Data,
-        invitationID: UUID,
-        invitationSecret: Data,
-        clientSignature: Data
+        clientName: String,
+        clientPairingNonce: Data,
+        scryptSalt: Data,
+        clientPublicValue: Data,
+        requestedPermissions: LSPPermission
     ) throws -> Data {
         try fixed(clientIdentityKey, count: 32)
-        try fixed(invitationSecret, count: 32)
-        try fixed(clientSignature, count: 64)
+        try fixed(clientPairingNonce, count: 16)
+        try fixed(scryptSalt, count: 16)
+        guard clientPublicValue.count == 65, clientPublicValue.first == 0x04,
+              !clientName.isEmpty, clientName.utf8.count <= 64 else {
+            throw DeterministicCBORError.malformed
+        }
+        try knownPermissions(requestedPermissions)
         return try encodeMap([
+            .unsigned(1),
             .unsigned(1),
             .bytes(uuidBytes(clientID)),
             .bytes(clientIdentityKey),
-            .bytes(uuidBytes(invitationID)),
-            .bytes(invitationSecret),
+            .text(clientName),
+            .bytes(clientPairingNonce),
+            .bytes(scryptSalt),
+            .bytes(clientPublicValue),
+            .unsigned(UInt64(requestedPermissions.rawValue)),
+        ])
+    }
+
+    public static func pairPending(from event: LSPControlEvent) throws -> LSPPairingPending {
+        guard event.messageType == LSPControlMessageType.pairPending.rawValue,
+              event.flags.contains(.response), !event.flags.contains(.errorResponse) else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 6)
+        guard try uint(values[0]) == 1,
+              try uint(values[1]) == UInt64(LSPControlStatus.success.rawValue),
+              try uint(values[2]) == 1 else { throw DeterministicCBORError.malformed }
+        let permissions = LSPPermission(rawValue: try uint32(values[5], nonzero: false))
+        try knownPermissions(permissions)
+        return .init(
+            sessionID: try uuid(try bytes(values[3], count: 16)),
+            expiresAtUTCSeconds: try uint(values[4]),
+            permissions: permissions
+        )
+    }
+
+    public static func pairPoll(sessionID: UUID) throws -> Data {
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(1),
+            .bytes(uuidBytes(sessionID)),
+        ])
+    }
+
+    public static func pairChallenge(from event: LSPControlEvent) throws -> LSPPairingChallenge {
+        guard event.messageType == LSPControlMessageType.pairChallenge.rawValue,
+              event.flags.contains(.response), !event.flags.contains(.errorResponse) else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 7)
+        guard try uint(values[0]) == 1, try uint(values[1]) == 1 else {
+            throw DeterministicCBORError.malformed
+        }
+        let serverPublicValue = try bytes(values[4], count: 65)
+        guard serverPublicValue.first == 0x04 else { throw DeterministicCBORError.malformed }
+        let permissions = LSPPermission(rawValue: try uint32(values[5], nonzero: false))
+        try knownPermissions(permissions)
+        return .init(
+            sessionID: try uuid(try bytes(values[2], count: 16)),
+            approvalGeneration: try uint32(values[3], nonzero: true),
+            serverPublicValue: serverPublicValue,
+            permissions: permissions,
+            expiresAtUTCSeconds: try uint(values[6])
+        )
+    }
+
+    public static func pairFinish(
+        sessionID: UUID,
+        approvalGeneration: UInt32,
+        clientConfirmation: Data,
+        clientSignature: Data
+    ) throws -> Data {
+        try fixed(clientConfirmation, count: 32)
+        try fixed(clientSignature, count: 64)
+        guard approvalGeneration != 0 else { throw DeterministicCBORError.malformed }
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(1),
+            .bytes(uuidBytes(sessionID)),
+            .unsigned(UInt64(approvalGeneration)),
+            .bytes(clientConfirmation),
             .bytes(clientSignature),
         ])
     }
 
-    public static func pairResponse(from event: LSPControlEvent) throws -> LSPPairingResponse {
-        let values = try responseValues(event, type: .pairResponse, count: 5)
-        try requireSuccess(values[1])
-        let permissions = LSPPermission(rawValue: try uint32(values[2], nonzero: false))
+    public static func pairResult(from event: LSPControlEvent) throws -> LSPPairingResult {
+        guard event.messageType == LSPControlMessageType.pairResult.rawValue,
+              event.flags.contains(.response), !event.flags.contains(.errorResponse) else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 9)
+        guard try uint(values[0]) == 1,
+              let status = LSPControlStatus(rawValue: try uint8(values[1], nonzero: false)),
+              try uint(values[2]) == 1 else { throw DeterministicCBORError.malformed }
+        guard status == .success else { throw status }
+        let permissions = LSPPermission(rawValue: try uint32(values[5], nonzero: false))
         try knownPermissions(permissions)
-        return LSPPairingResponse(
+        return .init(
+            sessionID: try uuid(try bytes(values[3], count: 16)),
+            approvalGeneration: try uint32(values[4], nonzero: true),
             permissions: permissions,
-            revocationGeneration: try uint32(values[3], nonzero: true),
-            serverSignature: try bytes(values[4], count: 64)
+            revocationGeneration: try uint32(values[6], nonzero: true),
+            serverConfirmation: try bytes(values[7], count: 32),
+            hostSignature: try bytes(values[8], count: 64)
         )
+    }
+
+    public static func controlError(
+        from event: LSPControlEvent,
+        expectedType: LSPControlMessageType
+    ) throws -> LSPControlStatus {
+        guard event.messageType == expectedType.rawValue,
+              event.flags.contains(.response), event.flags.contains(.errorResponse) else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 2)
+        guard try uint(values[0]) == 1,
+              let status = LSPControlStatus(rawValue: try uint8(values[1], nonzero: false)),
+              status != .success else { throw DeterministicCBORError.malformed }
+        return status
     }
 
     public static func authenticationTranscript(

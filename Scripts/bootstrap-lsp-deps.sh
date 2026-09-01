@@ -22,16 +22,22 @@ archive_has_symbol() {
 
 validate_prefix() {
     [[ -f "$prefix/include/wolfssl/options.h" ]]
+    [[ -f "$prefix/include/wolfssl/lsp_spake2_settings.h" ]]
     [[ -f "$prefix/include/wolfssl/ssl.h" ]]
     [[ -f "$prefix/include/srtp2/srtp.h" ]]
     [[ -f "$prefix/lib/libwolfssl.a" ]]
     [[ -f "$prefix/lib/libsrtp2.a" ]]
     [[ -f "$manifest" ]]
     grep -qx "wolfssl_version=$wolfssl_version" "$manifest"
+    grep -qx "schema=2" "$manifest"
+    grep -qx "wolfssl_spake2=RFC9382-P256-SHA256-HKDF-HMAC" "$manifest"
     grep -qx "libsrtp_version=$libsrtp_version" "$manifest"
     grep -qx "libsrtp_crypto=wolfcrypt" "$manifest"
     archive_has_symbol "$prefix/lib/libwolfssl.a" "_wolfDTLSv1_3_client_method"
     archive_has_symbol "$prefix/lib/libwolfssl.a" "_wolfSSL_export_dtls_srtp_keying_material"
+    archive_has_symbol "$prefix/lib/libwolfssl.a" "_wc_scrypt_ex"
+    archive_has_symbol "$prefix/lib/libwolfssl.a" "_wc_ecc_mulmod_ex2"
+    archive_has_symbol "$prefix/lib/libwolfssl.a" "_ecc_projective_add_point_safe"
     archive_has_symbol "$prefix/lib/libsrtp2.a" "_srtp_create"
     ar -t "$prefix/lib/libsrtp2.a" | grep -q "aes_gcm_wolfssl"
 }
@@ -85,9 +91,36 @@ cmake -S "$task_temp/wolfssl-$wolfssl_version-stable" -B "$task_temp/wolfssl-bui
     -DWOLFSSL_AESGCM=ON \
     -DWOLFSSL_CURVE25519=ON \
     -DWOLFSSL_ED25519=ON \
-    -DWOLFSSL_OPENSSLEXTRA=ON
+    -DWOLFSSL_OPENSSLEXTRA=ON \
+    -DWOLFSSL_PWDBASED=yes \
+    -DWOLFSSL_PUBLIC_MP=yes \
+    -DWOLFSSL_HARDEN=yes \
+    -DWOLFSSL_ECC=yes \
+    -DWOLFSSL_SP_MATH_ALL=yes \
+    -DCMAKE_C_FLAGS="-DHAVE_SCRYPT -DWOLFSSL_PUBLIC_ECC_ADD_DBL -DWOLFSSL_ECC_GEN_REJECT_SAMPLING"
 cmake --build "$task_temp/wolfssl-build" --parallel "$jobs"
 cmake --install "$task_temp/wolfssl-build"
+
+spake2_settings="$staged_prefix/include/wolfssl/lsp_spake2_settings.h"
+{
+    print -r -- "#pragma once"
+    print -r -- "#include <wolfssl/options.h>"
+    print -r -- "#ifndef HAVE_SCRYPT"
+    print -r -- "#define HAVE_SCRYPT"
+    print -r -- "#endif"
+    print -r -- "#ifndef WOLFSSL_PUBLIC_MP"
+    print -r -- "#define WOLFSSL_PUBLIC_MP"
+    print -r -- "#endif"
+    print -r -- "#ifndef WOLFSSL_PUBLIC_ECC_ADD_DBL"
+    print -r -- "#define WOLFSSL_PUBLIC_ECC_ADD_DBL"
+    print -r -- "#endif"
+    print -r -- "#ifndef WOLFSSL_ECC_GEN_REJECT_SAMPLING"
+    print -r -- "#define WOLFSSL_ECC_GEN_REJECT_SAMPLING"
+    print -r -- "#endif"
+    print -r -- "#ifndef WOLFSSL_SP_MATH_ALL"
+    print -r -- "#define WOLFSSL_SP_MATH_ALL"
+    print -r -- "#endif"
+} > "$spake2_settings"
 
 libsrtp_source="$task_temp/libsrtp-$libsrtp_version"
 cp "$repository_root/Vendor/CLibSRTP/Patches/aes_gcm_wolfssl.c" "$libsrtp_source/crypto/cipher/aes_gcm_wolfssl.c"
@@ -107,12 +140,13 @@ cmake --build "$task_temp/libsrtp-build" --parallel "$jobs"
 cmake --install "$task_temp/libsrtp-build"
 
 {
-    print -r -- "schema=1"
+    print -r -- "schema=2"
     print -r -- "wolfssl_version=$wolfssl_version"
     print -r -- "wolfssl_source_sha256=$wolfssl_sha256"
     print -r -- "libsrtp_version=$libsrtp_version"
     print -r -- "libsrtp_source_sha256=$libsrtp_sha256"
     print -r -- "libsrtp_crypto=wolfcrypt"
+    print -r -- "wolfssl_spake2=RFC9382-P256-SHA256-HKDF-HMAC"
     print -r -- "deployment_target=$deployment_target"
     print -r -- "architecture=arm64"
 } > "$staged_prefix/.umbra-lsp-deps.manifest"

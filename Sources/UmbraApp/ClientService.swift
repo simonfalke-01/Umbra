@@ -31,6 +31,7 @@ protocol UmbraClientServicing: AnyObject {
     func setEventHandler(_ handler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?)
     func discoverHosts() async throws -> [HostDisplayModel]
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel
+    func preparePairing(hostID: HostID) async throws -> PairingPreparation
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel
     func cancelPairing(hostID: HostID) async
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel
@@ -52,6 +53,13 @@ protocol UmbraClientServicing: AnyObject {
 }
 
 extension UmbraClientServicing {
+    func preparePairing(hostID: HostID) async throws -> PairingPreparation {
+        .init(
+            pin: String(format: "%04d", Int.random(in: 0...9_999)),
+            provisionalSPKIFingerprint: nil
+        )
+    }
+
     func launchApplication(
         id: ApplicationID,
         on hostID: HostID,

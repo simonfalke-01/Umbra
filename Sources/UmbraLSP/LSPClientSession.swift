@@ -54,6 +54,13 @@ struct LSPAmbiguousAttachFailure: Error, Sendable {
 
 private struct LSPRollbackCompletedFailure: Error, Sendable {}
 
+private struct LSPPairingContext: Sendable {
+    var host: LSPDiscoveredPairingHost
+    var serverHello: LSPServerHello
+    var pending: LSPPairingPending
+    var native: LSPNativePairing
+}
+
 enum LSPAttachOutcome: UInt8, Sendable {
     case notSubmitted
     case submittedNoAuthenticatedOutcome
@@ -152,6 +159,7 @@ public actor LSPClientSession {
     )
     private var captureTransferred = true
     private var pendingNativeHandoff: LSPNativeHandoff?
+    private var pairingContext: LSPPairingContext?
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -190,55 +198,190 @@ public actor LSPClientSession {
         return try LSPClientSession(configuration: configuration, identity: identity, videoRenderer: videoRenderer)
     }
 
-    /// Connects and pairs with one fresh single-use invitation.
-    public func pair(invitation: LSPPairingInvitation) async throws -> LSPTrustRecord {
-        guard !invitation.isExpired else { throw LSPControlStatus.authenticationFailed }
-        let serverHello = try await connect(endpoint: invitation.endpoint)
-        guard serverHello.hostID == invitation.hostID,
-              serverHello.hostIdentityKey == invitation.hostIdentityKey,
-              serverHello.serverSPKISHA256 == invitation.serverSPKISHA256,
-              let clientNonce
-        else {
+    /// Starts discovered-host PIN pairing and returns the six digits for local display only.
+    public func beginPairing(
+        host: LSPDiscoveredPairingHost,
+        clientName: String = "Umbra",
+        requestedPermissions: LSPPermission = [
+            .browseApplications,
+            .startOrAttach,
+            .input,
+            .stopOwnStream,
+            .controllerOutput,
+        ]
+    ) async throws -> LSPPairingPrompt {
+        try Task.checkCancellation()
+        guard pairingContext == nil else { throw LSPControlStatus.busy }
+        let serverHello = try await connect(endpoint: host.endpoint)
+        try Task.checkCancellation()
+        guard serverHello.hostID == host.hostID,
+              serverHello.serverSPKISHA256 == host.serverSPKISHA256 else {
             throw LSPTransportError.spkiMismatch
         }
+        let native = try transport.makePairing(
+            clientID: identity.clientID,
+            clientIdentityKey: identity.publicKeyRawRepresentation,
+            clientName: clientName,
+            requestedPermissions: requestedPermissions.rawValue
+        )
+        do {
+            let material = try native.begin()
+            let event = try await transport.request(
+                messageType: LSPControlMessageType.pairBegin.rawValue,
+                payload: try LSPControlWire.pairBegin(
+                    clientID: identity.clientID,
+                    clientIdentityKey: identity.publicKeyRawRepresentation,
+                    clientName: clientName,
+                    clientPairingNonce: material.clientPairingNonce,
+                    scryptSalt: material.scryptSalt,
+                    clientPublicValue: material.clientPublicValue,
+                    requestedPermissions: requestedPermissions
+                )
+            )
+            try Task.checkCancellation()
+            if event.flags.contains(.errorResponse) {
+                throw try LSPControlWire.controlError(from: event, expectedType: .pairPending)
+            }
+            let pending = try LSPControlWire.pairPending(from: event)
+            guard !pending.permissions.isEmpty,
+                  pending.permissions.subtracting(requestedPermissions).isEmpty else {
+                throw LSPControlStatus.permissionDenied
+            }
+            try native.bindPending(
+                sessionID: pending.sessionID,
+                permissions: pending.permissions.rawValue,
+                expiresAtUTCSeconds: pending.expiresAtUTCSeconds
+            )
+            pairingContext = .init(
+                host: host,
+                serverHello: serverHello,
+                pending: pending,
+                native: native
+            )
+            return .init(host: host, pin: material.pin, expiresAtUTCSeconds: pending.expiresAtUTCSeconds)
+        } catch {
+            try? native.cancel()
+            state = .failed(.pairingFailed)
+            throw error
+        }
+    }
 
-        let transcript = try LSPControlWire.pairingTranscript(
-            hostID: invitation.hostID,
-            clientID: identity.clientID,
-            invitationID: invitation.invitationID,
-            clientNonce: clientNonce,
-            serverNonce: serverHello.serverNonce,
-            permissions: invitation.offeredPermissions
-        )
-        let privateKey = try identity.privateKey
-        let signature = try privateKey.signature(for: transcript)
-        let request = try LSPControlWire.pairRequest(
-            clientID: identity.clientID,
-            clientIdentityKey: privateKey.publicKey.rawRepresentation,
-            invitationID: invitation.invitationID,
-            invitationSecret: invitation.invitationSecret,
-            clientSignature: signature
-        )
-        let event = try await transport.request(
-            messageType: LSPControlMessageType.pairRequest.rawValue,
-            payload: request
-        )
-        let response = try LSPControlWire.pairResponse(from: event)
-        guard response.permissions == invitation.offeredPermissions else {
-            throw LSPControlStatus.authenticationFailed
+    /// Polls one active PIN approval and persists nothing until every confirmation verifies.
+    public func completePairing() async throws -> LSPTrustRecord {
+        guard let pairingContext else { throw LSPTransportError.invalidState }
+        do {
+            var backoff = Duration.milliseconds(250)
+            let challenge: LSPPairingChallenge
+            while true {
+                try Task.checkCancellation()
+                guard UInt64(Date().timeIntervalSince1970) < pairingContext.pending.expiresAtUTCSeconds else {
+                    throw LSPTransportError.pairingExpired
+                }
+                do {
+                    let event = try await transport.request(
+                        messageType: LSPControlMessageType.pairPoll.rawValue,
+                        payload: try LSPControlWire.pairPoll(sessionID: pairingContext.pending.sessionID)
+                    )
+                    if event.flags.contains(.errorResponse) {
+                        let status = try LSPControlWire.controlError(from: event, expectedType: .pairPending)
+                        if status == .busy || status == .timeout {
+                            try await Task.sleep(for: backoff)
+                            backoff = min(backoff * 2, .seconds(2))
+                            continue
+                        }
+                        throw status
+                    }
+                    if event.messageType == LSPControlMessageType.pairPending.rawValue {
+                        let pending = try LSPControlWire.pairPending(from: event)
+                        guard pending == pairingContext.pending else {
+                            throw LSPTransportError.pairingGenerationMismatch
+                        }
+                        try await Task.sleep(for: backoff)
+                        backoff = min(backoff * 2, .seconds(2))
+                        continue
+                    }
+                    challenge = try LSPControlWire.pairChallenge(from: event)
+                    break
+                } catch LSPTransportError.timeout {
+                    try await Task.sleep(for: backoff)
+                    backoff = min(backoff * 2, .seconds(2))
+                }
+            }
+
+            let confirmation = try pairingContext.native.acceptChallenge(
+                sessionID: challenge.sessionID,
+                approvalGeneration: challenge.approvalGeneration,
+                permissions: challenge.permissions.rawValue,
+                expiresAtUTCSeconds: challenge.expiresAtUTCSeconds,
+                serverPublicValue: challenge.serverPublicValue
+            )
+            guard confirmation.sessionID == challenge.sessionID,
+                  confirmation.approvalGeneration == challenge.approvalGeneration,
+                  confirmation.permissions == challenge.permissions.rawValue,
+                  confirmation.expiresAtUTCSeconds == challenge.expiresAtUTCSeconds else {
+                throw LSPTransportError.pairingGenerationMismatch
+            }
+            let clientSignature = try identity.privateKey.signature(for: confirmation.clientSignatureInput)
+            let finishEvent = try await transport.request(
+                messageType: LSPControlMessageType.pairFinish.rawValue,
+                payload: try LSPControlWire.pairFinish(
+                    sessionID: confirmation.sessionID,
+                    approvalGeneration: confirmation.approvalGeneration,
+                    clientConfirmation: confirmation.clientConfirmation,
+                    clientSignature: clientSignature
+                )
+            )
+            if finishEvent.flags.contains(.errorResponse) {
+                throw try LSPControlWire.controlError(from: finishEvent, expectedType: .pairResult)
+            }
+            let result = try LSPControlWire.pairResult(from: finishEvent)
+            guard result.sessionID == challenge.sessionID,
+                  result.approvalGeneration == challenge.approvalGeneration,
+                  result.permissions == challenge.permissions else {
+                throw LSPTransportError.pairingGenerationMismatch
+            }
+            let nativeResult = try pairingContext.native.verifyHost(
+                sessionID: result.sessionID,
+                approvalGeneration: result.approvalGeneration,
+                revocationGeneration: result.revocationGeneration,
+                serverConfirmation: result.serverConfirmation
+            )
+            guard nativeResult.sessionID == result.sessionID,
+                  nativeResult.approvalGeneration == result.approvalGeneration,
+                  nativeResult.permissions == result.permissions.rawValue,
+                  nativeResult.revocationGeneration == result.revocationGeneration else {
+                throw LSPTransportError.pairingGenerationMismatch
+            }
+            let hostPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: pairingContext.serverHello.hostIdentityKey
+            )
+            guard hostPublicKey.isValidSignature(result.hostSignature, for: nativeResult.hostSignatureInput) else {
+                throw LSPControlStatus.authenticationFailed
+            }
+            self.pairingContext = nil
+            state = .authenticated
+            return LSPTrustRecord(
+                hostID: pairingContext.host.hostID,
+                hostIdentityKey: pairingContext.serverHello.hostIdentityKey,
+                dtlsSPKISHA256: pairingContext.host.serverSPKISHA256,
+                permissions: result.permissions,
+                revocationGeneration: UInt64(result.revocationGeneration)
+            )
+        } catch {
+            try? pairingContext.native.cancel()
+            self.pairingContext = nil
+            state = .failed(error is CancellationError ? .invalidState : .pairingFailed)
+            throw error
         }
-        let hostPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: invitation.hostIdentityKey)
-        guard hostPublicKey.isValidSignature(response.serverSignature, for: transcript) else {
-            throw LSPControlStatus.authenticationFailed
-        }
-        state = .authenticated
-        return LSPTrustRecord(
-            hostID: invitation.hostID,
-            hostIdentityKey: invitation.hostIdentityKey,
-            dtlsSPKISHA256: invitation.serverSPKISHA256,
-            permissions: response.permissions,
-            revocationGeneration: UInt64(response.revocationGeneration)
-        )
+    }
+
+    /// Cancels the active pairing attempt and zeroizes native PIN material.
+    public func cancelPairing() {
+        guard let pairingContext else { return }
+        try? pairingContext.native.cancel()
+        self.pairingContext = nil
+        state = .stopped
+        try? transport.stop()
     }
 
     /// Reconnects and authenticates a previously paired LSP identity.
@@ -1325,6 +1468,14 @@ public actor LSPClientSession {
             guard response.serverSPKISHA256 == endpoint.serverSPKISHA256 else {
                 throw LSPTransportError.spkiMismatch
             }
+            try transport.bindHostHello(
+                connectionGeneration: response.connectionGeneration,
+                hostID: response.hostID,
+                hostIdentityKey: response.hostIdentityKey,
+                serverSPKISHA256: response.serverSPKISHA256,
+                clientNonce: nonce,
+                serverNonce: response.serverNonce
+            )
             clientNonce = nonce
             hello = response
             return response

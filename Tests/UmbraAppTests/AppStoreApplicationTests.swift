@@ -91,6 +91,44 @@ final class AppStoreApplicationTests: XCTestCase {
         XCTAssertNil(store.failure)
     }
 
+    func testLSPPairingDisplaysNativeSixDigitPINWithoutRegeneration() async {
+        let host = makeHost(id: "lsp:00112233-4455-6677-8899-aabbccddeeff")
+        let service = AppStoreClientServiceSpy(
+            hosts: [host],
+            applications: [:],
+            preparedPIN: "004200"
+        )
+        let store = AppStore(service: service)
+
+        store.beginPairing(host)
+        await waitUntil { store.presentedSheet == .pair(host.id, pin: "004200") }
+
+        XCTAssertEqual(service.preparePairingRequests, [host.id])
+        XCTAssertEqual(
+            store.pairingPreparations[host.id]?.provisionalSPKIFingerprint,
+            "00112233 44556677"
+        )
+    }
+
+    func testCancellingLSPBeforePINSheetCancelsServiceAttempt() async {
+        let host = makeHost(id: "lsp:00112233-4455-6677-8899-aabbccddeeff")
+        let service = AppStoreClientServiceSpy(
+            hosts: [host],
+            applications: [:],
+            suspendsPairingPreparation: true,
+            preparedPIN: "004200"
+        )
+        let store = AppStore(service: service)
+
+        store.beginPairing(host)
+        await waitUntil { service.pendingPairingPreparationCount == 1 }
+        store.cancelCurrentOperation()
+        await waitUntil { service.cancelPairingRequests == [host.id] }
+
+        XCTAssertNil(store.presentedSheet)
+        XCTAssertNil(store.pairingPreparations[host.id])
+    }
+
     func testReplacingRunningApplicationWaitsForExplicitConfirmation() async throws {
         let host = makeHost(id: "host")
         let running = makeApplication(id: 1, hostID: host.id, name: "Running", isRunning: true)
@@ -794,6 +832,11 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
     private let suspendsPairing: Bool
     private let suspendsApplicationLaunch: Bool
     private let suspendsApplicationRequests: Bool
+    private let preparedPIN: String
+    private let suspendsPairingPreparation: Bool
+    private(set) var preparePairingRequests: [HostID] = []
+    private(set) var cancelPairingRequests: [HostID] = []
+    private var pairingPreparationContinuations: [HostID: CheckedContinuation<PairingPreparation, Error>] = [:]
     private var pairingContinuations: [CheckedContinuation<HostDisplayModel, any Error>] = []
     private var applicationLaunchContinuations: [CheckedContinuation<Void, any Error>] = []
     private var pendingApplicationRequests: [PendingApplicationRequest] = []
@@ -804,7 +847,9 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
         pairingError: Error? = nil,
         suspendsPairing: Bool = false,
         suspendsApplicationLaunch: Bool = false,
-        suspendsApplicationRequests: Bool = false
+        suspendsApplicationRequests: Bool = false,
+        suspendsPairingPreparation: Bool = false,
+        preparedPIN: String = "1234"
     ) {
         self.hosts = hosts
         applicationsByHost = applications
@@ -812,9 +857,12 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
         self.suspendsPairing = suspendsPairing
         self.suspendsApplicationLaunch = suspendsApplicationLaunch
         self.suspendsApplicationRequests = suspendsApplicationRequests
+        self.suspendsPairingPreparation = suspendsPairingPreparation
+        self.preparedPIN = preparedPIN
     }
 
     var pendingPairingCount: Int { pairingContinuations.count }
+    var pendingPairingPreparationCount: Int { pairingPreparationContinuations.count }
     var pendingApplicationLaunchCount: Int { applicationLaunchContinuations.count }
 
     func pendingApplicationRequestCount(for hostID: HostID) -> Int {
@@ -881,6 +929,17 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
     func disconnectSession() async { disconnectCount += 1 }
 
     func addHost(_ endpoint: HostEndpointInput) async throws -> HostDisplayModel { throw unused() }
+    func preparePairing(hostID: HostID) async throws -> PairingPreparation {
+        preparePairingRequests.append(hostID)
+        let preparation = PairingPreparation(
+            pin: preparedPIN,
+            provisionalSPKIFingerprint: preparedPIN.count == 6 ? "00112233 44556677" : nil
+        )
+        guard suspendsPairingPreparation else { return preparation }
+        return try await withCheckedThrowingContinuation { continuation in
+            pairingPreparationContinuations[hostID] = continuation
+        }
+    }
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
         if let pairingError { throw pairingError }
         if suspendsPairing {
@@ -898,7 +957,10 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
     func completeNextApplicationLaunch() {
         applicationLaunchContinuations.removeFirst().resume(returning: ())
     }
-    func cancelPairing(hostID: HostID) async {}
+    func cancelPairing(hostID: HostID) async {
+        cancelPairingRequests.append(hostID)
+        pairingPreparationContinuations.removeValue(forKey: hostID)?.resume(throwing: CancellationError())
+    }
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw unused() }
     func deleteHost(id: HostID) async throws { throw unused() }
     func wakeHost(id: HostID) async throws -> HostDisplayModel { throw unused() }

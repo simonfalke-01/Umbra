@@ -44,7 +44,7 @@ public struct LSPTransportConfiguration: Sendable {
     }
 }
 
-/// Exact remote LSP endpoint derived from an invitation or persisted trust.
+/// Exact remote LSP endpoint derived from validated discovery or persisted trust.
 public struct LSPTransportEndpoint: Equatable, Sendable {
     /// DNS name or numeric IP literal.
     public var host: String
@@ -143,6 +143,54 @@ public struct LSPNativeInputBaselineSnapshot: Sendable, Equatable {
     public var inputAuthorityEpoch: UInt32
     public var eventGeneration: UInt64
     public var acknowledged: Bool
+}
+
+/// Client-side native PIN-pairing lifecycle copied only at control frequency.
+public enum LSPNativePairingPhase: UInt32, Sendable {
+    case created = 0
+    case begun = 1
+    case pendingBound = 2
+    case challengeAccepted = 3
+    case complete = 4
+    case cancelled = 5
+    case failed = 6
+}
+
+/// Native-generated public PAKE material and the user-visible six-digit PIN.
+public struct LSPNativePairingBegin: Equatable, Sendable {
+    public var pin: String
+    public var scryptSalt: Data
+    public var clientPairingNonce: Data
+    public var clientPublicValue: Data
+}
+
+/// Native-generated client confirmation and exact Ed25519 signature input.
+public struct LSPNativePairingClientConfirmation: Equatable, Sendable {
+    public var sessionID: UUID
+    public var approvalGeneration: UInt32
+    public var permissions: UInt32
+    public var expiresAtUTCSeconds: UInt64
+    public var clientConfirmation: Data
+    public var clientSignatureInput: Data
+}
+
+/// Native-verified host confirmation and exact Ed25519 signature input.
+public struct LSPNativePairingResult: Equatable, Sendable {
+    public var sessionID: UUID
+    public var approvalGeneration: UInt32
+    public var permissions: UInt32
+    public var revocationGeneration: UInt32
+    public var expiresAtUTCSeconds: UInt64
+    public var hostSignatureInput: Data
+}
+
+/// Secret-free native pairing state suitable for UI polling and diagnostics.
+public struct LSPNativePairingSnapshot: Equatable, Sendable {
+    public var phase: LSPNativePairingPhase
+    public var permissions: UInt32
+    public var approvalGeneration: UInt32
+    public var revocationGeneration: UInt32
+    public var expiresAtUTCSeconds: UInt64
 }
 
 /// Authenticated version-one LSPC flags.
@@ -499,6 +547,10 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
     case inputPermissionDenied
     case inputUnavailable
     case rollbackPending
+    case pairingFailed
+    case pairingExpired
+    case pairingGenerationMismatch
+    case pairingConfirmationFailed
     case unknownStatus(Int32)
 
     public var errorDescription: String? {
@@ -545,6 +597,14 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
             "Preferred native input capture is unavailable."
         case .rollbackPending:
             "Native input rollback is waiting for the fresh baseline acknowledgement."
+        case .pairingFailed:
+            "Native LSP PIN pairing failed."
+        case .pairingExpired:
+            "The LSP pairing PIN expired."
+        case .pairingGenerationMismatch:
+            "The LSP pairing response does not match this approval."
+        case .pairingConfirmationFailed:
+            "The LSP host pairing confirmation is not authentic."
         case .unknownStatus(let status):
             "The LSP native core returned unknown status \(status)."
         }
@@ -613,7 +673,7 @@ public final class LSPTransport: @unchecked Sendable {
 
     /// Starts and synchronously authenticates the pinned DTLS association.
     ///
-    /// - Parameter endpoint: Invitation- or trust-derived host, port, and SPKI pin.
+    /// - Parameter endpoint: Discovery- or trust-derived host, port, and SPKI pin.
     /// - Throws: A fail-closed provider or lifecycle error.
     public func start(endpoint: LSPTransportEndpoint) throws {
         let hostBytes = Array(endpoint.host.utf8)
@@ -646,6 +706,50 @@ public final class LSPTransport: @unchecked Sendable {
     /// - Throws: A typed lifecycle error.
     public func stop() throws {
         try Self.requireSuccess(clsp_core_stop(core))
+    }
+
+    /// Binds the validated SERVER_HELLO identity to this authenticated DTLS association.
+    public func bindHostHello(
+        connectionGeneration: UInt32,
+        hostID: UUID,
+        hostIdentityKey: Data,
+        serverSPKISHA256: Data,
+        clientNonce: Data,
+        serverNonce: Data
+    ) throws {
+        guard connectionGeneration != 0,
+              hostIdentityKey.count == 32,
+              serverSPKISHA256.count == 32,
+              clientNonce.count == 32,
+              serverNonce.count == 32 else {
+            throw LSPTransportError.invalidConfiguration
+        }
+        var identity = clsp_host_hello_identity_t()
+        identity.abi_version = Self.abiVersion
+        identity.structure_size = UInt32(MemoryLayout<clsp_host_hello_identity_t>.size)
+        identity.connection_generation = connectionGeneration
+        Self.copyUUID(hostID, to: &identity.host_id)
+        Self.copy(hostIdentityKey, to: &identity.host_identity_key)
+        Self.copy(serverSPKISHA256, to: &identity.server_spki_sha256)
+        Self.copy(clientNonce, to: &identity.client_nonce)
+        Self.copy(serverNonce, to: &identity.server_nonce)
+        try Self.requireSuccess(clsp_core_bind_host_hello(core, &identity))
+    }
+
+    /// Creates one native owner for a single six-digit PIN pairing attempt.
+    public func makePairing(
+        clientID: UUID,
+        clientIdentityKey: Data,
+        clientName: String,
+        requestedPermissions: UInt32
+    ) throws -> LSPNativePairing {
+        try LSPNativePairing(
+            transport: self,
+            clientID: clientID,
+            clientIdentityKey: clientIdentityKey,
+            clientName: clientName,
+            requestedPermissions: requestedPermissions
+        )
     }
 
     /// Copies one low-rate telemetry snapshot without exposing packet storage.
@@ -1244,9 +1348,231 @@ public final class LSPTransport: @unchecked Sendable {
             throw LSPTransportError.inputUnavailable
         case CLSP_STATUS_ROLLBACK_PENDING:
             throw LSPTransportError.rollbackPending
+        case CLSP_STATUS_PAIRING_FAILED:
+            throw LSPTransportError.pairingFailed
+        case CLSP_STATUS_PAIRING_EXPIRED:
+            throw LSPTransportError.pairingExpired
+        case CLSP_STATUS_PAIRING_GENERATION_MISMATCH:
+            throw LSPTransportError.pairingGenerationMismatch
+        case CLSP_STATUS_PAIRING_CONFIRMATION_FAILED:
+            throw LSPTransportError.pairingConfirmationFailed
         default:
             throw LSPTransportError.unknownStatus(Int32(status.rawValue))
         }
+    }
+
+    fileprivate static func copy<T>(_ data: Data, to destination: inout T) {
+        data.withUnsafeBytes { source in
+            withUnsafeMutableBytes(of: &destination) { target in
+                target.copyBytes(from: source)
+            }
+        }
+    }
+
+    fileprivate static func copyUUID<T>(_ identifier: UUID, to destination: inout T) {
+        var bytes = identifier.uuid
+        withUnsafeBytes(of: &bytes) { source in
+            withUnsafeMutableBytes(of: &destination) { target in
+                target.copyBytes(from: source)
+            }
+        }
+    }
+
+    fileprivate static func data<T>(_ value: T, count: Int? = nil) -> Data {
+        var value = value
+        return withUnsafeBytes(of: &value) { bytes in
+            Data(bytes.prefix(count ?? bytes.count))
+        }
+    }
+
+    fileprivate static func uuid<T>(_ value: T) throws -> UUID {
+        let bytes = data(value)
+        guard bytes.count == 16, bytes.contains(where: { $0 != 0 }) else {
+            throw LSPTransportError.internalFailure
+        }
+        var uuid: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        withUnsafeMutableBytes(of: &uuid) { $0.copyBytes(from: bytes) }
+        return UUID(uuid: uuid)
+    }
+}
+
+/// Opaque owner for one native six-digit PIN-pairing transaction.
+public final class LSPNativePairing: @unchecked Sendable {
+    private let handle: OpaquePointer
+
+    fileprivate init(
+        transport: LSPTransport,
+        clientID: UUID,
+        clientIdentityKey: Data,
+        clientName: String,
+        requestedPermissions: UInt32
+    ) throws {
+        let nameBytes = Array(clientName.utf8)
+        guard clientIdentityKey.count == 32,
+              !nameBytes.isEmpty,
+              nameBytes.count <= 64,
+              requestedPermissions != 0 else {
+            throw LSPTransportError.invalidConfiguration
+        }
+        var configuration = clsp_pairing_configuration_t()
+        configuration.abi_version = LSPTransport.abiVersion
+        configuration.structure_size = UInt32(MemoryLayout<clsp_pairing_configuration_t>.size)
+        configuration.requested_permissions = requestedPermissions
+        LSPTransport.copyUUID(clientID, to: &configuration.client_id)
+        LSPTransport.copy(clientIdentityKey, to: &configuration.client_identity_key)
+        var output: OpaquePointer?
+        try nameBytes.withUnsafeBufferPointer { buffer in
+            configuration.client_name = .init(data: buffer.baseAddress, length: buffer.count)
+            try LSPTransport.requireSuccess(clsp_pairing_create(transport.core, &configuration, &output))
+        }
+        guard let output else { throw LSPTransportError.internalFailure }
+        handle = output
+    }
+
+    deinit {
+        clsp_pairing_release(handle)
+    }
+
+    /// Generates the PIN and public PAKE material exactly once.
+    public func begin() throws -> LSPNativePairingBegin {
+        var native = clsp_pairing_begin_t()
+        try LSPTransport.requireSuccess(clsp_pairing_begin(handle, &native))
+        guard native.abi_version == LSPTransport.abiVersion,
+              native.structure_size == MemoryLayout<clsp_pairing_begin_t>.size,
+              LSPTransport.data(native.reserved_zero).allSatisfy({ $0 == 0 }),
+              LSPTransport.data(native.reserved_tail).allSatisfy({ $0 == 0 }) else {
+            throw LSPTransportError.internalFailure
+        }
+        let pinBytes = LSPTransport.data(native.pin_digits)
+        guard pinBytes.count == 6,
+              pinBytes.allSatisfy({ (48...57).contains($0) }),
+              let pin = String(data: pinBytes, encoding: .ascii) else {
+            throw LSPTransportError.internalFailure
+        }
+        let clientPublicValue = LSPTransport.data(native.client_point)
+        guard clientPublicValue.first == 0x04 else { throw LSPTransportError.internalFailure }
+        return .init(
+            pin: pin,
+            scryptSalt: LSPTransport.data(native.scrypt_salt),
+            clientPairingNonce: LSPTransport.data(native.client_pairing_nonce),
+            clientPublicValue: clientPublicValue
+        )
+    }
+
+    /// Binds the authenticated host-issued PENDING session and expiry.
+    public func bindPending(
+        sessionID: UUID,
+        permissions: UInt32,
+        expiresAtUTCSeconds: UInt64
+    ) throws {
+        var native = clsp_pairing_pending_t()
+        native.abi_version = LSPTransport.abiVersion
+        native.structure_size = UInt32(MemoryLayout<clsp_pairing_pending_t>.size)
+        native.effective_permissions = permissions
+        native.expires_at_utc_seconds = expiresAtUTCSeconds
+        LSPTransport.copyUUID(sessionID, to: &native.pairing_session_id)
+        try LSPTransport.requireSuccess(clsp_pairing_bind_pending(handle, &native))
+    }
+
+    /// Validates one authenticated challenge and produces cA plus its signature input.
+    public func acceptChallenge(
+        sessionID: UUID,
+        approvalGeneration: UInt32,
+        permissions: UInt32,
+        expiresAtUTCSeconds: UInt64,
+        serverPublicValue: Data
+    ) throws -> LSPNativePairingClientConfirmation {
+        guard serverPublicValue.count == 65 else { throw LSPTransportError.invalidConfiguration }
+        var challenge = clsp_pairing_challenge_t()
+        challenge.abi_version = LSPTransport.abiVersion
+        challenge.structure_size = UInt32(MemoryLayout<clsp_pairing_challenge_t>.size)
+        challenge.approval_generation = approvalGeneration
+        challenge.effective_permissions = permissions
+        challenge.expires_at_utc_seconds = expiresAtUTCSeconds
+        LSPTransport.copyUUID(sessionID, to: &challenge.pairing_session_id)
+        LSPTransport.copy(serverPublicValue, to: &challenge.host_point)
+        var output = clsp_pairing_client_confirmation_t()
+        try LSPTransport.requireSuccess(clsp_pairing_accept_challenge(handle, &challenge, &output))
+        guard output.abi_version == LSPTransport.abiVersion,
+              output.structure_size == MemoryLayout<clsp_pairing_client_confirmation_t>.size,
+              LSPTransport.data(output.reserved_zero).allSatisfy({ $0 == 0 }),
+              output.client_signature_input_length > 0,
+              Int(output.client_signature_input_length) <= MemoryLayout.size(ofValue: output.client_signature_input) else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            sessionID: try LSPTransport.uuid(output.pairing_session_id),
+            approvalGeneration: output.approval_generation,
+            permissions: output.effective_permissions,
+            expiresAtUTCSeconds: output.expires_at_utc_seconds,
+            clientConfirmation: LSPTransport.data(output.client_confirmation),
+            clientSignatureInput: LSPTransport.data(
+                output.client_signature_input,
+                count: Int(output.client_signature_input_length)
+            )
+        )
+    }
+
+    /// Verifies cB and returns the exact host Ed25519 signature input.
+    public func verifyHost(
+        sessionID: UUID,
+        approvalGeneration: UInt32,
+        revocationGeneration: UInt32,
+        serverConfirmation: Data
+    ) throws -> LSPNativePairingResult {
+        guard serverConfirmation.count == 32 else { throw LSPTransportError.invalidConfiguration }
+        var confirmation = clsp_pairing_host_confirmation_t()
+        confirmation.abi_version = LSPTransport.abiVersion
+        confirmation.structure_size = UInt32(MemoryLayout<clsp_pairing_host_confirmation_t>.size)
+        confirmation.approval_generation = approvalGeneration
+        confirmation.revocation_generation = revocationGeneration
+        LSPTransport.copyUUID(sessionID, to: &confirmation.pairing_session_id)
+        LSPTransport.copy(serverConfirmation, to: &confirmation.host_confirmation)
+        var output = clsp_pairing_result_t()
+        try LSPTransport.requireSuccess(clsp_pairing_verify_host(handle, &confirmation, &output))
+        guard output.abi_version == LSPTransport.abiVersion,
+              output.structure_size == MemoryLayout<clsp_pairing_result_t>.size,
+              output.reserved_zero == 0,
+              LSPTransport.data(output.reserved_tail).allSatisfy({ $0 == 0 }),
+              output.host_signature_input_length > 0,
+              Int(output.host_signature_input_length) <= MemoryLayout.size(ofValue: output.host_signature_input) else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            sessionID: try LSPTransport.uuid(output.pairing_session_id),
+            approvalGeneration: output.approval_generation,
+            permissions: output.effective_permissions,
+            revocationGeneration: output.revocation_generation,
+            expiresAtUTCSeconds: output.expires_at_utc_seconds,
+            hostSignatureInput: LSPTransport.data(
+                output.host_signature_input,
+                count: Int(output.host_signature_input_length)
+            )
+        )
+    }
+
+    /// Cancels and immediately zeroizes an incomplete pairing transaction.
+    public func cancel() throws {
+        try LSPTransport.requireSuccess(clsp_pairing_cancel(handle))
+    }
+
+    /// Copies secret-free native pairing state.
+    public func snapshot() throws -> LSPNativePairingSnapshot {
+        var output = clsp_pairing_snapshot_t()
+        try LSPTransport.requireSuccess(clsp_pairing_copy_snapshot(handle, &output))
+        guard output.abi_version == LSPTransport.abiVersion,
+              output.structure_size == MemoryLayout<clsp_pairing_snapshot_t>.size,
+              output.reserved_zero == 0,
+              let phase = LSPNativePairingPhase(rawValue: output.phase) else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            phase: phase,
+            permissions: output.effective_permissions,
+            approvalGeneration: output.approval_generation,
+            revocationGeneration: output.revocation_generation,
+            expiresAtUTCSeconds: output.expires_at_utc_seconds
+        )
     }
 }
 

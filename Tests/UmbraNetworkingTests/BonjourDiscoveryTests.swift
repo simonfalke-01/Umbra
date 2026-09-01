@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import XCTest
 @testable import UmbraNetworking
 
@@ -102,6 +103,31 @@ final class BonjourDiscoveryTests: XCTestCase {
 
         XCTAssertEqual(factory.requestedKinds, [.lumenStreamingProtocol])
         discovery.stop()
+    }
+
+    func testResolvedServiceUsesSRVTargetPortAndInterfaceMetadata() throws {
+        let service = DiscoveredHostService(
+            name: "Gaming PC",
+            type: "_lumen-stream._udp",
+            domain: "lab.local.",
+            interfaceName: "en7",
+            changeToken: 42
+        )
+        let resolved = try NetworkBonjourDiscovery.resolvedEndpoint(
+            from: .hostPort(host: "lumen-target.lab.local", port: 49_999),
+            service: service
+        )
+
+        XCTAssertEqual(resolved.targetHost, "lumen-target.lab.local")
+        XCTAssertEqual(resolved.port, 49_999)
+        XCTAssertEqual(resolved.serviceName, "Gaming PC")
+        XCTAssertEqual(resolved.domain, "lab.local.")
+        XCTAssertEqual(resolved.interfaceName, "en7")
+        XCTAssertEqual(resolved.changeToken, 42)
+        XCTAssertThrowsError(try NetworkBonjourDiscovery.resolvedEndpoint(
+            from: .service(name: "Gaming PC", type: "_lumen-stream._udp", domain: "local.", interface: nil),
+            service: service
+        ))
     }
 }
 

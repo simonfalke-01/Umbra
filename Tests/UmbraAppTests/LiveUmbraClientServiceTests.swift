@@ -1,5 +1,6 @@
 import Foundation
 import UmbraCore
+@testable import UmbraLSP
 import UmbraNetworking
 import UmbraServices
 import XCTest
@@ -7,6 +8,39 @@ import XCTest
 
 @MainActor
 final class LiveUmbraClientServiceTests: XCTestCase {
+    func testReleasedHostIDMutationImmediatelyReplacesVisibleLSPRow() async throws {
+        let fixture = makeFixture(remoteApplications: [])
+        let originalID = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        let changedID = UUID(uuidString: "10213243-5465-7687-98a9-bacbdcedfe0f")!
+        let original = LSPDiscoveredPairingHost(
+            hostID: originalID,
+            serverSPKISHA256: Data(repeating: 0x11, count: 32),
+            port: 48_030,
+            host: "srv-a.local",
+            name: "Unverified Gaming PC",
+            capabilities: "input,video",
+            domain: "local.",
+            interfaceName: "en0",
+            discoveryChangeToken: 1,
+            discoveryServiceID: "Unverified Gaming PC|_lumen-stream._udp|local.|en0"
+        )
+        var changed = original
+        changed.hostID = changedID
+        changed.serverSPKISHA256 = Data(repeating: 0x22, count: 32)
+        changed.host = "srv-b.local"
+        changed.discoveryChangeToken = 2
+        fixture.client.handleLSPPairingDiscoveryMutation(.replaced(oldHostID: originalID, host: original))
+        fixture.client.handleLSPPairingDiscoveryMutation(.replaced(oldHostID: originalID, host: changed))
+
+        let visible = try await fixture.client.discoverHosts()
+        XCTAssertFalse(visible.contains(where: { $0.id == HostID("lsp:\(originalID.uuidString.lowercased())") }))
+        let changedRow = try XCTUnwrap(
+            visible.first(where: { $0.id == HostID("lsp:\(changedID.uuidString.lowercased())") })
+        )
+        XCTAssertTrue(changedRow.details.contains("srv-b.local:48030"))
+        XCTAssertTrue(changedRow.details.contains(changed.provisionalSPKIFingerprint))
+    }
+
     func testRuntimeResolutionBuildsGUIIntentWithoutDroppingPolicy() {
         let runtime = makeDistinctRuntimeResolution()
 

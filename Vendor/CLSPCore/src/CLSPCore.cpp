@@ -8,6 +8,8 @@
 #include "core/core.h"
 #include "runtime/BufferInternal.h"
 #include "runtime/Runtime.h"
+#include "runtime/SecureZero.h"
+#include "runtime/WolfsslSpake2.h"
 #include "transport/generation_fence.h"
 
 #include <atomic>
@@ -17,11 +19,21 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <ctime>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <shared_mutex>
+
+#if CLSP_CORE_HAS_WOLFSSL
+  #if __has_include(<wolfssl/lsp_spake2_settings.h>)
+    #include <wolfssl/lsp_spake2_settings.h>
+  #else
+    #include <wolfssl/options.h>
+  #endif
+  #include <wolfssl/wolfcrypt/random.h>
+#endif
 
 extern "C" std::uint8_t clsp_apple_input_capture_apply_lspg(
   clsp_apple_input_capture_t *capture,
@@ -66,6 +78,7 @@ struct clsp_core {
   std::atomic<bool> video_callback_active {false};  ///< Prevents recursive complete-frame delivery.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
   std::mutex handoff_observer_mutex;  ///< Serializes handoff observation binding replacement.
+  std::mutex host_hello_mutex;  ///< Serializes authenticated SERVER_HELLO identity binding.
   std::mutex producer_wait_mutex;  ///< Wait owner for native producer-lease drain.
   std::condition_variable producer_wait_condition;  ///< Producer-lease drain notification.
   mutable std::mutex baseline_mutex;  ///< Serializes association-local baseline readiness.
@@ -74,6 +87,9 @@ struct clsp_core {
   std::atomic<std::uint32_t> producer_leases {0};  ///< In-flight input producer operations.
   std::atomic<bool> producers_accepting {true};  ///< Input producer admission gate.
   clsp_handoff_observer_binding *handoff_observer {};  ///< Non-owning-by-contract ref-counted observer binding.
+  clsp_host_hello_identity_t host_hello {};  ///< Exact association-bound authenticated host identity.
+  std::array<std::uint8_t, 32> expected_server_spki {};  ///< Current endpoint's pinned server SPKI digest.
+  bool host_hello_bound {};  ///< Whether `host_hello` is valid for the current runtime.
   std::uint32_t baseline_connection_generation {};  ///< Last configured association generation.
   std::uint32_t baseline_input_generation {};  ///< Last configured input generation.
   std::uint32_t baseline_authority_epoch {};  ///< Last handoff-derived local authority epoch.
@@ -105,6 +121,8 @@ struct clsp_core {
     if (callbacks.context != nullptr) {
       callbacks.release_context(callbacks.context);
     }
+    lumen::lsp::secure_zero({reinterpret_cast<std::uint8_t *>(&host_hello), sizeof(host_hello)});
+    lumen::lsp::secure_zero(expected_server_spki);
   }
 };
 
@@ -157,6 +175,37 @@ struct clsp_handoff {
   std::uint64_t committed_count {};  ///< Irreversible ATTACH commits.
   std::uint64_t definite_rollback_count {};  ///< Definitely rejected safe rollbacks.
   std::uint64_t terminal_count {};  ///< Terminal fail-closed transitions.
+};
+
+/** @brief Native client-side PIN-pairing owner hidden behind `clsp_pairing_t`. */
+struct clsp_pairing {
+  std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
+  mutable std::mutex mutex;  ///< Serializes the one-shot pairing lifecycle.
+  clsp_core_t *core {};  ///< Retained authenticated association.
+  clsp_host_hello_identity_t host_hello {};  ///< Copied authenticated association identity.
+  std::array<std::uint8_t, 32> pairing_exporter {};  ///< Dedicated pairing TLS exporter.
+  std::array<std::uint8_t, 16> client_id {};  ///< Stable client UUID bytes.
+  std::array<std::uint8_t, 32> client_identity_key {};  ///< Stable Ed25519 client public key.
+  std::array<std::uint8_t, 64> client_name {};  ///< Copied UTF-8 client name.
+  std::size_t client_name_length {};  ///< Populated client-name bytes.
+  std::uint32_t requested_permissions {};  ///< Requested known permission mask.
+  std::uint32_t phase {CLSP_PAIRING_PHASE_CREATED};  ///< Current `clsp_pairing_phase_t`.
+  std::array<std::uint8_t, 6> pin {};  ///< Secret six-digit ASCII PIN.
+  std::array<std::uint8_t, 16> salt {};  ///< Secret per-session scrypt salt.
+  std::array<std::uint8_t, 16> client_pairing_nonce {};  ///< BEGIN pairing nonce.
+  lumen::lsp::Spake2Point point_a {};  ///< Generated client SPAKE point.
+  lumen::lsp::Spake2Point point_b {};  ///< Validated host SPAKE point.
+  lumen::lsp::Spake2Confirmation confirmation_a {};  ///< Client confirmation cA.
+  std::array<std::uint8_t, 16> pairing_session_id {};  ///< Host-issued PENDING session.
+  std::uint32_t effective_permissions {};  ///< Host-bounded permission mask.
+  std::uint32_t approval_generation {};  ///< One-time host approval generation.
+  std::uint32_t revocation_generation {};  ///< RESULT revocation generation.
+  std::uint64_t expires_at_utc_seconds {};  ///< Exact PENDING/CHALLENGE expiry.
+  std::array<std::uint8_t, 512> aad {};  ///< Canonical exact-17 pairing AAD.
+  std::size_t aad_length {};  ///< Populated AAD bytes.
+#if CLSP_CORE_HAS_WOLFSSL
+  std::unique_ptr<lumen::lsp::WolfsslSpake2ClientSession> spake;  ///< Secret SPAKE session owner.
+#endif
 };
 
 namespace umbra::lsp {
@@ -480,6 +529,276 @@ namespace {
     static std::atomic<std::uint64_t> fallback {1};
     return fallback.fetch_add(1, std::memory_order_relaxed);
 #endif
+  }
+
+  /** @brief Return whether fixed bytes contain at least one nonzero octet. */
+  template<typename Range>
+  [[nodiscard]] bool contains_nonzero(const Range &bytes) noexcept {
+    return std::any_of(std::begin(bytes), std::end(bytes), [](const std::uint8_t byte) { return byte != 0U; });
+  }
+
+  /** @brief Fill bytes from wolfCrypt's process-backed CSPRNG. */
+  [[nodiscard]] clsp_status_t random_bytes(const std::span<std::uint8_t> output) noexcept {
+#if CLSP_CORE_HAS_WOLFSSL
+    if (output.empty() || output.size() > static_cast<std::size_t>(std::numeric_limits<word32>::max())) {
+      return CLSP_STATUS_INVALID_ARGUMENT;
+    }
+    WC_RNG rng {};
+    if (wc_InitRng(&rng) != 0) return CLSP_STATUS_PAIRING_FAILED;
+    const auto status = wc_RNG_GenerateBlock(
+      &rng,
+      output.data(),
+      static_cast<word32>(output.size())
+    );
+    wc_FreeRng(&rng);
+    return status == 0 ? CLSP_STATUS_OK : CLSP_STATUS_PAIRING_FAILED;
+#else
+    (void)output;
+    return CLSP_STATUS_MISSING_WOLFSSL;
+#endif
+  }
+
+  /** @brief Fill a bounded random field and reject the all-zero encoding. */
+  [[nodiscard]] clsp_status_t random_nonzero_bytes(const std::span<std::uint8_t> output) noexcept {
+    for (std::uint32_t attempt = 0; attempt < 8U; ++attempt) {
+      const auto status = random_bytes(output);
+      if (status != CLSP_STATUS_OK) return status;
+      if (std::any_of(output.begin(), output.end(), [](const std::uint8_t byte) { return byte != 0U; })) {
+        return CLSP_STATUS_OK;
+      }
+    }
+    return CLSP_STATUS_PAIRING_FAILED;
+  }
+
+  /** @brief Generate an unbiased six-digit ASCII PIN, including leading zeroes. */
+  [[nodiscard]] clsp_status_t generate_pairing_pin(std::array<std::uint8_t, 6> &pin) noexcept {
+    constexpr std::uint64_t range = std::uint64_t {UINT32_MAX} + 1U;
+    constexpr std::uint64_t limit = range / 1'000'000U * 1'000'000U;
+    std::array<std::uint8_t, 4> sample_bytes {};
+    std::uint32_t sample = 0;
+    do {
+      const auto status = random_bytes(sample_bytes);
+      if (status != CLSP_STATUS_OK) return status;
+      sample = static_cast<std::uint32_t>(sample_bytes[0]) << 24U |
+               static_cast<std::uint32_t>(sample_bytes[1]) << 16U |
+               static_cast<std::uint32_t>(sample_bytes[2]) << 8U |
+               static_cast<std::uint32_t>(sample_bytes[3]);
+    } while (sample >= limit);
+    auto value = sample % 1'000'000U;
+    for (std::size_t index = pin.size(); index != 0U; --index) {
+      pin[index - 1U] = static_cast<std::uint8_t>('0' + value % 10U);
+      value /= 10U;
+    }
+    lumen::lsp::secure_zero(sample_bytes);
+    return CLSP_STATUS_OK;
+  }
+
+  /** @brief Validate canonical UTF-8 scalar encoding for a bounded client name. */
+  [[nodiscard]] bool valid_utf8_name(const std::span<const std::uint8_t> bytes) noexcept {
+    if (bytes.empty() || bytes.size() > 64U) return false;
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+      const auto first = bytes[offset++];
+      if (first <= 0x7fU) {
+        if (first < 0x20U || first == 0x7fU) return false;
+        continue;
+      }
+      std::uint32_t scalar = 0;
+      std::size_t continuation = 0;
+      if (first >= 0xc2U && first <= 0xdfU) { scalar = first & 0x1fU; continuation = 1; }
+      else if (first >= 0xe0U && first <= 0xefU) { scalar = first & 0x0fU; continuation = 2; }
+      else if (first >= 0xf0U && first <= 0xf4U) { scalar = first & 0x07U; continuation = 3; }
+      else return false;
+      if (continuation > bytes.size() - offset) return false;
+      for (std::size_t index = 0; index < continuation; ++index) {
+        const auto byte = bytes[offset++];
+        if ((byte & 0xc0U) != 0x80U) return false;
+        scalar = (scalar << 6U) | (byte & 0x3fU);
+      }
+      if ((continuation == 2U && scalar < 0x800U) ||
+          (continuation == 3U && scalar < 0x10000U) ||
+          scalar > 0x10ffffU || (scalar >= 0xd800U && scalar <= 0xdfffU)) return false;
+    }
+    return true;
+  }
+
+  /** @brief Bounded deterministic-CBOR encoder for flat pairing maps. */
+  class pairing_cbor_encoder {
+  public:
+    explicit pairing_cbor_encoder(const std::span<std::uint8_t> output) noexcept: output_ {output} {}
+
+    [[nodiscard]] bool map(const std::uint64_t count) noexcept { return head(5U, count); }
+    [[nodiscard]] bool unsigned_integer(const std::uint64_t value) noexcept { return head(0U, value); }
+    [[nodiscard]] bool bytes(const std::span<const std::uint8_t> value) noexcept {
+      return head(2U, value.size()) && append(value);
+    }
+    [[nodiscard]] bool text(const std::string_view value) noexcept {
+      return head(3U, value.size()) && append(std::as_bytes(std::span {value.data(), value.size()}));
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return offset_; }
+
+  private:
+    [[nodiscard]] bool append(const std::span<const std::byte> bytes) noexcept {
+      if (bytes.size() > output_.size() - offset_) return false;
+      for (const auto byte : bytes) output_[offset_++] = std::to_integer<std::uint8_t>(byte);
+      return true;
+    }
+    [[nodiscard]] bool append(const std::span<const std::uint8_t> bytes) noexcept {
+      return append(std::as_bytes(bytes));
+    }
+    [[nodiscard]] bool octet(const std::uint8_t byte) noexcept {
+      if (offset_ == output_.size()) return false;
+      output_[offset_++] = byte;
+      return true;
+    }
+    [[nodiscard]] bool head(const std::uint8_t major, const std::uint64_t value) noexcept {
+      if (value < 24U) return octet(static_cast<std::uint8_t>(major << 5U | value));
+      if (value <= UINT8_MAX) return octet(static_cast<std::uint8_t>(major << 5U | 24U)) && octet(value);
+      if (value <= UINT16_MAX) {
+        return octet(static_cast<std::uint8_t>(major << 5U | 25U)) && octet(value >> 8U) && octet(value);
+      }
+      if (value <= UINT32_MAX) {
+        if (!octet(static_cast<std::uint8_t>(major << 5U | 26U))) return false;
+        for (int shift = 24; shift >= 0; shift -= 8) if (!octet(value >> shift)) return false;
+        return true;
+      }
+      if (!octet(static_cast<std::uint8_t>(major << 5U | 27U))) return false;
+      for (int shift = 56; shift >= 0; shift -= 8) if (!octet(value >> shift)) return false;
+      return true;
+    }
+
+    std::span<std::uint8_t> output_;  ///< Caller-owned fixed output.
+    std::size_t offset_ {};  ///< Populated bytes.
+  };
+
+  /** @brief Map one provider result to the narrow public pairing status set. */
+  [[nodiscard]] constexpr clsp_status_t pairing_status(const lumen::lsp::Spake2Status status) noexcept {
+    using Status = lumen::lsp::Spake2Status;
+    switch (status) {
+      case Status::success: return CLSP_STATUS_OK;
+      case Status::invalid_argument:
+      case Status::invalid_pin:
+      case Status::invalid_salt:
+      case Status::invalid_scalar:
+      case Status::invalid_point: return CLSP_STATUS_INVALID_CONFIGURATION;
+      case Status::invalid_state: return CLSP_STATUS_INVALID_STATE;
+      case Status::unavailable: return CLSP_STATUS_MISSING_WOLFSSL;
+      case Status::crypto_failure: return CLSP_STATUS_PAIRING_FAILED;
+      case Status::confirmation_failed: return CLSP_STATUS_PAIRING_CONFIRMATION_FAILED;
+    }
+    return CLSP_STATUS_PAIRING_FAILED;
+  }
+
+  /** @brief Encode the exact frozen 18-key PIN-pairing AAD. */
+  [[nodiscard]] bool build_pairing_aad(
+    clsp_pairing_t &pairing,
+    const clsp_pairing_challenge_t &challenge
+  ) noexcept {
+    static constexpr std::string_view label = "lumen-stream/1 pin-pair aad";
+    pairing_cbor_encoder encoder {pairing.aad};
+    const auto key = [&](const std::uint64_t value) { return encoder.unsigned_integer(value); };
+    const auto ok = encoder.map(18U) &&
+      key(1U) && encoder.text(label) &&
+      key(2U) && encoder.unsigned_integer(1U) &&
+      key(3U) && encoder.bytes(pairing.host_hello.host_id) &&
+      key(4U) && encoder.bytes(pairing.host_hello.host_identity_key) &&
+      key(5U) && encoder.bytes(pairing.host_hello.server_spki_sha256) &&
+      key(6U) && encoder.bytes(pairing.client_id) &&
+      key(7U) && encoder.bytes(pairing.client_identity_key) &&
+      key(8U) && encoder.bytes(challenge.pairing_session_id) &&
+      key(9U) && encoder.bytes(pairing.client_pairing_nonce) &&
+      key(10U) && encoder.unsigned_integer(pairing.host_hello.connection_generation) &&
+      key(11U) && encoder.unsigned_integer(challenge.approval_generation) &&
+      key(12U) && encoder.bytes(pairing.host_hello.client_nonce) &&
+      key(13U) && encoder.bytes(pairing.host_hello.server_nonce) &&
+      key(14U) && encoder.bytes(pairing.salt) &&
+      key(15U) && encoder.unsigned_integer(pairing.requested_permissions) &&
+      key(16U) && encoder.unsigned_integer(challenge.effective_permissions) &&
+      key(17U) && encoder.unsigned_integer(challenge.expires_at_utc_seconds) &&
+      key(18U) && encoder.bytes(pairing.pairing_exporter);
+    pairing.aad_length = ok ? encoder.size() : 0U;
+    return ok;
+  }
+
+  /** @brief Encode the exact frozen three-key client signature transcript. */
+  [[nodiscard]] bool build_client_signature_input(
+    const clsp_pairing_t &pairing,
+    clsp_pairing_client_confirmation_t &output
+  ) noexcept {
+    static constexpr std::string_view label = "lumen-stream/1 pin-pair client";
+    pairing_cbor_encoder encoder {output.client_signature_input};
+    const auto ok = encoder.map(3U) &&
+      encoder.unsigned_integer(1U) && encoder.text(label) &&
+      encoder.unsigned_integer(2U) && encoder.bytes(
+        std::span<const std::uint8_t> {pairing.aad}.first(pairing.aad_length)
+      ) &&
+      encoder.unsigned_integer(3U) && encoder.bytes(pairing.confirmation_a);
+    if (!ok || encoder.size() > UINT16_MAX) return false;
+    output.client_signature_input_length = static_cast<std::uint16_t>(encoder.size());
+    return true;
+  }
+
+  /** @brief Encode the exact frozen five-key host signature transcript. */
+  [[nodiscard]] bool build_host_signature_input(
+    const clsp_pairing_t &pairing,
+    const lumen::lsp::Spake2Confirmation &confirmation_b,
+    const std::uint32_t revocation_generation,
+    clsp_pairing_result_t &output
+  ) noexcept {
+    static constexpr std::string_view label = "lumen-stream/1 pin-pair host";
+    pairing_cbor_encoder encoder {output.host_signature_input};
+    const auto ok = encoder.map(5U) &&
+      encoder.unsigned_integer(1U) && encoder.text(label) &&
+      encoder.unsigned_integer(2U) && encoder.bytes(
+        std::span<const std::uint8_t> {pairing.aad}.first(pairing.aad_length)
+      ) &&
+      encoder.unsigned_integer(3U) && encoder.bytes(pairing.confirmation_a) &&
+      encoder.unsigned_integer(4U) && encoder.bytes(confirmation_b) &&
+      encoder.unsigned_integer(5U) && encoder.unsigned_integer(revocation_generation);
+    if (!ok || encoder.size() > UINT16_MAX) return false;
+    output.host_signature_input_length = static_cast<std::uint16_t>(encoder.size());
+    return true;
+  }
+
+  /** @brief Zeroize every pairing secret while preserving secret-free terminal telemetry. */
+  void zeroize_pairing_secrets(clsp_pairing_t &pairing) noexcept {
+#if CLSP_CORE_HAS_WOLFSSL
+    pairing.spake.reset();
+#endif
+    lumen::lsp::secure_zero(pairing.pin);
+    lumen::lsp::secure_zero(pairing.salt);
+    lumen::lsp::secure_zero(pairing.client_pairing_nonce);
+    lumen::lsp::secure_zero(pairing.point_a);
+    lumen::lsp::secure_zero(pairing.point_b);
+    lumen::lsp::secure_zero(pairing.confirmation_a);
+    lumen::lsp::secure_zero(pairing.pairing_exporter);
+    lumen::lsp::secure_zero(pairing.aad);
+    pairing.aad_length = 0;
+  }
+
+  /** @brief Latch non-retryable pairing failure and zeroize every secret. */
+  [[nodiscard]] clsp_status_t fail_pairing_locked(
+    clsp_pairing_t &pairing,
+    const clsp_status_t status
+  ) noexcept {
+    pairing.phase = CLSP_PAIRING_PHASE_FAILED;
+    zeroize_pairing_secrets(pairing);
+    return status;
+  }
+
+  /** @brief Return whether the current UTC whole second reached pairing expiry. */
+  [[nodiscard]] bool pairing_expired(const clsp_pairing_t &pairing) noexcept {
+    const auto now = std::time(nullptr);
+    return now < 0 || pairing.expires_at_utc_seconds == 0U ||
+           static_cast<std::uint64_t>(now) >= pairing.expires_at_utc_seconds;
+  }
+
+  /** @brief Verify that the pairing still names its original authenticated association. */
+  [[nodiscard]] bool pairing_association_authenticated(const clsp_pairing_t &pairing) noexcept {
+    std::shared_lock runtime_lock(pairing.core->runtime_mutex);
+    return pairing.core->runtime != nullptr &&
+           pairing.core->state.load(std::memory_order_acquire) == CLSP_LIFECYCLE_AUTHENTICATED &&
+           pairing.core->runtime->current_connection_generation() == pairing.host_hello.connection_generation;
   }
 
   /** @brief Add one owning reference to an internal observer binding. */
@@ -1340,6 +1659,422 @@ extern "C" void clsp_core_release(clsp_core_t *core) {
   }
 }
 
+extern "C" clsp_status_t clsp_core_bind_host_hello(
+  clsp_core_t *core,
+  const clsp_host_hello_identity_t *identity
+) {
+  if (core == nullptr || identity == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (identity->abi_version != CLSP_CORE_ABI_VERSION ||
+      identity->structure_size != sizeof(clsp_host_hello_identity_t)) {
+    return CLSP_STATUS_ABI_MISMATCH;
+  }
+  const auto nonzero = [](const auto &bytes) {
+    return std::any_of(std::begin(bytes), std::end(bytes), [](const std::uint8_t byte) { return byte != 0U; });
+  };
+  if (identity->connection_generation == 0U || identity->reserved_zero != 0U ||
+      !nonzero(identity->host_id) || !nonzero(identity->host_identity_key) ||
+      !nonzero(identity->server_spki_sha256) || !nonzero(identity->client_nonce) ||
+      !nonzero(identity->server_nonce)) {
+    return CLSP_STATUS_INVALID_CONFIGURATION;
+  }
+  std::shared_lock runtime_lock(core->runtime_mutex);
+  if (core->runtime == nullptr || core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
+    return CLSP_STATUS_NOT_AUTHENTICATED;
+  }
+  if (core->runtime->current_connection_generation() != identity->connection_generation) {
+    return CLSP_STATUS_PAIRING_GENERATION_MISMATCH;
+  }
+  std::lock_guard host_lock(core->host_hello_mutex);
+  if (!std::equal(
+        std::begin(identity->server_spki_sha256),
+        std::end(identity->server_spki_sha256),
+        core->expected_server_spki.begin()
+      )) {
+    return CLSP_STATUS_SPKI_MISMATCH;
+  }
+  if (core->host_hello_bound) {
+    return std::memcmp(&core->host_hello, identity, sizeof(*identity)) == 0 ?
+             CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+  }
+  core->host_hello = *identity;
+  core->host_hello_bound = true;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_pairing_create(
+  clsp_core_t *core,
+  const clsp_pairing_configuration_t *configuration,
+  clsp_pairing_t **output
+) {
+  if (core == nullptr || configuration == nullptr || output == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  *output = nullptr;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (configuration->abi_version != CLSP_CORE_ABI_VERSION ||
+      configuration->structure_size != sizeof(clsp_pairing_configuration_t)) {
+    return CLSP_STATUS_ABI_MISMATCH;
+  }
+  const auto client_name = std::span<const std::uint8_t> {
+    configuration->client_name.data,
+    configuration->client_name.length
+  };
+  constexpr std::uint32_t known_permissions = 0x7fU;
+  if (configuration->client_name.data == nullptr || !valid_utf8_name(client_name) ||
+      !contains_nonzero(configuration->client_id) || !contains_nonzero(configuration->client_identity_key) ||
+      configuration->requested_permissions == 0U ||
+      (configuration->requested_permissions & ~known_permissions) != 0U || configuration->reserved_zero != 0U) {
+    return CLSP_STATUS_INVALID_CONFIGURATION;
+  }
+
+  std::array<std::uint8_t, 32> pairing_exporter {};
+  std::uint32_t connection_generation = 0;
+  {
+    std::shared_lock runtime_lock(core->runtime_mutex);
+    if (core->runtime == nullptr || core->state.load(std::memory_order_acquire) != CLSP_LIFECYCLE_AUTHENTICATED) {
+      return CLSP_STATUS_NOT_AUTHENTICATED;
+    }
+    connection_generation = core->runtime->current_connection_generation();
+    const auto exporter_status = core->runtime->copy_pairing_exporter(pairing_exporter);
+    if (exporter_status != CLSP_STATUS_OK) return exporter_status;
+  }
+  clsp_host_hello_identity_t host_hello {};
+  {
+    std::lock_guard host_lock(core->host_hello_mutex);
+    if (!core->host_hello_bound || core->host_hello.connection_generation != connection_generation) {
+      lumen::lsp::secure_zero(pairing_exporter);
+      return CLSP_STATUS_NOT_AUTHENTICATED;
+    }
+    host_hello = core->host_hello;
+  }
+
+  auto *pairing = new (std::nothrow) clsp_pairing_t;
+  if (pairing == nullptr) {
+    lumen::lsp::secure_zero(pairing_exporter);
+    return CLSP_STATUS_RESOURCE_EXHAUSTED;
+  }
+  pairing->core = core;
+  clsp_core_retain(core);
+  pairing->host_hello = host_hello;
+  pairing->pairing_exporter = pairing_exporter;
+  std::copy_n(configuration->client_id, pairing->client_id.size(), pairing->client_id.begin());
+  std::copy_n(
+    configuration->client_identity_key,
+    pairing->client_identity_key.size(),
+    pairing->client_identity_key.begin()
+  );
+  std::copy(client_name.begin(), client_name.end(), pairing->client_name.begin());
+  pairing->client_name_length = client_name.size();
+  pairing->requested_permissions = configuration->requested_permissions;
+  lumen::lsp::secure_zero(pairing_exporter);
+  *output = pairing;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" void clsp_pairing_retain(clsp_pairing_t *pairing) {
+  if (pairing != nullptr) pairing->references.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void clsp_pairing_release(clsp_pairing_t *pairing) {
+  if (pairing == nullptr || pairing->references.fetch_sub(1, std::memory_order_acq_rel) != 1U) return;
+  {
+    std::lock_guard lock(pairing->mutex);
+    zeroize_pairing_secrets(*pairing);
+    lumen::lsp::secure_zero(pairing->client_id);
+    lumen::lsp::secure_zero(pairing->client_identity_key);
+    lumen::lsp::secure_zero(pairing->client_name);
+    lumen::lsp::secure_zero({
+      reinterpret_cast<std::uint8_t *>(&pairing->host_hello),
+      sizeof(pairing->host_hello)
+    });
+  }
+  clsp_core_release(pairing->core);
+  pairing->core = nullptr;
+  delete pairing;
+}
+
+extern "C" clsp_status_t clsp_pairing_begin(
+  clsp_pairing_t *pairing,
+  clsp_pairing_begin_t *output
+) {
+  if (pairing == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  *output = {.abi_version = CLSP_CORE_ABI_VERSION, .structure_size = sizeof(*output)};
+  if (callback_stack_contains(pairing->core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard lock(pairing->mutex);
+  if (pairing->phase != CLSP_PAIRING_PHASE_CREATED) return CLSP_STATUS_INVALID_STATE;
+  if (!pairing_association_authenticated(*pairing)) {
+    return fail_pairing_locked(*pairing, CLSP_STATUS_NOT_AUTHENTICATED);
+  }
+  auto status = generate_pairing_pin(pairing->pin);
+  if (status == CLSP_STATUS_OK) status = random_nonzero_bytes(pairing->salt);
+  if (status == CLSP_STATUS_OK) status = random_nonzero_bytes(pairing->client_pairing_nonce);
+  if (status != CLSP_STATUS_OK) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    zeroize_pairing_secrets(*pairing);
+    return status;
+  }
+#if CLSP_CORE_HAS_WOLFSSL
+  lumen::lsp::Spake2Status provider_status = lumen::lsp::Spake2Status::success;
+  pairing->spake = lumen::lsp::WolfsslSpake2ClientSession::create(
+    {
+      .pin = std::string_view {reinterpret_cast<const char *>(pairing->pin.data()), pairing->pin.size()},
+      .salt = pairing->salt,
+      .identity_a = pairing->client_id,
+      .identity_b = pairing->host_hello.host_id,
+    },
+    provider_status
+  );
+  status = pairing_status(provider_status);
+  if (status == CLSP_STATUS_OK && pairing->spake != nullptr) {
+    status = pairing_status(pairing->spake->start(pairing->point_a));
+  }
+  if (status != CLSP_STATUS_OK || pairing->spake == nullptr) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    zeroize_pairing_secrets(*pairing);
+    return status == CLSP_STATUS_OK ? CLSP_STATUS_PAIRING_FAILED : status;
+  }
+#else
+  pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+  zeroize_pairing_secrets(*pairing);
+  return CLSP_STATUS_MISSING_WOLFSSL;
+#endif
+  std::copy(pairing->pin.begin(), pairing->pin.end(), std::begin(output->pin_digits));
+  std::copy(pairing->salt.begin(), pairing->salt.end(), std::begin(output->scrypt_salt));
+  std::copy(
+    pairing->client_pairing_nonce.begin(),
+    pairing->client_pairing_nonce.end(),
+    std::begin(output->client_pairing_nonce)
+  );
+  std::copy(pairing->point_a.begin(), pairing->point_a.end(), std::begin(output->client_point));
+  lumen::lsp::secure_zero(pairing->pin);
+  pairing->phase = CLSP_PAIRING_PHASE_BEGUN;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_pairing_bind_pending(
+  clsp_pairing_t *pairing,
+  const clsp_pairing_pending_t *pending
+) {
+  if (pairing == nullptr || pending == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(pairing->core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (pending->abi_version != CLSP_CORE_ABI_VERSION || pending->structure_size != sizeof(*pending)) {
+    return CLSP_STATUS_ABI_MISMATCH;
+  }
+  std::lock_guard lock(pairing->mutex);
+  if (pairing->phase != CLSP_PAIRING_PHASE_BEGUN) return CLSP_STATUS_INVALID_STATE;
+  if (!pairing_association_authenticated(*pairing)) {
+    return fail_pairing_locked(*pairing, CLSP_STATUS_NOT_AUTHENTICATED);
+  }
+  const auto now = std::time(nullptr);
+  if (now < 0 || pending->expires_at_utc_seconds <= static_cast<std::uint64_t>(now) ||
+      pending->expires_at_utc_seconds > static_cast<std::uint64_t>(now) + 120U) {
+    return fail_pairing_locked(*pairing, CLSP_STATUS_PAIRING_EXPIRED);
+  }
+  if (!contains_nonzero(pending->pairing_session_id) || pending->effective_permissions == 0U ||
+      (pending->effective_permissions & ~pairing->requested_permissions) != 0U || pending->reserved_zero != 0U) {
+    return CLSP_STATUS_INVALID_CONFIGURATION;
+  }
+  std::copy_n(
+    pending->pairing_session_id,
+    pairing->pairing_session_id.size(),
+    pairing->pairing_session_id.begin()
+  );
+  pairing->effective_permissions = pending->effective_permissions;
+  pairing->expires_at_utc_seconds = pending->expires_at_utc_seconds;
+  pairing->phase = CLSP_PAIRING_PHASE_PENDING_BOUND;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_pairing_accept_challenge(
+  clsp_pairing_t *pairing,
+  const clsp_pairing_challenge_t *challenge,
+  clsp_pairing_client_confirmation_t *output
+) {
+  if (pairing == nullptr || challenge == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  *output = {.abi_version = CLSP_CORE_ABI_VERSION, .structure_size = sizeof(*output)};
+  if (callback_stack_contains(pairing->core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (challenge->abi_version != CLSP_CORE_ABI_VERSION || challenge->structure_size != sizeof(*challenge)) {
+    return CLSP_STATUS_ABI_MISMATCH;
+  }
+  std::lock_guard lock(pairing->mutex);
+  if (pairing->phase != CLSP_PAIRING_PHASE_PENDING_BOUND
+#if CLSP_CORE_HAS_WOLFSSL
+      || pairing->spake == nullptr
+#endif
+  ) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  if (!pairing_association_authenticated(*pairing)) {
+    return fail_pairing_locked(*pairing, CLSP_STATUS_NOT_AUTHENTICATED);
+  }
+  if (pairing_expired(*pairing) || challenge->expires_at_utc_seconds != pairing->expires_at_utc_seconds) {
+    return fail_pairing_locked(*pairing, CLSP_STATUS_PAIRING_EXPIRED);
+  }
+  if (!std::equal(
+        std::begin(challenge->pairing_session_id),
+        std::end(challenge->pairing_session_id),
+        pairing->pairing_session_id.begin()
+      ) || challenge->approval_generation == 0U) {
+    return CLSP_STATUS_PAIRING_GENERATION_MISMATCH;
+  }
+  if (challenge->effective_permissions != pairing->effective_permissions ||
+      challenge->host_point[0] != 0x04U ||
+      std::any_of(
+        std::begin(challenge->reserved_tail),
+        std::end(challenge->reserved_tail),
+        [](const std::uint8_t byte) { return byte != 0U; }
+      )) {
+    return CLSP_STATUS_INVALID_CONFIGURATION;
+  }
+  std::copy_n(challenge->host_point, pairing->point_b.size(), pairing->point_b.begin());
+  if (!build_pairing_aad(*pairing, *challenge)) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    zeroize_pairing_secrets(*pairing);
+    return CLSP_STATUS_INTERNAL_FAILURE;
+  }
+#if CLSP_CORE_HAS_WOLFSSL
+  auto status = pairing_status(pairing->spake->receive_host_point(
+    pairing->point_b,
+    std::span<const std::uint8_t> {pairing->aad}.first(pairing->aad_length),
+    pairing->confirmation_a
+  ));
+#else
+  const auto status = CLSP_STATUS_MISSING_WOLFSSL;
+#endif
+  if (status != CLSP_STATUS_OK) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    zeroize_pairing_secrets(*pairing);
+    return status;
+  }
+  pairing->approval_generation = challenge->approval_generation;
+  std::copy(
+    pairing->pairing_session_id.begin(),
+    pairing->pairing_session_id.end(),
+    std::begin(output->pairing_session_id)
+  );
+  output->approval_generation = pairing->approval_generation;
+  output->effective_permissions = pairing->effective_permissions;
+  output->expires_at_utc_seconds = pairing->expires_at_utc_seconds;
+  std::copy(
+    pairing->confirmation_a.begin(),
+    pairing->confirmation_a.end(),
+    std::begin(output->client_confirmation)
+  );
+  if (!build_client_signature_input(*pairing, *output)) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    zeroize_pairing_secrets(*pairing);
+    return CLSP_STATUS_INTERNAL_FAILURE;
+  }
+  pairing->phase = CLSP_PAIRING_PHASE_CHALLENGE_ACCEPTED;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_pairing_verify_host(
+  clsp_pairing_t *pairing,
+  const clsp_pairing_host_confirmation_t *confirmation,
+  clsp_pairing_result_t *output
+) {
+  if (pairing == nullptr || confirmation == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  *output = {.abi_version = CLSP_CORE_ABI_VERSION, .structure_size = sizeof(*output)};
+  if (callback_stack_contains(pairing->core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (confirmation->abi_version != CLSP_CORE_ABI_VERSION ||
+      confirmation->structure_size != sizeof(*confirmation)) {
+    return CLSP_STATUS_ABI_MISMATCH;
+  }
+  std::lock_guard lock(pairing->mutex);
+  if (pairing->phase != CLSP_PAIRING_PHASE_CHALLENGE_ACCEPTED
+#if CLSP_CORE_HAS_WOLFSSL
+      || pairing->spake == nullptr
+#endif
+  ) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  if (!pairing_association_authenticated(*pairing)) {
+    return fail_pairing_locked(*pairing, CLSP_STATUS_NOT_AUTHENTICATED);
+  }
+  if (pairing_expired(*pairing)) return fail_pairing_locked(*pairing, CLSP_STATUS_PAIRING_EXPIRED);
+  if (!std::equal(
+        std::begin(confirmation->pairing_session_id),
+        std::end(confirmation->pairing_session_id),
+        pairing->pairing_session_id.begin()
+      ) || confirmation->approval_generation != pairing->approval_generation ||
+      confirmation->revocation_generation == 0U) {
+    return CLSP_STATUS_PAIRING_GENERATION_MISMATCH;
+  }
+  lumen::lsp::Spake2Confirmation confirmation_b {};
+  lumen::lsp::Spake2SharedKey shared_key {};
+  std::copy_n(
+    confirmation->host_confirmation,
+    confirmation_b.size(),
+    confirmation_b.begin()
+  );
+#if CLSP_CORE_HAS_WOLFSSL
+  const auto status = pairing_status(pairing->spake->verify_host_confirmation(confirmation_b, shared_key));
+#else
+  const auto status = CLSP_STATUS_MISSING_WOLFSSL;
+#endif
+  lumen::lsp::secure_zero(shared_key);
+  if (status != CLSP_STATUS_OK) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    lumen::lsp::secure_zero(confirmation_b);
+    zeroize_pairing_secrets(*pairing);
+    return status;
+  }
+  pairing->revocation_generation = confirmation->revocation_generation;
+  std::copy(
+    pairing->pairing_session_id.begin(),
+    pairing->pairing_session_id.end(),
+    std::begin(output->pairing_session_id)
+  );
+  output->approval_generation = pairing->approval_generation;
+  output->effective_permissions = pairing->effective_permissions;
+  output->revocation_generation = pairing->revocation_generation;
+  output->expires_at_utc_seconds = pairing->expires_at_utc_seconds;
+  if (!build_host_signature_input(*pairing, confirmation_b, pairing->revocation_generation, *output)) {
+    pairing->phase = CLSP_PAIRING_PHASE_FAILED;
+    lumen::lsp::secure_zero(confirmation_b);
+    zeroize_pairing_secrets(*pairing);
+    return CLSP_STATUS_INTERNAL_FAILURE;
+  }
+  lumen::lsp::secure_zero(confirmation_b);
+  pairing->phase = CLSP_PAIRING_PHASE_COMPLETE;
+  zeroize_pairing_secrets(*pairing);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_pairing_cancel(clsp_pairing_t *pairing) {
+  if (pairing == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(pairing->core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard lock(pairing->mutex);
+  if (pairing->phase == CLSP_PAIRING_PHASE_COMPLETE || pairing->phase == CLSP_PAIRING_PHASE_CANCELLED) {
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  pairing->phase = CLSP_PAIRING_PHASE_CANCELLED;
+  zeroize_pairing_secrets(*pairing);
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_pairing_copy_snapshot(
+  const clsp_pairing_t *pairing,
+  clsp_pairing_snapshot_t *output
+) {
+  if (pairing == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(pairing->core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard lock(pairing->mutex);
+  *output = {
+    .abi_version = CLSP_CORE_ABI_VERSION,
+    .structure_size = sizeof(*output),
+    .phase = pairing->phase,
+    .effective_permissions = pairing->effective_permissions,
+    .approval_generation = pairing->approval_generation,
+    .revocation_generation = pairing->revocation_generation,
+    .expires_at_utc_seconds = pairing->expires_at_utc_seconds,
+    .reserved_zero = 0,
+  };
+  return CLSP_STATUS_OK;
+}
+
 extern "C" clsp_status_t clsp_handoff_create(
   clsp_core_t *active,
   const std::uint32_t active_connection_generation,
@@ -1994,6 +2729,12 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
   if (core->runtime != nullptr) {
     return CLSP_STATUS_INVALID_STATE;
   }
+  {
+    std::lock_guard host_lock(core->host_hello_mutex);
+    core->host_hello = {};
+    core->host_hello_bound = false;
+    std::copy_n(endpoint->server_spki_sha256, core->expected_server_spki.size(), core->expected_server_spki.begin());
+  }
   auto *runtime = new (std::nothrow) umbra::lsp::Runtime {
     core->configuration,
     {
@@ -2035,6 +2776,11 @@ extern "C" clsp_status_t clsp_core_stop(clsp_core_t *core) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
   const auto quiesce_status = quiesce_core_producers(core);
+  {
+    std::lock_guard host_lock(core->host_hello_mutex);
+    core->host_hello = {};
+    core->host_hello_bound = false;
+  }
   std::unique_lock runtime_lock(core->runtime_mutex);
   const auto prior_state = core->state.load(std::memory_order_acquire);
   if (core->runtime == nullptr) {
@@ -2514,6 +3260,14 @@ extern "C" const char *clsp_status_description(const clsp_status_t status) {
       return "native LSP input capture is unavailable";
     case CLSP_STATUS_ROLLBACK_PENDING:
       return "input rollback baseline acknowledgement is pending";
+    case CLSP_STATUS_PAIRING_FAILED:
+      return "native PIN pairing failed";
+    case CLSP_STATUS_PAIRING_EXPIRED:
+      return "native PIN pairing expired";
+    case CLSP_STATUS_PAIRING_GENERATION_MISMATCH:
+      return "native PIN pairing generation mismatch";
+    case CLSP_STATUS_PAIRING_CONFIRMATION_FAILED:
+      return "native PIN pairing confirmation failed";
   }
   return "unknown LSP status";
 }

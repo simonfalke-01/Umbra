@@ -22,11 +22,23 @@ extern "C" {
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
 
+/** @brief Fixed decimal digits in one native LSP PIN. */
+#define CLSP_PAIRING_PIN_DIGITS UINT32_C(6)
+
+/** @brief Uncompressed P-256 SPAKE2+ point size. */
+#define CLSP_PAIRING_POINT_BYTES UINT32_C(65)
+
+/** @brief SPAKE2+ confirmation size. */
+#define CLSP_PAIRING_CONFIRMATION_BYTES UINT32_C(32)
+
   /** @brief Opaque native protocol-core handle. */
   typedef struct clsp_core clsp_core_t;
 
   /** @brief Opaque native fresh-association reconnect/rekey owner. */
   typedef struct clsp_handoff clsp_handoff_t;
+
+  /** @brief Opaque native client-side six-digit PIN-pairing owner. */
+  typedef struct clsp_pairing clsp_pairing_t;
 
   /** @brief Opaque retained native byte-buffer handle. */
   typedef struct clsp_buffer clsp_buffer_t;
@@ -64,6 +76,10 @@ extern "C" {
     CLSP_STATUS_INPUT_PERMISSION_DENIED = 19,  ///< macOS denied preferred raw HID capture.
     CLSP_STATUS_INPUT_UNAVAILABLE = 20,  ///< No supported native HID capture source is available.
     CLSP_STATUS_ROLLBACK_PENDING = 21,  ///< Same-generation rollback awaits an authenticated fresh baseline ACK.
+    CLSP_STATUS_PAIRING_FAILED = 22,  ///< Native PIN-pairing state or provider operation failed.
+    CLSP_STATUS_PAIRING_EXPIRED = 23,  ///< The bounded PIN-pairing approval expired.
+    CLSP_STATUS_PAIRING_GENERATION_MISMATCH = 24,  ///< Session or approval generation did not match.
+    CLSP_STATUS_PAIRING_CONFIRMATION_FAILED = 25,  ///< SPAKE2+ host confirmation was not authentic.
   } clsp_status_t;
 
   /** @brief Operator-selected congestion-control profile. */
@@ -187,6 +203,126 @@ extern "C" {
     uint16_t reserved_zero;  ///< Reserved and required to be zero.
     uint8_t server_spki_sha256[32];  ///< Required nonzero SHA-256 leaf SubjectPublicKeyInfo pin.
   } clsp_endpoint_t;
+
+  /** @brief Authenticated SERVER_HELLO identity bound to one DTLS association. */
+  typedef struct clsp_host_hello_identity {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_host_hello_identity_t)`.
+    uint32_t connection_generation;  ///< Nonzero SERVER_HELLO connection generation.
+    uint32_t reserved_zero;  ///< Reserved and required to be zero.
+    uint8_t host_id[16];  ///< Stable nonzero host UUID bytes.
+    uint8_t host_identity_key[32];  ///< Stable nonzero Ed25519 host public key.
+    uint8_t server_spki_sha256[32];  ///< Exact pinned DTLS leaf SPKI digest.
+    uint8_t client_nonce[32];  ///< Exact CLIENT_HELLO nonce.
+    uint8_t server_nonce[32];  ///< Exact SERVER_HELLO nonce.
+  } clsp_host_hello_identity_t;
+
+  /** @brief Native client-side PIN-pairing lifecycle. */
+  typedef enum clsp_pairing_phase {
+    CLSP_PAIRING_PHASE_CREATED = 0,  ///< Pairing owner exists but BEGIN was not produced.
+    CLSP_PAIRING_PHASE_BEGUN = 1,  ///< PIN, salt, nonce, and pA were generated once.
+    CLSP_PAIRING_PHASE_PENDING_BOUND = 2,  ///< Authenticated host-issued PENDING scope is bound.
+    CLSP_PAIRING_PHASE_CHALLENGE_ACCEPTED = 3,  ///< Valid challenge produced client confirmation cA.
+    CLSP_PAIRING_PHASE_COMPLETE = 4,  ///< Host confirmation cB was verified exactly once.
+    CLSP_PAIRING_PHASE_CANCELLED = 5,  ///< Pairing was explicitly cancelled and zeroized.
+    CLSP_PAIRING_PHASE_FAILED = 6,  ///< Pairing failed closed and zeroized secrets.
+  } clsp_pairing_phase_t;
+
+  /** @brief Fixed client identity and requested authorization for PIN pairing. */
+  typedef struct clsp_pairing_configuration {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_pairing_configuration_t)`.
+    uint8_t client_id[16];  ///< Stable nonzero client UUID bytes.
+    uint8_t client_identity_key[32];  ///< Stable nonzero Ed25519 client public key.
+    clsp_const_byte_span_t client_name;  ///< UTF-8 client name containing 1 through 64 bytes.
+    uint32_t requested_permissions;  ///< Nonzero known LSP permission mask.
+    uint32_t reserved_zero;  ///< Reserved and required to be zero.
+  } clsp_pairing_configuration_t;
+
+  /** @brief Authenticated host-issued PAIR_PENDING scope bound before BEGIN. */
+  typedef struct clsp_pairing_pending {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_pairing_pending_t)`.
+    uint8_t pairing_session_id[16];  ///< Random nonzero host-issued session identifier.
+    uint32_t effective_permissions;  ///< Nonzero subset of requested permissions.
+    uint32_t reserved_zero;  ///< Reserved and required to be zero.
+    uint64_t expires_at_utc_seconds;  ///< Host-issued expiry within the configured lifetime.
+  } clsp_pairing_pending_t;
+
+  /** @brief Generated coarse PAIR_BEGIN material and display PIN. */
+  typedef struct clsp_pairing_begin {
+    uint32_t abi_version;  ///< Material layout version.
+    uint32_t structure_size;  ///< Size of this material structure.
+    uint8_t pin_digits[6];  ///< Six ASCII decimal digits, including leading zeroes.
+    uint8_t reserved_zero[2];  ///< Reserved and zero.
+    uint8_t scrypt_salt[16];  ///< Random per-session scrypt salt.
+    uint8_t client_pairing_nonce[16];  ///< Random BEGIN pairing nonce.
+    uint8_t client_point[65];  ///< Uncompressed P-256 SPAKE2+ point pA.
+    uint8_t reserved_tail[7];  ///< Reserved and zero.
+  } clsp_pairing_begin_t;
+
+  /** @brief Validated authenticated PAIR_CHALLENGE fields. */
+  typedef struct clsp_pairing_challenge {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_pairing_challenge_t)`.
+    uint8_t pairing_session_id[16];  ///< Exact BEGIN session identifier.
+    uint32_t approval_generation;  ///< Nonzero one-time host approval generation.
+    uint32_t effective_permissions;  ///< Exact PENDING permission mask.
+    uint64_t expires_at_utc_seconds;  ///< Exact PENDING expiry.
+    uint8_t host_point[65];  ///< Uncompressed P-256 SPAKE2+ point pB.
+    uint8_t reserved_tail[7];  ///< Reserved and zero.
+  } clsp_pairing_challenge_t;
+
+  /** @brief Client confirmation bound to the exact challenge and DTLS exporter. */
+  typedef struct clsp_pairing_client_confirmation {
+    uint32_t abi_version;  ///< Confirmation layout version.
+    uint32_t structure_size;  ///< Size of this confirmation structure.
+    uint8_t pairing_session_id[16];  ///< Exact pairing session identifier.
+    uint32_t approval_generation;  ///< Exact challenge approval generation.
+    uint32_t effective_permissions;  ///< Exact challenge permission mask.
+    uint64_t expires_at_utc_seconds;  ///< Exact challenge expiry.
+    uint8_t client_confirmation[32];  ///< SPAKE2+ confirmation cA.
+    uint16_t client_signature_input_length;  ///< Leading encoded client-signature transcript bytes.
+    uint8_t reserved_zero[6];  ///< Reserved and zero.
+    uint8_t client_signature_input[576];  ///< Deterministic-CBOR client signature transcript.
+  } clsp_pairing_client_confirmation_t;
+
+  /** @brief Host confirmation input echoed with strict session generations. */
+  typedef struct clsp_pairing_host_confirmation {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_pairing_host_confirmation_t)`.
+    uint8_t pairing_session_id[16];  ///< Exact pairing session identifier.
+    uint32_t approval_generation;  ///< Exact challenge approval generation.
+    uint32_t revocation_generation;  ///< Nonzero RESULT revocation generation.
+    uint8_t host_confirmation[32];  ///< SPAKE2+ confirmation cB.
+  } clsp_pairing_host_confirmation_t;
+
+  /** @brief Completed native pairing output excluding secret Ke and PIN material. */
+  typedef struct clsp_pairing_result {
+    uint32_t abi_version;  ///< Result layout version.
+    uint32_t structure_size;  ///< Size of this result structure.
+    uint8_t pairing_session_id[16];  ///< Completed pairing session identifier.
+    uint32_t approval_generation;  ///< Consumed host approval generation.
+    uint32_t effective_permissions;  ///< Authorized permission mask.
+    uint32_t revocation_generation;  ///< Consumed RESULT revocation generation.
+    uint32_t reserved_zero;  ///< Reserved and zero.
+    uint64_t expires_at_utc_seconds;  ///< Consumed approval expiry.
+    uint16_t host_signature_input_length;  ///< Leading encoded host-signature transcript bytes.
+    uint8_t reserved_tail[6];  ///< Reserved and zero.
+    uint8_t host_signature_input[640];  ///< Deterministic-CBOR host signature transcript.
+  } clsp_pairing_result_t;
+
+  /** @brief Secret-free low-rate pairing telemetry. */
+  typedef struct clsp_pairing_snapshot {
+    uint32_t abi_version;  ///< Snapshot layout version.
+    uint32_t structure_size;  ///< Size of this snapshot structure.
+    uint32_t phase;  ///< One `clsp_pairing_phase_t` value.
+    uint32_t effective_permissions;  ///< PENDING/CHALLENGE permissions, otherwise zero.
+    uint32_t approval_generation;  ///< Approval generation after CHALLENGE, otherwise zero.
+    uint32_t revocation_generation;  ///< RESULT revocation generation after completion, otherwise zero.
+    uint64_t expires_at_utc_seconds;  ///< Current bounded expiry, otherwise zero.
+    uint64_t reserved_zero;  ///< Reserved and zero.
+  } clsp_pairing_snapshot_t;
 
   /** @brief Coarse native lifecycle notification delivered without core locks held. */
   typedef struct clsp_lifecycle_event {
@@ -739,6 +875,60 @@ extern "C" {
    * @param core Core handle, or null for no operation.
    */
   void clsp_core_release(clsp_core_t *core);
+
+  /** @brief Bind one validated authenticated SERVER_HELLO identity to its DTLS association. */
+  clsp_status_t clsp_core_bind_host_hello(
+    clsp_core_t *core,
+    const clsp_host_hello_identity_t *identity
+  );
+
+  /** @brief Create one native client-side PIN-pairing owner bound to an authenticated core. */
+  clsp_status_t clsp_pairing_create(
+    clsp_core_t *core,
+    const clsp_pairing_configuration_t *configuration,
+    clsp_pairing_t **output
+  );
+
+  /** @brief Add one owning reference to a native pairing handle. */
+  void clsp_pairing_retain(clsp_pairing_t *pairing);
+
+  /** @brief Release one pairing reference and zeroize secrets at zero. */
+  void clsp_pairing_release(clsp_pairing_t *pairing);
+
+  /** @brief Generate the six-digit PIN, nonce, salt, session, and client point once. */
+  clsp_status_t clsp_pairing_begin(
+    clsp_pairing_t *pairing,
+    clsp_pairing_begin_t *output
+  );
+
+  /** @brief Bind the exact authenticated host PENDING session, permissions, and expiry. */
+  clsp_status_t clsp_pairing_bind_pending(
+    clsp_pairing_t *pairing,
+    const clsp_pairing_pending_t *pending
+  );
+
+  /** @brief Validate one challenge and produce exact client confirmation cA. */
+  clsp_status_t clsp_pairing_accept_challenge(
+    clsp_pairing_t *pairing,
+    const clsp_pairing_challenge_t *challenge,
+    clsp_pairing_client_confirmation_t *output
+  );
+
+  /** @brief Verify exact host confirmation cB and return host-signature input. */
+  clsp_status_t clsp_pairing_verify_host(
+    clsp_pairing_t *pairing,
+    const clsp_pairing_host_confirmation_t *confirmation,
+    clsp_pairing_result_t *output
+  );
+
+  /** @brief Cancel and immediately zeroize one incomplete native pairing. */
+  clsp_status_t clsp_pairing_cancel(clsp_pairing_t *pairing);
+
+  /** @brief Copy one secret-free native pairing snapshot. */
+  clsp_status_t clsp_pairing_copy_snapshot(
+    const clsp_pairing_t *pairing,
+    clsp_pairing_snapshot_t *output
+  );
 
   /**
    * @brief Construct a native reconnect/rekey owner above one active association core.

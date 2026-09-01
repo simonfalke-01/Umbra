@@ -8,6 +8,7 @@
 #include "CLSPCore.h"
 
 #include <cstdint>
+#include <span>
 
 namespace umbra::lsp {
   /** @brief Non-owning callbacks from the native worker to the C ABI owner. */
@@ -245,6 +246,14 @@ namespace umbra::lsp {
 
     /** @brief Return the authenticated confirmed UDP payload ceiling. */
     [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept;
+
+    /** @brief Copy the authenticated association's exact DTLS-SRTP exporter for native transcript binding. */
+    [[nodiscard]] clsp_status_t copy_pairing_exporter(
+      std::span<std::uint8_t, 32> output
+    ) const noexcept;
+
+    /** @brief Return the authenticated SERVER_HELLO connection generation. */
+    [[nodiscard]] std::uint32_t current_connection_generation() const noexcept;
 
   private:
     class Impl;

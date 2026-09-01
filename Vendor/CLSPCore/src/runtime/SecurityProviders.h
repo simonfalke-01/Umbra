@@ -19,6 +19,12 @@ namespace umbra::lsp {
   /** @brief Exact directional DTLS-SRTP exporter bytes. */
   using DtlsSrtpExporter = std::array<std::uint8_t, dtls_srtp_exporter_size>;
 
+  /** @brief Dedicated TLS exporter length for PIN-pairing transcript binding. */
+  inline constexpr std::size_t pairing_exporter_size = 32;
+
+  /** @brief Dedicated `EXPORTER-Lumen-LSP-Pairing-v1` bytes. */
+  using PairingExporter = std::array<std::uint8_t, pairing_exporter_size>;
+
   /** @brief Exact negotiated inbound video SRTP stream registry. */
   struct VideoSrtpInboundConfiguration {
     std::uint32_t primary_ssrc {};  ///< Required primary video SSRC using encrypted extensions.
@@ -91,6 +97,9 @@ namespace umbra::lsp {
 
     /** @brief Return the validated 56-byte exporter after authentication. */
     [[nodiscard]] const DtlsSrtpExporter &exporter() const noexcept;
+
+    /** @brief Return the dedicated validated 32-byte PIN-pairing exporter. */
+    [[nodiscard]] const PairingExporter &pairing_exporter() const noexcept;
 
   private:
     class Impl;

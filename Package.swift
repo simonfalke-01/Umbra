@@ -8,6 +8,7 @@ let lspDependencyPrefix = ProcessInfo.processInfo.environment["UMBRA_LSP_DEPS_PR
 let lspSecurityAvailable = lspDependencyPrefix.map { prefix in
     let requiredPaths = [
         "include/wolfssl/ssl.h",
+        "include/wolfssl/lsp_spake2_settings.h",
         "include/srtp2/srtp.h",
         "lib/libwolfssl.a",
         "lib/libsrtp2.a",
@@ -17,6 +18,7 @@ let lspSecurityAvailable = lspDependencyPrefix.map { prefix in
     }
 } ?? false
 let lspCoreDependencies: [Target.Dependency] = lspSecurityAvailable ? ["CWolfSSL", "CLibSRTP"] : []
+let lspCoreExclude = lspSecurityAvailable ? [] : ["src/runtime/WolfsslSpake2.cpp"]
 let lspCoreCXXSettings: [CXXSetting] = lspSecurityAvailable ? [
     .define("CLSP_CORE_HAS_WOLFSSL", to: "1"),
     .define("CLSP_CORE_HAS_LIBSRTP", to: "1"),
@@ -97,6 +99,7 @@ let package = Package(
             name: "CLSPCore",
             dependencies: lspCoreDependencies,
             path: "Vendor/CLSPCore",
+            exclude: lspCoreExclude,
             publicHeadersPath: "include",
             cxxSettings: [
                 .headerSearchPath("."),
