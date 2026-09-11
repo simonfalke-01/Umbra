@@ -796,6 +796,7 @@ public final class LSPTransport: @unchecked Sendable {
     }
 
     deinit {
+        _ = clsp_core_stop(core)
         clsp_core_release(core)
     }
 

@@ -26,6 +26,10 @@
 #include <new>
 #include <shared_mutex>
 
+#if defined(__APPLE__)
+  #include <dispatch/dispatch.h>
+#endif
+
 #if CLSP_CORE_HAS_WOLFSSL
   #if __has_include(<wolfssl/lsp_spake2_settings.h>)
     #include <wolfssl/lsp_spake2_settings.h>
@@ -71,7 +75,7 @@ struct clsp_handoff_observer_binding;
 
 /** @brief Native core object hidden behind `clsp_core_t`. */
 struct clsp_core {
-  std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
+  std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count or terminal finalization sentinel.
   std::atomic<std::uint32_t> state {CLSP_LIFECYCLE_CREATED};  ///< Coarse lifecycle state.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
   std::mutex handoff_observer_mutex;  ///< Serializes handoff observation binding replacement.
@@ -119,9 +123,13 @@ struct clsp_core {
 
   /** @brief Release the explicitly retained callback context. */
   ~clsp_core() {
-    if (runtime != nullptr) {
-      (void)runtime->stop();
-      delete runtime;
+    {
+      std::unique_lock runtime_lock(runtime_mutex);
+      if (runtime != nullptr) {
+        (void)runtime->stop();
+        delete runtime;
+        runtime = nullptr;
+      }
     }
     if (callbacks.context != nullptr) {
       callbacks.release_context(callbacks.context);
@@ -338,6 +346,8 @@ namespace umbra::lsp {
 }  // namespace umbra::lsp
 
 namespace {
+  inline constexpr auto finalizing_core_reference =
+    std::numeric_limits<std::uint32_t>::max();  ///< Terminal value that forbids zero-reference resurrection.
   inline constexpr std::size_t maximum_callback_stack_depth = 16;  ///< Bounded nested callbacks across distinct cores.
   thread_local std::array<const clsp_core_t *, maximum_callback_stack_depth> active_callback_cores {};  ///< Current thread callback owners.
   thread_local std::size_t active_callback_depth {};  ///< Occupied callback-owner entries.
@@ -350,6 +360,47 @@ namespace {
       }
     }
     return false;
+  }
+
+  /** @brief Retain one live core without reviving terminal finalization. */
+  [[nodiscard]] bool try_retain_core(clsp_core_t *core) noexcept {
+    if (core == nullptr) {
+      return false;
+    }
+    auto references = core->references.load(std::memory_order_relaxed);
+    while (references != 0U && references < finalizing_core_reference - 1U) {
+      if (core->references.compare_exchange_weak(
+            references,
+            references + 1U,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed
+          )) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+#if defined(__APPLE__)
+  /** @brief Destroy a callback-released core away from its runtime worker stack. */
+  void destroy_core_asynchronously(void *context) noexcept {
+    delete static_cast<clsp_core_t *>(context);
+  }
+#endif
+
+  /** @brief Complete terminal core finalization without joining the current callback worker. */
+  void finalize_core(clsp_core_t *core) noexcept {
+#if defined(__APPLE__)
+    if (callback_stack_contains(core)) {
+      dispatch_async_f(
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+        core,
+        destroy_core_asynchronously
+      );
+      return;
+    }
+#endif
+    delete core;
   }
 
   /** @brief Bounded callback-stack marker enabling same-core reentry rejection. */
@@ -1328,7 +1379,9 @@ namespace {
     if (core->callbacks.lifecycle == nullptr) {
       return;
     }
-    clsp_core_retain(core);
+    if (!try_retain_core(core)) {
+      return;
+    }
     const clsp_lifecycle_event_t event {
       .abi_version = CLSP_CORE_ABI_VERSION,
       .structure_size = sizeof(clsp_lifecycle_event_t),
@@ -1350,7 +1403,9 @@ namespace {
     if (core->callbacks.control == nullptr) {
       return;
     }
-    clsp_core_retain(core);
+    if (!try_retain_core(core)) {
+      return;
+    }
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
       clsp_core_release(core);
@@ -1432,7 +1487,9 @@ namespace {
   void runtime_audio_packet(void *context, const clsp_audio_packet_event_t &event) noexcept {
     auto *core = static_cast<clsp_core_t *>(context);
     if (core->callbacks.audio_packet == nullptr) return;
-    clsp_core_retain(core);
+    if (!try_retain_core(core)) {
+      return;
+    }
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
       clsp_core_release(core);
@@ -1446,7 +1503,9 @@ namespace {
   void runtime_audio_timing(void *context, const clsp_audio_timing_event_t &event) noexcept {
     auto *core = static_cast<clsp_core_t *>(context);
     if (core->callbacks.audio_timing == nullptr) return;
-    clsp_core_retain(core);
+    if (!try_retain_core(core)) {
+      return;
+    }
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
       clsp_core_release(core);
@@ -1464,7 +1523,10 @@ namespace {
       clsp_buffer_release(event.frame);
       return;
     }
-    clsp_core_retain(core);
+    if (!try_retain_core(core)) {
+      clsp_buffer_release(event.frame);
+      return;
+    }
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
       clsp_buffer_release(event.frame);
@@ -1481,7 +1543,9 @@ namespace {
     if (core->callbacks.path_probe == nullptr) {
       return true;
     }
-    clsp_core_retain(core);
+    if (!try_retain_core(core)) {
+      return false;
+    }
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
       clsp_core_release(core);
@@ -1645,14 +1709,28 @@ extern "C" clsp_status_t clsp_core_create(
 }
 
 extern "C" void clsp_core_retain(clsp_core_t *core) {
-  if (core != nullptr) {
-    core->references.fetch_add(1, std::memory_order_relaxed);
-  }
+  (void)try_retain_core(core);
 }
 
 extern "C" void clsp_core_release(clsp_core_t *core) {
-  if (core != nullptr && core->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-    delete core;
+  if (core == nullptr) {
+    return;
+  }
+  auto references = core->references.load(std::memory_order_acquire);
+  while (references != 0U && references != finalizing_core_reference) {
+    const auto next = references == 1U ? finalizing_core_reference : references - 1U;
+    if (!core->references.compare_exchange_weak(
+          references,
+          next,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire
+        )) {
+      continue;
+    }
+    if (next == finalizing_core_reference) {
+      finalize_core(core);
+    }
+    return;
   }
 }
 
