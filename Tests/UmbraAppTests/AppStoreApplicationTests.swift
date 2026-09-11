@@ -933,7 +933,9 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
         preparePairingRequests.append(hostID)
         let preparation = PairingPreparation(
             pin: preparedPIN,
-            provisionalSPKIFingerprint: preparedPIN.count == 6 ? "00112233 44556677" : nil
+            provisionalSPKIFingerprint: preparedPIN.count == 6 ? "00112233 44556677" : nil,
+            requestedPermissions: [],
+            effectivePermissions: []
         )
         guard suspendsPairingPreparation else { return preparation }
         return try await withCheckedThrowingContinuation { continuation in

@@ -73,9 +73,6 @@ struct clsp_handoff_observer_binding;
 struct clsp_core {
   std::atomic<std::uint32_t> references {1};  ///< Explicit ABI ownership count.
   std::atomic<std::uint32_t> state {CLSP_LIFECYCLE_CREATED};  ///< Coarse lifecycle state.
-  std::atomic<bool> callback_active {false};  ///< Rejects reentrant ABI operations.
-  std::atomic<bool> audio_callback_active {false};  ///< Prevents recursive complete-audio delivery.
-  std::atomic<bool> video_callback_active {false};  ///< Prevents recursive complete-frame delivery.
   std::mutex apple_capture_mutex;  ///< Serializes low-rate LSPG application with capture teardown.
   std::mutex handoff_observer_mutex;  ///< Serializes handoff observation binding replacement.
   std::mutex host_hello_mutex;  ///< Serializes authenticated SERVER_HELLO identity binding.
@@ -83,6 +80,8 @@ struct clsp_core {
   std::condition_variable producer_wait_condition;  ///< Producer-lease drain notification.
   mutable std::mutex baseline_mutex;  ///< Serializes association-local baseline readiness.
   mutable std::condition_variable baseline_condition;  ///< Baseline readiness wait notification.
+  std::mutex device_offer_mutex;  ///< Serializes coarse native hot-plug offers.
+  mutable std::mutex native_timing_mutex;  ///< Serializes coarse fixed-layout timing publications.
   mutable std::shared_mutex runtime_mutex;  ///< Prevents runtime reclamation during ABI calls.
   std::atomic<std::uint32_t> producer_leases {0};  ///< In-flight input producer operations.
   std::atomic<bool> producers_accepting {true};  ///< Input producer admission gate.
@@ -95,6 +94,12 @@ struct clsp_core {
   std::uint32_t baseline_authority_epoch {};  ///< Last handoff-derived local authority epoch.
   std::uint64_t baseline_event_generation {};  ///< Monotonic readiness transition generation.
   bool baseline_acknowledged {};  ///< Whether the exact current baseline is authenticated.
+  std::array<clsp_device_offer_event_t, 32> device_offers {};  ///< Bounded device-offer ring.
+  std::size_t device_offer_read {};  ///< Next event to drain.
+  std::size_t device_offer_write {};  ///< Next free event slot.
+  std::size_t device_offer_count {};  ///< Occupied events.
+  std::uint64_t next_device_offer_sequence {1};  ///< Next nonzero event identity.
+  clsp_native_timing_snapshot_t native_timing {};  ///< Latest worker stages merged with device capture evidence.
   clsp_apple_input_capture_t *apple_capture {};  ///< Active native controller-output owner.
   umbra::lsp::Runtime *runtime {};  ///< Owned native socket/security/control runtime.
   clsp_configuration_t configuration {};  ///< Caller configuration copied at creation.
@@ -1314,13 +1319,13 @@ namespace {
   }
 
   /** @brief Publish one non-reentrant lifecycle event without protocol locks held. */
-  void publish_lifecycle(clsp_core_t *core, const std::uint32_t state) noexcept {
+  void publish_lifecycle(
+    clsp_core_t *core,
+    const std::uint32_t state,
+    const clsp_status_t terminal_status
+  ) noexcept {
     core->state.store(state, std::memory_order_release);
     if (core->callbacks.lifecycle == nullptr) {
-      return;
-    }
-    auto expected = false;
-    if (!core->callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
     }
     clsp_core_retain(core);
@@ -1329,15 +1334,14 @@ namespace {
       .structure_size = sizeof(clsp_lifecycle_event_t),
       .state = state,
       .reserved_zero = 0,
+      .terminal_status = static_cast<std::uint32_t>(terminal_status),
     };
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
-      core->callback_active.store(false, std::memory_order_release);
       clsp_core_release(core);
       return;
     }
     core->callbacks.lifecycle(core->callbacks.context, &event);
-    core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
   }
 
@@ -1346,27 +1350,35 @@ namespace {
     if (core->callbacks.control == nullptr) {
       return;
     }
-    auto expected = false;
-    if (!core->callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      return;
-    }
     clsp_core_retain(core);
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
-      core->callback_active.store(false, std::memory_order_release);
       clsp_core_release(core);
       return;
     }
     core->callbacks.control(core->callbacks.context, &event);
-    core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
   }
 
   /** @brief Receive one native runtime lifecycle transition. */
-  void runtime_lifecycle(void *context, const std::uint32_t state) noexcept {
+  void runtime_lifecycle(
+    void *context,
+    const std::uint32_t state,
+    const clsp_status_t terminal_status
+  ) noexcept {
     auto *core = static_cast<clsp_core_t *>(context);
-    publish_lifecycle(core, state);
-    if (state == CLSP_LIFECYCLE_FAILED) {
+    const auto raw_terminal = static_cast<std::uint32_t>(terminal_status);
+    const auto assigned_terminal = raw_terminal <=
+      static_cast<std::uint32_t>(CLSP_STATUS_PAIRING_CONFIRMATION_FAILED);
+    const auto valid_terminal = assigned_terminal &&
+      (state == CLSP_LIFECYCLE_FAILED ? terminal_status != CLSP_STATUS_OK : terminal_status == CLSP_STATUS_OK);
+    const auto published_state = valid_terminal ? state : static_cast<std::uint32_t>(CLSP_LIFECYCLE_FAILED);
+    publish_lifecycle(
+      core,
+      published_state,
+      valid_terminal ? terminal_status : CLSP_STATUS_INTERNAL_FAILURE
+    );
+    if (published_state == CLSP_LIFECYCLE_FAILED) {
       with_handoff_observer(core, [&](clsp_handoff_t *handoff) {
         (void)clsp_handoff_lost(handoff, core);
       });
@@ -1420,17 +1432,13 @@ namespace {
   void runtime_audio_packet(void *context, const clsp_audio_packet_event_t &event) noexcept {
     auto *core = static_cast<clsp_core_t *>(context);
     if (core->callbacks.audio_packet == nullptr) return;
-    auto expected = false;
-    if (!core->audio_callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     clsp_core_retain(core);
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
-      core->audio_callback_active.store(false, std::memory_order_release);
       clsp_core_release(core);
       return;
     }
     core->callbacks.audio_packet(core->callbacks.context, &event);
-    core->audio_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
   }
 
@@ -1438,17 +1446,13 @@ namespace {
   void runtime_audio_timing(void *context, const clsp_audio_timing_event_t &event) noexcept {
     auto *core = static_cast<clsp_core_t *>(context);
     if (core->callbacks.audio_timing == nullptr) return;
-    auto expected = false;
-    if (!core->audio_callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     clsp_core_retain(core);
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
-      core->audio_callback_active.store(false, std::memory_order_release);
       clsp_core_release(core);
       return;
     }
     core->callbacks.audio_timing(core->callbacks.context, &event);
-    core->audio_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
   }
 
@@ -1460,37 +1464,14 @@ namespace {
       clsp_buffer_release(event.frame);
       return;
     }
-    auto expected = false;
-    if (!core->video_callback_active.compare_exchange_strong(
-          expected,
-          true,
-          std::memory_order_acq_rel
-        )) {
-      clsp_buffer_release(event.frame);
-      return;
-    }
-    expected = false;
-    if (!core->callback_active.compare_exchange_strong(
-          expected,
-          true,
-          std::memory_order_acq_rel
-        )) {
-      core->video_callback_active.store(false, std::memory_order_release);
-      clsp_buffer_release(event.frame);
-      return;
-    }
     clsp_core_retain(core);
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
-      core->callback_active.store(false, std::memory_order_release);
-      core->video_callback_active.store(false, std::memory_order_release);
       clsp_buffer_release(event.frame);
       clsp_core_release(core);
       return;
     }
     core->callbacks.video_access_unit(core->callbacks.context, &event);
-    core->callback_active.store(false, std::memory_order_release);
-    core->video_callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
   }
 
@@ -1500,19 +1481,13 @@ namespace {
     if (core->callbacks.path_probe == nullptr) {
       return true;
     }
-    auto expected = false;
-    if (!core->callback_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      return false;
-    }
     clsp_core_retain(core);
     callback_core_scope callback_scope {core};
     if (!callback_scope.active()) {
-      core->callback_active.store(false, std::memory_order_release);
       clsp_core_release(core);
       return false;
     }
     core->callbacks.path_probe(core->callbacks.context, &event);
-    core->callback_active.store(false, std::memory_order_release);
     clsp_core_release(core);
     return true;
   }
@@ -1562,6 +1537,28 @@ namespace {
         core->path_probe_timeouts.fetch_add(amount, std::memory_order_relaxed);
         return;
     }
+  }
+
+  /** @brief Publish one worker-owned native timing snapshot without invoking product callbacks. */
+  void runtime_timing(void *context, const clsp_native_timing_snapshot_t &snapshot) noexcept {
+    auto *core = static_cast<clsp_core_t *>(context);
+    std::lock_guard lock(core->native_timing_mutex);
+    core->native_timing.abi_version = CLSP_CORE_ABI_VERSION;
+    core->native_timing.structure_size = sizeof(clsp_native_timing_snapshot_t);
+    core->native_timing.snapshot_generation = snapshot.snapshot_generation;
+    core->native_timing.snapshot_time_microseconds = snapshot.snapshot_time_microseconds;
+    core->native_timing.stream_generation = snapshot.stream_generation;
+    core->native_timing.input_generation = snapshot.input_generation;
+    core->native_timing.video_generation = snapshot.video_generation;
+    core->native_timing.audio_generation = snapshot.audio_generation;
+    core->native_timing.pointer_generation = snapshot.pointer_generation;
+    std::copy(std::begin(snapshot.controller_generations), std::end(snapshot.controller_generations),
+              std::begin(core->native_timing.controller_generations));
+    std::copy(std::begin(snapshot.touch_generations), std::end(snapshot.touch_generations),
+              std::begin(core->native_timing.touch_generations));
+    std::copy(std::begin(snapshot.pen_generations), std::end(snapshot.pen_generations),
+              std::begin(core->native_timing.pen_generations));
+    std::copy(std::begin(snapshot.stages), std::end(snapshot.stages), std::begin(core->native_timing.stages));
   }
 
   /** @brief Apply authenticated LSPG through the currently active Apple capture owner. */
@@ -2742,6 +2739,7 @@ extern "C" clsp_status_t clsp_core_start(clsp_core_t *core, const clsp_endpoint_
       .lifecycle = runtime_lifecycle,
       .control = runtime_control,
       .counter = runtime_counter,
+      .timing = runtime_timing,
       .controller_output = runtime_controller_output,
       .input_baseline = runtime_input_baseline,
       .audio_packet = runtime_audio_packet,
@@ -2809,7 +2807,7 @@ extern "C" clsp_status_t clsp_core_send_control(
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
@@ -2827,7 +2825,7 @@ extern "C" clsp_status_t clsp_core_configure_input(
   if (core == nullptr || configuration == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
@@ -2836,6 +2834,37 @@ extern "C" clsp_status_t clsp_core_configure_input(
     }
     return runtime.configure_input(*configuration);
   });
+}
+
+extern "C" clsp_status_t clsp_core_update_input_rates(
+  clsp_core_t *core,
+  const clsp_input_rate_update_t *update
+) {
+  if (core == nullptr || update == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.update_input_rates(*update); });
+}
+
+extern "C" clsp_status_t clsp_core_copy_input_feedback(
+  const clsp_core_t *core,
+  clsp_input_feedback_snapshot_t *output
+) {
+  if (core == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::shared_lock runtime_lock(core->runtime_mutex);
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->copy_input_feedback(*output);
+}
+
+extern "C" clsp_status_t clsp_core_copy_input_edge_snapshot(
+  const clsp_core_t *core,
+  clsp_input_edge_snapshot_t *output
+) {
+  if (core == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::shared_lock runtime_lock(core->runtime_mutex);
+  return core->runtime == nullptr ? CLSP_STATUS_NOT_AUTHENTICATED :
+                                    core->runtime->copy_input_edge_snapshot(*output);
 }
 
 extern "C" clsp_status_t clsp_core_send_control_response(
@@ -2847,7 +2876,7 @@ extern "C" clsp_status_t clsp_core_send_control_response(
   const std::uint32_t deadline_milliseconds
 ) {
   if (core == nullptr || error_response > 1U) return CLSP_STATUS_INVALID_ARGUMENT;
-  if (core->callback_active.load(std::memory_order_acquire)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
     return runtime.send_control_response(
       message_type,
@@ -3071,10 +3100,21 @@ extern "C" clsp_status_t clsp_core_neutralize_input(clsp_core_t *core) {
   if (core == nullptr) {
     return CLSP_STATUS_INVALID_ARGUMENT;
   }
-  if (core->callback_active.load(std::memory_order_acquire)) {
+  if (callback_stack_contains(core)) {
     return CLSP_STATUS_REENTRANT_CALLBACK;
   }
   return with_runtime(core, [](umbra::lsp::Runtime &runtime) { return runtime.neutralize_input(); });
+}
+
+extern "C" clsp_status_t clsp_core_restart_input_baseline(clsp_core_t *core) {
+  if (core == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  const auto baseline_id = fresh_baseline_id();
+  const auto status = with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.restart_input_baseline(baseline_id);
+  });
+  if (status == CLSP_STATUS_OK) resume_core_producers(core);
+  return status;
 }
 
 extern "C" clsp_status_t clsp_core_submit_controller_edge(
@@ -3143,6 +3183,144 @@ extern "C" bool clsp_core_register_apple_capture(
   return true;
 }
 
+extern "C" void clsp_core_publish_device_offer(
+  clsp_core_t *core,
+  clsp_device_offer_event_t event
+) {
+  if (core == nullptr || event.kind < CLSP_DEVICE_OFFER_ARRIVED ||
+      event.kind > CLSP_DEVICE_OFFER_RATE_OBSERVED ||
+      event.device_type < CLSP_DEVICE_OFFER_POINTER || event.device_type > CLSP_DEVICE_OFFER_CONTROLLER ||
+      event.device_id == 0U || event.instance_generation == 0U ||
+      event.capture_source < CLSP_DEVICE_CAPTURE_IOHID || event.capture_source > CLSP_DEVICE_CAPTURE_APPKIT ||
+      (event.device_type == CLSP_DEVICE_OFFER_POINTER && event.device_id != 1U) ||
+      (event.device_type == CLSP_DEVICE_OFFER_CONTROLLER && event.device_id > 16U)) return;
+  event.dropped_samples = 0U;
+  event.attributed_wire_bytes = 0U;
+  (void)with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    event.dropped_samples = runtime.input_dropped_samples(
+      event.device_type,
+      event.device_id,
+      event.instance_generation
+    );
+    event.attributed_wire_bytes = runtime.input_attributed_wire_bytes(
+      event.device_type,
+      event.device_id,
+      event.instance_generation
+    );
+    return CLSP_STATUS_OK;
+  });
+  if (event.kind == CLSP_DEVICE_OFFER_REMOVED) {
+    event.observed_capture_hz = 0U;
+    event.observed_sensor_hz = 0U;
+    event.minimum_state_rate = 0U;
+    event.maximum_state_rate = 0U;
+    event.minimum_sensor_rate = 0U;
+    event.maximum_sensor_rate = 0U;
+    event.effective_wire_bits_per_second = 0U;
+    event.minimum_sample_interval_microseconds = 0U;
+    event.maximum_sample_interval_microseconds = 0U;
+    event.maximum_state_packet_bytes = 0U;
+    event.maximum_sensor_packet_bytes = 0U;
+  }
+  {
+    std::lock_guard timing_lock(core->native_timing_mutex);
+    auto &device = core->native_timing.devices[
+      event.device_type == CLSP_DEVICE_OFFER_POINTER ? 0U : event.device_id
+    ];
+    device = {
+      .state_spacing = {
+        .count = event.state_spacing_count,
+        .p50_microseconds = event.state_spacing_p50_microseconds,
+        .p95_microseconds = event.state_spacing_p95_microseconds,
+        .p99_microseconds = event.state_spacing_p99_microseconds,
+        .maximum_microseconds = event.state_spacing_maximum_microseconds,
+        .drops = event.state_spacing_drops,
+        .flags = event.timing_flags,
+      },
+      .sensor_spacing = {
+        .count = event.sensor_spacing_count,
+        .p50_microseconds = event.sensor_spacing_p50_microseconds,
+        .p95_microseconds = event.sensor_spacing_p95_microseconds,
+        .p99_microseconds = event.sensor_spacing_p99_microseconds,
+        .maximum_microseconds = event.sensor_spacing_maximum_microseconds,
+        .drops = event.sensor_spacing_drops,
+        .flags = event.device_type == CLSP_DEVICE_OFFER_CONTROLLER &&
+                     (event.maximum_sensor_rate != 0U || event.sensor_spacing_count != 0U) ?
+                   event.timing_flags : 0U,
+      },
+      .captured_samples = event.captured_samples,
+      .dropped_samples = event.dropped_samples,
+      .attributed_wire_bytes = event.attributed_wire_bytes,
+      .device_id = event.device_id,
+      .instance_generation = event.instance_generation,
+      .observed_state_hz = event.observed_capture_hz,
+      .observed_sensor_hz = event.observed_sensor_hz,
+      .device_type = event.device_type,
+      .capture_source = event.capture_source,
+      .active = static_cast<std::uint8_t>(event.kind != CLSP_DEVICE_OFFER_REMOVED),
+    };
+  }
+  std::lock_guard lock(core->device_offer_mutex);
+  event.abi_version = CLSP_CORE_ABI_VERSION;
+  event.structure_size = sizeof(clsp_device_offer_event_t);
+  event.event_sequence = core->next_device_offer_sequence++;
+  if (core->next_device_offer_sequence == 0U) ++core->next_device_offer_sequence;
+  event.reserved_zero[0] = event.reserved_zero[1] = event.reserved_zero[2] = 0;
+  event.reserved_zero[3] = event.reserved_zero[4] = 0;
+  if (core->device_offer_count == core->device_offers.size()) {
+    core->device_offer_read = (core->device_offer_read + 1U) % core->device_offers.size();
+    --core->device_offer_count;
+  }
+  core->device_offers[core->device_offer_write] = event;
+  core->device_offer_write = (core->device_offer_write + 1U) % core->device_offers.size();
+  ++core->device_offer_count;
+}
+
+extern "C" void clsp_core_observe_input_device(
+  clsp_core_t *core,
+  const std::uint8_t device_type,
+  const std::uint32_t device_id,
+  const std::uint32_t instance_generation,
+  const bool active,
+  const std::uint8_t sensor_mask
+) {
+  if (core == nullptr || device_type < 2U || device_type > 5U || device_id == 0U ||
+      instance_generation == 0U || (device_type != 3U && sensor_mask != 0U) ||
+      (sensor_mask & ~std::uint8_t {3}) != 0U) return;
+  (void)with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    runtime.observe_input_device(
+      device_type,
+      device_id,
+      instance_generation,
+      active,
+      sensor_mask
+    );
+    return CLSP_STATUS_OK;
+  });
+}
+
+extern "C" clsp_status_t clsp_core_poll_device_offer(
+  clsp_core_t *core,
+  clsp_device_offer_event_t *output
+) {
+  if (core == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard lock(core->device_offer_mutex);
+  if (core->device_offer_count == 0U) {
+    *output = {
+      .abi_version = CLSP_CORE_ABI_VERSION,
+      .structure_size = sizeof(clsp_device_offer_event_t),
+      .kind = CLSP_DEVICE_OFFER_NONE,
+    };
+    return CLSP_STATUS_OK;
+  }
+  *output = core->device_offers[core->device_offer_read];
+  core->device_offers[core->device_offer_read] = {};
+  core->device_offer_read = (core->device_offer_read + 1U) % core->device_offers.size();
+  --core->device_offer_count;
+  return CLSP_STATUS_OK;
+}
+
 extern "C" void clsp_core_unregister_apple_capture(
   clsp_core_t *core,
   clsp_apple_input_capture_t *capture
@@ -3182,8 +3360,22 @@ extern "C" clsp_status_t clsp_core_copy_telemetry(
     .path_probe_timeouts = core->path_probe_timeouts.load(std::memory_order_relaxed),
     .current_udp_payload_size = core->runtime == nullptr ? std::uint16_t {1'200} :
                                                            core->runtime->current_udp_payload_size(),
-    .reserved_zero = 0,
+    .current_receive_udp_payload_size = core->runtime == nullptr ? std::uint16_t {1'200} :
+                                                                   core->runtime->current_receive_udp_payload_size(),
   };
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_core_copy_native_timing(
+  const clsp_core_t *core,
+  clsp_native_timing_snapshot_t *output
+) {
+  if (core == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  if (callback_stack_contains(core)) return CLSP_STATUS_REENTRANT_CALLBACK;
+  std::lock_guard lock(core->native_timing_mutex);
+  *output = core->native_timing;
+  output->abi_version = CLSP_CORE_ABI_VERSION;
+  output->structure_size = sizeof(clsp_native_timing_snapshot_t);
   return CLSP_STATUS_OK;
 }
 

@@ -13,6 +13,7 @@
 #include "../transport/repair.h"
 #include "../transport/rtcp.h"
 #include "BufferInternal.h"
+#include "FixedTelemetry.h"
 #include "SecurityProviders.h"
 #include "TransportFeedback.h"
 
@@ -53,6 +54,12 @@ namespace umbra::lsp {
     constexpr std::size_t receive_batch_size = 64;  ///< Initial bounded receive batch.
     constexpr std::size_t control_queue_capacity = 64;  ///< Bounded pre-wire control queue.
     constexpr std::size_t capture_queue_capacity = 4'096;  ///< Bounded allocation-free Apple capture ring.
+    constexpr std::size_t safe_udp_payload = 1'200;  ///< Mandatory LSP/1 unprobed UDP payload.
+    constexpr std::size_t input_rtp_header_bytes = 12;  ///< Fixed RTP header without extensions.
+    constexpr std::size_t input_srtp_tag_bytes = 16;  ///< AEAD AES-128-GCM authentication tag.
+    constexpr std::size_t baseline_part_data_capacity =
+      safe_udp_payload - input_rtp_header_bytes - input_srtp_tag_bytes -
+      lumen::lsp::input_plane::common_header_size - lumen::lsp::input_plane::baseline_part_header_size;
     constexpr std::size_t microphone_queue_capacity = 3;  ///< Two live packets plus one SPSC sentinel slot.
     constexpr std::size_t maximum_microphone_opus_bytes = 1'172;  ///< 1,200 minus RTP and SRTP tag.
     constexpr std::size_t video_delivery_queue_capacity =
@@ -703,6 +710,26 @@ namespace umbra::lsp {
         return bytes_;
       }
 
+      /** @brief Transfer the root token without releasing its pool reference. */
+      [[nodiscard]] std::uint64_t detach() noexcept {
+        const auto token = token_;
+        pool_ = nullptr;
+        token_ = 0;
+        bytes_ = {};
+        return token;
+      }
+
+      /** @brief Adopt one detached root token without changing its reference count. */
+      [[nodiscard]] bool adopt(VideoReceivePool &pool, const std::uint64_t token) noexcept {
+        reset();
+        auto bytes = pool.mutable_bytes(token);
+        if (token == 0U || bytes.empty()) return false;
+        pool_ = &pool;
+        token_ = token;
+        bytes_ = bytes;
+        return true;
+      }
+
       /** @brief Release any current root reference. */
       void reset() noexcept {
         if (pool_ != nullptr) {
@@ -1096,7 +1123,7 @@ namespace umbra::lsp {
     Impl(const clsp_configuration_t &configuration, const RuntimeCallbacks callbacks) noexcept:
         configuration_ {configuration},
         callbacks_ {callbacks},
-        rto_ {true} {
+        rto_ {lumen::lsp::control_path_profile::local} {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       mutex_ready_ = pthread_mutex_init(&mutex_, nullptr) == 0;
       condition_ready_ = mutex_ready_ && pthread_cond_init(&condition_, nullptr) == 0;
@@ -1142,12 +1169,16 @@ namespace umbra::lsp {
 
       stop_requested_.store(false, std::memory_order_release);
       terminal_failed_.store(false, std::memory_order_release);
+      terminal_status_.store(CLSP_STATUS_OK, std::memory_order_release);
       startup_complete_ = false;
       startup_status_ = CLSP_STATUS_TIMEOUT;
       publish_lifecycle(CLSP_LIFECYCLE_CONNECTING);
       if (pthread_create(&worker_, nullptr, worker_entry, this) != 0) {
         cleanup_platform();
-        publish_lifecycle(CLSP_LIFECYCLE_FAILED);
+        publish_lifecycle(
+          CLSP_LIFECYCLE_FAILED,
+          latch_terminal_status(CLSP_STATUS_SOCKET_FAILURE)
+        );
         return CLSP_STATUS_SOCKET_FAILURE;
       }
       worker_started_ = true;
@@ -1186,7 +1217,7 @@ namespace umbra::lsp {
         request_stop();
         join_worker();
         cleanup_platform();
-        publish_lifecycle(CLSP_LIFECYCLE_FAILED);
+        publish_lifecycle(CLSP_LIFECYCLE_FAILED, latch_terminal_status(status));
       }
       return status;
 #else
@@ -1239,7 +1270,7 @@ namespace umbra::lsp {
       pthread_mutex_lock(&mutex_);
       if (control_queue_full_locked()) {
         pthread_mutex_unlock(&mutex_);
-        increment(RuntimeCounter::dropped);
+        producer_dropped_.fetch_add(1U, std::memory_order_relaxed);
         return CLSP_STATUS_CONTROL_WINDOW_FULL;
       }
       auto &command = control_queue_[control_queue_tail_];
@@ -1292,7 +1323,7 @@ namespace umbra::lsp {
       pthread_mutex_lock(&mutex_);
       if (control_reservation_.occupied || control_queue_full_locked()) {
         pthread_mutex_unlock(&mutex_);
-        increment(RuntimeCounter::dropped);
+        producer_dropped_.fetch_add(1U, std::memory_order_relaxed);
         return CLSP_STATUS_CONTROL_WINDOW_FULL;
       }
       auto &command = control_reservation_.command;
@@ -1507,6 +1538,7 @@ namespace umbra::lsp {
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
       microphone_configuration_ = configuration;
+      pending_microphone_ = {};
       microphone_read_.store(0, std::memory_order_release);
       microphone_write_.store(0, std::memory_order_release);
       microphone_sequence_ = static_cast<std::uint16_t>(arc4random());
@@ -1557,11 +1589,12 @@ namespace umbra::lsp {
     [[nodiscard]] clsp_status_t stop_microphone() noexcept {
       microphone_active_.store(false, std::memory_order_release);
       microphone_prepared_.store(false, std::memory_order_release);
+      pending_microphone_ = {};
       microphone_read_.store(microphone_write_.load(std::memory_order_acquire), std::memory_order_release);
       return CLSP_STATUS_OK;
     }
 
-    /** @brief Install one immutable schema-v3 video/repair generation and bounded AU storage. */
+    /** @brief Install one immutable video schema revision three repair generation and bounded AU storage. */
     [[nodiscard]] clsp_status_t
     configure_video(const clsp_video_configuration_t &configuration) noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
@@ -1958,6 +1991,10 @@ namespace umbra::lsp {
       return current_udp_payload_size_.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] std::uint16_t current_receive_udp_payload_size() const noexcept {
+      return receive_udp_payload_size_.load(std::memory_order_acquire);
+    }
+
     /** @brief Copy the exact authenticated exporter for native pairing transcript binding. */
     [[nodiscard]] clsp_status_t copy_pairing_exporter(
       const std::span<std::uint8_t, 32> output
@@ -2178,12 +2215,179 @@ namespace umbra::lsp {
     }
 
     /** @brief Queue one bounded relative-pointer record. */
+    [[nodiscard]] clsp_status_t update_input_rates(const clsp_input_rate_update_t &update) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire)) return CLSP_STATUS_NOT_AUTHENTICATED;
+      if (update.abi_version != CLSP_CORE_ABI_VERSION || update.structure_size != sizeof(update) ||
+          update.stream_generation == 0U || update.input_generation == 0U ||
+          update.pointer_rate < 125U || update.pointer_rate > 16'000U ||
+          update.controller_rate < 125U || update.controller_rate > 2'000U ||
+          update.sensor_rate < 125U || update.sensor_rate > 4'000U ||
+          update.reconciliation_rate < 50U || update.reconciliation_rate > 1'000U ||
+          update.reserved_input_wire_bits_per_second == 0U ||
+          update.reserved_input_wire_bits_per_second > 32'000'000U) return CLSP_STATUS_INVALID_CONFIGURATION;
+      pthread_mutex_lock(&mutex_);
+      if (!input_configured_ || pending_input_rate_update_ ||
+          update.stream_generation != input_configuration_.stream_generation ||
+          update.input_generation != input_configuration_.input_generation) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      pending_input_rates_ = update;
+      const auto token = input_rate_update_requested_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+      pending_input_rate_token_ = token;
+      pending_input_rate_update_ = true;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      timespec deadline {};
+      if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      deadline.tv_nsec += 100'000'000L;
+      if (deadline.tv_nsec >= 1'000'000'000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1'000'000'000L; }
+      pthread_mutex_lock(&mutex_);
+      while (input_rate_update_completed_.load(std::memory_order_acquire) < token) {
+        const auto wait = pthread_cond_timedwait(&condition_, &mutex_, &deadline);
+        if (wait == ETIMEDOUT) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_TIMEOUT; }
+        if (wait != 0) { pthread_mutex_unlock(&mutex_); return CLSP_STATUS_INTERNAL_FAILURE; }
+      }
+      pthread_mutex_unlock(&mutex_);
+      return CLSP_STATUS_OK;
+#else
+      (void)update;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t copy_input_feedback(clsp_input_feedback_snapshot_t &output) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      pthread_mutex_lock(&mutex_);
+      output = input_feedback_snapshot_;
+      pthread_mutex_unlock(&mutex_);
+      return output.abi_version == CLSP_CORE_ABI_VERSION ? CLSP_STATUS_OK : CLSP_STATUS_INVALID_STATE;
+#else
+      (void)output;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t copy_input_edge_snapshot(clsp_input_edge_snapshot_t &output) const noexcept {
+      const auto stream_generation = published_stream_generation_.load(std::memory_order_acquire);
+      const auto input_generation = published_input_generation_.load(std::memory_order_acquire);
+      if (stream_generation == 0U || input_generation == 0U) return CLSP_STATUS_INVALID_STATE;
+      output = {
+        .abi_version = CLSP_CORE_ABI_VERSION,
+        .structure_size = sizeof(clsp_input_edge_snapshot_t),
+        .stream_generation = stream_generation,
+        .input_generation = input_generation,
+        .latest_assigned_edge_id = published_latest_edge_id_.load(std::memory_order_acquire),
+        .latest_edge_sample_time_microseconds = published_latest_edge_time_.load(std::memory_order_acquire),
+      };
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Publish one native device generation for the next deterministic baseline. */
+    void observe_input_device(
+      const std::uint8_t device_type,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation,
+      const bool active,
+      const std::uint8_t sensor_mask
+    ) noexcept {
+      if (instance_generation == 0U) return;
+      const auto device = static_cast<lumen::lsp::input_plane::device_type>(device_type);
+      if (device == lumen::lsp::input_plane::device_type::pointer && device_id == 1U) {
+        if (active) {
+          const auto prior = pointer_drop_generation_.exchange(instance_generation, std::memory_order_acq_rel);
+          if (prior != instance_generation) {
+            pointer_dropped_samples_.store(0U, std::memory_order_release);
+            pointer_attributed_wire_bytes_.store(0U, std::memory_order_release);
+          }
+          published_pointer_generation_.store(instance_generation, std::memory_order_release);
+        } else if (published_pointer_generation_.load(std::memory_order_acquire) == instance_generation) {
+          published_pointer_generation_.store(0U, std::memory_order_release);
+        }
+        return;
+      }
+      if (device_id > 16U) return;
+      const auto index = device_id - 1U;
+      if (device == lumen::lsp::input_plane::device_type::controller) {
+        if (active) {
+          const auto prior = controller_drop_generations_[index].exchange(instance_generation, std::memory_order_acq_rel);
+          if (prior != instance_generation) {
+            controller_dropped_samples_[index].store(0U, std::memory_order_release);
+            controller_attributed_wire_bytes_[index].store(0U, std::memory_order_release);
+          }
+          published_controller_sensor_masks_[index].store(sensor_mask, std::memory_order_release);
+          published_controller_generations_[index].store(instance_generation, std::memory_order_release);
+        } else if (published_controller_generations_[index].load(std::memory_order_acquire) == instance_generation) {
+          published_controller_sensor_masks_[index].store(0U, std::memory_order_release);
+          published_controller_generations_[index].store(0U, std::memory_order_release);
+        }
+        return;
+      }
+      auto *generations = device == lumen::lsp::input_plane::device_type::touch ?
+                            &published_touch_generations_ :
+                            device == lumen::lsp::input_plane::device_type::pen ?
+                              &published_pen_generations_ : nullptr;
+      if (generations == nullptr) return;
+      if (active) {
+        (*generations)[index].store(instance_generation, std::memory_order_release);
+      } else if ((*generations)[index].load(std::memory_order_acquire) == instance_generation) {
+        (*generations)[index].store(0U, std::memory_order_release);
+      }
+    }
+
+    /** @brief Return cumulative ring drops for one exact device generation. */
+    [[nodiscard]] std::uint64_t input_dropped_samples(
+      const std::uint8_t offer_type,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation
+    ) const noexcept {
+      if (offer_type == CLSP_DEVICE_OFFER_POINTER && device_id == 1U &&
+          pointer_drop_generation_.load(std::memory_order_acquire) == instance_generation) {
+        return pointer_dropped_samples_.load(std::memory_order_acquire);
+      }
+      if (offer_type == CLSP_DEVICE_OFFER_CONTROLLER && device_id >= 1U && device_id <= 16U) {
+        const auto index = device_id - 1U;
+        if (controller_drop_generations_[index].load(std::memory_order_acquire) == instance_generation) {
+          return controller_dropped_samples_[index].load(std::memory_order_acquire);
+        }
+      }
+      return 0U;
+    }
+
+    /** @brief Return attributable state/sensor complete IP bytes for one exact generation. */
+    [[nodiscard]] std::uint64_t input_attributed_wire_bytes(
+      const std::uint8_t offer_type,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation
+    ) const noexcept {
+      if (offer_type == CLSP_DEVICE_OFFER_POINTER && device_id == 1U &&
+          pointer_drop_generation_.load(std::memory_order_acquire) == instance_generation) {
+        return pointer_attributed_wire_bytes_.load(std::memory_order_acquire);
+      }
+      if (offer_type == CLSP_DEVICE_OFFER_CONTROLLER && device_id >= 1U && device_id <= 16U) {
+        const auto index = device_id - 1U;
+        if (controller_drop_generations_[index].load(std::memory_order_acquire) == instance_generation) {
+          return controller_attributed_wire_bytes_[index].load(std::memory_order_acquire);
+        }
+      }
+      return 0U;
+    }
+
+    /** @brief Queue one bounded relative-pointer record. */
     [[nodiscard]] clsp_status_t submit_pointer(const clsp_pointer_sample_t &sample) noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (!authenticated_.load(std::memory_order_acquire) || sample.sample_time_microseconds == 0) {
         return sample.sample_time_microseconds == 0 ? CLSP_STATUS_INVALID_ARGUMENT : CLSP_STATUS_NOT_AUTHENTICATED;
       }
-      CaptureRecord record {.kind = CaptureKind::pointer, .pointer = sample};
+      CaptureRecord record {
+        .kind = CaptureKind::pointer,
+        .pointer = sample,
+        .device_generation = std::max<std::uint32_t>(
+          1U,
+          published_pointer_generation_.load(std::memory_order_acquire)
+        ),
+      };
       return enqueue_capture(record);
 #else
       (void)sample;
@@ -2203,7 +2407,14 @@ namespace umbra::lsp {
           (pointer && edge.control_id > 5U)) {
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
-      CaptureRecord record {.kind = CaptureKind::edge, .edge = edge};
+      CaptureRecord record {
+        .kind = CaptureKind::edge,
+        .edge = edge,
+        .device_generation = pointer ? std::max<std::uint32_t>(
+          1U,
+          published_pointer_generation_.load(std::memory_order_acquire)
+        ) : 1U,
+      };
       return enqueue_capture(record);
 #else
       (void)edge;
@@ -2217,6 +2428,18 @@ namespace umbra::lsp {
           edge.instance_generation == 0 || edge.kind < 5 || edge.kind > 8 || edge.reserved_zero != 0 ||
           ((edge.kind == 7 || edge.kind == 8) && edge.control_id > 31)) {
         return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      if (edge.kind == 5U) {
+        observe_input_device(
+          3U,
+          edge.controller_id,
+          edge.instance_generation,
+          true,
+          published_controller_sensor_masks_[edge.controller_id - 1U].load(std::memory_order_acquire)
+        );
+      } else if (edge.kind == 6U) {
+        observe_input_device(4U, edge.controller_id, edge.instance_generation, false, 0U);
+        observe_input_device(3U, edge.controller_id, edge.instance_generation, false, 0U);
       }
       CaptureRecord record {.kind = CaptureKind::controller_edge, .controller_edge = edge};
       return enqueue_capture(record);
@@ -2247,7 +2470,16 @@ namespace umbra::lsp {
           sensor.reserved_zero[0] != 0 || sensor.reserved_zero[1] != 0 || sensor.reserved_zero[2] != 0) {
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
-      CaptureRecord record {.kind = CaptureKind::controller_sensor, .controller_sensor = sensor};
+      const auto sensor_index = sensor.controller_id - 1U;
+      published_controller_sensor_masks_[sensor_index].fetch_or(
+        static_cast<std::uint8_t>(1U << (sensor.sensor_type - 1U)),
+        std::memory_order_acq_rel
+      );
+      CaptureRecord record {
+        .kind = CaptureKind::controller_sensor,
+        .controller_sensor = sensor,
+        .timestamp_unknown = true,
+      };
       return enqueue_capture(record);
 #else
       (void)sensor;
@@ -2261,6 +2493,9 @@ namespace umbra::lsp {
           edge.contact_id == 0 || edge.contact_id > 16 || edge.instance_generation == 0 ||
           edge.kind < 9 || edge.kind > 11 || edge.reserved_zero[0] != 0 || edge.reserved_zero[1] != 0 || edge.reserved_zero[2] != 0) {
         return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      if (edge.kind == 9U) {
+        observe_input_device(4U, edge.controller_id, edge.instance_generation, true, 0U);
       }
       CaptureRecord record {.kind = CaptureKind::touch_edge, .touch_edge = edge};
       return enqueue_capture(record);
@@ -2395,6 +2630,7 @@ namespace umbra::lsp {
     /** @brief One retained authenticated host request awaiting a semantic response. */
     struct PendingInboundRequest {
       std::uint64_t request_id {};  ///< Nonzero host request ID.
+      lumen::lsp::response_semantic_identity identity {};  ///< Exact cache discriminator.
       lumen::lsp::packet_slab<maximum_control_frame> frame {};  ///< Exact original LSPC bytes.
       bool occupied {};  ///< Whether this slot is live.
     };
@@ -2439,12 +2675,16 @@ namespace umbra::lsp {
       clsp_controller_touch_edge_t touch_edge {};  ///< Touch lifecycle fields.
       clsp_controller_touch_state_t touch_state {};  ///< Touch coordinate fields.
       std::uint64_t neutralize_token {};  ///< Synchronous quiesce completion token.
+      std::uint32_t device_generation {};  ///< Pointer/keyboard generation absent from their compact ABI records.
+      bool timestamp_unknown {};  ///< Timestamp begins at callback entry instead of device delivery.
     };
 
     /** @brief Worker-owned latest controller analog state. */
     struct ControllerLatest {
       clsp_controller_state_t value {};  ///< Latest captured value.
       std::uint64_t physical_ordinal {};  ///< Increasing native sample ordinal.
+      std::uint64_t buttons {};  ///< Current exactly-once digital-button bitmap.
+      std::uint64_t composed_microseconds {};  ///< Worker composition time for the newest state.
       std::uint64_t last_sent_us {};  ///< Most recent network submission.
       bool dirty {};  ///< Whether a newer sample awaits submission.
     };
@@ -2453,6 +2693,7 @@ namespace umbra::lsp {
     struct ControllerSensorLatest {
       clsp_controller_sensor_t value {};  ///< Latest captured vector.
       std::uint64_t physical_ordinal {};  ///< Increasing native sample ordinal.
+      std::uint64_t composed_microseconds {};  ///< Worker composition time for the newest vector.
       std::uint64_t last_sent_us {};  ///< Most recent network submission.
       bool dirty {};  ///< Whether a newer vector awaits submission.
     };
@@ -2461,8 +2702,20 @@ namespace umbra::lsp {
     struct TouchLatest {
       clsp_controller_touch_state_t value {};  ///< Latest captured contact.
       std::uint64_t physical_ordinal {};  ///< Increasing contact sample ordinal.
+      std::uint64_t composed_microseconds {};  ///< Worker composition time for the newest contact state.
       std::uint64_t last_sent_us {};  ///< Most recent network submission.
+      bool active {};  ///< Whether the contact belongs in the latest touch state.
       bool dirty {};  ///< Whether newer coordinates await submission.
+    };
+
+    /** @brief Fixed correlation for one exactly-once edge through authenticated host ACK. */
+    struct EdgeTimingSlot {
+      std::uint64_t edge_id {};  ///< Exact edge identity occupying this modulo slot.
+      std::uint64_t composed_microseconds {};  ///< Worker composition time.
+      std::uint64_t first_submitted_microseconds {};  ///< First successful socket submission.
+      std::uint64_t last_submitted_microseconds {};  ///< Most recent retry submission.
+      std::uint8_t transmissions {};  ///< Saturating successful submissions.
+      bool occupied {};  ///< Whether authenticated host acknowledgement remains pending.
     };
 
     /** @brief Boundary metadata retained for either of the two incomplete video frames. */
@@ -2470,6 +2723,7 @@ namespace umbra::lsp {
       bool occupied {};  ///< Whether this slot tracks a provisional RTP frame.
       lumen::lsp::media::frame_key key {};  ///< SSRC plus extended timestamp key.
       std::uint64_t deadline_microseconds {};  ///< Fixed deadline shared by every fragment.
+      std::uint64_t first_authenticated_microseconds {};  ///< Earliest local SRTP-auth completion in the frame.
       std::uint64_t arrival_order {};  ///< Oldest-frame bounded eviction order.
       std::uint64_t frame_id {};  ///< Repeated nonzero frame identifier when observed.
       std::uint32_t recovery_epoch {};  ///< Repeated nonzero recovery epoch when observed.
@@ -2552,6 +2806,25 @@ namespace umbra::lsp {
       [[nodiscard]] explicit operator bool() const noexcept {
         return kind != Kind::none && length != 0;
       }
+    };
+
+    /** @brief One exact protected microphone RTP datagram retained across socket backpressure. */
+    struct PendingProtectedMicrophone {
+      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Immutable already-protected RTP bytes.
+      std::size_t length {};  ///< Exact protected datagram length.
+      std::size_t queue_index {};  ///< Source Opus queue slot committed only after send.
+      std::size_t opus_bytes {};  ///< Source payload bytes for sender counters.
+      std::uint64_t charged_bits {};  ///< Aggregate reverse-controller debit on success.
+      bool occupied {};  ///< Whether exact bytes await first/retry submission.
+    };
+
+    /** @brief One protected video RTP datagram deferred behind urgent reverse work. */
+    struct DeferredVideoDatagram {
+      std::uint64_t token {};  ///< Original socket receive-slab root token.
+      std::size_t length {};  ///< Protected datagram length.
+      std::uint64_t arrival_microseconds {};  ///< Kernel monotonic arrival time.
+      native_ecn_mark ecn {native_ecn_mark::unknown};  ///< Kernel ECN evidence.
+      bool kernel_timestamped {};  ///< Whether monotonic kernel ancillary time was present.
     };
 
     /** @brief One urgent protected Generic NACK retained across socket backpressure. */
@@ -2701,9 +2974,92 @@ namespace umbra::lsp {
 
     /** @brief Increment one C ABI telemetry counter. */
     void increment(const RuntimeCounter counter, const std::uint64_t amount = 1) const noexcept {
-      if (callbacks_.counter != nullptr) {
-        callbacks_.counter(callbacks_.context, static_cast<std::uint32_t>(counter), amount);
+      const auto index = static_cast<std::size_t>(counter);
+      if (index < worker_counters_.size()) {
+        worker_counters_[index] = saturating_add(worker_counters_[index], amount);
       }
+    }
+
+    /** @brief Record one same-endpoint stage duration or one invalid correlation. */
+    void record_timing_stage(
+      const clsp_native_timing_stage_t stage,
+      const std::uint64_t start_microseconds,
+      const std::uint64_t end_microseconds,
+      const std::uint32_t flags = 0U
+    ) noexcept {
+      auto &distribution = timing_distributions_[static_cast<std::size_t>(stage)];
+      if (start_microseconds == 0U || end_microseconds < start_microseconds) {
+        distribution.drop(flags | CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT);
+        return;
+      }
+      distribution.record(end_microseconds - start_microseconds, flags);
+    }
+
+    /** @brief Publish cumulative fixed-bucket timing stages at the coarse telemetry cadence. */
+    void publish_timing_snapshot(const std::uint64_t now) noexcept {
+      if (callbacks_.timing == nullptr) return;
+      if (last_timing_publication_microseconds_ != 0U &&
+          now - last_timing_publication_microseconds_ < 250'000U) return;
+      auto generation = ++timing_snapshot_generation_;
+      if (generation == 0U) generation = ++timing_snapshot_generation_;
+      clsp_native_timing_snapshot_t snapshot {
+        .abi_version = CLSP_CORE_ABI_VERSION,
+        .structure_size = sizeof(clsp_native_timing_snapshot_t),
+        .snapshot_generation = generation,
+        .snapshot_time_microseconds = now,
+        .stream_generation = input_configured_ ? input_configuration_.stream_generation : 0U,
+        .input_generation = input_configured_ ? input_configuration_.input_generation : 0U,
+        .video_generation = video_configured_.load(std::memory_order_acquire) ?
+                              video_configuration_.video_generation : 0U,
+        .audio_generation = audio_configured_.load(std::memory_order_acquire) ?
+                              audio_configuration_.audio_generation : 0U,
+        .pointer_generation = std::max<std::uint32_t>(
+          1U,
+          published_pointer_generation_.load(std::memory_order_acquire)
+        ),
+      };
+      constexpr auto local_flags = CLSP_NATIVE_TIMING_AVAILABLE |
+                                   CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                                   CLSP_NATIVE_TIMING_SAME_ENDPOINT;
+      for (std::size_t index = 0U; index < timing_distributions_.size(); ++index) {
+        snapshot.stages[index] = timing_distributions_[index].snapshot(local_flags);
+      }
+      for (std::size_t index = 0U; index < 16U; ++index) {
+        snapshot.controller_generations[index] =
+          published_controller_generations_[index].load(std::memory_order_acquire);
+        snapshot.touch_generations[index] =
+          published_touch_generations_[index].load(std::memory_order_acquire);
+        snapshot.pen_generations[index] =
+          published_pen_generations_[index].load(std::memory_order_acquire);
+      }
+      callbacks_.timing(callbacks_.context, snapshot);
+      last_timing_publication_microseconds_ = now;
+    }
+
+    /** @brief Publish worker-owned counter deltas at no more than four hertz. */
+    void flush_telemetry(const std::uint64_t now, const bool force = false) noexcept {
+      if (callbacks_.counter == nullptr && callbacks_.timing == nullptr) return;
+      const auto interval = std::max<std::uint64_t>(250'000U, static_cast<std::uint64_t>(configuration_.telemetry_interval_milliseconds) * 1'000U);
+      if (!force && last_telemetry_flush_microseconds_ != 0U &&
+          now - last_telemetry_flush_microseconds_ < interval) return;
+      if (callbacks_.counter != nullptr) {
+        worker_counters_[static_cast<std::size_t>(RuntimeCounter::dropped)] = saturating_add(
+          worker_counters_[static_cast<std::size_t>(RuntimeCounter::dropped)],
+          producer_dropped_.exchange(0U, std::memory_order_acq_rel)
+        );
+        for (std::size_t index = 0; index < worker_counters_.size(); ++index) {
+          const auto amount = worker_counters_[index];
+          if (amount != 0U) {
+            callbacks_.counter(callbacks_.context, static_cast<std::uint32_t>(index), amount);
+            worker_counters_[index] = 0;
+          }
+        }
+      }
+      timing_distributions_[CLSP_NATIVE_TIMING_INPUT_CALLBACK_TO_COMPOSE].add_drops(
+        producer_callback_timing_drops_.exchange(0U, std::memory_order_acq_rel)
+      );
+      publish_timing_snapshot(now);
+      last_telemetry_flush_microseconds_ = now;
     }
 
     /** @brief Validate one exact schema-revision-three video generation mapping. */
@@ -2930,6 +3286,7 @@ namespace umbra::lsp {
            ++index) {
         clsp_buffer_release(pending_video_deliveries_[index].frame);
         pending_video_deliveries_[index] = {};
+        pending_video_auth_times_[index] = 0U;
       }
       pending_video_delivery_count_ = 0;
       if (video_reassembler_) {
@@ -3069,8 +3426,39 @@ namespace umbra::lsp {
     }
 
     /** @brief Retain one exact host request until Swift installs and responds. */
+    [[nodiscard]] static std::optional<lumen::lsp::response_semantic_identity> response_identity(
+      const lumen::lsp::lspc_header &header,
+      const std::span<const std::uint8_t> request
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (header.message_type == 0U || header.connection_generation == 0U || header.request_id == 0U ||
+          request.empty() || request.size() > static_cast<std::size_t>(std::numeric_limits<word32>::max())) {
+        return std::nullopt;
+      }
+      lumen::lsp::response_semantic_identity identity {
+        .message_type = header.message_type,
+        .schema_version = 1,
+        .generation = header.connection_generation,
+      };
+      lumen::lsp::wire::write_be<std::uint64_t>(identity.semantic_id, header.request_id);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {identity.semantic_id}.subspan(8, 4), header.connection_generation);
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {identity.semantic_id}.subspan(12, 2), header.message_type);
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {identity.semantic_id}.subspan(14, 2), 1U);
+      if (wc_Sha256Hash(request.data(), static_cast<word32>(request.size()), identity.request_digest.data()) != 0) {
+        return std::nullopt;
+      }
+      return identity;
+#else
+      (void)header;
+      (void)request;
+      return std::nullopt;
+#endif
+    }
+
+    /** @brief Retain one exact host request until Swift installs and responds. */
     [[nodiscard]] bool retain_inbound_request(
       const std::uint64_t request_id,
+      const lumen::lsp::response_semantic_identity &identity,
       const std::span<const std::uint8_t> frame
     ) noexcept {
       PendingInboundRequest *free_slot = nullptr;
@@ -3083,6 +3471,7 @@ namespace umbra::lsp {
       }
       if (free_slot == nullptr) return false;
       free_slot->request_id = request_id;
+      free_slot->identity = identity;
       free_slot->frame.assign(frame);
       free_slot->occupied = true;
       return true;
@@ -3096,10 +3485,25 @@ namespace umbra::lsp {
       return nullptr;
     }
 
-    /** @brief Publish one coarse lifecycle transition. */
-    void publish_lifecycle(const std::uint32_t state) const noexcept {
+    /** @brief Preserve and return the first non-success terminal status. */
+    [[nodiscard]] clsp_status_t latch_terminal_status(const clsp_status_t status) noexcept {
+      auto expected = static_cast<std::uint32_t>(CLSP_STATUS_OK);
+      (void)terminal_status_.compare_exchange_strong(
+        expected,
+        static_cast<std::uint32_t>(status),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire
+      );
+      return static_cast<clsp_status_t>(terminal_status_.load(std::memory_order_acquire));
+    }
+
+    /** @brief Publish one coarse lifecycle transition with exact terminal status. */
+    void publish_lifecycle(
+      const std::uint32_t state,
+      const clsp_status_t terminal_status = CLSP_STATUS_OK
+    ) const noexcept {
       if (callbacks_.lifecycle != nullptr) {
-        callbacks_.lifecycle(callbacks_.context, state);
+        callbacks_.lifecycle(callbacks_.context, state, terminal_status);
       }
     }
 
@@ -3237,7 +3641,11 @@ namespace umbra::lsp {
       (void)setsockopt(socket_, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &enabled, sizeof(enabled));
 #endif
       const int receive_ecn = 1;
+      const int do_not_fragment = 1;
       if (socket_family_ == AF_INET) {
+        if (setsockopt(socket_, IPPROTO_IP, IP_DONTFRAG, &do_not_fragment, sizeof(do_not_fragment)) != 0) {
+          return CLSP_STATUS_SOCKET_FAILURE;
+        }
   #ifdef IP_RECVTOS
         (void) setsockopt(socket_, IPPROTO_IP, IP_RECVTOS, &receive_ecn, sizeof(receive_ecn));
   #endif
@@ -3248,6 +3656,14 @@ namespace umbra::lsp {
           .operator_configured_limit = 1'472,
         });
       } else if (socket_family_ == AF_INET6) {
+  #ifdef IPV6_DONTFRAG
+        constexpr auto ipv6_do_not_fragment_option = IPV6_DONTFRAG;
+  #else
+        constexpr int ipv6_do_not_fragment_option = 62;
+  #endif
+        if (setsockopt(socket_, IPPROTO_IPV6, ipv6_do_not_fragment_option, &do_not_fragment, sizeof(do_not_fragment)) != 0) {
+          return CLSP_STATUS_SOCKET_FAILURE;
+        }
   #ifdef IPV6_RECVTCLASS
         (void) setsockopt(socket_, IPPROTO_IPV6, IPV6_RECVTCLASS, &receive_ecn, sizeof(receive_ecn));
   #endif
@@ -3262,6 +3678,7 @@ namespace umbra::lsp {
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
       current_udp_payload_size_.store(1'200U, std::memory_order_release);
+      receive_udp_payload_size_.store(1'200U, std::memory_order_release);
       kqueue_ = kqueue();
       if (kqueue_ < 0) {
         return CLSP_STATUS_SOCKET_FAILURE;
@@ -3362,14 +3779,17 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
-        deliver_path_probe_events();
-        deliver_video_frames();
         status = retry_control();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
           return;
         }
         status = process_input_configuration();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        status = process_input_rate_update();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
           return;
@@ -3394,6 +3814,13 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        status = process_deferred_video_batch();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
+        deliver_path_probe_events();
+        deliver_video_frames();
         if (video_configured_.load(std::memory_order_acquire)) {
           const auto video_now = monotonic_microseconds();
           expire_video_frames(video_now);
@@ -3435,11 +3862,19 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        flush_telemetry(transport_now);
       }
+      flush_telemetry(monotonic_microseconds(), true);
     }
 
     /** @brief Drain up to the bounded initial receive batch from the UDP socket. */
     [[nodiscard]] clsp_status_t drain_socket() noexcept {
+      clear_deferred_video_batch();
+      const auto drain_started_microseconds = monotonic_microseconds();
+      std::uint64_t oldest_arrival_microseconds = 0U;
+      std::size_t drained_datagrams = 0U;
+      bool batch_used_kernel_timestamp = false;
+      bool batch_used_fallback_timestamp = false;
       for (std::size_t index = 0; index < receive_batch_size; ++index) {
         std::array<std::uint8_t, maximum_udp_payload> fallback_packet {};
         VideoReceiveLease receive_lease;
@@ -3456,9 +3891,11 @@ namespace umbra::lsp {
         message.msg_control = control.data();
         message.msg_controllen = control.size();
         const auto received = recvmsg(socket_, &message, 0);
-        const auto arrival_microseconds = monotonic_microseconds();
+        auto arrival_microseconds = monotonic_microseconds();
+        auto kernel_timestamped = false;
         if (received < 0) {
-          return errno == EAGAIN || errno == EWOULDBLOCK ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
+          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+          return CLSP_STATUS_SOCKET_FAILURE;
         }
         if (received == 0) {
           increment(RuntimeCounter::dropped);
@@ -3470,6 +3907,18 @@ namespace umbra::lsp {
         }
         auto ecn = native_ecn_mark::unknown;
         for (auto *header = CMSG_FIRSTHDR(&message); header != nullptr; header = CMSG_NXTHDR(&message, header)) {
+#ifdef SCM_TIMESTAMP_MONOTONIC
+          if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_TIMESTAMP_MONOTONIC &&
+              header->cmsg_len >= CMSG_LEN(sizeof(std::uint64_t))) {
+            std::uint64_t timestamp_nanoseconds = 0;
+            std::memcpy(&timestamp_nanoseconds, CMSG_DATA(header), sizeof(timestamp_nanoseconds));
+            if (timestamp_nanoseconds != 0U) {
+              arrival_microseconds = timestamp_nanoseconds / 1'000U;
+              kernel_timestamped = true;
+            }
+            continue;
+          }
+#endif
           auto ipv4_tos = header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_TOS;
   #ifdef IP_RECVTOS
           ipv4_tos = ipv4_tos || (header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_RECVTOS);
@@ -3501,9 +3950,33 @@ namespace umbra::lsp {
           }
           break;
         }
+        ++drained_datagrams;
+        batch_used_kernel_timestamp = batch_used_kernel_timestamp || kernel_timestamped;
+        batch_used_fallback_timestamp = batch_used_fallback_timestamp || !kernel_timestamped;
+        oldest_arrival_microseconds = oldest_arrival_microseconds == 0U ? arrival_microseconds :
+          std::min(oldest_arrival_microseconds, arrival_microseconds);
         auto datagram = receive_storage.first(static_cast<std::size_t>(received));
         const auto protected_datagram_size = static_cast<std::uint16_t>(datagram.size());
-        switch (classify(datagram)) {
+        const auto packet_class = classify(datagram);
+        if (packet_class == PacketClass::srtp_or_srtcp && srtp_.ready() && !is_rtcp(datagram) &&
+            datagram.size() >= 12U) {
+          const auto visible_ssrc = lumen::lsp::wire::read_be<std::uint32_t>(datagram.subspan(8, 4));
+          if (video_lane_for_ssrc(visible_ssrc) != VideoRtpLane::none) {
+            if (receive_lease.token() == 0U) {
+              record_local_video_pressure();
+              increment(RuntimeCounter::dropped);
+              continue;
+            }
+            auto &deferred = deferred_video_[deferred_video_count_++];
+            deferred.token = receive_lease.detach();
+            deferred.length = datagram.size();
+            deferred.arrival_microseconds = arrival_microseconds;
+            deferred.ecn = ecn;
+            deferred.kernel_timestamped = kernel_timestamped;
+            continue;
+          }
+        }
+        switch (packet_class) {
           case PacketClass::dtls: {
             const auto status = dtls_.receive(datagram);
             if (status != CLSP_STATUS_OK) {
@@ -3555,6 +4028,10 @@ namespace umbra::lsp {
                                   srtp_.unprotect_video(receive_storage, packet_length, rtcp, replay) :
                                   srtp_.unprotect(receive_storage, packet_length, rtcp, replay);
             if (status != CLSP_STATUS_OK) {
+              timing_distributions_[CLSP_NATIVE_TIMING_RECEIVE_TO_AUTH].drop(
+                kernel_timestamped ? CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED :
+                                       CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT
+              );
               if (replay && feedback_rtp_candidate) {
                 auto *fingerprints = video_rtp_candidate ? video_fingerprints(video_lane) :
                                                            &authenticated_audio_fingerprints_;
@@ -3582,6 +4059,14 @@ namespace umbra::lsp {
               increment(RuntimeCounter::authentication_failure);
               break;
             }
+            const auto authenticated_microseconds = monotonic_microseconds();
+            record_timing_stage(
+              CLSP_NATIVE_TIMING_RECEIVE_TO_AUTH,
+              arrival_microseconds,
+              authenticated_microseconds,
+              kernel_timestamped ? CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED :
+                                     CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT
+            );
             increment(RuntimeCounter::received);
             if (use_video_context && !rtcp && receive_lease.token() == 0) {
               record_local_video_pressure();
@@ -3598,7 +4083,7 @@ namespace umbra::lsp {
                                            PathProbePacketResult::not_probe;
             if (path_probe == PathProbePacketResult::invalid ||
                 (path_probe == PathProbePacketResult::not_probe &&
-                 protected_datagram_size > current_udp_payload_size_.load(std::memory_order_acquire))) {
+                 protected_datagram_size > receive_udp_payload_size_.load(std::memory_order_acquire))) {
               increment(RuntimeCounter::dropped);
               break;
             }
@@ -3653,6 +4138,7 @@ namespace umbra::lsp {
               plaintext,
               rtcp,
               arrival_microseconds,
+              authenticated_microseconds,
               receive_lease.token()
             );
             if (realtime_failure_status_ != CLSP_STATUS_OK) {
@@ -3670,6 +4156,148 @@ namespace umbra::lsp {
             break;
         }
       }
+      if (drained_datagrams != 0U) {
+        const auto drained_microseconds = monotonic_microseconds();
+        record_timing_stage(
+          CLSP_NATIVE_TIMING_SOCKET_BATCH_DRAIN,
+          drain_started_microseconds,
+          drained_microseconds
+        );
+        record_timing_stage(
+          CLSP_NATIVE_TIMING_SOCKET_BATCH_OLDEST_AGE,
+          oldest_arrival_microseconds,
+          drained_microseconds,
+          (batch_used_kernel_timestamp ? CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED : 0U) |
+          (batch_used_fallback_timestamp ? CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT : 0U)
+        );
+      }
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Authenticate/process deferred video only after urgent reverse submission. */
+    void clear_deferred_video_batch() noexcept {
+      for (std::size_t index = 0; index < deferred_video_count_; ++index) {
+        if (deferred_video_[index].token != 0U) {
+          (void)video_receive_pool_.release(deferred_video_[index].token);
+        }
+        deferred_video_[index] = {};
+      }
+      deferred_video_count_ = 0;
+    }
+
+    /** @brief Authenticate/process deferred video only after urgent reverse submission. */
+    [[nodiscard]] clsp_status_t process_deferred_video_batch() noexcept {
+      for (std::size_t index = 0; index < deferred_video_count_; ++index) {
+        auto &deferred = deferred_video_[index];
+        VideoReceiveLease receive_lease;
+        if (!receive_lease.adopt(video_receive_pool_, deferred.token)) {
+          record_local_video_pressure();
+          increment(RuntimeCounter::dropped);
+          continue;
+        }
+        deferred.token = 0;
+        auto receive_storage = receive_lease.bytes();
+        auto datagram = receive_storage.first(deferred.length);
+        const auto protected_datagram_size = static_cast<std::uint16_t>(deferred.length);
+        const auto visible_ssrc = lumen::lsp::wire::read_be<std::uint32_t>(datagram.subspan(8, 4));
+        const auto video_lane = video_lane_for_ssrc(visible_ssrc);
+        if (video_lane == VideoRtpLane::none || !inbound_ssrc_registered(visible_ssrc, false) || datagram.size() < 28U) {
+          increment(RuntimeCounter::dropped);
+          continue;
+        }
+        const auto visible_sequence = lumen::lsp::wire::read_be<std::uint16_t>(datagram.subspan(2, 2));
+        const auto visible_timestamp = lumen::lsp::wire::read_be<std::uint32_t>(datagram.subspan(4, 4));
+        const auto first_header_byte = datagram[0];
+        const auto second_header_byte = datagram[1];
+        std::array<std::uint8_t, 16> authentication_tag {};
+        std::copy(datagram.end() - 16, datagram.end(), authentication_tag.begin());
+        auto packet_length = datagram.size();
+        bool replay = false;
+        const auto unprotect_status = srtp_.unprotect_video(receive_storage, packet_length, false, replay);
+        if (unprotect_status != CLSP_STATUS_OK) {
+          timing_distributions_[CLSP_NATIVE_TIMING_RECEIVE_TO_AUTH].drop(
+            deferred.kernel_timestamped ? CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED :
+                                            CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT
+          );
+          if (replay) {
+            auto *fingerprints = video_fingerprints(video_lane);
+            if (fingerprints != nullptr) {
+              if (const auto *fingerprint = authenticated_rtp_fingerprint(
+                    *fingerprints,
+                    visible_sequence,
+                    visible_ssrc,
+                    visible_timestamp,
+                    protected_datagram_size,
+                    first_header_byte,
+                    second_header_byte,
+                    authentication_tag
+                  )) {
+                record_video_duplicate_ce(*fingerprint, deferred.ecn, video_lane);
+                increment(RuntimeCounter::received);
+                continue;
+              }
+            }
+          }
+          increment(RuntimeCounter::authentication_failure);
+          continue;
+        }
+        const auto authenticated_microseconds = monotonic_microseconds();
+        record_timing_stage(
+          CLSP_NATIVE_TIMING_RECEIVE_TO_AUTH,
+          deferred.arrival_microseconds,
+          authenticated_microseconds,
+          deferred.kernel_timestamped ? CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED :
+                                          CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT
+        );
+        increment(RuntimeCounter::received);
+        if (protected_datagram_size > receive_udp_payload_size_.load(std::memory_order_acquire)) {
+          increment(RuntimeCounter::dropped);
+          continue;
+        }
+        const auto plaintext = std::span<const std::uint8_t> {receive_storage.data(), packet_length};
+        const auto video_rtp = lumen::lsp::parse_rtp_fixed_header(plaintext);
+        if (!video_rtp || video_rtp.header.ssrc != visible_ssrc ||
+            video_rtp.header.payload_type != video_payload_type(video_lane)) {
+          increment(RuntimeCounter::dropped);
+          continue;
+        }
+        record_video_feedback_for_lane(
+          plaintext,
+          protected_datagram_size,
+          deferred.arrival_microseconds,
+          deferred.ecn,
+          video_lane
+        );
+        if (auto *fingerprints = video_fingerprints(video_lane); fingerprints != nullptr) {
+          store_authenticated_rtp_fingerprint(
+            *fingerprints,
+            visible_sequence,
+            visible_ssrc,
+            visible_timestamp,
+            protected_datagram_size,
+            deferred.arrival_microseconds,
+            first_header_byte,
+            second_header_byte,
+            authentication_tag
+          );
+        }
+        if (!handle_authenticated_realtime(
+              plaintext,
+              false,
+              deferred.arrival_microseconds,
+              authenticated_microseconds,
+              receive_lease.token()
+            )) {
+          increment(RuntimeCounter::dropped);
+        }
+        if (realtime_failure_status_ != CLSP_STATUS_OK) {
+          const auto failure = realtime_failure_status_;
+          realtime_failure_status_ = CLSP_STATUS_OK;
+          clear_deferred_video_batch();
+          return failure;
+        }
+      }
+      clear_deferred_video_batch();
       return CLSP_STATUS_OK;
     }
 
@@ -3785,8 +4413,25 @@ namespace umbra::lsp {
                                           input_configuration_.input_payload_type == selected.input_payload_type;
       input_configuration_ = selected;
       pending_controller_ack_ = {};
-      if (!pointer_composer_.reset(1, 1) || !edge_sender_.reset(selected.input_generation)) {
+      const auto pointer_generation = std::max<std::uint32_t>(
+        1U,
+        published_pointer_generation_.load(std::memory_order_acquire)
+      );
+      if (!pointer_composer_.reset(1, pointer_generation) || !edge_sender_.reset(selected.input_generation)) {
         return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+      for (std::size_t index = 0; index < controller_states_.size(); ++index) {
+        const auto controller_generation = published_controller_generations_[index].load(std::memory_order_acquire);
+        controller_states_[index] = {};
+        controller_states_[index].physical_ordinal = 1U;
+        controller_states_[index].value.controller_id = static_cast<std::uint32_t>(index + 1U);
+        controller_states_[index].value.instance_generation = controller_generation;
+        for (auto &sensor : controller_sensors_[index]) {
+          sensor = {};
+          sensor.physical_ordinal = 1U;
+        }
+        touch_states_[index] = {};
+        touch_states_[index].physical_ordinal = 1U;
       }
       input_configured_ = true;
       capture_accepting_ = true;
@@ -3806,9 +4451,20 @@ namespace umbra::lsp {
         );
       }
       baseline_last_sent_us_ = 0;
+      baseline_body_length_ = 0;
+      baseline_edge_watermark_ = 0;
+      baseline_next_part_index_ = 0U;
+      baseline_part_count_ = 0U;
+      baseline_first_submitted_microseconds_ = 0U;
       pointer_dirty_ = false;
-      pointer_ordinal_ = 0;
+      pointer_ordinal_ = 1U;
+      pointer_composed_microseconds_ = 0U;
+      for (auto &timing : edge_timing_) timing = {};
       latest_edge_id_ = 0;
+      published_stream_generation_.store(selected.stream_generation, std::memory_order_release);
+      published_input_generation_.store(selected.input_generation, std::memory_order_release);
+      published_latest_edge_id_.store(0U, std::memory_order_release);
+      published_latest_edge_time_.store(0U, std::memory_order_release);
       latest_state_sequence_ = 2;
       next_state_sequence_ = 2;
       if (!restoring_same_mapping) {
@@ -3846,12 +4502,100 @@ namespace umbra::lsp {
       }
       input_tokens_bits_ = selected.reserved_input_wire_bits_per_second / 500U;
       input_last_credit_us_ = monotonic_microseconds();
+      reverse_tokens_bits_ = input_tokens_bits_;
+      reverse_last_credit_us_ = input_last_credit_us_;
       last_pointer_sent_us_ = 0;
-      input_configuration_completed_.store(token, std::memory_order_release);
       pthread_mutex_lock(&mutex_);
+      input_feedback_snapshot_ = {
+        .abi_version = CLSP_CORE_ABI_VERSION,
+        .structure_size = sizeof(clsp_input_feedback_snapshot_t),
+        .stream_generation = selected.stream_generation,
+        .input_generation = selected.input_generation,
+        .pointer_rate = selected.pointer_rate,
+        .controller_rate = selected.controller_rate,
+        .sensor_rate = selected.sensor_rate,
+        .reconciliation_rate = selected.reconciliation_rate,
+        .reserved_input_wire_bits_per_second = selected.reserved_input_wire_bits_per_second,
+      };
+      input_configuration_completed_.store(token, std::memory_order_release);
       pthread_cond_broadcast(&condition_);
       pthread_mutex_unlock(&mutex_);
       return CLSP_STATUS_OK;
+    }
+
+    /** @brief Move captured records into portable native composers. */
+    [[nodiscard]] clsp_status_t process_input_rate_update() noexcept {
+      clsp_input_rate_update_t selected {};
+      std::uint64_t token = 0;
+      pthread_mutex_lock(&mutex_);
+      if (!pending_input_rate_update_) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_OK;
+      }
+      selected = pending_input_rates_;
+      token = pending_input_rate_token_;
+      pending_input_rate_update_ = false;
+      pthread_mutex_unlock(&mutex_);
+      if (!input_configured_ || selected.stream_generation != input_configuration_.stream_generation ||
+          selected.input_generation != input_configuration_.input_generation) return CLSP_STATUS_INVALID_STATE;
+      input_configuration_.pointer_rate = selected.pointer_rate;
+      input_configuration_.controller_rate = selected.controller_rate;
+      input_configuration_.sensor_rate = selected.sensor_rate;
+      input_configuration_.reconciliation_rate = selected.reconciliation_rate;
+      input_configuration_.reserved_input_wire_bits_per_second = selected.reserved_input_wire_bits_per_second;
+      input_tokens_bits_ = std::min(
+        input_tokens_bits_,
+        selected.reserved_input_wire_bits_per_second / 500U
+      );
+      pthread_mutex_lock(&mutex_);
+      input_feedback_snapshot_.pointer_rate = selected.pointer_rate;
+      input_feedback_snapshot_.controller_rate = selected.controller_rate;
+      input_feedback_snapshot_.sensor_rate = selected.sensor_rate;
+      input_feedback_snapshot_.reconciliation_rate = selected.reconciliation_rate;
+      input_feedback_snapshot_.reserved_input_wire_bits_per_second = selected.reserved_input_wire_bits_per_second;
+      input_rate_update_completed_.store(token, std::memory_order_release);
+      pthread_cond_broadcast(&condition_);
+      pthread_mutex_unlock(&mutex_);
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Return the local captured timestamp carried by one native input record. */
+    [[nodiscard]] static std::uint64_t capture_record_timestamp(const CaptureRecord &record) noexcept {
+      switch (record.kind) {
+        case CaptureKind::pointer:
+          return record.pointer.sample_time_microseconds;
+        case CaptureKind::edge:
+          return record.edge.sample_time_microseconds;
+        case CaptureKind::controller_edge:
+          return record.controller_edge.sample_time_microseconds;
+        case CaptureKind::controller_state:
+          return record.controller_state.sample_time_microseconds;
+        case CaptureKind::controller_sensor:
+          return record.controller_sensor.sample_time_microseconds;
+        case CaptureKind::touch_edge:
+          return record.touch_edge.sample_time_microseconds;
+        case CaptureKind::touch_state:
+          return record.touch_state.sample_time_microseconds;
+        case CaptureKind::neutralize:
+          return 0U;
+      }
+      return 0U;
+    }
+
+    /** @brief Retain one bounded edge correlation until authenticated LSPI acknowledgement. */
+    void retain_edge_timing(
+      const std::uint64_t edge_id,
+      const std::uint64_t composed_microseconds
+    ) noexcept {
+      auto &slot = edge_timing_[edge_id % edge_timing_.size()];
+      if (slot.occupied && slot.edge_id != edge_id) {
+        timing_distributions_[CLSP_NATIVE_TIMING_INPUT_ACK_AGE].drop();
+      }
+      slot = {
+        .edge_id = edge_id,
+        .composed_microseconds = composed_microseconds,
+        .occupied = true,
+      };
     }
 
     /** @brief Move captured records into portable native composers. */
@@ -3867,6 +4611,16 @@ namespace umbra::lsp {
         }
         record = capture_queue_[read];
         capture_read_.store((read + 1U) % capture_queue_capacity, std::memory_order_release);
+        const auto composed_microseconds = monotonic_microseconds();
+        const auto captured_microseconds = capture_record_timestamp(record);
+        if (captured_microseconds != 0U) {
+          record_timing_stage(
+            CLSP_NATIVE_TIMING_INPUT_CALLBACK_TO_COMPOSE,
+            captured_microseconds,
+            composed_microseconds,
+            record.timestamp_unknown ? CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT : 0U
+          );
+        }
 
         if (record.kind == CaptureKind::neutralize) {
           capture_accepting_ = false;
@@ -3883,7 +4637,7 @@ namespace umbra::lsp {
         if (record.kind == CaptureKind::pointer) {
           ++pointer_ordinal_;
           const auto result = pointer_composer_.add_relative(
-            1,
+            record.device_generation,
             pointer_ordinal_,
             record.pointer.delta_x,
             record.pointer.delta_y,
@@ -3893,6 +4647,7 @@ namespace umbra::lsp {
           if (result == lumen::lsp::input_plane::pointer_compose_result::accepted) {
             pointer_dirty_ = true;
             pointer_sample_time_us_ = record.pointer.sample_time_microseconds;
+            pointer_composed_microseconds_ = composed_microseconds;
           } else if (result != lumen::lsp::input_plane::pointer_compose_result::batch_full) {
             return CLSP_STATUS_INTERNAL_FAILURE;
           }
@@ -3901,27 +4656,73 @@ namespace umbra::lsp {
 
         if (record.kind == CaptureKind::controller_state) {
           auto &state = controller_states_[record.controller_state.controller_id - 1U];
+          if (published_controller_generations_[record.controller_state.controller_id - 1U].load(
+                std::memory_order_acquire
+              ) != record.controller_state.instance_generation) {
+            continue;
+          }
           state.value = record.controller_state;
           ++state.physical_ordinal;
+          state.composed_microseconds = composed_microseconds;
           state.dirty = true;
           continue;
         }
         if (record.kind == CaptureKind::controller_sensor) {
+          if (published_controller_generations_[record.controller_sensor.controller_id - 1U].load(
+                std::memory_order_acquire
+              ) != record.controller_sensor.instance_generation) {
+            continue;
+          }
           auto &sensor = controller_sensors_[record.controller_sensor.controller_id - 1U]
                                             [record.controller_sensor.sensor_type - 1U];
           sensor.value = record.controller_sensor;
           ++sensor.physical_ordinal;
+          sensor.composed_microseconds = composed_microseconds;
           sensor.dirty = true;
           continue;
         }
         if (record.kind == CaptureKind::controller_edge || record.kind == CaptureKind::touch_edge) {
           const auto controller = record.kind == CaptureKind::controller_edge;
+          if (controller) {
+            const auto index = record.controller_edge.controller_id - 1U;
+            auto &state = controller_states_[index];
+            if (record.controller_edge.kind == 5U) {
+              state = {};
+              state.value.controller_id = record.controller_edge.controller_id;
+              state.value.instance_generation = record.controller_edge.instance_generation;
+              state.physical_ordinal = 1U;
+              for (auto &sensor : controller_sensors_[index]) {
+                sensor = {};
+                sensor.physical_ordinal = 1U;
+              }
+              touch_states_[index] = {};
+              touch_states_[index].physical_ordinal = 1U;
+            } else if (record.controller_edge.kind == 6U) {
+              state.buttons = 0U;
+              state.dirty = false;
+              for (auto &sensor : controller_sensors_[index]) sensor.dirty = false;
+              touch_states_[index].active = false;
+              touch_states_[index].dirty = false;
+            } else if (record.controller_edge.control_id < 64U) {
+              const auto mask = std::uint64_t {1} << record.controller_edge.control_id;
+              if (record.controller_edge.kind == 7U) state.buttons |= mask;
+              if (record.controller_edge.kind == 8U) state.buttons &= ~mask;
+              state.composed_microseconds = composed_microseconds;
+              state.dirty = true;
+            }
+          } else {
+            auto &touch = touch_states_[record.touch_edge.controller_id - 1U];
+            if (record.touch_edge.kind == 9U) touch.active = true;
+            if (record.touch_edge.kind == 10U || record.touch_edge.kind == 11U) touch.active = false;
+            touch.composed_microseconds = composed_microseconds;
+            touch.dirty = true;
+          }
           lumen::lsp::input_plane::edge_record edge {
             .physical_time_us = controller ? record.controller_edge.sample_time_microseconds : record.touch_edge.sample_time_microseconds,
             .kind = static_cast<lumen::lsp::input_plane::edge_kind>(controller ? record.controller_edge.kind : record.touch_edge.kind),
             .device = controller ? lumen::lsp::input_plane::device_type::controller : lumen::lsp::input_plane::device_type::touch,
-            .control_id = controller ? record.controller_edge.control_id : static_cast<std::uint16_t>(record.touch_edge.controller_id),
-            .device_id = controller ? record.controller_edge.controller_id : record.touch_edge.contact_id,
+            .control_id = controller ? record.controller_edge.control_id : static_cast<std::uint16_t>(record.touch_edge.contact_id),
+            .device_id = controller ? record.controller_edge.controller_id : record.touch_edge.controller_id,
             .instance_generation = controller ? record.controller_edge.instance_generation : record.touch_edge.instance_generation,
           };
           std::uint64_t assigned_id = 0;
@@ -3929,12 +4730,21 @@ namespace umbra::lsp {
             return CLSP_STATUS_RESOURCE_EXHAUSTED;
           }
           latest_edge_id_ = assigned_id;
+          retain_edge_timing(assigned_id, composed_microseconds);
+          published_latest_edge_id_.store(assigned_id, std::memory_order_release);
+          published_latest_edge_time_.store(edge.physical_time_us, std::memory_order_release);
           continue;
         }
         if (record.kind == CaptureKind::touch_state) {
-          auto &touch = touch_states_[record.touch_state.contact_id - 1U];
+          auto &touch = touch_states_[record.touch_state.controller_id - 1U];
+          if (published_touch_generations_[record.touch_state.controller_id - 1U].load(
+                std::memory_order_acquire
+              ) != record.touch_state.instance_generation) {
+            continue;
+          }
           touch.value = record.touch_state;
           ++touch.physical_ordinal;
+          touch.composed_microseconds = composed_microseconds;
           touch.dirty = true;
           continue;
         }
@@ -3957,6 +4767,9 @@ namespace umbra::lsp {
                    CLSP_STATUS_INTERNAL_FAILURE;
         }
         latest_edge_id_ = assigned_id;
+        retain_edge_timing(assigned_id, composed_microseconds);
+        published_latest_edge_id_.store(assigned_id, std::memory_order_release);
+        published_latest_edge_time_.store(edge.physical_time_us, std::memory_order_release);
       }
     }
 
@@ -3967,6 +4780,7 @@ namespace umbra::lsp {
       }
       const auto now = monotonic_microseconds();
       replenish_input_credit(now);
+      replenish_reverse_credit(now);
       if (!baseline_acknowledged_) {
         if (baseline_last_sent_us_ == 0 || now - baseline_last_sent_us_ >= 20'000U) {
           return send_baseline(now);
@@ -4009,39 +4823,303 @@ namespace umbra::lsp {
       return CLSP_STATUS_OK;
     }
 
-    /** @brief Serialize and send the exact neutral one-part baseline. */
-    [[nodiscard]] clsp_status_t send_baseline(const std::uint64_t now) noexcept {
-      std::array<std::uint8_t, 16> baseline {'L', 'S', 'P', 'B', 1, 0, 0, 0};
-      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {baseline}.subspan(8, 8), latest_edge_id_);
-      std::array<std::uint8_t, 32> digest {};
-      if (wc_Sha256Hash(baseline.data(), static_cast<word32>(baseline.size()), digest.data()) != 0) {
-        return CLSP_STATUS_INTERNAL_FAILURE;
-      }
-      std::array<std::uint8_t, lumen::lsp::input_plane::baseline_part_header_size + 16> part_bytes {};
-      const lumen::lsp::input_plane::baseline_part part {
-        .part_index = 0,
-        .part_count = 1,
-        .total_length = static_cast<std::uint32_t>(baseline.size()),
-        .part_offset = 0,
-        .part_length = static_cast<std::uint32_t>(baseline.size()),
-        .digest = digest,
-        .bytes = baseline,
+    /** @brief Freeze every active device generation into one deterministic neutral baseline body. */
+    [[nodiscard]] clsp_status_t build_neutral_baseline() noexcept {
+      using namespace lumen::lsp::input_plane;
+      baseline_edge_watermark_ = latest_edge_id_;
+      std::array<input_baseline_record_view, maximum_input_baseline_records> records {};
+      std::size_t record_count = 0U;
+      auto append = [&](const input_baseline_record_header &header, const auto &payload) noexcept {
+        if (record_count >= records.size()) return false;
+        records[record_count++] = {.header = header, .payload = payload};
+        return true;
       };
-      if (lumen::lsp::input_plane::serialize_baseline_part(part, part_bytes) != lumen::lsp::input_plane::wire_error::none) {
+
+      std::array<std::uint8_t, core_state_payload_size> core_payload {};
+      const core_state_payload core {
+        .neutral = true,
+        .keyboard_instance_generation = 1U,
+        .physical_ordinal = 1U,
+        .text_barrier_edge_id = baseline_edge_watermark_,
+      };
+      if (serialize_core_state_payload(core, core_payload) != wire_error::none ||
+          !append(
+            {
+              .kind = baseline_record_kind::core,
+              .payload_length = static_cast<std::uint32_t>(core_payload.size()),
+              .instance_generation = 1U,
+              .state_sequence = 1U,
+              .physical_ordinal = 1U,
+            },
+            core_payload
+          )) return CLSP_STATUS_INTERNAL_FAILURE;
+
+      constexpr std::size_t maximum_lifecycle_records = 49U;
+      std::array<std::array<std::uint8_t, 4>, maximum_lifecycle_records> lifecycle_payloads {};
+      std::size_t lifecycle_count = 0U;
+      auto append_lifecycle = [&](const device_type device, const std::uint32_t device_id, const std::uint32_t generation) noexcept {
+        if (generation == 0U || lifecycle_count >= lifecycle_payloads.size()) return generation == 0U;
+        auto &payload = lifecycle_payloads[lifecycle_count++];
+        if (serialize_device_lifecycle_payload({.device = device, .presence = device_presence::active}, payload) !=
+            wire_error::none) return false;
+        return append(
+          {
+            .kind = baseline_record_kind::device_lifecycle,
+            .subtype = static_cast<std::uint8_t>(device),
+            .payload_length = static_cast<std::uint32_t>(payload.size()),
+            .device_id = device_id,
+            .instance_generation = generation,
+            .state_sequence = 1U,
+            .physical_ordinal = 1U,
+          },
+          payload
+        );
+      };
+
+      const auto pointer_generation = std::max<std::uint32_t>(
+        1U,
+        published_pointer_generation_.load(std::memory_order_acquire)
+      );
+      if (!append_lifecycle(device_type::pointer, 1U, pointer_generation)) return CLSP_STATUS_RESOURCE_EXHAUSTED;
+      for (std::size_t index = 0; index < 16U; ++index) {
+        const auto generation = published_controller_generations_[index].load(std::memory_order_acquire);
+        if (generation != 0U && !append_lifecycle(device_type::controller, index + 1U, generation)) {
+          return CLSP_STATUS_RESOURCE_EXHAUSTED;
+        }
+      }
+      for (std::size_t index = 0; index < 16U; ++index) {
+        const auto generation = published_touch_generations_[index].load(std::memory_order_acquire);
+        if (generation != 0U && !append_lifecycle(device_type::touch, index + 1U, generation)) {
+          return CLSP_STATUS_RESOURCE_EXHAUSTED;
+        }
+      }
+      for (std::size_t index = 0; index < 16U; ++index) {
+        const auto generation = published_pen_generations_[index].load(std::memory_order_acquire);
+        if (generation != 0U && !append_lifecycle(device_type::pen, index + 1U, generation)) {
+          return CLSP_STATUS_RESOURCE_EXHAUSTED;
+        }
+      }
+
+      std::array<std::uint8_t, pointer_payload_size> pointer_bytes {};
+      const pointer_payload pointer {
+        .instance_generation = pointer_generation,
+        .mode = pointer_flag::relative,
+        .represented_reports = 1U,
+        .physical_ordinal = 1U,
+      };
+      if (serialize_pointer_payload(pointer, pointer_bytes) != wire_error::none ||
+          !append(
+            {
+              .kind = baseline_record_kind::pointer,
+              .payload_length = static_cast<std::uint32_t>(pointer_bytes.size()),
+              .device_id = 1U,
+              .instance_generation = pointer_generation,
+              .state_sequence = 1U,
+              .physical_ordinal = 1U,
+            },
+            pointer_bytes
+          )) return CLSP_STATUS_INTERNAL_FAILURE;
+
+      std::array<std::array<std::uint8_t, controller_state_payload_size>, 16> controller_payloads {};
+      for (std::size_t index = 0; index < 16U; ++index) {
+        const auto generation = published_controller_generations_[index].load(std::memory_order_acquire);
+        if (generation == 0U) continue;
+        controller_state_payload state {
+          .prefix = {
+            .device = device_type::controller,
+            .represented_reports = 1U,
+            .device_id = static_cast<std::uint32_t>(index + 1U),
+            .instance_generation = generation,
+            .record_length = controller_state_payload_size,
+            .physical_ordinal = 1U,
+          },
+        };
+        auto &payload = controller_payloads[index];
+        if (serialize_controller_state_payload(state, payload) != wire_error::none ||
+            !append(
+              {
+                .kind = baseline_record_kind::controller,
+                .payload_length = static_cast<std::uint32_t>(payload.size()),
+                .device_id = static_cast<std::uint32_t>(index + 1U),
+                .instance_generation = generation,
+                .state_sequence = 1U,
+                .physical_ordinal = 1U,
+              },
+              payload
+            )) return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+
+      std::array<std::array<std::uint8_t, controller_sensor_payload_size>, 32> sensor_payloads {};
+      std::size_t sensor_payload_count = 0U;
+      for (std::uint8_t sensor_value = 1U; sensor_value <= 2U; ++sensor_value) {
+        for (std::size_t index = 0; index < 16U; ++index) {
+          const auto generation = published_controller_generations_[index].load(std::memory_order_acquire);
+          const auto mask = published_controller_sensor_masks_[index].load(std::memory_order_acquire);
+          if (generation == 0U || (mask & (1U << (sensor_value - 1U))) == 0U) continue;
+          controller_sensor_payload sensor {
+            .prefix = {
+              .device = device_type::controller,
+              .represented_reports = 1U,
+              .device_id = static_cast<std::uint32_t>(index + 1U),
+              .instance_generation = generation,
+              .record_length = controller_sensor_payload_size,
+              .physical_ordinal = 1U,
+            },
+            .sensor = static_cast<sensor_type>(sensor_value),
+          };
+          auto &payload = sensor_payloads[sensor_payload_count++];
+          if (serialize_controller_sensor_payload(sensor, payload) != wire_error::none ||
+              !append(
+                {
+                  .kind = baseline_record_kind::controller_sensor,
+                  .subtype = sensor_value,
+                  .payload_length = static_cast<std::uint32_t>(payload.size()),
+                  .device_id = static_cast<std::uint32_t>(index + 1U),
+                  .instance_generation = generation,
+                  .state_sequence = 1U,
+                  .physical_ordinal = 1U,
+                },
+                payload
+              )) return CLSP_STATUS_INTERNAL_FAILURE;
+        }
+      }
+
+      std::array<std::array<std::uint8_t, touch_state_header_size>, 16> touch_payloads {};
+      for (std::size_t index = 0; index < 16U; ++index) {
+        const auto generation = published_touch_generations_[index].load(std::memory_order_acquire);
+        if (generation == 0U) continue;
+        const touch_state_view touch {
+          .prefix = {
+            .device = device_type::touch,
+            .represented_reports = 1U,
+            .device_id = static_cast<std::uint32_t>(index + 1U),
+            .instance_generation = generation,
+            .record_length = touch_state_header_size,
+            .physical_ordinal = 1U,
+          },
+        };
+        auto &payload = touch_payloads[index];
+        if (serialize_touch_state_payload(touch, payload) != wire_error::none ||
+            !append(
+              {
+                .kind = baseline_record_kind::touch,
+                .payload_length = static_cast<std::uint32_t>(payload.size()),
+                .device_id = static_cast<std::uint32_t>(index + 1U),
+                .instance_generation = generation,
+                .state_sequence = 1U,
+                .physical_ordinal = 1U,
+              },
+              payload
+            )) return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+
+      std::array<std::array<std::uint8_t, pen_state_payload_size>, 16> pen_payloads {};
+      for (std::size_t index = 0; index < 16U; ++index) {
+        const auto generation = published_pen_generations_[index].load(std::memory_order_acquire);
+        if (generation == 0U) continue;
+        const pen_state_payload pen {
+          .prefix = {
+            .device = device_type::pen,
+            .represented_reports = 1U,
+            .device_id = static_cast<std::uint32_t>(index + 1U),
+            .instance_generation = generation,
+            .record_length = pen_state_payload_size,
+            .physical_ordinal = 1U,
+          },
+        };
+        auto &payload = pen_payloads[index];
+        if (serialize_pen_state_payload(pen, payload) != wire_error::none ||
+            !append(
+              {
+                .kind = baseline_record_kind::pen,
+                .payload_length = static_cast<std::uint32_t>(payload.size()),
+                .device_id = static_cast<std::uint32_t>(index + 1U),
+                .instance_generation = generation,
+                .state_sequence = 1U,
+                .physical_ordinal = 1U,
+              },
+              payload
+            )) return CLSP_STATUS_INTERNAL_FAILURE;
+      }
+
+      const auto serialized = serialize_input_baseline(
+        {
+          .neutral = true,
+          .edge_watermark = baseline_edge_watermark_,
+          .text_barrier_edge_id = baseline_edge_watermark_,
+          .records = std::span<const input_baseline_record_view> {records}.first(record_count),
+        },
+        baseline_body_
+      );
+      if (serialized.error != wire_error::none || serialized.bytes_written == 0U) {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
+      baseline_body_length_ = serialized.bytes_written;
+      if (!parse_input_baseline(
+            std::span<const std::uint8_t> {baseline_body_}.first(baseline_body_length_)
+          )) return CLSP_STATUS_INTERNAL_FAILURE;
+      baseline_part_count_ = static_cast<std::uint8_t>(
+        (baseline_body_length_ + baseline_part_data_capacity - 1U) / baseline_part_data_capacity
+      );
+      baseline_next_part_index_ = 0U;
+      if (baseline_part_count_ == 0U || baseline_part_count_ > maximum_baseline_parts ||
+          wc_Sha256Hash(
+            baseline_body_.data(),
+            static_cast<word32>(baseline_body_length_),
+            baseline_digest_.data()
+          ) != 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      return CLSP_STATUS_OK;
+    }
+
+    /** @brief Serialize and send one path-safe part of the retained neutral baseline. */
+    [[nodiscard]] clsp_status_t send_baseline(const std::uint64_t now) noexcept {
+      if (baseline_body_length_ == 0U) {
+        const auto build = build_neutral_baseline();
+        if (build != CLSP_STATUS_OK) return build;
+      }
+      const auto part_index = baseline_next_part_index_;
+      const auto part_offset = static_cast<std::size_t>(part_index) * baseline_part_data_capacity;
+      const auto part_length = std::min(baseline_part_data_capacity, baseline_body_length_ - part_offset);
+      const auto baseline = std::span<const std::uint8_t> {baseline_body_}.first(baseline_body_length_);
+      std::array<
+        std::uint8_t,
+        lumen::lsp::input_plane::baseline_part_header_size + baseline_part_data_capacity
+      > part_bytes {};
+      const lumen::lsp::input_plane::baseline_part part {
+        .part_index = part_index,
+        .part_count = baseline_part_count_,
+        .total_length = static_cast<std::uint32_t>(baseline.size()),
+        .part_offset = static_cast<std::uint32_t>(part_offset),
+        .part_length = static_cast<std::uint32_t>(part_length),
+        .digest = baseline_digest_,
+        .bytes = baseline.subspan(part_offset, part_length),
+      };
+      const auto part_output = std::span<std::uint8_t> {part_bytes}.first(
+        lumen::lsp::input_plane::baseline_part_header_size + part_length
+      );
+      if (lumen::lsp::input_plane::serialize_baseline_part(part, part_output) !=
+          lumen::lsp::input_plane::wire_error::none) return CLSP_STATUS_INTERNAL_FAILURE;
       const lumen::lsp::input_plane::common_header header {
         .input_generation = input_configuration_.input_generation,
         .kind = lumen::lsp::input_plane::packet_kind::baseline_part,
-        .state_sequence = 1,
+        .state_sequence = 1U,
         .sample_time_us = now,
         .object_id = baseline_id_,
-        .edge_watermark = latest_edge_id_,
+        .edge_watermark = baseline_edge_watermark_,
       };
       bool submitted = false;
-      const auto status = send_input_packet(header, part_bytes, now, submitted);
+      const auto status = send_input_packet(header, part_output, now, submitted);
       if (status == CLSP_STATUS_OK && submitted) {
-        baseline_last_sent_us_ = now;
+        if (baseline_first_submitted_microseconds_ == 0U) {
+          baseline_first_submitted_microseconds_ = monotonic_microseconds();
+        }
+        baseline_next_part_index_ = static_cast<std::uint8_t>(part_index + 1U);
+        if (baseline_next_part_index_ == baseline_part_count_) {
+          baseline_next_part_index_ = 0U;
+          baseline_last_sent_us_ = now;
+        } else {
+          baseline_last_sent_us_ = 0U;
+        }
       }
       return status;
     }
@@ -4074,6 +5152,21 @@ namespace umbra::lsp {
       if (status == CLSP_STATUS_OK && submitted && !edge_sender_.mark_sent(edges.front().edge_id, edges.size(), now)) {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
+      if (status == CLSP_STATUS_OK && submitted) {
+        const auto submitted_microseconds = monotonic_microseconds();
+        for (const auto &edge : edges) {
+          auto &timing = edge_timing_[edge.edge_id % edge_timing_.size()];
+          if (!timing.occupied || timing.edge_id != edge.edge_id) {
+            timing_distributions_[CLSP_NATIVE_TIMING_INPUT_ACK_AGE].drop();
+            continue;
+          }
+          if (timing.first_submitted_microseconds == 0U) {
+            timing.first_submitted_microseconds = submitted_microseconds;
+          }
+          timing.last_submitted_microseconds = submitted_microseconds;
+          if (timing.transmissions != std::numeric_limits<std::uint8_t>::max()) ++timing.transmissions;
+        }
+      }
       return status;
     }
 
@@ -4094,7 +5187,14 @@ namespace umbra::lsp {
         .edge_watermark = latest_edge_id_,
       };
       bool submitted = false;
-      const auto status = send_input_packet(header, payload, now, submitted);
+      const auto status = send_input_packet(
+        header,
+        payload,
+        now,
+        submitted,
+        pointer_composed_microseconds_,
+        true
+      );
       if (status == CLSP_STATUS_OK && submitted) {
         latest_state_sequence_ = sequence;
         ++next_state_sequence_;
@@ -4105,22 +5205,36 @@ namespace umbra::lsp {
       return status;
     }
 
-    /** @brief Serialize and submit one exact 36-byte controller analog record. */
+    /** @brief Convert one finite controller sensor component to signed Q16.16. */
+    [[nodiscard]] static std::int32_t sensor_q16_16(const float value) noexcept {
+      if (value != value) return 0;
+      const auto bounded = std::clamp(static_cast<double>(value), -32'768.0, 32'767.9999847412109375);
+      return static_cast<std::int32_t>(bounded * 65'536.0);
+    }
+
+    /** @brief Serialize and submit one exact frozen controller state record. */
     [[nodiscard]] clsp_status_t send_controller_state(const std::size_t index, const std::uint64_t now) noexcept {
       auto &state = controller_states_[index];
-      std::array<std::uint8_t, 36> payload {};
-      payload[0] = 3;
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(2, 2), 1);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(4, 4), state.value.controller_id);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(8, 4), state.value.instance_generation);
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(12, 2), 36);
-      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {payload}.subspan(16, 8), state.physical_ordinal);
-      payload[24] = state.value.left_trigger;
-      payload[25] = state.value.right_trigger;
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(28, 2), std::bit_cast<std::uint16_t>(state.value.left_stick_x));
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(30, 2), std::bit_cast<std::uint16_t>(state.value.left_stick_y));
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(32, 2), std::bit_cast<std::uint16_t>(state.value.right_stick_x));
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(34, 2), std::bit_cast<std::uint16_t>(state.value.right_stick_y));
+      lumen::lsp::input_plane::controller_state_payload frozen {
+        .prefix = {
+          .device = lumen::lsp::input_plane::device_type::controller,
+          .represented_reports = 1U,
+          .device_id = state.value.controller_id,
+          .instance_generation = state.value.instance_generation,
+          .record_length = lumen::lsp::input_plane::controller_state_payload_size,
+          .physical_ordinal = state.physical_ordinal,
+        },
+        .buttons = state.buttons,
+      };
+      frozen.axes[0] = state.value.left_stick_x;
+      frozen.axes[1] = state.value.left_stick_y;
+      frozen.axes[2] = state.value.right_stick_x;
+      frozen.axes[3] = state.value.right_stick_y;
+      frozen.triggers[0] = static_cast<std::uint16_t>(state.value.left_trigger) * 257U;
+      frozen.triggers[1] = static_cast<std::uint16_t>(state.value.right_trigger) * 257U;
+      std::array<std::uint8_t, lumen::lsp::input_plane::controller_state_payload_size> payload {};
+      if (lumen::lsp::input_plane::serialize_controller_state_payload(frozen, payload) !=
+          lumen::lsp::input_plane::wire_error::none) return CLSP_STATUS_INTERNAL_FAILURE;
       const auto sequence = next_state_sequence_;
       const lumen::lsp::input_plane::common_header header {
         .input_generation = input_configuration_.input_generation,
@@ -4131,7 +5245,14 @@ namespace umbra::lsp {
         .edge_watermark = latest_edge_id_,
       };
       bool submitted = false;
-      const auto status = send_input_packet(header, payload, now, submitted);
+      const auto status = send_input_packet(
+        header,
+        payload,
+        now,
+        submitted,
+        state.composed_microseconds,
+        true
+      );
       if (status == CLSP_STATUS_OK && submitted) {
         latest_state_sequence_ = sequence;
         ++next_state_sequence_;
@@ -4148,17 +5269,25 @@ namespace umbra::lsp {
       const std::uint64_t now
     ) noexcept {
       auto &sensor = controller_sensors_[index][sensor_index];
-      std::array<std::uint8_t, 36> payload {};
-      payload[0] = 3;
-      payload[1] = sensor.value.sensor_type;
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(2, 2), 1);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(4, 4), sensor.value.controller_id);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(8, 4), sensor.value.instance_generation);
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(12, 2), 36);
-      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {payload}.subspan(16, 8), sensor.physical_ordinal);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(24, 4), std::bit_cast<std::uint32_t>(sensor.value.x));
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(28, 4), std::bit_cast<std::uint32_t>(sensor.value.y));
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(32, 4), std::bit_cast<std::uint32_t>(sensor.value.z));
+      const lumen::lsp::input_plane::controller_sensor_payload frozen {
+        .prefix = {
+          .device = lumen::lsp::input_plane::device_type::controller,
+          .represented_reports = 1U,
+          .device_id = sensor.value.controller_id,
+          .instance_generation = sensor.value.instance_generation,
+          .record_length = lumen::lsp::input_plane::controller_sensor_payload_size,
+          .physical_ordinal = sensor.physical_ordinal,
+        },
+        .sensor = static_cast<lumen::lsp::input_plane::sensor_type>(sensor.value.sensor_type),
+        .vector = {
+          sensor_q16_16(sensor.value.x),
+          sensor_q16_16(sensor.value.y),
+          sensor_q16_16(sensor.value.z),
+        },
+      };
+      std::array<std::uint8_t, lumen::lsp::input_plane::controller_sensor_payload_size> payload {};
+      if (lumen::lsp::input_plane::serialize_controller_sensor_payload(frozen, payload) !=
+          lumen::lsp::input_plane::wire_error::none) return CLSP_STATUS_INTERNAL_FAILURE;
       const auto sequence = next_state_sequence_;
       const lumen::lsp::input_plane::common_header header {
         .input_generation = input_configuration_.input_generation,
@@ -4169,7 +5298,14 @@ namespace umbra::lsp {
         .edge_watermark = latest_edge_id_,
       };
       bool submitted = false;
-      const auto status = send_input_packet(header, payload, now, submitted);
+      const auto status = send_input_packet(
+        header,
+        payload,
+        now,
+        submitted,
+        sensor.composed_microseconds,
+        true
+      );
       if (status == CLSP_STATUS_OK && submitted) {
         latest_state_sequence_ = sequence;
         ++next_state_sequence_;
@@ -4179,31 +5315,63 @@ namespace umbra::lsp {
       return status;
     }
 
-    /** @brief Serialize and submit one exact 40-byte controller touch record. */
+    /** @brief Serialize and submit one exact frozen direct-touch device record. */
     [[nodiscard]] clsp_status_t send_touch_state(const std::size_t index, const std::uint64_t now) noexcept {
       auto &touch = touch_states_[index];
-      std::array<std::uint8_t, 40> payload {};
-      payload[0] = 4;
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(2, 2), 1);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(4, 4), touch.value.contact_id);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(8, 4), touch.value.instance_generation);
-      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {payload}.subspan(12, 2), 40);
-      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {payload}.subspan(16, 8), touch.physical_ordinal);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(24, 4), touch.value.controller_id);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(28, 4), touch.value.x);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(32, 4), touch.value.y);
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {payload}.subspan(36, 4), touch.value.pressure);
+      const std::array<lumen::lsp::input_plane::touch_contact_payload, 1> contacts {{
+        {
+          .contact_id = static_cast<std::uint16_t>(touch.value.contact_id),
+          .active = true,
+          .x = touch.value.x,
+          .y = touch.value.y,
+          .pressure = static_cast<std::uint16_t>(touch.value.pressure >> 16U),
+          .physical_ordinal = touch.physical_ordinal,
+        },
+      }};
+      const auto active_contacts = touch.active ?
+        std::span<const lumen::lsp::input_plane::touch_contact_payload> {contacts} :
+        std::span<const lumen::lsp::input_plane::touch_contact_payload> {};
+      const auto payload_length = lumen::lsp::input_plane::touch_state_header_size +
+                                  active_contacts.size() * lumen::lsp::input_plane::touch_contact_size;
+      const lumen::lsp::input_plane::touch_state_view frozen {
+        .prefix = {
+          .device = lumen::lsp::input_plane::device_type::touch,
+          .represented_reports = 1U,
+          .device_id = touch.value.controller_id,
+          .instance_generation = touch.value.instance_generation,
+          .record_length = static_cast<std::uint16_t>(payload_length),
+          .physical_ordinal = touch.physical_ordinal,
+        },
+        .contacts = active_contacts,
+      };
+      std::array<
+        std::uint8_t,
+        lumen::lsp::input_plane::touch_state_header_size + lumen::lsp::input_plane::touch_contact_size
+      > payload {};
+      const auto live_payload = std::span<std::uint8_t> {payload}.first(payload_length);
+      if (lumen::lsp::input_plane::serialize_touch_state_payload(frozen, live_payload) !=
+          lumen::lsp::input_plane::wire_error::none) return CLSP_STATUS_INTERNAL_FAILURE;
       const auto sequence = next_state_sequence_;
       const lumen::lsp::input_plane::common_header header {
         .input_generation = input_configuration_.input_generation,
         .kind = lumen::lsp::input_plane::packet_kind::device_state,
         .state_sequence = sequence,
         .sample_time_us = touch.value.sample_time_microseconds,
-        .object_id = lumen::lsp::input_plane::make_device_object_id(lumen::lsp::input_plane::device_type::touch, touch.value.contact_id),
+        .object_id = lumen::lsp::input_plane::make_device_object_id(
+          lumen::lsp::input_plane::device_type::touch,
+          touch.value.controller_id
+        ),
         .edge_watermark = latest_edge_id_,
       };
       bool submitted = false;
-      const auto status = send_input_packet(header, payload, now, submitted);
+      const auto status = send_input_packet(
+        header,
+        live_payload,
+        now,
+        submitted,
+        touch.composed_microseconds,
+        true
+      );
       if (status == CLSP_STATUS_OK && submitted) {
         latest_state_sequence_ = sequence;
         ++next_state_sequence_;
@@ -4218,7 +5386,9 @@ namespace umbra::lsp {
       const lumen::lsp::input_plane::common_header &header,
       const std::span<const std::uint8_t> payload,
       const std::uint64_t now,
-      bool &submitted
+      bool &submitted,
+      const std::uint64_t composed_microseconds = 0U,
+      const bool attributable_device_state = false
     ) noexcept {
       submitted = false;
       std::array<std::uint8_t, maximum_udp_payload> packet {};
@@ -4239,37 +5409,122 @@ namespace umbra::lsp {
       }
       auto length = rtp_result.bytes_written + lumen::lsp::input_plane::common_header_size + payload.size();
       const auto charged_bits = static_cast<std::uint64_t>(length + 16U + 28U) * 8U;
-      if (charged_bits > input_tokens_bits_) {
+      if (charged_bits > input_tokens_bits_ || charged_bits > reverse_tokens_bits_) {
         return CLSP_STATUS_OK;
       }
       const auto status = srtp_.protect(packet, length, false);
       if (status != CLSP_STATUS_OK) {
+        if (composed_microseconds != 0U) {
+          timing_distributions_[CLSP_NATIVE_TIMING_INPUT_COMPOSE_TO_PROTECT].drop();
+        }
         return status;
+      }
+      const auto protected_microseconds = monotonic_microseconds();
+      if (composed_microseconds != 0U) {
+        record_timing_stage(
+          CLSP_NATIVE_TIMING_INPUT_COMPOSE_TO_PROTECT,
+          composed_microseconds,
+          protected_microseconds
+        );
       }
       const auto sent = ::send(socket_, packet.data(), length, 0);
       ++rtp_sequence_;
       if (sent != static_cast<ssize_t>(length)) {
+        timing_distributions_[CLSP_NATIVE_TIMING_INPUT_PROTECT_TO_SUBMIT].drop();
+        if (sent < 0 && errno == EMSGSIZE) {
+          current_udp_payload_size_.store(1'200U, std::memory_order_release);
+          return CLSP_STATUS_OK;
+        }
         return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
       }
       input_tokens_bits_ -= charged_bits;
+      reverse_tokens_bits_ -= charged_bits;
       submitted = true;
+      const auto submitted_microseconds = monotonic_microseconds();
+      record_timing_stage(
+        CLSP_NATIVE_TIMING_INPUT_PROTECT_TO_SUBMIT,
+        protected_microseconds,
+        submitted_microseconds
+      );
+      if (attributable_device_state) {
+        const auto complete_ip_bytes = static_cast<std::uint64_t>(length) + 28U;
+        if (header.kind == lumen::lsp::input_plane::packet_kind::pointer_motion) {
+          pointer_attributed_wire_bytes_.fetch_add(complete_ip_bytes, std::memory_order_relaxed);
+        } else if (header.kind == lumen::lsp::input_plane::packet_kind::device_state ||
+                   header.kind == lumen::lsp::input_plane::packet_kind::sensor_state) {
+          const auto device_id = static_cast<std::uint32_t>(header.object_id);
+          if (device_id >= 1U && device_id <= controller_attributed_wire_bytes_.size()) {
+            controller_attributed_wire_bytes_[device_id - 1U].fetch_add(
+              complete_ip_bytes,
+              std::memory_order_relaxed
+            );
+          }
+        }
+      }
       increment(RuntimeCounter::transmitted);
       (void)now;
       return CLSP_STATUS_OK;
+    }
+
+    /** @brief Retry one immutable protected microphone datagram and commit source state once. */
+    [[nodiscard]] clsp_status_t transmit_pending_microphone() noexcept {
+  #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!pending_microphone_.occupied) return CLSP_STATUS_OK;
+      const auto sent = ::send(socket_, pending_microphone_.bytes.data(), pending_microphone_.length, 0);
+      if (sent == static_cast<ssize_t>(pending_microphone_.length)) {
+        microphone_tokens_bits_ -= std::min(microphone_tokens_bits_, pending_microphone_.charged_bits);
+        reverse_tokens_bits_ -= std::min(reverse_tokens_bits_, pending_microphone_.charged_bits);
+        microphone_marker_.store(false, std::memory_order_release);
+        microphone_timestamp_ += 960U;
+        ++microphone_packet_count_;
+        microphone_octet_count_ += static_cast<std::uint32_t>(pending_microphone_.opus_bytes);
+        microphone_queue_[pending_microphone_.queue_index].clear();
+        microphone_read_.store(
+          (pending_microphone_.queue_index + 1U) % microphone_queue_capacity,
+          std::memory_order_release
+        );
+        pending_microphone_ = {};
+        increment(RuntimeCounter::transmitted);
+        return CLSP_STATUS_OK;
+      }
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+        return CLSP_STATUS_OK;
+      }
+      if (sent < 0 && errno == EMSGSIZE) {
+        current_udp_payload_size_.store(1'200U, std::memory_order_release);
+        microphone_marker_.store(true, std::memory_order_release);
+        microphone_queue_[pending_microphone_.queue_index].clear();
+        microphone_read_.store(
+          (pending_microphone_.queue_index + 1U) % microphone_queue_capacity,
+          std::memory_order_release
+        );
+        pending_microphone_ = {};
+        return CLSP_STATUS_OK;
+      }
+      return CLSP_STATUS_SOCKET_FAILURE;
+  #else
+      return CLSP_STATUS_UNSUPPORTED;
+  #endif
     }
 
     /** @brief Pace, protect, and submit at most one complete microphone Opus packet. */
     [[nodiscard]] clsp_status_t transmit_microphone() noexcept {
   #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (!microphone_active_.load(std::memory_order_acquire)) return CLSP_STATUS_OK;
+      if (pending_microphone_.occupied) return transmit_pending_microphone();
       const auto now = monotonic_microseconds();
       replenish_microphone_credit(now);
+      replenish_reverse_credit(now);
       const auto read = microphone_read_.load(std::memory_order_relaxed);
       if (read != microphone_write_.load(std::memory_order_acquire)) {
         const auto opus = microphone_queue_[read].bytes();
         const auto charged = static_cast<std::uint64_t>(12U + opus.size() + 16U + 28U) * 8U;
-        if (charged <= microphone_tokens_bits_) {
-          std::array<std::uint8_t, maximum_udp_payload> packet {};
+        const auto input_reserve = input_configured_ ?
+          input_configuration_.reserved_input_wire_bits_per_second / 1'000U : 0U;
+        if (charged <= microphone_tokens_bits_ && reverse_tokens_bits_ > input_reserve &&
+            charged <= reverse_tokens_bits_ - input_reserve) {
+          auto &packet = pending_microphone_.bytes;
+          std::fill(packet.begin(), packet.end(), 0);
           const lumen::lsp::rtp_fixed_header header {
             .marker = microphone_marker_.load(std::memory_order_acquire),
             .payload_type = microphone_configuration_.microphone_payload_type,
@@ -4286,19 +5541,13 @@ namespace umbra::lsp {
           const auto protected_status = srtp_.protect(packet, length, false);
           if (protected_status != CLSP_STATUS_OK) return protected_status;
           ++microphone_sequence_;
-          const auto sent = ::send(socket_, packet.data(), length, 0);
-          if (sent == static_cast<ssize_t>(length)) {
-            microphone_tokens_bits_ -= charged;
-            microphone_marker_.store(false, std::memory_order_release);
-            microphone_timestamp_ += 960U;
-            ++microphone_packet_count_;
-            microphone_octet_count_ += static_cast<std::uint32_t>(opus.size());
-            microphone_queue_[read].clear();
-            microphone_read_.store((read + 1U) % microphone_queue_capacity, std::memory_order_release);
-            increment(RuntimeCounter::transmitted);
-          } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            return CLSP_STATUS_SOCKET_FAILURE;
-          }
+          pending_microphone_.length = length;
+          pending_microphone_.queue_index = read;
+          pending_microphone_.opus_bytes = opus.size();
+          pending_microphone_.charged_bits = charged;
+          pending_microphone_.occupied = true;
+          const auto send_status = transmit_pending_microphone();
+          if (send_status != CLSP_STATUS_OK) return send_status;
         }
       }
       if (microphone_packet_count_ != 0 &&
@@ -4309,6 +5558,29 @@ namespace umbra::lsp {
   #else
       return CLSP_STATUS_UNSUPPORTED;
   #endif
+    }
+
+    /** @brief Refill one aggregate reverse controller while preserving the input reservation. */
+    void replenish_reverse_credit(const std::uint64_t now) noexcept {
+      if (reverse_last_credit_us_ == 0U || now < reverse_last_credit_us_) {
+        reverse_last_credit_us_ = now;
+        return;
+      }
+      const auto input_rate = input_configured_ ? input_configuration_.reserved_input_wire_bits_per_second : 0U;
+      const auto microphone_rate = microphone_active_.load(std::memory_order_acquire) ?
+                                     microphone_pacing_rate(microphone_configuration_) : 0U;
+      const auto rate = input_rate + microphone_rate;
+      const auto elapsed = now - reverse_last_credit_us_;
+      const auto earned = rate == 0U ? 0U :
+        (elapsed > std::numeric_limits<std::uint64_t>::max() / rate ?
+           std::numeric_limits<std::uint64_t>::max() : elapsed * rate / 1'000'000U);
+      const auto capacity = std::max<std::uint64_t>(
+        input_rate / 500U + microphone_rate / 25U,
+        2U * static_cast<std::uint64_t>(maximum_udp_payload + 28U) * 8U
+      );
+      reverse_tokens_bits_ = earned >= capacity || reverse_tokens_bits_ >= capacity - earned ?
+                               capacity : reverse_tokens_bits_ + earned;
+      reverse_last_credit_us_ = now;
     }
 
     /** @brief Refill the reverse-microphone pacer below the dedicated input lane. */
@@ -4736,6 +6008,7 @@ namespace umbra::lsp {
         unmatched_path_probe_ = {};
         last_received_probe_id_ = probe.probe_id;
         last_received_probe_size_ = probe.udp_payload_size;
+        receive_udp_payload_size_.store(probe.udp_payload_size, std::memory_order_release);
       } else if (!unmatched_path_probe_.occupied ||
                  (unmatched_path_probe_.probe_id == probe.probe_id &&
                   unmatched_path_probe_.udp_payload_size == probe.udp_payload_size)) {
@@ -4814,6 +6087,7 @@ namespace umbra::lsp {
           (void) path_mtu_->probe_timed_out();
         }
         last_path_raise_microseconds_ = now;
+        current_udp_payload_size_.store(1'200U, std::memory_order_release);
         outbound_path_probe_ = {};
         emitted_path_probe_id_.store(0, std::memory_order_release);
         emitted_path_probe_size_.store(0, std::memory_order_release);
@@ -4870,6 +6144,7 @@ namespace umbra::lsp {
             emitted_path_probe_id_.store(0, std::memory_order_release);
             emitted_path_probe_size_.store(0, std::memory_order_release);
             increment(RuntimeCounter::path_probe_timeouts);
+            current_udp_payload_size_.store(1'200U, std::memory_order_release);
             last_path_raise_microseconds_ = now;
             pthread_mutex_unlock(&mutex_);
           } else {
@@ -5631,6 +6906,7 @@ namespace umbra::lsp {
           now,
           video_configuration_.maximum_frame_age_microseconds
         ),
+        .first_authenticated_microseconds = now,
         .arrival_order = video_next_metadata_order_++,
       };
       return selected;
@@ -6303,6 +7579,7 @@ namespace umbra::lsp {
         return false;
       }
       if (pending_video_delivery_count_ >= pending_video_deliveries_.size()) {
+        timing_distributions_[CLSP_NATIVE_TIMING_AUTH_TO_HANDOFF].drop();
         clsp_buffer_release(buffer);
         retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
@@ -6322,6 +7599,7 @@ namespace umbra::lsp {
           lumen::lsp::transport::lspv_event::capacity_transition
         );
         pthread_mutex_unlock(&mutex_);
+        timing_distributions_[CLSP_NATIVE_TIMING_AUTH_TO_HANDOFF].drop();
         clsp_buffer_release(buffer);
         retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
@@ -6333,6 +7611,7 @@ namespace umbra::lsp {
       if (!remember_delivered_video_frame(completed.frame_id, metadata->recovery_epoch, metadata->independent)) {
         (void)video_decoder_credit_.release();
         pthread_mutex_unlock(&mutex_);
+        timing_distributions_[CLSP_NATIVE_TIMING_AUTH_TO_HANDOFF].drop();
         clsp_buffer_release(buffer);
         retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
         erase_video_metadata(key);
@@ -6364,8 +7643,10 @@ namespace umbra::lsp {
         .reserved_zero = 0,
         .encoded_access_unit = buffer,
       };
+      const auto first_authenticated_microseconds = metadata->first_authenticated_microseconds;
       retire_video_frame(key, VideoRetirementReason::completed, metadata->frame_id, metadata->recovery_epoch);
       erase_video_metadata(key);
+      pending_video_auth_times_[pending_video_delivery_count_] = first_authenticated_microseconds;
       pending_video_deliveries_[pending_video_delivery_count_++] = event;
       return true;
     }
@@ -6624,8 +7905,14 @@ namespace umbra::lsp {
       }
       for (std::size_t index = 0; index < pending_video_delivery_count_;
            ++index) {
+        record_timing_stage(
+          CLSP_NATIVE_TIMING_AUTH_TO_HANDOFF,
+          pending_video_auth_times_[index],
+          monotonic_microseconds()
+        );
         callbacks_.video_frame(callbacks_.context, pending_video_deliveries_[index]);
         pending_video_deliveries_[index] = {};
+        pending_video_auth_times_[index] = 0U;
       }
       pending_video_delivery_count_ = 0;
     }
@@ -6743,6 +8030,7 @@ namespace umbra::lsp {
       const std::span<const std::uint8_t> packet,
       const bool rtcp,
       const std::uint64_t arrival_microseconds,
+      const std::uint64_t authenticated_microseconds,
       const std::uint64_t packet_token
     ) noexcept {
       if (packet.size() < 12U || (packet[0] >> 6U) != 2U) {
@@ -6754,7 +8042,7 @@ namespace umbra::lsp {
           return false;
         }
         const auto video_lane = video_lane_for_ssrc(rtp.header.ssrc);
-        const auto now = monotonic_microseconds();
+        const auto now = authenticated_microseconds;
         if (video_lane == VideoRtpLane::primary) {
           return handle_authenticated_video(
                    packet,
@@ -6790,6 +8078,11 @@ namespace umbra::lsp {
           .reserved_zero = 0,
           .opus_packet = {.data = opus.data(), .length = opus.size()},
         };
+        record_timing_stage(
+          CLSP_NATIVE_TIMING_AUTH_TO_HANDOFF,
+          authenticated_microseconds,
+          monotonic_microseconds()
+        );
         callbacks_.audio_packet(callbacks_.context, event);
         return true;
       }
@@ -6867,6 +8160,14 @@ namespace umbra::lsp {
         !baseline_acknowledged_ && ack.value.accepted_baseline_id == baseline_id_;
       if (baseline_became_acknowledged) {
         baseline_acknowledged_ = true;
+        if (baseline_first_submitted_microseconds_ != 0U) {
+          record_timing_stage(
+            CLSP_NATIVE_TIMING_INPUT_ACK_AGE,
+            baseline_first_submitted_microseconds_,
+            monotonic_microseconds()
+          );
+          baseline_first_submitted_microseconds_ = 0U;
+        }
         if (callbacks_.input_baseline != nullptr) {
           callbacks_.input_baseline(
             callbacks_.context,
@@ -6877,11 +8178,47 @@ namespace umbra::lsp {
           );
         }
       }
+      const auto acknowledged_microseconds = monotonic_microseconds();
+      for (auto &timing : edge_timing_) {
+        if (!timing.occupied) continue;
+        auto acknowledged = timing.edge_id <= ack.value.contiguous_edge_id;
+        if (!acknowledged && timing.edge_id > ack.value.contiguous_edge_id) {
+          const auto distance = timing.edge_id - ack.value.contiguous_edge_id;
+          acknowledged = distance <= 64U &&
+                         (ack.value.edge_reception_bitmap & (std::uint64_t {1} << (distance - 1U))) != 0U;
+        }
+        if (!acknowledged) continue;
+        if (timing.first_submitted_microseconds == 0U) {
+          timing_distributions_[CLSP_NATIVE_TIMING_INPUT_ACK_AGE].drop();
+        } else {
+          record_timing_stage(
+            CLSP_NATIVE_TIMING_INPUT_ACK_AGE,
+            timing.first_submitted_microseconds,
+            acknowledged_microseconds
+          );
+        }
+        timing = {};
+      }
       edge_sender_.acknowledge(ack.value.contiguous_edge_id, ack.value.edge_reception_bitmap);
       if ((ack.value.flags & static_cast<std::uint8_t>(lumen::lsp::input_plane::lspi_flag::baseline_requested)) != 0) {
         baseline_acknowledged_ = false;
         baseline_last_sent_us_ = 0;
+        baseline_body_length_ = 0;
+        baseline_edge_watermark_ = 0;
+        baseline_first_submitted_microseconds_ = 0U;
+        baseline_id_ = (static_cast<std::uint64_t>(arc4random()) << 32U) | arc4random();
+        if (baseline_id_ == 0U) baseline_id_ = 1U;
       }
+      pthread_mutex_lock(&mutex_);
+      input_feedback_snapshot_.accepted_baseline_id = ack.value.accepted_baseline_id;
+      input_feedback_snapshot_.contiguous_edge_id = ack.value.contiguous_edge_id;
+      input_feedback_snapshot_.edge_reception_bitmap = ack.value.edge_reception_bitmap;
+      input_feedback_snapshot_.received_at_microseconds = arrival_microseconds;
+      input_feedback_snapshot_.baseline_acknowledged = static_cast<std::uint8_t>(baseline_acknowledged_);
+      input_feedback_snapshot_.baseline_requested = static_cast<std::uint8_t>(
+        (ack.value.flags & static_cast<std::uint8_t>(lumen::lsp::input_plane::lspi_flag::baseline_requested)) != 0
+      );
+      pthread_mutex_unlock(&mutex_);
       return true;
     }
 
@@ -6976,7 +8313,13 @@ namespace umbra::lsp {
         path_intent_probe_size_ = 0;
         path_intent_control_ = {};
       }
-      outbound_window_.acknowledge(parsed.header.acknowledgement_base, parsed.header.acknowledgement_bitmap);
+      const auto control_now = monotonic_microseconds();
+      (void)outbound_window_.acknowledge(
+        parsed.header.acknowledgement_base,
+        parsed.header.acknowledgement_bitmap,
+        control_now,
+        rto_
+      );
       const auto observed = receive_window_.observe(parsed.header.message_id);
       if (observed == lumen::lsp::receive_id_result::too_far_ahead ||
           observed == lumen::lsp::receive_id_result::too_old ||
@@ -6997,9 +8340,16 @@ namespace umbra::lsp {
       const auto semantic_request = !lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::response) &&
                                     !lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::acknowledgement_only) &&
                                     parsed.header.request_id != 0;
+      const auto semantic_identity = semantic_request ? response_identity(parsed.header, plaintext) : std::nullopt;
+      if (semantic_request && !semantic_identity) return false;
       if (observed == lumen::lsp::receive_id_result::duplicate) {
         if (semantic_request) {
-          const auto cached = inbound_response_cache_.lookup(parsed.header.request_id, plaintext);
+          const auto cached = inbound_response_cache_.lookup(
+            parsed.header.request_id,
+            *semantic_identity,
+            plaintext,
+            control_now
+          );
           if (cached.result == lumen::lsp::response_cache_result::hit) {
             const auto status = dtls_.send_application_data(cached.response);
             if (status != CLSP_STATUS_OK) return false;
@@ -7013,7 +8363,7 @@ namespace umbra::lsp {
       if (lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::acknowledgement_only)) {
         return true;
       }
-      if (semantic_request && !retain_inbound_request(parsed.header.request_id, plaintext)) return false;
+      if (semantic_request && !retain_inbound_request(parsed.header.request_id, *semantic_identity, plaintext)) return false;
       if (parsed.header.message_type == 0x0002U && parsed.header.connection_generation != 0) {
         connection_generation_ = parsed.header.connection_generation;
         authenticated_connection_generation_.store(connection_generation_, std::memory_order_release);
@@ -7095,15 +8445,33 @@ namespace umbra::lsp {
         if (command.response) {
           pending_request = pending_inbound_request(command.request_id);
           if (pending_request == nullptr) return CLSP_STATUS_INVALID_STATE;
-          const auto cached = inbound_response_cache_.insert(command.request_id, pending_request->frame.bytes(), encoded);
+          const auto now = monotonic_microseconds();
+          const auto cached = inbound_response_cache_.insert(
+            command.request_id,
+            {
+              .identity = pending_request->identity,
+              .retention_deadline_microseconds = saturating_add(now, 120'000'000U),
+            },
+            pending_request->frame.bytes(),
+            encoded,
+            now
+          );
           if (cached != lumen::lsp::response_cache_result::stored && cached != lumen::lsp::response_cache_result::hit) {
             return CLSP_STATUS_INTERNAL_FAILURE;
+          }
+        }
+        if (!command.transmit_path_probe) {
+          const auto reserved = outbound_window_.reserve(message_id, encoded, command.deadline_microseconds);
+          if (reserved != lumen::lsp::outbound_store_result::stored) {
+            return reserved == lumen::lsp::outbound_store_result::window_full ?
+                     CLSP_STATUS_CONTROL_WINDOW_FULL : CLSP_STATUS_INTERNAL_FAILURE;
           }
         }
         const auto status = dtls_.send_application_data(encoded);
         if (status != CLSP_STATUS_OK) {
           return status;
         }
+        const auto submitted_at = monotonic_microseconds();
         increment(RuntimeCounter::transmitted);
         if (command.transmit_path_probe) {
           if (path_intent_control_.occupied) {
@@ -7121,19 +8489,9 @@ namespace umbra::lsp {
           path_intent_probe_id_ = command.path_probe_id;
           path_intent_probe_size_ = command.path_probe_size;
           path_probe_notification_pending_ = false;
-        } else {
-          const auto stored = outbound_window_.store(
-            message_id,
-            encoded,
-            monotonic_microseconds(),
-            command.deadline_microseconds,
-            rto_
-          );
-          if (stored != lumen::lsp::outbound_store_result::stored) {
-            return stored == lumen::lsp::outbound_store_result::window_full ?
-                     CLSP_STATUS_CONTROL_WINDOW_FULL :
-                     CLSP_STATUS_INTERNAL_FAILURE;
-          }
+        } else if (outbound_window_.mark_initial_submitted(message_id, submitted_at, rto_) !=
+                   lumen::lsp::outbound_submission_result::submitted) {
+          return CLSP_STATUS_INTERNAL_FAILURE;
         }
         if (pending_request != nullptr) {
           pending_request->occupied = false;
@@ -7215,11 +8573,61 @@ namespace umbra::lsp {
 
     /** @brief Fail the worker without exposing parser/security details to the peer. */
     void fail_worker(const clsp_status_t status) noexcept {
+      clear_deferred_video_batch();
+      flush_telemetry(monotonic_microseconds(), true);
       signal_startup(status);
       terminal_failed_.store(true, std::memory_order_release);
       authenticated_.store(false, std::memory_order_release);
       stop_requested_.store(true, std::memory_order_release);
-      publish_lifecycle(CLSP_LIFECYCLE_FAILED);
+      publish_lifecycle(CLSP_LIFECYCLE_FAILED, latch_terminal_status(status));
+    }
+
+    /** @brief Attribute one bounded ring failure to its exact native device generation. */
+    void record_capture_drop(const CaptureRecord &record) noexcept {
+      if (record.kind == CaptureKind::pointer || record.kind == CaptureKind::edge) {
+        const auto pointer_edge = record.kind == CaptureKind::pointer ||
+                                  record.edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN ||
+                                  record.edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_UP;
+        if (pointer_edge && record.device_generation != 0U &&
+            pointer_drop_generation_.load(std::memory_order_acquire) == record.device_generation) {
+          pointer_dropped_samples_.fetch_add(1U, std::memory_order_relaxed);
+        }
+        return;
+      }
+      std::uint32_t controller_id = 0U;
+      std::uint32_t generation = 0U;
+      switch (record.kind) {
+        case CaptureKind::controller_edge:
+          controller_id = record.controller_edge.controller_id;
+          generation = record.controller_edge.instance_generation;
+          break;
+        case CaptureKind::controller_state:
+          controller_id = record.controller_state.controller_id;
+          generation = record.controller_state.instance_generation;
+          break;
+        case CaptureKind::controller_sensor:
+          controller_id = record.controller_sensor.controller_id;
+          generation = record.controller_sensor.instance_generation;
+          break;
+        case CaptureKind::touch_edge:
+          controller_id = record.touch_edge.controller_id;
+          generation = record.touch_edge.instance_generation;
+          break;
+        case CaptureKind::touch_state:
+          controller_id = record.touch_state.controller_id;
+          generation = record.touch_state.instance_generation;
+          break;
+        case CaptureKind::pointer:
+        case CaptureKind::edge:
+        case CaptureKind::neutralize:
+          return;
+      }
+      if (controller_id >= 1U && controller_id <= 16U) {
+        const auto index = controller_id - 1U;
+        if (controller_drop_generations_[index].load(std::memory_order_acquire) == generation) {
+          controller_dropped_samples_[index].fetch_add(1U, std::memory_order_relaxed);
+        }
+      }
     }
 
     /** @brief Copy one capture record into the bounded native ring. */
@@ -7227,7 +8635,9 @@ namespace umbra::lsp {
       const auto write = capture_write_.load(std::memory_order_relaxed);
       const auto next = (write + 1U) % capture_queue_capacity;
       if (next == capture_read_.load(std::memory_order_acquire)) {
-        increment(RuntimeCounter::dropped);
+        producer_dropped_.fetch_add(1U, std::memory_order_relaxed);
+        producer_callback_timing_drops_.fetch_add(1U, std::memory_order_relaxed);
+        record_capture_drop(record);
         return CLSP_STATUS_RESOURCE_EXHAUSTED;
       }
       capture_queue_[write] = record;
@@ -7294,6 +8704,16 @@ namespace umbra::lsp {
 
     clsp_configuration_t configuration_ {};  ///< Copied immutable core configuration.
     RuntimeCallbacks callbacks_ {};  ///< Stable C ABI owner callbacks.
+    mutable std::array<std::uint64_t, 12> worker_counters_ {};  ///< Socket-worker telemetry deltas.
+    std::array<FixedTelemetryDistribution, CLSP_NATIVE_TIMING_STAGE_COUNT>
+      timing_distributions_ {};  ///< Worker-owned cumulative native stage histograms.
+    std::array<EdgeTimingSlot, lumen::lsp::input_plane::edge_sender::capacity>
+      edge_timing_ {};  ///< Exact edge-to-ACK correlations.
+    std::atomic<std::uint64_t> producer_dropped_ {0};  ///< Producer-side bounded drops drained by worker.
+    std::atomic<std::uint64_t> producer_callback_timing_drops_ {0};  ///< Ring drops without compose timestamps.
+    std::uint64_t last_telemetry_flush_microseconds_ {};  ///< Last <=4 Hz counter publication.
+    std::uint64_t timing_snapshot_generation_ {};  ///< Monotonic coarse timing publication identity.
+    std::uint64_t last_timing_publication_microseconds_ {};  ///< Hard four-hertz publication floor.
     clsp_status_t realtime_failure_status_ {CLSP_STATUS_OK};  ///< Fatal authenticated parser result bubbled to the worker.
     WolfSSLDtlsClient dtls_;  ///< Exact-policy DTLS client.
     SrtpSession srtp_;  ///< Directional AEAD AES-128-GCM contexts.
@@ -7307,6 +8727,8 @@ namespace umbra::lsp {
     std::array<CaptureRecord, capture_queue_capacity> capture_queue_ {};  ///< Allocation-free captured-input ring.
     clsp_input_configuration_t pending_input_configuration_ {};  ///< Producer-copied pending input mapping.
     clsp_input_configuration_t input_configuration_ {};  ///< Worker-owned active input mapping.
+    clsp_input_rate_update_t pending_input_rates_ {};  ///< Producer-copied authenticated rate renegotiation.
+    clsp_input_feedback_snapshot_t input_feedback_snapshot_ {};  ///< Latest coarse LSPI/effective-rate evidence.
     lumen::lsp::input_plane::pointer_composer pointer_composer_;  ///< Cumulative relative pointer state.
     lumen::lsp::input_plane::edge_sender edge_sender_;  ///< Exactly-once retained edge window.
     std::array<ControllerLatest, 16> controller_states_ {};  ///< Latest analog state by controller slot.
@@ -7314,12 +8736,18 @@ namespace umbra::lsp {
     std::array<TouchLatest, 16> touch_states_ {};  ///< Latest controller touch contacts.
     std::atomic<bool> stop_requested_ {false};  ///< Cross-thread idempotent stop request.
     std::atomic<bool> terminal_failed_ {false};  ///< Preserve FAILED while reclaiming a failed runtime.
+    std::atomic<std::uint32_t> terminal_status_ {CLSP_STATUS_OK};  ///< First fatal runtime status.
     std::atomic<bool> authenticated_ {false};  ///< Product-visible exact-security readiness.
     std::atomic<bool> audio_configured_ {false};  ///< Exact host-audio mapping admission gate.
     std::atomic<bool> video_configured_ {false};  ///< Exact primary-video mapping admission gate.
     std::atomic<bool> video_delivery_active_ {false};  ///< ACK-gated complete-frame publication.
     std::atomic<bool> path_discovery_enabled_ {false};  ///< Native PMTU search activation.
+    std::atomic<std::uint32_t> published_stream_generation_ {0};  ///< Coarse current stream generation.
+    std::atomic<std::uint32_t> published_input_generation_ {0};  ///< Coarse current input generation.
+    std::atomic<std::uint64_t> published_latest_edge_id_ {0};  ///< Coarse newest assigned edge ID.
+    std::atomic<std::uint64_t> published_latest_edge_time_ {0};  ///< Coarse newest edge capture time.
     std::atomic<std::uint16_t> current_udp_payload_size_ {1'200};  ///< Authenticated confirmed ceiling.
+    std::atomic<std::uint16_t> receive_udp_payload_size_ {1'200};  ///< Independently confirmed host-to-client ceiling.
     std::atomic<std::uint32_t> authenticated_connection_generation_ {0};  ///< Published SERVER_HELLO generation.
     std::atomic<std::uint64_t> emitted_path_probe_id_ {0};  ///< Native probe offered to Swift.
     std::atomic<std::uint16_t> emitted_path_probe_size_ {0};  ///< Offered protected payload size.
@@ -7357,8 +8785,12 @@ namespace umbra::lsp {
     lumen::lsp::transport::source_replay_window video_source_replay_;  ///< Shared original/FEC/RTX-OSN admission state.
     lumen::lsp::transport::video_gap_tracker<maximum_video_gap_count> video_gap_tracker_;  ///< Primary gap/NACK state.
     std::array<clsp_video_frame_event_t, video_delivery_queue_capacity> pending_video_deliveries_ {};  ///< Post-drain frame callbacks.
+    std::array<std::uint64_t, video_delivery_queue_capacity> pending_video_auth_times_ {};  ///< Earliest auth time per pending frame.
     std::array<clsp_path_probe_event_t, 4> pending_path_probe_events_ {};  ///< Retained coarse probe callbacks.
     clsp_microphone_configuration_t microphone_configuration_ {};  ///< Installed reverse microphone tuple.
+    PendingProtectedMicrophone pending_microphone_ {};  ///< Exact protected RTP retry state.
+    std::array<DeferredVideoDatagram, receive_batch_size> deferred_video_ {};  ///< Current bounded priority batch.
+    std::size_t deferred_video_count_ {};  ///< Protected video packets collected this worker turn.
     std::array<lumen::lsp::packet_slab<maximum_microphone_opus_bytes>, microphone_queue_capacity> microphone_queue_ {};  ///< Complete Opus SPSC queue.
     std::atomic<std::size_t> microphone_read_ {0};  ///< Native sender queue read cursor.
     std::atomic<std::size_t> microphone_write_ {0};  ///< Swift encoder queue write cursor.
@@ -7369,6 +8801,8 @@ namespace umbra::lsp {
     std::atomic<std::uint64_t> neutralize_completed_ {0};  ///< Worker-completed neutralize token.
     std::atomic<std::uint64_t> input_configuration_requested_ {0};  ///< Latest synchronous mapping token.
     std::atomic<std::uint64_t> input_configuration_completed_ {0};  ///< Worker-installed mapping token.
+    std::atomic<std::uint64_t> input_rate_update_requested_ {0};  ///< Latest producer rate-update token.
+    std::atomic<std::uint64_t> input_rate_update_completed_ {0};  ///< Worker-applied rate-update token.
     std::atomic<std::uint64_t> completed_response_request_ {0};  ///< Last submitted/cached semantic response ID.
     std::size_t control_queue_head_ {};  ///< Next queued request to consume.
     std::size_t control_queue_tail_ {};  ///< Next free queue slot.
@@ -7384,6 +8818,17 @@ namespace umbra::lsp {
     PathIntentControlFrame path_intent_control_ {};  ///< Optional nonfatal reliable probe intent.
     std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
     std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
+    std::atomic<std::uint32_t> published_pointer_generation_ {1};  ///< Logical pointer generation available to AppKit/native capture.
+    std::array<std::atomic<std::uint32_t>, 16> published_controller_generations_ {};  ///< Active controller generations.
+    std::array<std::atomic<std::uint32_t>, 16> published_touch_generations_ {};  ///< Active touch-device generations.
+    std::array<std::atomic<std::uint32_t>, 16> published_pen_generations_ {};  ///< Active pen-device generations.
+    std::array<std::atomic<std::uint8_t>, 16> published_controller_sensor_masks_ {};  ///< Active gyro/accelerometer capabilities.
+    std::atomic<std::uint32_t> pointer_drop_generation_ {1};  ///< Exact generation owning pointer drop telemetry.
+    std::atomic<std::uint64_t> pointer_dropped_samples_ {0};  ///< Bounded pointer ring drops in the exact generation.
+    std::atomic<std::uint64_t> pointer_attributed_wire_bytes_ {0};  ///< Pointer state complete IP bytes.
+    std::array<std::atomic<std::uint32_t>, 16> controller_drop_generations_ {};  ///< Exact controller drop generations.
+    std::array<std::atomic<std::uint64_t>, 16> controller_dropped_samples_ {};  ///< Bounded controller ring drops.
+    std::array<std::atomic<std::uint64_t>, 16> controller_attributed_wire_bytes_ {};  ///< Controller state/sensor IP bytes.
     std::uint64_t next_message_id_ {1};  ///< Next nonzero client-to-host LSPC message ID.
     std::uint64_t next_control_reservation_token_ {};  ///< Next invisible request reservation incarnation.
     std::uint64_t next_inbound_security_install_token_ {1};  ///< Next provider-install request token.
@@ -7428,17 +8873,29 @@ namespace umbra::lsp {
     UnmatchedPathProbe unmatched_path_probe_ {};  ///< One authenticated reordered LSPP.
     OutboundPathProbePacket outbound_path_probe_ {};  ///< Client probe send/timer state.
     std::uint64_t pending_input_configuration_token_ {};  ///< Token paired with pending START/ATTACH mapping.
+    std::uint64_t pending_input_rate_token_ {};  ///< Token paired with pending rate renegotiation.
     std::uint64_t pending_baseline_id_ {};  ///< Exact handoff rollback baseline ID, or zero for native generation.
     std::uint32_t connection_generation_ {};  ///< Zero through CLIENT_HELLO, then host-assigned generation.
     std::uint64_t baseline_id_ {};  ///< Current random neutral-baseline identifier.
     std::uint64_t baseline_last_sent_us_ {};  ///< Most recent baseline submission time.
+    std::array<std::uint8_t, lumen::lsp::input_plane::maximum_baseline_bytes>
+      baseline_body_ {};  ///< Byte-identical complete neutral baseline retained through ACK.
+    std::array<std::uint8_t, 32> baseline_digest_ {};  ///< SHA-256 over the exact retained complete baseline.
+    std::size_t baseline_body_length_ {};  ///< Populated deterministic baseline bytes.
+    std::uint64_t baseline_edge_watermark_ {};  ///< Frozen edge watermark for the retained baseline ID.
+    std::uint64_t baseline_first_submitted_microseconds_ {};  ///< First part submission awaiting host ACK.
+    std::uint8_t baseline_next_part_index_ {};  ///< Next path-safe part in the retained retransmission cycle.
+    std::uint8_t baseline_part_count_ {};  ///< Frozen path-safe part count one through thirty-two.
     std::uint64_t pointer_ordinal_ {};  ///< Monotonic physical pointer sample ordinal.
     std::uint64_t pointer_sample_time_us_ {};  ///< Newest captured pointer time.
+    std::uint64_t pointer_composed_microseconds_ {};  ///< Worker composition time for newest pointer state.
     std::uint64_t latest_edge_id_ {};  ///< Newest assigned physical edge identifier.
     std::uint64_t latest_state_sequence_ {2};  ///< Latest sampled replaceable-state sequence.
     std::uint64_t next_state_sequence_ {2};  ///< Next replaceable-state sequence.
     std::uint64_t input_tokens_bits_ {};  ///< Dedicated input-pacer credit.
     std::uint64_t input_last_credit_us_ {};  ///< Last token refill time.
+    std::uint64_t reverse_tokens_bits_ {};  ///< Aggregate input-plus-microphone pacing credit.
+    std::uint64_t reverse_last_credit_us_ {};  ///< Aggregate reverse-controller refill time.
     std::uint64_t last_pointer_sent_us_ {};  ///< Last cumulative pointer submission time.
     std::uint16_t rtp_sequence_ {};  ///< Input RTP sequence with libSRTP rollover tracking.
     std::uint16_t microphone_sequence_ {};  ///< Microphone RTP sequence.
@@ -7449,6 +8906,7 @@ namespace umbra::lsp {
     std::uint64_t microphone_last_credit_us_ {};  ///< Last microphone token refill.
     std::uint64_t microphone_last_report_us_ {};  ///< Last microphone RTCP SR submission.
     bool input_configuration_pending_ {};  ///< Producer installed a new START mapping.
+    bool pending_input_rate_update_ {};  ///< Producer queued one worker-owned rate update.
     bool video_sequence_initialized_ {};  ///< Whether extended sequence state has an origin.
     bool video_timestamp_initialized_ {};  ///< Whether extended timestamp state has an origin.
     bool feedback_sequence_initialized_ {};  ///< Whether CCFB sequence expansion has an origin.
@@ -7616,6 +9074,10 @@ namespace umbra::lsp {
     return impl_ == nullptr ? std::uint16_t {1'200} : impl_->current_udp_payload_size();
   }
 
+  std::uint16_t Runtime::current_receive_udp_payload_size() const noexcept {
+    return impl_ == nullptr ? std::uint16_t {1'200} : impl_->current_receive_udp_payload_size();
+  }
+
   clsp_status_t Runtime::copy_pairing_exporter(
     const std::span<std::uint8_t, 32> output
   ) const noexcept {
@@ -7647,6 +9109,47 @@ namespace umbra::lsp {
 
   clsp_status_t Runtime::configure_input(const clsp_input_configuration_t &configuration) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->configure_input(configuration);
+  }
+
+  clsp_status_t Runtime::update_input_rates(const clsp_input_rate_update_t &update) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->update_input_rates(update);
+  }
+
+  clsp_status_t Runtime::copy_input_feedback(clsp_input_feedback_snapshot_t &output) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->copy_input_feedback(output);
+  }
+
+  clsp_status_t Runtime::copy_input_edge_snapshot(clsp_input_edge_snapshot_t &output) const noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->copy_input_edge_snapshot(output);
+  }
+
+  void Runtime::observe_input_device(
+    const std::uint8_t device_type,
+    const std::uint32_t device_id,
+    const std::uint32_t instance_generation,
+    const bool active,
+    const std::uint8_t sensor_mask
+  ) noexcept {
+    if (impl_ != nullptr) {
+      impl_->observe_input_device(device_type, device_id, instance_generation, active, sensor_mask);
+    }
+  }
+
+  std::uint64_t Runtime::input_dropped_samples(
+    const std::uint8_t offer_type,
+    const std::uint32_t device_id,
+    const std::uint32_t instance_generation
+  ) const noexcept {
+    return impl_ == nullptr ? 0U : impl_->input_dropped_samples(offer_type, device_id, instance_generation);
+  }
+
+  std::uint64_t Runtime::input_attributed_wire_bytes(
+    const std::uint8_t offer_type,
+    const std::uint32_t device_id,
+    const std::uint32_t instance_generation
+  ) const noexcept {
+    return impl_ == nullptr ? 0U :
+                              impl_->input_attributed_wire_bytes(offer_type, device_id, instance_generation);
   }
 
   clsp_status_t Runtime::submit_pointer(const clsp_pointer_sample_t &sample) noexcept {

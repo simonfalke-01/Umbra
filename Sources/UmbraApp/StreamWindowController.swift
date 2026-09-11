@@ -5,6 +5,8 @@ import Metal
 import QuartzCore
 import UmbraCore
 import UmbraIntegration
+import UmbraLSP
+import UmbraLSPTransport
 import UmbraMedia
 import UmbraPlatform
 import UmbraServices
@@ -27,6 +29,23 @@ enum StreamPerformanceMetric: CaseIterable, Sendable {
     case audioQueue
     case videoPackets
     case audioPackets
+    case lspLifecycle
+    case lspDatagrams
+    case lspDrops
+    case lspAuthenticationFailures
+    case lspPathMTU
+    case lspReconnect
+    case lspInputDevices
+    case lspFrameToDecoder
+    case lspDecodeCompletion
+    case lspMetalCommit
+    case lspAudioDecode
+    case lspReconnectDuration
+    case lspNativeStages
+    case lspMetalCompletion
+    case lspAudioHealth
+    case lspFrameToMetal
+    case lspAudioReceive
 
     var title: String {
         switch self {
@@ -47,6 +66,23 @@ enum StreamPerformanceMetric: CaseIterable, Sendable {
         case .audioQueue: "Audio queue"
         case .videoPackets: "Video packets"
         case .audioPackets: "Audio packets"
+        case .lspLifecycle: "LSP lifecycle"
+        case .lspDatagrams: "LSP datagrams"
+        case .lspDrops: "LSP drops"
+        case .lspAuthenticationFailures: "LSP auth failures"
+        case .lspPathMTU: "LSP UDP payload"
+        case .lspReconnect: "LSP reconnect"
+        case .lspInputDevices: "LSP input devices"
+        case .lspFrameToDecoder: "LSP frame to decoder"
+        case .lspDecodeCompletion: "LSP decode completion"
+        case .lspMetalCommit: "LSP Metal commit"
+        case .lspAudioDecode: "LSP audio decode"
+        case .lspReconnectDuration: "LSP reconnect duration"
+        case .lspNativeStages: "LSP native stages"
+        case .lspMetalCompletion: "LSP Metal completion"
+        case .lspAudioHealth: "LSP audio health"
+        case .lspFrameToMetal: "LSP frame to Metal enqueue"
+        case .lspAudioReceive: "LSP audio receive to decode"
         }
     }
 }
@@ -69,7 +105,12 @@ enum StreamStatisticsPresenter {
     static func make(
         renderer: MediaPipelineStatistics?,
         decoder: MediaPipelineStatistics?,
-        transport: StreamTransportStatistics?
+        transport: StreamTransportStatistics?,
+        lsp: LSPTelemetrySnapshot? = nil,
+        reconnect: LSPReconnectSnapshot? = nil,
+        devices: [LSPDeviceRateTelemetry] = [],
+        product: LSPProductTelemetrySnapshot? = nil,
+        nativeTiming: LSPNativeTimingSnapshot? = nil
     ) -> StreamStatisticsPresentation {
         let videoRate: String
         if let renderer, renderer.presentedFrames > 0 {
@@ -134,12 +175,62 @@ enum StreamStatisticsPresenter {
                 ?? "Unavailable",
             .audioPackets: transport.map { String($0.audioPackets) }
                 ?? "Unavailable",
+            .lspLifecycle: lsp.map { String(describing: $0.lifecycle) } ?? "Unavailable",
+            .lspDatagrams: lsp.map { "RX \($0.receivedDatagrams) / TX \($0.transmittedDatagrams)" }
+                ?? "Unavailable",
+            .lspDrops: lsp.map { String($0.droppedDatagrams) } ?? "Unavailable",
+            .lspAuthenticationFailures: lsp.map { String($0.authenticationFailures) } ?? "Unavailable",
+            .lspPathMTU: lsp.map {
+                "TX \($0.currentUDPPayloadSize) / RX \($0.currentReceiveUDPPayloadSize) bytes"
+            } ?? "Unavailable",
+            .lspReconnect: reconnect.map { String(describing: $0.phase) } ?? "Unavailable",
+            .lspInputDevices: devices.isEmpty ? "Unavailable" : devices.map {
+                "\($0.deviceType) \($0.deviceID).\($0.instanceGeneration): " +
+                    "capture \($0.observedCaptureRate) Hz, state \($0.selectedStateRate) Hz" +
+                    ($0.selectedSensorRate == 0 ? "" : ", sensor \($0.selectedSensorRate) Hz") +
+                    ", drops \($0.droppedSamples), wire \($0.effectiveWireBitsPerSecond) bps" +
+                    ($0.stateSpacing.map { ", spacing p99 \($0.p99Microseconds)µs" } ?? "")
+            }.joined(separator: " | "),
+            .lspFrameToDecoder: distribution(product?.completeFrameReceiveToVideoToolboxSubmit),
+            .lspDecodeCompletion: distribution(product?.videoToolboxSubmitToDecodeCompletion),
+            .lspMetalCommit: distribution(product?.metalEnqueueToCommit),
+            .lspAudioDecode: distribution(product?.audioDecodeAndRenderEnqueue),
+            .lspReconnectDuration: distribution(product?.reconnectDuration),
+            .lspNativeStages: nativeTiming.map { snapshot in
+                zip(LSPNativeTimingStage.allCases, snapshot.stages).compactMap { stage, value in
+                    guard value.flags.contains(.available), value.count > 0 else { return nil }
+                    let domain = value.flags.contains(.clientMonotonic)
+                        ? (value.flags.contains(.kernelTimestamped)
+                            ? "client-monotonic/kernel-timestamped" : "client-monotonic")
+                        : "unknown"
+                    return "\(stage): n=\(value.count) p99=\(value.p99Microseconds)µs " +
+                        "max=\(value.maximumMicroseconds)µs drops=\(value.drops) [\(domain)]"
+                }.joined(separator: " | ")
+            }.flatMap { $0.isEmpty ? nil : $0 } ?? "Unavailable",
+            .lspMetalCompletion: distribution(product?.metalCommitToCompletion),
+            .lspAudioHealth: {
+                guard let product,
+                      product.audioUnderruns != nil || product.audioRebuffers != nil else {
+                    return "Unavailable"
+                }
+                return "underruns=\(product.audioUnderruns.map(String.init) ?? "Unavailable") " +
+                    "rebuffers=\(product.audioRebuffers.map(String.init) ?? "Unavailable")"
+            }(),
+            .lspFrameToMetal: distribution(product?.completeFrameReceiveToMetalEnqueue),
+            .lspAudioReceive: distribution(product?.audioReceiveToDecode),
         ])
     }
 
     private static func frameCount(_ count: Int) -> String {
         guard count >= 0 else { return "Unavailable" }
         return "\(count) \(count == 1 ? "frame" : "frames")"
+    }
+
+    private static func distribution(_ value: LSPDistributionSnapshot?) -> String {
+        guard let value else { return "Unavailable" }
+        return "n=\(value.count) p50=\(value.p50Microseconds)µs " +
+            "p95=\(value.p95Microseconds)µs p99=\(value.p99Microseconds)µs " +
+            "max=\(value.maximumMicroseconds)µs drops=\(value.drops) [\(value.clockDomain)]"
     }
 
     private static func percentiles(_ summary: LatencyPercentileSummary?) -> String {
@@ -228,7 +319,9 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     var onStopRequested: ((Bool) async -> Void)?
     var onStatisticsToggle: (() -> Void)?
     var onControllerMouseModeChanged: ((Bool) -> Void)?
+    var onTextCommit: ((String) -> Void)?
     var isStreamWindowVisible: Bool { window.isVisible }
+    var nativeLSPControllerOwnershipForTesting: Bool { nativeLSPControllerOwnership }
 
     private let window: NSWindow
     private let streamContainerView: StreamContainerView
@@ -256,6 +349,12 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private var showsStatistics = false
     private var streamStatistics: StreamTransportStatistics?
     private var videoPipelineStatistics: MediaPipelineStatistics?
+    private var lspTelemetry: LSPTelemetrySnapshot?
+    private var lspReconnectTelemetry: LSPReconnectSnapshot?
+    private var lspDeviceRateTelemetry: [LSPDeviceRateTelemetry] = []
+    private var lspProductTelemetry: LSPProductTelemetrySnapshot?
+    private var lspNativeTimingTelemetry: LSPNativeTimingSnapshot?
+    private var nativeLSPControllerOwnership = false
     private var activePreferences: StreamingPreferences?
     private var activeEffectivePolicy: EffectiveStreamingPolicy?
     private var activeSystemShortcutCaptureMode: SystemShortcutCaptureMode = .off
@@ -353,6 +452,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         window.delegate = self
         contentView.keyboard = keyboard
         contentView.pointer = pointer
+        contentView.onRequestTextInput = { [weak self] in self?.requestTextInput() }
         contentView.onLayout = { [weak self] size, scale in
             guard let self else { return }
             let drawableSize = size.scaled(by: scale)
@@ -600,7 +700,8 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             throw UmbraIntegrationError.mediaConfigurationFailed("LSP renderer activation was superseded.")
         }
         keepAwake.setActive(preferences.keepAwake, reason: "Umbra is streaming \(applicationName)")
-        controllers.start()
+        controllers.stop()
+        nativeLSPControllerOwnership = true
         positionWindow(on: targetScreen, videoSize: contentView.videoSize)
     }
 
@@ -704,6 +805,11 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         statisticsTimer = nil
         streamStatistics = nil
         videoPipelineStatistics = nil
+        lspTelemetry = nil
+        lspReconnectTelemetry = nil
+        lspDeviceRateTelemetry.removeAll(keepingCapacity: true)
+        lspProductTelemetry = nil
+        lspNativeTimingTelemetry = nil
         setStatisticsVisible(false)
         setPointerCapture(false)
         pointerCapture.handle(.focusChanged(false))
@@ -712,6 +818,10 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         windowModeCoordinator.setWindowActivationSuppressed(true)
         dismissStreamSurfaceAndRestoreApplicationWindows(forcePresentationReset: true)
         await renderer?.awaitPresentationQuiescence()
+        if nativeLSPControllerOwnership {
+            nativeLSPControllerOwnership = false
+            controllers.start()
+        }
     }
 
     private func dismissStreamSurfaceAndRestoreApplicationWindows(
@@ -998,13 +1108,35 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         setStatisticsVisible(!showsStatistics)
     }
 
+    private func requestTextInput() {
+        guard isSessionActive, onTextCommit != nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Send Text to Host"
+        alert.informativeText = "Enter text or use your current macOS input method. Text is committed once after preceding input edges."
+        alert.addButton(withTitle: "Send")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.placeholderString = "Text"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = field.stringValue
+        guard !value.isEmpty else { return }
+        onTextCommit?(value)
+    }
+
     private func setStatisticsVisible(_ visible: Bool) {
         showsStatistics = visible
         contentView.setStatisticsPresentation(
             visible ? StreamStatisticsPresenter.make(
                 renderer: nil,
                 decoder: nil,
-                transport: nil
+                transport: nil,
+                lsp: nil,
+                reconnect: nil,
+                devices: [],
+                product: nil,
+                nativeTiming: nil
             ) : nil
         )
         statisticsTimer?.invalidate()
@@ -1022,7 +1154,12 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         contentView.setStatisticsPresentation(StreamStatisticsPresenter.make(
             renderer: nil,
             decoder: videoPipelineStatistics,
-            transport: streamStatistics
+            transport: streamStatistics,
+            lsp: lspTelemetry,
+            reconnect: lspReconnectTelemetry,
+            devices: lspDeviceRateTelemetry,
+            product: lspProductTelemetry,
+            nativeTiming: lspNativeTimingTelemetry
         ))
     }
 
@@ -1032,6 +1169,20 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     func updateVideoPipelineStatistics(_ statistics: MediaPipelineStatistics) {
         videoPipelineStatistics = statistics
+    }
+
+    func updateLSPStatistics(
+        _ telemetry: LSPTelemetrySnapshot,
+        reconnect: LSPReconnectSnapshot?,
+        devices: [LSPDeviceRateTelemetry] = [],
+        product: LSPProductTelemetrySnapshot? = nil,
+        nativeTiming: LSPNativeTimingSnapshot? = nil
+    ) {
+        lspTelemetry = telemetry
+        lspReconnectTelemetry = reconnect
+        lspDeviceRateTelemetry = devices
+        lspProductTelemetry = product
+        lspNativeTimingTelemetry = nativeTiming
     }
 
     private func setPointerCapture(_ active: Bool) {
@@ -1424,6 +1575,7 @@ final class StreamMetalView: NSView {
         }
     }
     var onLayout: ((CGSize, CGFloat) -> Void)?
+    var onRequestTextInput: (() -> Void)?
 
     var metalLayer: CAMetalLayer {
         guard let layer = layer as? CAMetalLayer else {
@@ -1509,6 +1661,23 @@ final class StreamMetalView: NSView {
     override func touchesBegan(with event: NSEvent) { handleTouches(event, matching: .began, phase: .began) }
     override func touchesMoved(with event: NSEvent) { handleTouches(event, matching: .moved, phase: .moved) }
     override func touchesEnded(with event: NSEvent) { handleTouches(event, matching: .ended, phase: .ended) }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu(title: "Stream")
+        let item = NSMenuItem(
+            title: "Send Text to Host…",
+            action: #selector(requestTextInputFromMenu),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.isEnabled = onRequestTextInput != nil
+        menu.addItem(item)
+        return menu
+    }
+
+    @objc private func requestTextInputFromMenu() {
+        onRequestTextInput?()
+    }
     override func touchesCancelled(with event: NSEvent) { handleTouches(event, matching: .cancelled, phase: .cancelled) }
 
     private func handleTouches(

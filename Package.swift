@@ -12,6 +12,8 @@ let lspSecurityAvailable = lspDependencyPrefix.map { prefix in
         "include/srtp2/srtp.h",
         "lib/libwolfssl.a",
         "lib/libsrtp2.a",
+        ".umbra-lsp-deps.manifest",
+        ".umbra-lsp-deps.manifest.sha256",
     ]
     return requiredPaths.allSatisfy { relativePath in
         FileManager.default.fileExists(atPath: "\(prefix)/\(relativePath)")
@@ -91,9 +93,7 @@ let package = Package(
             name: "CLibSRTP",
             path: "Vendor/CLibSRTP",
             pkgConfig: lspDependencyPrefix == nil ? "libsrtp2" : nil,
-            providers: lspDependencyPrefix == nil ? [
-                .brew(["srtp"]),
-            ] : []
+            providers: []
         ),
         .target(
             name: "CLSPCore",

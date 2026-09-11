@@ -141,6 +141,24 @@ struct PairHostSheet: View {
                 }
             }
 
+            if let preparation = store.pairingPreparations[host.id],
+               !preparation.effectivePermissions.isEmpty {
+                VStack(alignment: .leading, spacing: UmbraLayout.space1) {
+                    Text("Permissions Lumen will grant")
+                        .font(.caption.weight(.semibold))
+                    Text(preparation.effectivePermissions.joined(separator: " • "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if preparation.effectivePermissions != preparation.requestedPermissions {
+                        Text("Lumen reduced the requested permission set. You can re-pair after changing host policy.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             if store.operation?.kind == .pairing {
                 ProgressView("Waiting for host confirmation…")
                     .controlSize(.small)
@@ -239,6 +257,7 @@ struct RenameHostSheet: View {
 
 struct HostDetailsSheet: View {
     let host: HostDisplayModel
+    @ObservedObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -261,6 +280,12 @@ struct HostDetailsSheet: View {
             .frame(minHeight: 160)
 
             HStack {
+                if host.id.rawValue.hasPrefix("lsp:") {
+                    Button(host.isPaired ? "Re-pair…" : "Pair…") {
+                        dismiss()
+                        store.beginPairing(host)
+                    }
+                }
                 Spacer()
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)

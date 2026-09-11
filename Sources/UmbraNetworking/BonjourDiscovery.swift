@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Network
 
 /// Network protocol advertised by a discovered host service.
@@ -315,15 +316,8 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
         guard case let .hostPort(host, port) = endpoint, port.rawValue != 0 else {
             throw BonjourEndpointResolutionError.invalidEndpoint
         }
-        let hostValue: String
-        switch host {
-        case .name(let name, _):
-            hostValue = name
-        case .ipv4, .ipv6:
-            hostValue = host.debugDescription
-        @unknown default:
-            throw BonjourEndpointResolutionError.invalidEndpoint
-        }
+        let interfaceName = host.interface?.name ?? service.interfaceName
+        let hostValue = try endpointHost(from: host, interfaceName: interfaceName)
         let trimmedHost = hostValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedHost.isEmpty else { throw BonjourEndpointResolutionError.invalidEndpoint }
         return .init(
@@ -332,9 +326,50 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
             serviceName: service.name,
             serviceType: service.type,
             domain: service.domain,
-            interfaceName: host.interface?.name ?? service.interfaceName,
+            interfaceName: interfaceName,
             changeToken: service.changeToken
         )
+    }
+
+    static func endpointHost(
+        from host: NWEndpoint.Host,
+        interfaceName: String?
+    ) throws -> String {
+        switch host {
+        case .name(let name, _):
+            return name
+        case .ipv4(let address):
+            return try numericAddress(address.rawValue, family: AF_INET)
+        case .ipv6(let address):
+            let value = try numericAddress(address.rawValue, family: AF_INET6)
+            guard ipv6RequiresScope(address.rawValue),
+                  let interfaceName,
+                  !interfaceName.isEmpty else { return value }
+            return "\(value)%\(interfaceName)"
+        @unknown default:
+            throw BonjourEndpointResolutionError.invalidEndpoint
+        }
+    }
+
+    private static func numericAddress(_ bytes: Data, family: Int32) throws -> String {
+        let expectedSize = family == AF_INET ? MemoryLayout<in_addr>.size : MemoryLayout<in6_addr>.size
+        guard bytes.count == expectedSize else { throw BonjourEndpointResolutionError.invalidEndpoint }
+        var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        let converted = bytes.withUnsafeBytes { source in
+            inet_ntop(family, source.baseAddress, &text, socklen_t(text.count))
+        }
+        guard converted != nil, let terminator = text.firstIndex(of: 0) else {
+            throw BonjourEndpointResolutionError.invalidEndpoint
+        }
+        return String(decoding: text[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    private static func ipv6RequiresScope(_ bytes: Data) -> Bool {
+        guard bytes.count == MemoryLayout<in6_addr>.size else { return false }
+        let octets = [UInt8](bytes)
+        let unicastLinkLocal = octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
+        let multicastScope = octets[0] == 0xff ? octets[1] & 0x0f : 0
+        return unicastLinkLocal || multicastScope == 1 || multicastScope == 2
     }
 
     convenience init(

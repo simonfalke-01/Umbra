@@ -165,6 +165,54 @@ Trust and host records commit as one recoverable product transaction: a failed
 second write rolls back the first, while the already verified pairing result is
 retained for a persistence-only retry.
 
+The product control boundary additionally freezes and wires reliable UTF-8/IME
+text behind an applied-edge barrier, generation-scoped hot-plug input-rate
+renegotiation, bounded SHA-256 committed object chunks, owner-qualified
+application quit, and generation-qualified `STREAM_ENDED`. Large text is
+uploaded before its `TEXT_INPUT` request. Application artwork may reference a
+completed object and enters the existing bounded owner-private artwork cache;
+object data never shares packet slabs.
+
+Text entry pauses native/AppKit capture, emits releases and neutral state,
+binds the request to the newest locally assigned edge ID, then installs and
+acknowledges a fresh neutral baseline before capture resumes. Native device
+arrival, removal, and observed-rate events cross only as bounded low-rate
+offers; Swift sends the authenticated rate request, applies the returned
+aggregate tuple to the native core, and publishes per-device capture/selected
+rates at statistics frequency.
+
+Signed certificate rotation is accepted only as an authenticated control
+request on the currently pinned association. Its transcript binds the host ID
+and Ed25519 identity, old and new SPKI digests, connection generation, and
+strictly increasing rotation generation. Umbra durably stages the new SPKI
+before a success acknowledgement while retaining the active pin. A fresh
+association accepts only the active or pending pin and promotes pending only
+after host-identity authentication succeeds. Discovery TXT changes never rotate
+trust.
+
+Adaptive low latency remains the LSP default. Competition LAN is selectable
+only with an explicit capacity ceiling. Pointer, controller, sensor, and
+reconciliation network rates are independent preferences with protocol bounds
+through 16 kHz, 2 kHz, 4 kHz, and 1 kHz respectively. These selections flow
+through START and do not depend on stream frame rate. The stream statistics
+overlay includes LSP transport lifecycle, datagram/drop/authentication counts,
+path payload size, and reconnect phase.
+
+Product-stage telemetry uses fixed 256-sample windows and publishes at one
+hertz. Complete-frame receive-to-VideoToolbox submission, decode completion,
+Metal enqueue/commit, audio receive/decode/render enqueue, per-device spacing,
+and reconnect duration report count, p50/p95/p99, maximum, drops, and explicit
+clock domain. Metal completion and AudioQueue underrun/rebuffer fields remain
+unavailable where their owning API exposes no coarse observation; Umbra does
+not fabricate them or label any proxy as physical presentation/input-to-photon.
+
+CLI-started LSP streams retain a long-lived owner process. Same-user local
+attach, stop, quit, and telemetry commands use a host-keyed Unix socket under a
+0700 UID-specific parent with a 0600 endpoint and peer-UID validation. Messages
+are bounded to 4 KiB and contain only host-scoped commands and coarse results;
+attach tokens, trust records, pins, and transport secrets never cross or persist
+in this IPC surface. Owner loss is terminal and never falls back to GameStream.
+
 ## Measurement boundaries
 
 Production telemetry records stage durations and p50/p95/p99 summaries using

@@ -15,8 +15,12 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case pairResult = 0x0015
     case authRequest = 0x0020
     case authResponse = 0x0021
+    case certificateRotate = 0x0022
+    case certificateRotateAck = 0x0023
     case listApplications = 0x0100
     case applications = 0x0101
+    case quitApplication = 0x0102
+    case quitApplicationResponse = 0x0103
     case start = 0x0200
     case startResponse = 0x0201
     case attach = 0x0202
@@ -29,9 +33,14 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case audioConfigAck = 0x0213
     case microphoneConfig = 0x0214
     case microphoneConfigAck = 0x0215
+    case textInput = 0x0216
+    case textInputResponse = 0x0217
+    case inputRateRequest = 0x0218
+    case inputRateResponse = 0x0219
     case streamEnded = 0x0220
     case pathProbe = 0x0300
     case pathProbeAck = 0x0301
+    case objectChunk = 0x0400
 }
 
 /// Stable status codes in exact LSP control responses.
@@ -90,6 +99,12 @@ public struct LSPAuthenticationResponse: Equatable, Sendable {
     public var revocationGeneration: UInt32
     public var connectionGeneration: UInt32
     public var serverSignature: Data
+
+    public func isAllowedTransition(from trust: LSPTrustRecord) -> Bool {
+        let generation = UInt64(revocationGeneration)
+        return generation > trust.revocationGeneration ||
+            (generation == trust.revocationGeneration && permissions == trust.permissions)
+    }
 }
 
 /// One native LSP application returned by the authenticated host.
@@ -102,6 +117,7 @@ public struct LSPApplication: Equatable, Identifiable, Sendable {
 /// Requested input-only START rates and aggregate wire budget.
 public struct LSPInputStartRequest: Equatable, Sendable {
     public var applicationID: String
+    public var resume: Bool
     public var pointerRate: UInt32
     public var controllerRate: UInt32
     public var sensorRate: UInt32
@@ -118,6 +134,7 @@ public struct LSPInputStartRequest: Equatable, Sendable {
 
     public init(
         applicationID: String,
+        resume: Bool = false,
         pointerRate: UInt32 = 1_000,
         controllerRate: UInt32 = 250,
         sensorRate: UInt32 = 250,
@@ -133,6 +150,7 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         maximumCaptureToPresentMicroseconds: UInt32 = 50_000
     ) {
         self.applicationID = applicationID
+        self.resume = resume
         self.pointerRate = pointerRate
         self.controllerRate = controllerRate
         self.sensorRate = sensorRate
@@ -528,7 +546,106 @@ public struct LSPVideoConfigurationRequest: Equatable, Sendable {
 /// Authenticated host notification that one exact LSP stream has ended.
 public struct LSPStreamEnded: Equatable, Sendable {
     public var sessionID: UUID
+    public var streamGeneration: UInt32
     public var reason: UInt8
+}
+
+/// Signed host-certificate SPKI rotation request bound to one authenticated association.
+public struct LSPCertificateRotation: Equatable, Sendable {
+    public var hostID: UUID
+    public var connectionGeneration: UInt32
+    public var rotationGeneration: UInt32
+    public var newSPKISHA256: Data
+    public var hostSignature: Data
+}
+
+/// One generation- and edge-barrier-bound UTF-8/IME commit.
+public struct LSPTextInputRequest: Equatable, Sendable {
+    public var sessionID: UUID
+    public var inputGeneration: UInt32
+    public var precedingEdgeID: UInt64
+    public var utf8Length: UInt16
+    public var inlineUTF8: Data?
+    public var objectID: UUID?
+    public var sha256: Data?
+}
+
+/// Device class used by authenticated runtime input-rate renegotiation.
+public enum LSPInputRateDeviceType: UInt8, CaseIterable, Sendable {
+    case pointer = 1
+    case controller = 2
+    case sensor = 3
+    case reconciliation = 4
+}
+
+/// Hot-plug rate offer scoped to one device instance and current input generation.
+public struct LSPInputRateOffer: Equatable, Sendable {
+    public enum Kind: UInt8, Sendable { case arrived = 1, removed = 2, rateObserved = 3 }
+    public var sessionID: UUID
+    public var inputGeneration: UInt32
+    public var kind: Kind
+    public var deviceType: LSPInputRateDeviceType
+    public var deviceID: UInt32
+    public var instanceGeneration: UInt32
+    public var observedCaptureRate: UInt32
+    public var minimumStateRate: UInt32
+    public var maximumStateRate: UInt32
+    public var minimumSensorRate: UInt32
+    public var maximumSensorRate: UInt32
+    public var maximumStatePacketBytes: UInt16
+    public var maximumSensorPacketBytes: UInt16
+}
+
+/// Host-selected hot-plug rates within the existing aggregate input budget.
+public struct LSPInputRateSelection: Equatable, Sendable {
+    public var sessionID: UUID
+    public var inputGeneration: UInt32
+    public var kind: LSPInputRateOffer.Kind
+    public var deviceType: LSPInputRateDeviceType
+    public var deviceID: UInt32
+    public var instanceGeneration: UInt32
+    public var stateRate: UInt32
+    public var sensorRate: UInt32
+    public var pointerRate: UInt32
+    public var controllerRate: UInt32
+    public var aggregateSensorRate: UInt32
+    public var reconciliationRate: UInt32
+    public var reservedInputWireBitsPerSecond: UInt64
+}
+
+/// Latest negotiated per-device capture and network-rate evidence for UI/CLI statistics.
+public struct LSPDeviceRateTelemetry: Equatable, Sendable {
+    public var kind: LSPInputRateOffer.Kind
+    public var deviceType: LSPInputRateDeviceType
+    public var deviceID: UInt32
+    public var instanceGeneration: UInt32
+    public var observedCaptureRate: UInt32
+    public var selectedStateRate: UInt32
+    public var selectedSensorRate: UInt32
+    public var captureSource: String = "unknown"
+    public var observedSensorRate: UInt32 = 0
+    public var capturedSamples: UInt64 = 0
+    public var droppedSamples: UInt64 = 0
+    public var attributedWireBytes: UInt64 = 0
+    public var effectiveWireBitsPerSecond: UInt64 = 0
+    public var stateSpacing: LSPDistributionSnapshot?
+    public var sensorSpacing: LSPDistributionSnapshot?
+}
+
+/// One bounded large-object chunk and its complete-object SHA-256 commitment.
+public struct LSPObjectChunk: Equatable, Sendable {
+    public var objectID: UUID
+    public var offset: UInt32
+    public var totalLength: UInt32
+    public var bytes: Data
+    public var sha256: Data
+}
+
+/// Authenticated acknowledgement for one contiguous large-object prefix.
+public struct LSPObjectChunkAcknowledgement: Equatable, Sendable {
+    public var objectID: UUID
+    public var nextOffset: UInt32
+    public var totalLength: UInt32
 }
 
 /// Exact authenticated PATH_PROBE intent or acknowledgement fields.
@@ -700,6 +817,14 @@ public enum LSPControlWire {
         return status
     }
 
+    public static func errorResponse(_ status: LSPControlStatus) throws -> Data {
+        guard status != .success else { throw DeterministicCBORError.malformed }
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(UInt64(status.rawValue)),
+        ])
+    }
+
     public static func authenticationTranscript(
         hostID: UUID,
         clientID: UUID,
@@ -742,6 +867,58 @@ public enum LSPControlWire {
         )
     }
 
+    public static func certificateRotation(from event: LSPControlEvent) throws -> LSPCertificateRotation {
+        guard event.messageType == LSPControlMessageType.certificateRotate.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 6)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        return .init(
+            hostID: try uuid(try bytes(values[1], count: 16)),
+            connectionGeneration: try uint32(values[2], nonzero: true),
+            rotationGeneration: try uint32(values[3], nonzero: true),
+            newSPKISHA256: try bytes(values[4], count: 32),
+            hostSignature: try bytes(values[5], count: 64)
+        )
+    }
+
+    public static func certificateRotationTranscript(
+        rotation: LSPCertificateRotation,
+        hostIdentityKey: Data,
+        currentSPKISHA256: Data
+    ) throws -> Data {
+        try fixed(hostIdentityKey, count: 32)
+        try fixed(currentSPKISHA256, count: 32)
+        guard rotation.newSPKISHA256 != currentSPKISHA256 else {
+            throw DeterministicCBORError.malformed
+        }
+        return try encodeMap([
+            .text("lumen-stream/1 certificate rotate"),
+            .unsigned(1),
+            .bytes(uuidBytes(rotation.hostID)),
+            .bytes(hostIdentityKey),
+            .bytes(currentSPKISHA256),
+            .bytes(rotation.newSPKISHA256),
+            .unsigned(UInt64(rotation.connectionGeneration)),
+            .unsigned(UInt64(rotation.rotationGeneration)),
+        ])
+    }
+
+    public static func certificateRotationAck(
+        status: LSPControlStatus,
+        rotation: LSPCertificateRotation
+    ) throws -> Data {
+        guard status == .success else { throw DeterministicCBORError.malformed }
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(UInt64(status.rawValue)),
+            .bytes(uuidBytes(rotation.hostID)),
+            .unsigned(UInt64(rotation.connectionGeneration)),
+            .unsigned(UInt64(rotation.rotationGeneration)),
+        ])
+    }
+
     public static func listApplications() throws -> Data {
         try encodeMap([.unsigned(1)])
     }
@@ -758,6 +935,28 @@ public enum LSPControlWire {
             let name = try text(fields[1], maximum: 256, allowEmpty: false)
             let imagePath = try text(fields[2], maximum: 512, allowEmpty: true)
             return LSPApplication(id: id, name: name, imagePath: imagePath)
+        }
+    }
+
+    public static func quitApplication(sessionID: UUID, applicationID: String) throws -> Data {
+        guard !applicationID.isEmpty, applicationID.utf8.count <= 128 else {
+            throw DeterministicCBORError.malformed
+        }
+        return try encodeMap([
+            .unsigned(1),
+            .bytes(uuidBytes(sessionID)),
+            .text(applicationID),
+        ])
+    }
+
+    public static func requireQuitApplicationResponse(
+        _ event: LSPControlEvent,
+        sessionID: UUID
+    ) throws {
+        let values = try responseValues(event, type: .quitApplicationResponse, count: 3)
+        try requireSuccess(values[1])
+        guard try uuid(try bytes(values[2], count: 16)) == sessionID else {
+            throw DeterministicCBORError.malformed
         }
     }
 
@@ -842,7 +1041,10 @@ public enum LSPControlWire {
         }
         return try encodeMap([
             .unsigned(1),
-            .text(request.applicationID),
+            .map([
+                .init(key: 1, value: .text(request.applicationID)),
+                .init(key: 2, value: .boolean(request.resume)),
+            ]),
             .unsigned(UInt64(request.pointerRate)),
             .unsigned(UInt64(request.controllerRate)),
             .unsigned(UInt64(request.sensorRate)),
@@ -1012,7 +1214,7 @@ public enum LSPControlWire {
         let selection = try videoSelection(value: values[3], streamGeneration: streamGeneration)
         let codecConfiguration = try videoCodecConfiguration(
             value: values[4],
-            expectedCodec: selection.nativeConfiguration.codec
+            selection: selection.nativeConfiguration
         )
         var native = selection.nativeConfiguration
         native.frameIDOrigin = try uint(values[5])
@@ -1047,16 +1249,217 @@ public enum LSPControlWire {
         ])
     }
 
+    public static func textInput(_ request: LSPTextInputRequest) throws -> Data {
+        guard request.inputGeneration != 0,
+              request.utf8Length > 0,
+              request.utf8Length <= 16_384 else {
+            throw DeterministicCBORError.malformed
+        }
+        let inline: DeterministicCBORValue
+        let objectID: DeterministicCBORValue
+        let digest: DeterministicCBORValue
+        if let bytes = request.inlineUTF8 {
+            guard bytes.count == Int(request.utf8Length),
+                  bytes.count <= 768,
+                  request.objectID == nil,
+                  request.sha256 == nil,
+                  String(data: bytes, encoding: .utf8) != nil else {
+                throw DeterministicCBORError.malformed
+            }
+            inline = .bytes(bytes)
+            objectID = .null
+            digest = .null
+        } else {
+            guard let identifier = request.objectID,
+                  let sha256 = request.sha256,
+                  sha256.count == 32,
+                  sha256.contains(where: { $0 != 0 }) else {
+                throw DeterministicCBORError.malformed
+            }
+            inline = .null
+            objectID = .bytes(uuidBytes(identifier))
+            digest = .bytes(sha256)
+        }
+        return try encodeMap([
+            .unsigned(1),
+            .bytes(uuidBytes(request.sessionID)),
+            .unsigned(UInt64(request.inputGeneration)),
+            .unsigned(request.precedingEdgeID),
+            .unsigned(UInt64(request.utf8Length)),
+            inline,
+            objectID,
+            digest,
+        ])
+    }
+
+    public static func requireTextInputResponse(
+        _ event: LSPControlEvent,
+        request: LSPTextInputRequest
+    ) throws {
+        let values = try responseValues(event, type: .textInputResponse, count: 5)
+        try requireSuccess(values[1])
+        guard try uuid(try bytes(values[2], count: 16)) == request.sessionID,
+              try uint32(values[3], nonzero: true) == request.inputGeneration,
+              try uint(values[4]) == request.precedingEdgeID else {
+            throw DeterministicCBORError.malformed
+        }
+    }
+
+    public static func inputRateRequest(_ offer: LSPInputRateOffer) throws -> Data {
+        try validateInputRateOffer(offer)
+        return try encodeMap([
+            .unsigned(1),
+            .bytes(uuidBytes(offer.sessionID)),
+            .unsigned(UInt64(offer.inputGeneration)),
+            .unsigned(UInt64(offer.deviceType.rawValue)),
+            .unsigned(UInt64(offer.deviceID)),
+            .unsigned(UInt64(offer.instanceGeneration)),
+            .unsigned(UInt64(offer.observedCaptureRate)),
+            .unsigned(UInt64(offer.minimumStateRate)),
+            .unsigned(UInt64(offer.maximumStateRate)),
+            .unsigned(UInt64(offer.minimumSensorRate)),
+            .unsigned(UInt64(offer.maximumSensorRate)),
+            .unsigned(UInt64(offer.maximumStatePacketBytes)),
+            .unsigned(UInt64(offer.maximumSensorPacketBytes)),
+        ])
+    }
+
+    public static func inputRateResponse(
+        from event: LSPControlEvent,
+        offer: LSPInputRateOffer
+    ) throws -> LSPInputRateSelection {
+        let values = try responseValues(event, type: .inputRateResponse, count: 14)
+        try requireSuccess(values[1])
+        guard try uuid(try bytes(values[2], count: 16)) == offer.sessionID,
+              try uint32(values[3], nonzero: true) == offer.inputGeneration,
+              try uint8(values[4], nonzero: true) == offer.deviceType.rawValue,
+              try uint32(values[5], nonzero: true) == offer.deviceID,
+              try uint32(values[6], nonzero: true) == offer.instanceGeneration else {
+            throw DeterministicCBORError.malformed
+        }
+        let stateRate = try uint32(values[7], nonzero: false)
+        let sensorRate = try uint32(values[8], nonzero: false)
+        let pointerRate = try uint32(values[9], nonzero: true)
+        let controllerRate = try uint32(values[10], nonzero: true)
+        let aggregateSensorRate = try uint32(values[11], nonzero: true)
+        let reconciliationRate = try uint32(values[12], nonzero: true)
+        let reservedInputWireBitsPerSecond = try uint(values[13])
+        guard (offer.kind == .removed && stateRate == 0 && sensorRate == 0) ||
+              (stateRate >= offer.minimumStateRate &&
+               stateRate <= offer.maximumStateRate &&
+               sensorRate >= offer.minimumSensorRate &&
+               sensorRate <= offer.maximumSensorRate),
+              (125...16_000).contains(pointerRate),
+              (125...2_000).contains(controllerRate),
+              (125...4_000).contains(aggregateSensorRate),
+              (50...1_000).contains(reconciliationRate),
+              (1...32_000_000).contains(reservedInputWireBitsPerSecond) else {
+            throw DeterministicCBORError.malformed
+        }
+        return .init(
+            sessionID: offer.sessionID,
+            inputGeneration: offer.inputGeneration,
+            kind: offer.kind,
+            deviceType: offer.deviceType,
+            deviceID: offer.deviceID,
+            instanceGeneration: offer.instanceGeneration,
+            stateRate: stateRate,
+            sensorRate: sensorRate,
+            pointerRate: pointerRate,
+            controllerRate: controllerRate,
+            aggregateSensorRate: aggregateSensorRate,
+            reconciliationRate: reconciliationRate,
+            reservedInputWireBitsPerSecond: reservedInputWireBitsPerSecond
+        )
+    }
+
+    public static func objectChunk(_ chunk: LSPObjectChunk) throws -> Data {
+        guard chunk.totalLength > 0,
+              chunk.totalLength <= 16 * 1_024 * 1_024,
+              !chunk.bytes.isEmpty,
+              chunk.bytes.count <= 768,
+              UInt64(chunk.offset) + UInt64(chunk.bytes.count) <= UInt64(chunk.totalLength),
+              chunk.sha256.count == 32,
+              chunk.sha256.contains(where: { $0 != 0 }) else {
+            throw DeterministicCBORError.malformed
+        }
+        return try encodeMap([
+            .unsigned(1),
+            .bytes(uuidBytes(chunk.objectID)),
+            .unsigned(UInt64(chunk.offset)),
+            .unsigned(UInt64(chunk.totalLength)),
+            .bytes(chunk.bytes),
+            .bytes(chunk.sha256),
+        ])
+    }
+
+    public static func objectChunk(from event: LSPControlEvent) throws -> LSPObjectChunk {
+        guard event.messageType == LSPControlMessageType.objectChunk.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 6)
+        guard try uint(values[0]) == 1,
+              case .bytes(let chunkBytes) = values[4] else {
+            throw DeterministicCBORError.malformed
+        }
+        let chunk = LSPObjectChunk(
+            objectID: try uuid(try bytes(values[1], count: 16)),
+            offset: try uint32(values[2], nonzero: false),
+            totalLength: try uint32(values[3], nonzero: true),
+            bytes: chunkBytes,
+            sha256: try bytes(values[5], count: 32)
+        )
+        _ = try objectChunk(chunk)
+        return chunk
+    }
+
+    public static func objectChunkAcknowledgement(
+        status: LSPControlStatus,
+        objectID: UUID,
+        nextOffset: UInt32,
+        totalLength: UInt32
+    ) throws -> Data {
+        guard status == .success, totalLength > 0, nextOffset <= totalLength else {
+            throw DeterministicCBORError.malformed
+        }
+        return try encodeMap([
+            .unsigned(1),
+            .unsigned(UInt64(status.rawValue)),
+            .bytes(uuidBytes(objectID)),
+            .unsigned(UInt64(nextOffset)),
+            .unsigned(UInt64(totalLength)),
+        ])
+    }
+
+    public static func objectChunkAcknowledgement(
+        from event: LSPControlEvent,
+        chunk: LSPObjectChunk
+    ) throws -> LSPObjectChunkAcknowledgement {
+        let values = try responseValues(event, type: .objectChunk, count: 5)
+        try requireSuccess(values[1])
+        let identifier = try uuid(try bytes(values[2], count: 16))
+        let nextOffset = try uint32(values[3], nonzero: false)
+        let totalLength = try uint32(values[4], nonzero: true)
+        guard identifier == chunk.objectID,
+              totalLength == chunk.totalLength,
+              nextOffset == chunk.offset + UInt32(chunk.bytes.count) else {
+            throw DeterministicCBORError.malformed
+        }
+        return .init(objectID: identifier, nextOffset: nextOffset, totalLength: totalLength)
+    }
+
     public static func streamEnded(from event: LSPControlEvent) throws -> LSPStreamEnded {
         guard event.messageType == LSPControlMessageType.streamEnded.rawValue,
               !event.flags.contains(.response), event.requestID == 0 else {
             throw DeterministicCBORError.malformed
         }
-        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 3)
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 4)
         guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
         return .init(
             sessionID: try uuid(try bytes(values[1], count: 16)),
-            reason: try uint8(values[2], nonzero: false)
+            streamGeneration: try uint32(values[2], nonzero: true),
+            reason: try uint8(values[3], nonzero: false)
         )
     }
 
@@ -1368,11 +1771,11 @@ public enum LSPControlWire {
 
     private static func videoCodecConfiguration(
         value: DeterministicCBORValue,
-        expectedCodec: UInt8
+        selection: LSPNativeVideoConfiguration
     ) throws -> LSPVideoCodecConfiguration {
         let values = try DeterministicCBOR.exactMap(value, count: 2)
         guard let codec = LSPVideoCodec(rawValue: try uint8(values[0], nonzero: true)),
-              codec.rawValue == expectedCodec,
+              codec.rawValue == selection.codec,
               case .array(let encodedUnits) = values[1]
         else { throw DeterministicCBORError.malformed }
         let expectedCount = switch codec {
@@ -1392,10 +1795,21 @@ public enum LSPControlWire {
             guard units.map({ $0[0] & 0x1f }) == [7, 8], units.allSatisfy(isPrefixFreeNAL) else {
                 throw DeterministicCBORError.malformed
             }
+            guard try h264SPSMatchesSelection(units[0], selection: selection) else {
+                throw DeterministicCBORError.malformed
+            }
         case .hevc:
             guard units.allSatisfy({ $0.count >= 2 }),
                   units.map({ ($0[0] >> 1) & 0x3f }) == [32, 33, 34],
                   units.allSatisfy(isPrefixFreeNAL) else {
+                throw DeterministicCBORError.malformed
+            }
+            let vpsProfile = try hevcVPSProfile(units[0])
+            guard try hevcSPSMatchesSelection(
+                units[1],
+                selection: selection,
+                expectedVPSProfile: vpsProfile
+            ) else {
                 throw DeterministicCBORError.malformed
             }
         case .av1:
@@ -1520,6 +1934,351 @@ public enum LSPControlWire {
         return Set(ssrcs).count == ssrcs.count && Set(payloadTypes).count == payloadTypes.count
     }
 
+    private struct VideoParameterSetFacts {
+        var profile: UInt8
+        var chromaFormat: UInt8
+        var bitDepth: UInt8
+        var colorPrimaries: UInt8
+        var transferCharacteristics: UInt8
+        var matrixCoefficients: UInt8
+        var fullRange: Bool
+    }
+
+    private struct BitReader {
+        var bytes: [UInt8]
+        var bitOffset = 0
+
+        mutating func bits(_ count: Int) throws -> UInt64 {
+            guard count >= 0, count <= 64, bitOffset + count <= bytes.count * 8 else {
+                throw DeterministicCBORError.malformed
+            }
+            var value: UInt64 = 0
+            for _ in 0..<count {
+                let byte = bytes[bitOffset / 8]
+                let shift = 7 - (bitOffset % 8)
+                value = (value << 1) | UInt64((byte >> shift) & 1)
+                bitOffset += 1
+            }
+            return value
+        }
+
+        mutating func flag() throws -> Bool { try bits(1) != 0 }
+
+        mutating func unsignedExpGolomb() throws -> UInt32 {
+            var leadingZeroes = 0
+            while try bits(1) == 0 {
+                leadingZeroes += 1
+                guard leadingZeroes <= 31 else { throw DeterministicCBORError.malformed }
+            }
+            let suffix = leadingZeroes == 0 ? 0 : try bits(leadingZeroes)
+            return UInt32((UInt64(1) << leadingZeroes) - 1 + suffix)
+        }
+
+        mutating func signedExpGolomb() throws -> Int32 {
+            let code = try unsignedExpGolomb()
+            let magnitude = Int32((code + 1) / 2)
+            return code.isMultiple(of: 2) ? -magnitude : magnitude
+        }
+    }
+
+    private static func rbsp(_ nal: Data, headerBytes: Int) throws -> [UInt8] {
+        guard nal.count > headerBytes else { throw DeterministicCBORError.malformed }
+        let source = Array(nal.dropFirst(headerBytes))
+        var result: [UInt8] = []
+        result.reserveCapacity(source.count)
+        var zeroCount = 0
+        for byte in source {
+            if zeroCount >= 2 && byte == 0x03 {
+                zeroCount = 0
+                continue
+            }
+            result.append(byte)
+            zeroCount = byte == 0 ? zeroCount + 1 : 0
+        }
+        return result
+    }
+
+    private static func h264SPSMatchesSelection(
+        _ sps: Data,
+        selection: LSPNativeVideoConfiguration
+    ) throws -> Bool {
+        var reader = BitReader(bytes: try rbsp(sps, headerBytes: 1))
+        let profileIDC = UInt8(try reader.bits(8))
+        _ = try reader.bits(8)
+        _ = try reader.bits(8)
+        _ = try reader.unsignedExpGolomb()
+        var chromaFormat: UInt8 = 1
+        var bitDepth: UInt8 = 8
+        if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].contains(profileIDC) {
+            chromaFormat = UInt8(try reader.unsignedExpGolomb())
+            guard chromaFormat <= 3 else { return false }
+            if chromaFormat == 3 { _ = try reader.flag() }
+            let lumaMinus8 = try reader.unsignedExpGolomb()
+            let chromaMinus8 = try reader.unsignedExpGolomb()
+            guard lumaMinus8 == chromaMinus8, lumaMinus8 <= 8 else { return false }
+            bitDepth = UInt8(8 + lumaMinus8)
+            _ = try reader.flag()
+            if try reader.flag() {
+                let count = chromaFormat == 3 ? 12 : 8
+                for index in 0..<count where try reader.flag() {
+                    try skipH264ScalingList(&reader, size: index < 6 ? 16 : 64)
+                }
+            }
+        }
+        _ = try reader.unsignedExpGolomb()
+        let pictureOrderCountType = try reader.unsignedExpGolomb()
+        if pictureOrderCountType == 0 {
+            _ = try reader.unsignedExpGolomb()
+        } else if pictureOrderCountType == 1 {
+            _ = try reader.flag()
+            _ = try reader.signedExpGolomb()
+            _ = try reader.signedExpGolomb()
+            let count = try reader.unsignedExpGolomb()
+            guard count <= 255 else { return false }
+            for _ in 0..<count { _ = try reader.signedExpGolomb() }
+        } else if pictureOrderCountType > 2 {
+            return false
+        }
+        _ = try reader.unsignedExpGolomb()
+        _ = try reader.flag()
+        _ = try reader.unsignedExpGolomb()
+        _ = try reader.unsignedExpGolomb()
+        let frameOnly = try reader.flag()
+        if !frameOnly { _ = try reader.flag() }
+        _ = try reader.flag()
+        if try reader.flag() {
+            for _ in 0..<4 { _ = try reader.unsignedExpGolomb() }
+        }
+        guard try reader.flag() else { return false }
+        let color = try parseVUIVideoSignal(&reader)
+        let expectedProfile: UInt8 = selection.profile == LSPVideoProfile.h264High.rawValue ? 100 : 244
+        return profileIDC == expectedProfile &&
+            chromaFormat == (selection.pixelFormat == LSPVideoPixelFormat.yuv4448Bit.rawValue ? 3 : 1) &&
+            bitDepth == 8 && colorMatches(color, selection: selection)
+    }
+
+    private static func skipH264ScalingList(_ reader: inout BitReader, size: Int) throws {
+        var lastScale: Int32 = 8
+        var nextScale: Int32 = 8
+        for _ in 0..<size {
+            if nextScale != 0 {
+                nextScale = (lastScale + (try reader.signedExpGolomb()) + 256) % 256
+            }
+            if nextScale != 0 { lastScale = nextScale }
+        }
+    }
+
+    private static func hevcSPSMatchesSelection(
+        _ sps: Data,
+        selection: LSPNativeVideoConfiguration,
+        expectedVPSProfile: UInt8
+    ) throws -> Bool {
+        var reader = BitReader(bytes: try rbsp(sps, headerBytes: 2))
+        _ = try reader.bits(4)
+        let maximumSubLayersMinus1 = Int(try reader.bits(3))
+        guard maximumSubLayersMinus1 <= 6 else { return false }
+        _ = try reader.flag()
+        let profileIDC = try parseHEVCProfileTierLevel(&reader, maximumSubLayersMinus1: maximumSubLayersMinus1)
+        _ = try reader.unsignedExpGolomb()
+        let chromaFormat = UInt8(try reader.unsignedExpGolomb())
+        guard chromaFormat <= 3 else { return false }
+        if chromaFormat == 3 { _ = try reader.flag() }
+        _ = try reader.unsignedExpGolomb()
+        _ = try reader.unsignedExpGolomb()
+        if try reader.flag() {
+            for _ in 0..<4 { _ = try reader.unsignedExpGolomb() }
+        }
+        let lumaMinus8 = try reader.unsignedExpGolomb()
+        let chromaMinus8 = try reader.unsignedExpGolomb()
+        guard lumaMinus8 == chromaMinus8, lumaMinus8 <= 8 else { return false }
+        let bitDepth = UInt8(8 + lumaMinus8)
+        let log2MaxPictureOrderCountMinus4 = Int(try reader.unsignedExpGolomb())
+        guard log2MaxPictureOrderCountMinus4 <= 12 else { return false }
+        let orderingInfoPresent = try reader.flag()
+        let firstLayer = orderingInfoPresent ? 0 : maximumSubLayersMinus1
+        for _ in firstLayer...maximumSubLayersMinus1 {
+            _ = try reader.unsignedExpGolomb()
+            _ = try reader.unsignedExpGolomb()
+            _ = try reader.unsignedExpGolomb()
+        }
+        for _ in 0..<6 { _ = try reader.unsignedExpGolomb() }
+        if try reader.flag(), try reader.flag() {
+            try skipHEVCScalingList(&reader)
+        }
+        _ = try reader.flag()
+        _ = try reader.flag()
+        if try reader.flag() {
+            _ = try reader.bits(4)
+            _ = try reader.bits(4)
+            _ = try reader.unsignedExpGolomb()
+            _ = try reader.unsignedExpGolomb()
+            _ = try reader.flag()
+        }
+        let shortTermSets = Int(try reader.unsignedExpGolomb())
+        guard shortTermSets <= 64 else { return false }
+        var deltaCounts: [Int] = []
+        for index in 0..<shortTermSets {
+            try parseHEVCShortTermReferenceSet(&reader, index: index, deltaCounts: &deltaCounts)
+        }
+        if try reader.flag() {
+            let longTermCount = Int(try reader.unsignedExpGolomb())
+            guard longTermCount <= 32 else { return false }
+            for _ in 0..<longTermCount {
+                _ = try reader.bits(log2MaxPictureOrderCountMinus4 + 4)
+                _ = try reader.flag()
+            }
+        }
+        _ = try reader.flag()
+        _ = try reader.flag()
+        guard try reader.flag() else { return false }
+        let color = try parseVUIVideoSignal(&reader)
+        let expectedProfile: UInt8 = switch LSPVideoProfile(rawValue: selection.profile) {
+        case .hevcMain: 1
+        case .hevcMain10: 2
+        case .hevcRangeExtensions: 4
+        default: 0
+        }
+        let expectedChroma: UInt8 = [
+            LSPVideoPixelFormat.yuv4448Bit.rawValue,
+            LSPVideoPixelFormat.yuv44410Bit.rawValue,
+        ].contains(selection.pixelFormat) ? 3 : 1
+        let expectedDepth: UInt8 = [
+            LSPVideoPixelFormat.yuv42010Bit.rawValue,
+            LSPVideoPixelFormat.yuv44410Bit.rawValue,
+        ].contains(selection.pixelFormat) ? 10 : 8
+        return profileIDC == expectedVPSProfile && profileIDC == expectedProfile &&
+            chromaFormat == expectedChroma &&
+            bitDepth == expectedDepth && colorMatches(color, selection: selection)
+    }
+
+    private static func hevcVPSProfile(_ vps: Data) throws -> UInt8 {
+        var reader = BitReader(bytes: try rbsp(vps, headerBytes: 2))
+        _ = try reader.bits(4)
+        _ = try reader.flag()
+        _ = try reader.flag()
+        _ = try reader.bits(6)
+        let maximumSubLayersMinus1 = Int(try reader.bits(3))
+        guard maximumSubLayersMinus1 <= 6 else { throw DeterministicCBORError.malformed }
+        _ = try reader.flag()
+        guard try reader.bits(16) == 0xffff else { throw DeterministicCBORError.malformed }
+        return try parseHEVCProfileTierLevel(
+            &reader,
+            maximumSubLayersMinus1: maximumSubLayersMinus1
+        )
+    }
+
+    private static func parseHEVCProfileTierLevel(
+        _ reader: inout BitReader,
+        maximumSubLayersMinus1: Int
+    ) throws -> UInt8 {
+        _ = try reader.bits(2)
+        _ = try reader.flag()
+        let profileIDC = UInt8(try reader.bits(5))
+        _ = try reader.bits(32)
+        _ = try reader.bits(4)
+        _ = try reader.bits(44)
+        _ = try reader.bits(8)
+        var profilePresent: [Bool] = []
+        var levelPresent: [Bool] = []
+        for _ in 0..<maximumSubLayersMinus1 {
+            profilePresent.append(try reader.flag())
+            levelPresent.append(try reader.flag())
+        }
+        if maximumSubLayersMinus1 > 0 {
+            for _ in maximumSubLayersMinus1..<8 { _ = try reader.bits(2) }
+        }
+        for index in 0..<maximumSubLayersMinus1 {
+            if profilePresent[index] {
+                _ = try reader.bits(2 + 1 + 5 + 32 + 4 + 44)
+            }
+            if levelPresent[index] { _ = try reader.bits(8) }
+        }
+        return profileIDC
+    }
+
+    private static func parseHEVCShortTermReferenceSet(
+        _ reader: inout BitReader,
+        index: Int,
+        deltaCounts: inout [Int]
+    ) throws {
+        let predicted: Bool
+        if index == 0 {
+            predicted = false
+        } else {
+            predicted = try reader.flag()
+        }
+        if predicted {
+            _ = try reader.flag()
+            _ = try reader.unsignedExpGolomb()
+            let referenceCount = deltaCounts[index - 1]
+            var count = 0
+            for _ in 0...referenceCount {
+                let used = try reader.flag()
+                let useDelta = used ? false : try reader.flag()
+                if used || useDelta { count += 1 }
+            }
+            deltaCounts.append(count)
+        } else {
+            let negative = Int(try reader.unsignedExpGolomb())
+            let positive = Int(try reader.unsignedExpGolomb())
+            guard negative + positive <= 64 else { throw DeterministicCBORError.malformed }
+            for _ in 0..<(negative + positive) {
+                _ = try reader.unsignedExpGolomb()
+                _ = try reader.flag()
+            }
+            deltaCounts.append(negative + positive)
+        }
+    }
+
+    private static func skipHEVCScalingList(_ reader: inout BitReader) throws {
+        for sizeID in 0..<4 {
+            let matrixStep = sizeID == 3 ? 3 : 1
+            for _ in stride(from: 0, to: 6, by: matrixStep) {
+                if try reader.flag() {
+                    if sizeID > 1 { _ = try reader.signedExpGolomb() }
+                    let coefficientCount = min(64, 1 << (4 + (sizeID * 2)))
+                    for _ in 0..<coefficientCount { _ = try reader.signedExpGolomb() }
+                } else {
+                    _ = try reader.unsignedExpGolomb()
+                }
+            }
+        }
+    }
+
+    private static func parseVUIVideoSignal(_ reader: inout BitReader) throws -> VideoParameterSetFacts {
+        if try reader.flag() {
+            let aspectRatioIDC = try reader.bits(8)
+            if aspectRatioIDC == 255 {
+                _ = try reader.bits(16)
+                _ = try reader.bits(16)
+            }
+        }
+        if try reader.flag() { _ = try reader.flag() }
+        guard try reader.flag() else { throw DeterministicCBORError.malformed }
+        _ = try reader.bits(3)
+        let fullRange = try reader.flag()
+        guard try reader.flag() else { throw DeterministicCBORError.malformed }
+        return .init(
+            profile: 0,
+            chromaFormat: 0,
+            bitDepth: 0,
+            colorPrimaries: UInt8(try reader.bits(8)),
+            transferCharacteristics: UInt8(try reader.bits(8)),
+            matrixCoefficients: UInt8(try reader.bits(8)),
+            fullRange: fullRange
+        )
+    }
+
+    private static func colorMatches(
+        _ facts: VideoParameterSetFacts,
+        selection: LSPNativeVideoConfiguration
+    ) -> Bool {
+        facts.colorPrimaries == selection.colorPrimaries &&
+            facts.transferCharacteristics == selection.transferCharacteristics &&
+            facts.matrixCoefficients == selection.matrixCoefficients &&
+            facts.fullRange == selection.fullRange
+    }
+
     private static func isPrefixFreeNAL(_ bytes: Data) -> Bool {
         !(bytes.count >= 3 && bytes[0] == 0 && bytes[1] == 0 &&
           (bytes[2] == 1 || (bytes.count >= 4 && bytes[2] == 0 && bytes[3] == 1)))
@@ -1586,6 +2345,14 @@ public enum LSPControlWire {
         return UInt8(integer)
     }
 
+    private static func uint16(_ value: DeterministicCBORValue, nonzero: Bool) throws -> UInt16 {
+        let integer = try uint(value)
+        guard integer <= UInt16.max, !nonzero || integer != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        return UInt16(integer)
+    }
+
     private static func boolean(_ value: DeterministicCBORValue) throws -> Bool {
         guard case .boolean(let decoded) = value else { throw DeterministicCBORError.malformed }
         return decoded
@@ -1621,6 +2388,50 @@ public enum LSPControlWire {
     private static func knownPermissions(_ permissions: LSPPermission) throws {
         guard permissions.subtracting(.allKnown).isEmpty else {
             throw DeterministicCBORError.malformed
+        }
+    }
+
+    private static func validateInputRateOffer(_ offer: LSPInputRateOffer) throws {
+        guard offer.inputGeneration != 0,
+              offer.instanceGeneration != 0,
+              offer.deviceID != 0,
+              offer.observedCaptureRate <= 100_000 else {
+            throw DeterministicCBORError.malformed
+        }
+        if offer.kind == .removed {
+            guard offer.minimumStateRate == 0, offer.maximumStateRate == 0,
+                  offer.minimumSensorRate == 0, offer.maximumSensorRate == 0,
+                  offer.maximumStatePacketBytes == 0, offer.maximumSensorPacketBytes == 0 else {
+                throw DeterministicCBORError.malformed
+            }
+            return
+        }
+        guard
+              offer.minimumStateRate <= offer.maximumStateRate,
+              offer.minimumSensorRate <= offer.maximumSensorRate,
+              (1...1_200).contains(offer.maximumStatePacketBytes) else {
+            throw DeterministicCBORError.malformed
+        }
+        let stateRange: ClosedRange<UInt32> = switch offer.deviceType {
+        case .pointer: 125...16_000
+        case .controller: 125...2_000
+        case .sensor: 125...4_000
+        case .reconciliation: 50...1_000
+        }
+        guard stateRange.contains(offer.minimumStateRate),
+              stateRange.contains(offer.maximumStateRate) else {
+            throw DeterministicCBORError.malformed
+        }
+        if offer.minimumSensorRate == 0 && offer.maximumSensorRate == 0 {
+            guard offer.maximumSensorPacketBytes == 0 else {
+                throw DeterministicCBORError.malformed
+            }
+        } else {
+            guard (125...4_000).contains(offer.minimumSensorRate),
+                  (125...4_000).contains(offer.maximumSensorRate),
+                  (1...1_200).contains(offer.maximumSensorPacketBytes) else {
+                throw DeterministicCBORError.malformed
+            }
         }
     }
 

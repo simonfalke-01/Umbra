@@ -32,6 +32,15 @@ status](Docs/FEATURE_PARITY.md).
 - Xcode 16 or later; current development uses Xcode 26
 - Homebrew `pkg-config`, `openssl@3`, and `opus` for debug builds
 
+LSP uses the pinned static wolfSSL 5.9.2 and libSRTP 2.8.0 wolfCrypt profile,
+not Homebrew's libSRTP package. Bootstrap and select that validated prefix
+before a debug build that needs LSP:
+
+```sh
+lsp_prefix="$(Scripts/bootstrap-lsp-deps.sh)"
+UMBRA_LSP_DEPS_PREFIX="$lsp_prefix" env -u CC -u CXX swift build
+```
+
 ## Build and test
 
 ```sh
@@ -39,8 +48,8 @@ env -u CC -u CXX swift build
 env -u CC -u CXX swift test
 ```
 
-Create a self-contained arm64 release bundle with pinned static OpenSSL and
-Opus builds:
+Create a self-contained arm64 release bundle with pinned static OpenSSL,
+Opus, wolfSSL, and libSRTP builds:
 
 ```sh
 Scripts/package-app.sh
@@ -55,4 +64,5 @@ measurements.
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+GPL-3.0. See [LICENSE](LICENSE), [NOTICE.md](NOTICE.md), and
+[third-party notices](THIRD_PARTY_NOTICES.md).

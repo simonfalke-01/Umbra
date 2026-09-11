@@ -213,6 +213,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var activeLSPHostID: UUID?
     private var plannedLSPRekeyTask: Task<Void, Never>?
     private var lspTelemetryTask: Task<Void, Never>?
+    private var lspDeviceOfferTask: Task<Void, Never>?
     private var latestLSPTelemetry: LSPTelemetrySnapshot?
     private var latestLSPReconnectTelemetry: LSPReconnectSnapshot?
     private var lspReconnectTasks: [UUID: Task<Void, Error>] = [:]
@@ -227,8 +228,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lastLegacyHosts: [HostDisplayModel] = []
     private var lastLSPHosts: [HostDisplayModel] = []
     private var discoveredLSPHosts: [UUID: HostDisplayModel] = [:]
+    private var identityChangedLSPHostIDs: Set<UUID> = []
     private var latestLSPDiscoveryTokens: [String: UInt64] = [:]
+    private var lspDiscoveryHostIDsByServiceID: [String: UUID] = [:]
     private var lspApplicationIDs: [HostID: [Int: String]] = [:]
+    private var lspApplicationArtworkReferences: [HostID: [Int: String]] = [:]
 
     init(
         service: UmbraApplicationService,
@@ -318,7 +322,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
         let initial = try await service.startMonitoring()
         let hosts = initial.isEmpty ? initial : try await service.refreshHosts()
         lastLegacyHosts = hosts.map(displayHost)
-        try await refreshPersistedLSPHosts()
+        do {
+            try await refreshPersistedLSPHosts()
+        } catch {
+            lastLSPHosts = []
+            eventHandler?(.sessionWarning(
+                "LSP host storage is unavailable; legacy GameStream discovery remains active."
+            ))
+        }
         return combinedHosts()
     }
 
@@ -331,16 +342,32 @@ final class LiveUmbraClientService: UmbraClientServicing {
         guard let nativeHostID = lspHostID(hostID) else {
             return .init(
                 pin: String(format: "%04d", Int.random(in: 0...9_999)),
-                provisionalSPKIFingerprint: nil
+                provisionalSPKIFingerprint: nil,
+                requestedPermissions: [],
+                effectivePermissions: []
             )
         }
         guard let lspProduct else {
             throw UmbraClientServiceError.unavailable("Native LSP pairing is unavailable in this build.")
         }
-        let prompt = try await lspProduct.beginPairing(hostID: nativeHostID)
+        var permissions: LSPPermission = [
+            .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput,
+        ]
+        if preferences.settings.lspPairMicrophonePermission || preferences.settings.clientMicrophoneEnabled {
+            permissions.insert(.microphone)
+        }
+        if preferences.settings.lspPairQuitPermission {
+            permissions.insert(.quitApplication)
+        }
+        let prompt = try await lspProduct.beginPairing(
+            hostID: nativeHostID,
+            requestedPermissions: permissions
+        )
         return .init(
             pin: prompt.pin,
-            provisionalSPKIFingerprint: prompt.host.provisionalSPKIFingerprint
+            provisionalSPKIFingerprint: prompt.host.provisionalSPKIFingerprint,
+            requestedPermissions: Self.permissionNames(prompt.requestedPermissions),
+            effectivePermissions: Self.permissionNames(prompt.effectivePermissions)
         )
     }
 
@@ -350,7 +377,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 throw UmbraClientServiceError.unavailable("Native LSP pairing is unavailable in this build.")
             }
             let host = try await lspProduct.completePairing(hostID: nativeHostID)
-            let display = displayLSPHost(host, paired: true, online: true)
+            let display = displayLSPHost(
+                host,
+                paired: true,
+                online: true,
+                trust: try await lspProduct.trust(hostID: nativeHostID)
+            )
+            identityChangedLSPHostIDs.remove(nativeHostID)
+            discoveredLSPHosts.removeValue(forKey: nativeHostID)
             upsertLSPHost(display)
             eventHandler?(.hosts(combinedHosts()))
             return display
@@ -382,6 +416,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
             lastLSPHosts.removeAll { $0.id == id }
             discoveredLSPHosts.removeValue(forKey: hostID)
             lspApplicationIDs.removeValue(forKey: id)
+            lspApplicationArtworkReferences.removeValue(forKey: id)
+            artworkLoadingTasks[id.rawValue]?.cancel()
+            artworkLoadingTasks[id.rawValue] = nil
+            artworkLoadingIDs[id.rawValue] = nil
+            await artworkCache.removeHost(id.rawValue)
             eventHandler?(.hosts(combinedHosts()))
             return
         }
@@ -416,8 +455,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     func applications(for id: HostID, includeHidden: Bool) async throws -> [ApplicationDisplayModel] {
         if let hostID = lspHostID(id), let lspProduct {
+            try await configureLSPTransport(lspProduct)
             let applications = try await lspProduct.applications(hostID: hostID)
+            let runningApplicationID = try? await lspProduct.activeApplicationID(hostID: hostID)
             var wireIDs: [Int: String] = [:]
+            var artworkReferences: [Int: String] = [:]
             var display: [ApplicationDisplayModel] = []
             display.reserveCapacity(applications.count)
             for application in applications {
@@ -426,17 +468,38 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     candidate = candidate == Int.max ? 1 : candidate + 1
                 }
                 wireIDs[candidate] = application.id
+                if LSPObjectReference.decode(application.imagePath) != nil {
+                    artworkReferences[candidate] = application.imagePath
+                }
                 display.append(ApplicationDisplayModel(
                     id: ApplicationID(candidate),
                     hostID: id,
                     name: application.name,
                     artworkURL: nil,
-                    isRunning: false,
+                    isRunning: application.id == runningApplicationID,
                     isHidden: false,
                     isDirectLaunch: false
                 ))
             }
             lspApplicationIDs[id] = wireIDs
+            lspApplicationArtworkReferences[id] = artworkReferences
+            if !artworkReferences.isEmpty {
+                let immutableArtworkReferences = artworkReferences
+                startArtworkLoading(
+                    hostID: id,
+                    applicationIDs: display.map { $0.id.rawValue },
+                    displayApplications: display,
+                    loader: { [lspProduct] displayID in
+                        guard let reference = immutableArtworkReferences[displayID] else {
+                            throw UmbraClientServiceError.invalidInput("Missing LSP artwork reference.")
+                        }
+                        return try await lspProduct.applicationObject(
+                            hostID: hostID,
+                            reference: reference
+                        )
+                    }
+                )
+            }
             return display
         }
         let catalog = try await applicationsPreservingLastCatalog(
@@ -499,6 +562,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                   let frameRate = preferenceResolver(preferences.settings).preferences.normalizedFrameRate
             else { throw UmbraClientServiceError.unavailable("Native LSP requires Metal and a valid refresh rate.") }
             let resolved = preferenceResolver(preferences.settings).preferences
+            try await configureLSPTransport(lspProduct, preferences: resolved)
             guard let streamWindow else {
                 throw UmbraClientServiceError.unavailable("Native LSP hardware video is unavailable.")
             }
@@ -508,7 +572,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
             let session = try await lspProduct.startInput(
                 hostID: nativeHostID,
                 applicationID: applicationID,
-                pointerRate: 1_000,
+                resume: resume,
+                pointerRate: UInt32(resolved.lspPointerRate),
+                controllerRate: UInt32(resolved.lspControllerRate),
+                sensorRate: UInt32(resolved.lspSensorRate),
+                reconciliationRate: UInt32(resolved.lspReconciliationRate),
                 microphoneOffer: microphoneOffer,
                 capabilities: lspMediaCapabilities,
                 preferences: resolved,
@@ -520,11 +588,26 @@ final class LiveUmbraClientService: UmbraClientServicing {
             do {
                 try lspInputCapture.transfer(to: session)
             } catch {
-                await lspProduct.stop(hostID: nativeHostID)
+                _ = await lspProduct.stop(hostID: nativeHostID)
                 throw error
             }
             started = true
             activeLSPHostID = nativeHostID
+            markLSPHostSession(hostID: nativeHostID, runningApplicationID: id)
+            streamWindow.onTextCommit = { [weak self] text in
+                Task { @MainActor [weak self] in
+                    guard let self, self.activeLSPHostID == nativeHostID else { return }
+                    do {
+                        try await self.lspInputCapture.performTextCommit {
+                            try await lspProduct.sendText(hostID: nativeHostID, text: text)
+                        }
+                    } catch {
+                        self.eventHandler?(.sessionWarning(
+                            "LSP text input failed: \(error.localizedDescription)"
+                        ))
+                    }
+                }
+            }
             installLSPReconnectHandler(session: session, hostID: nativeHostID)
             scheduleLSPMaintenance(session: session, hostID: nativeHostID)
             return
@@ -588,13 +671,34 @@ final class LiveUmbraClientService: UmbraClientServicing {
         plannedLSPRekeyTask = nil
         lspTelemetryTask?.cancel()
         lspTelemetryTask = nil
+        lspDeviceOfferTask?.cancel()
+        lspDeviceOfferTask = nil
         lspInputCapture.stop()
+        streamWindow?.onTextCommit = nil
         if let hostID = activeLSPHostID {
-            await lspProduct?.stop(hostID: hostID)
+            let stopResult = await lspProduct?.stop(hostID: hostID) ?? .notRunning
             activeLSPHostID = nil
+            markLSPHostSession(hostID: hostID, runningApplicationID: nil)
             await streamWindow?.finish()
+            switch stopResult {
+            case .notRunning, .stopped:
+                break
+            case .remoteRejected(let status):
+                eventHandler?(.sessionWarning("Lumen rejected remote STOP (status \(status.rawValue)); local teardown completed."))
+            case .transportFailed(let error):
+                eventHandler?(.sessionWarning("Remote STOP could not be confirmed: \(error.localizedDescription). Local teardown completed."))
+            }
+            return
         }
         _ = try? await service.stopSession(quitHostApplication: false)
+    }
+
+    func stopFromStreamWindow(quitHostApplication: Bool) async {
+        if activeLSPHostID != nil {
+            await disconnectSession()
+        } else {
+            _ = try? await service.stopSession(quitHostApplication: quitHostApplication)
+        }
     }
 
     /// Executes the product reconnect/rekey boundary without legacy fallback.
@@ -680,8 +784,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 guard await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
                 self.plannedLSPRekeyTask?.cancel()
                 self.lspTelemetryTask?.cancel()
+                self.lspDeviceOfferTask?.cancel()
                 self.lspInputCapture.stop()
                 self.activeLSPHostID = nil
+                self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
+                self.streamWindow?.onTextCommit = nil
                 await self.streamWindow?.finish()
                 switch termination {
                 case .streamEnded:
@@ -702,8 +809,17 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     try await self.reconnectLSPInput(hostID: hostID, reason: .transportLoss)
                     self.eventHandler?(.sessionWarning("Native LSP input reconnected with fresh security keys."))
                 } catch {
+                    self.plannedLSPRekeyTask?.cancel()
+                    self.lspTelemetryTask?.cancel()
+                    self.lspDeviceOfferTask?.cancel()
                     self.lspInputCapture.stop()
+                    self.activeLSPHostID = nil
+                    self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
+                    self.streamWindow?.onTextCommit = nil
+                    await self.lspProduct?.failSession(hostID: hostID)
+                    await self.streamWindow?.finish()
                     self.eventHandler?(.sessionWarning("Native LSP reconnect failed: \(error.localizedDescription)"))
+                    self.onSessionTerminated?(false)
                 }
             }
         }
@@ -712,6 +828,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private func scheduleLSPMaintenance(session: LSPClientSession, hostID: UUID) {
         plannedLSPRekeyTask?.cancel()
         lspTelemetryTask?.cancel()
+        lspDeviceOfferTask?.cancel()
         plannedLSPRekeyTask = Task { @MainActor [weak self, session] in
             do {
                 try await Task.sleep(for: .seconds(30 * 60))
@@ -730,9 +847,57 @@ final class LiveUmbraClientService: UmbraClientServicing {
                       await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
                 self.latestLSPTelemetry = try? await session.telemetrySnapshot()
                 self.latestLSPReconnectTelemetry = await self.lspProduct?.reconnectTelemetry(hostID: hostID)
+                if let telemetry = self.latestLSPTelemetry {
+                    let devices = await self.lspProduct?.deviceRateTelemetry(hostID: hostID) ?? []
+                    let productTelemetry = await self.lspProduct?.productTelemetry(hostID: hostID)
+                    let nativeTiming = try? await self.lspProduct?.nativeTimingTelemetry(hostID: hostID)
+                    self.streamWindow?.updateLSPStatistics(
+                        telemetry,
+                        reconnect: self.latestLSPReconnectTelemetry,
+                        devices: devices,
+                        product: productTelemetry,
+                        nativeTiming: nativeTiming ?? nil
+                    )
+                }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+        lspDeviceOfferTask = Task { @MainActor [weak self, session] in
+            while !Task.isCancelled {
+                guard let self,
+                      await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
+                do {
+                    try await self.lspProduct?.drainDeviceOffers(hostID: hostID)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    self.eventHandler?(.sessionWarning(
+                        "LSP device rate negotiation failed and will retry: \(error.localizedDescription)"
+                    ))
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    private func configureLSPTransport(
+        _ product: LSPProductClient,
+        preferences explicitPreferences: StreamingPreferences? = nil
+    ) async throws {
+        let settings = explicitPreferences ?? preferenceResolver(preferences.settings).preferences
+        let profile: LSPTransportProfile
+        switch settings.lspNetworkProfile {
+        case .adaptiveLowLatency:
+            profile = .adaptiveLowLatency
+        case .competitionLAN:
+            guard let capacity = UInt32(exactly: settings.lspCompetitionCapacityMbps), capacity > 0 else {
+                throw UmbraClientServiceError.invalidInput(
+                    "Competition LSP requires an explicit positive capacity ceiling."
+                )
+            }
+            profile = .competitionLAN(capacityMbps: capacity)
+        }
+        try await product.configureTransport(.init(profile: profile))
     }
 
     private func lspMicrophoneOffer() async throws -> LSPMicrophoneOffer? {
@@ -765,8 +930,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws {
-        if lspHostID(hostID) != nil {
-            throw UmbraClientServiceError.unavailable("LSP application quit is not implemented by the current control slice.")
+        if let nativeHostID = lspHostID(hostID) {
+            guard let applicationID = lspApplicationIDs[hostID]?[id.rawValue], let lspProduct else {
+                throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
+            }
+            try await lspProduct.quitApplication(hostID: nativeHostID, applicationID: applicationID)
+            return
         }
         _ = try await service.cancelHostApplication(
             hostID: hostID.rawValue,
@@ -816,12 +985,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
         paired: Bool,
         online: Bool,
         provisionalSPKIFingerprint: String? = nil,
-        nameIsUnverified: Bool = false
+        nameIsUnverified: Bool = false,
+        trust: LSPTrustRecord? = nil,
+        identityChanged: Bool = false
     ) -> HostDisplayModel {
         var details = [
             "Protocol: Lumen Streaming Protocol",
             "Address: \(host.address):\(host.port)",
-            "Trust: \(paired ? "Paired" : "PIN pairing required")",
+            "Trust: \(identityChanged ? "Identity changed — re-pair required" : (paired ? "Paired" : "PIN pairing required"))",
         ]
         if nameIsUnverified {
             details.append("Discovery name (unverified): \(host.name)")
@@ -835,11 +1006,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
         if let interfaceName = host.interfaceName {
             details.append("Network interface: \(interfaceName)")
         }
+        if let trust {
+            details.append("Effective permissions: \(Self.permissionNames(trust.permissions).joined(separator: ", "))")
+        }
         return HostDisplayModel(
             id: HostID("lsp:\(host.hostID.uuidString.lowercased())"),
             name: host.name,
-            status: online ? .online : .unknown,
-            isPaired: paired,
+            status: online && !identityChanged ? .online : .unknown,
+            isPaired: paired && !identityChanged,
             hasActiveSession: false,
             canWake: false,
             isServerSupported: true,
@@ -1082,6 +1256,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
             (HostID("lsp:\($0.key.uuidString.lowercased())"), $0.value)
         })
         for host in lastLSPHosts {
+            if let hostID = lspHostID(host.id), identityChangedLSPHostIDs.contains(hostID) {
+                continue
+            }
             nativeByID[host.id] = host
         }
         return lastLegacyHosts + nativeByID.values
@@ -1092,9 +1269,16 @@ final class LiveUmbraClientService: UmbraClientServicing {
             lastLSPHosts = []
             return
         }
-        lastLSPHosts = try await lspProduct.hosts().map {
-            displayLSPHost($0, paired: true, online: true)
+        var persisted: [HostDisplayModel] = []
+        for host in try await lspProduct.hosts() {
+            persisted.append(displayLSPHost(
+                host,
+                paired: true,
+                online: false,
+                trust: try await lspProduct.trust(hostID: host.hostID)
+            ))
         }
+        lastLSPHosts = persisted
     }
 
     private func upsertLSPHost(_ host: HostDisplayModel) {
@@ -1102,16 +1286,86 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lastLSPHosts.append(host)
     }
 
+    private func markLSPHostSession(
+        hostID: UUID,
+        runningApplicationID: ApplicationID?
+    ) {
+        let displayID = HostID("lsp:\(hostID.uuidString.lowercased())")
+        if let index = lastLSPHosts.firstIndex(where: { $0.id == displayID }) {
+            lastLSPHosts[index].hasActiveSession = runningApplicationID != nil
+            lastLSPHosts[index].runningApplicationID = runningApplicationID
+        }
+        if var discovered = discoveredLSPHosts[hostID] {
+            discovered.hasActiveSession = runningApplicationID != nil
+            discovered.runningApplicationID = runningApplicationID
+            discoveredLSPHosts[hostID] = discovered
+        }
+        eventHandler?(.hosts(combinedHosts()))
+    }
+
     private func handleLSPDiscovery(_ event: DiscoveryEvent) async {
         switch event {
         case .added(let service), .updated(_, let service):
             latestLSPDiscoveryTokens[service.id] = service.changeToken
-            guard let resolved = try? await lspDiscovery.resolveEndpoint(for: service),
+            guard let serviceWithTXT = await LSPBonjourTXTResolver().resolve(service),
+                  let resolved = try? await lspDiscovery.resolveEndpoint(for: serviceWithTXT),
                   latestLSPDiscoveryTokens[service.id] == service.changeToken,
                   let candidate = LSPDiscovery.pairingHost(
-                    from: service,
+                    from: serviceWithTXT,
                     resolvedEndpoint: resolved
                   ) else { return }
+            lspDiscoveryHostIDsByServiceID[service.id] = candidate.hostID
+            if let lspProduct {
+                let refresh: LSPPairedDiscoveryRefresh
+                do {
+                    refresh = try await lspProduct.refreshPairedDiscovery(candidate)
+                } catch {
+                    eventHandler?(.sessionWarning(
+                        "Couldn’t securely refresh discovered LSP host state: \(error.localizedDescription)"
+                    ))
+                    return
+                }
+                _ = await lspProduct.registerDiscoveredPairingHost(candidate)
+                switch refresh {
+                case .matched(let host, let trust):
+                    identityChangedLSPHostIDs.remove(candidate.hostID)
+                    discoveredLSPHosts.removeValue(forKey: candidate.hostID)
+                    upsertLSPHost(displayLSPHost(
+                        host,
+                        paired: true,
+                        online: true,
+                        trust: trust
+                    ))
+                    eventHandler?(.hosts(combinedHosts()))
+                    return
+                case .identityChanged(let expected, let advertised):
+                    identityChangedLSPHostIDs.insert(candidate.hostID)
+                    let record = LSPHostRecord(
+                        hostID: candidate.hostID,
+                        name: candidate.name,
+                        address: candidate.host,
+                        port: candidate.port,
+                        lastSeen: Date(),
+                        discoveryDomain: candidate.domain,
+                        interfaceName: candidate.interfaceName
+                    )
+                    var display = displayLSPHost(
+                        record,
+                        paired: false,
+                        online: true,
+                        provisionalSPKIFingerprint: candidate.provisionalSPKIFingerprint,
+                        nameIsUnverified: true,
+                        identityChanged: true
+                    )
+                    display.details += "\nStored SPKI: \(Self.groupedFingerprint(expected))"
+                    display.details += "\nAdvertised SPKI: \(Self.groupedFingerprint(advertised))"
+                    discoveredLSPHosts[candidate.hostID] = display
+                    eventHandler?(.hosts(combinedHosts()))
+                    return
+                case .unpaired:
+                    break
+                }
+            }
             let displayedCandidate: LSPDiscoveredPairingHost
             if let lspProduct {
                 displayedCandidate = await lspProduct.registerDiscoveredPairingHost(candidate)
@@ -1137,7 +1391,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
             eventHandler?(.hosts(combinedHosts()))
         case .removed(let service):
             latestLSPDiscoveryTokens.removeValue(forKey: service.id)
-            if let encodedID = service.txtRecord["id"], let hostID = Self.uuid(fromLowercaseHex: encodedID) {
+            let hostID = lspDiscoveryHostIDsByServiceID.removeValue(forKey: service.id) ??
+                service.txtRecord["id"].flatMap(Self.uuid(fromLowercaseHex:))
+            if let hostID {
                 let canRemove: Bool
                 if let lspProduct {
                     canRemove = await lspProduct.unregisterDiscoveredPairingHost(
@@ -1150,6 +1406,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 if canRemove {
                     discoveredLSPHosts.removeValue(forKey: hostID)
                 }
+                identityChangedLSPHostIDs.remove(hostID)
+                await markPersistedLSPHostOffline(hostID)
                 eventHandler?(.hosts(combinedHosts()))
             }
         case .failed:
@@ -1183,6 +1441,19 @@ final class LiveUmbraClientService: UmbraClientServicing {
         eventHandler?(.hosts(combinedHosts()))
     }
 
+    private func markPersistedLSPHostOffline(_ hostID: UUID) async {
+        guard let lspProduct,
+              let host = try? await lspProduct.hosts().first(where: { $0.hostID == hostID }) else {
+            return
+        }
+        upsertLSPHost(displayLSPHost(
+            host,
+            paired: true,
+            online: false,
+            trust: try? await lspProduct.trust(hostID: hostID)
+        ))
+    }
+
     private func lspHostID(_ id: HostID) -> UUID? {
         guard id.rawValue.hasPrefix("lsp:") else { return nil }
         return UUID(uuidString: String(id.rawValue.dropFirst(4)))
@@ -1210,6 +1481,27 @@ final class LiveUmbraClientService: UmbraClientServicing {
             hash &*= 1_099_511_628_211
         }
         return max(1, Int(hash & UInt64(Int.max)))
+    }
+
+    private static func permissionNames(_ permissions: LSPPermission) -> [String] {
+        [
+            (LSPPermission.browseApplications, "Browse applications"),
+            (.startOrAttach, "Start or attach streams"),
+            (.input, "Keyboard, pointer, controller, and text input"),
+            (.microphone, "Microphone forwarding"),
+            (.stopOwnStream, "Stop own stream"),
+            (.quitApplication, "Quit hosted application"),
+            (.controllerOutput, "Controller rumble, lights, and haptics"),
+        ].compactMap { permissions.contains($0.0) ? $0.1 : nil }
+    }
+
+    private static func groupedFingerprint(_ bytes: Data) -> String {
+        let hex = bytes.map { String(format: "%02X", $0) }.joined()
+        return stride(from: 0, to: hex.count, by: 8).map { offset in
+            let start = hex.index(hex.startIndex, offsetBy: offset)
+            let end = hex.index(start, offsetBy: min(8, hex.count - offset))
+            return String(hex[start..<end])
+        }.joined(separator: " ")
     }
 }
 
@@ -1355,17 +1647,14 @@ final class LiveApplicationComposition {
             streamWindow: streamWindow,
             lspMediaCapabilities: mediaCapabilities
         )
-        streamWindow.onStopRequested = { [applicationService] quitHostApplication in
-            _ = try? await applicationService.stopSession(
-                quitHostApplication: quitHostApplication
-            )
+        streamWindow.onStopRequested = { [weak clientService] quitHostApplication in
+            await clientService?.stopFromStreamWindow(quitHostApplication: quitHostApplication)
         }
         Task { await compatibilityUpdater.refresh(applicationService) }
     }
 
     func stopForApplicationTermination() async {
         await clientService.disconnectSession()
-        _ = try? await applicationService.stopSession(quitHostApplication: false)
     }
 
     private static func makeSupportLog() -> SupportLog? {

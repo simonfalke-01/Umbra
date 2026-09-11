@@ -20,6 +20,9 @@ public final class LSPAudioPlayout: @unchecked Sendable {
     private var lastDecodedTimestamp: UInt32?
     private var latestTiming: LSPAudioTiming?
     private var frameDuration: TimeInterval = 0.010
+    private var receiveTimes: [UInt64: UInt64] = [:]
+    private var receiveToDecode = LSPFixedDurationWindow()
+    private var decodeAndRenderEnqueue = LSPFixedDurationWindow()
 
     /// Builds and starts the real decoder/renderer before native packet admission is ACKed.
     public func configure(_ configuration: LSPNativeAudioConfiguration) throws {
@@ -60,6 +63,7 @@ public final class LSPAudioPlayout: @unchecked Sendable {
             pendingPacket = nil
             expectedSequence = nil
             lastDecodedTimestamp = nil
+            receiveTimes.removeAll(keepingCapacity: true)
             self.frameDuration = frameDuration
         }
         old?.decoder.stop()
@@ -68,6 +72,7 @@ public final class LSPAudioPlayout: @unchecked Sendable {
 
     /// Queues one complete native-authenticated Opus packet for decode and AudioQueue playout.
     public func submit(_ packet: LSPAudioPacket) {
+        let receiveTime = Self.monotonicMicroseconds()
         decodeQueue.async { [weak self] in
             guard let self else { return }
             let decoder = lock.withLock { () -> OpusMultistreamDecoder? in
@@ -78,6 +83,11 @@ public final class LSPAudioPlayout: @unchecked Sendable {
                 return pipeline.decoder
             }
             guard let decoder else { return }
+            if self.receiveTimes.count >= 64 {
+                self.receiveTimes.removeAll(keepingCapacity: true)
+                self.lock.withLock { self.receiveToDecode.drop() }
+            }
+            self.receiveTimes[Self.packetKey(packet)] = receiveTime
             process(packet, decoder: decoder)
         }
     }
@@ -99,6 +109,7 @@ public final class LSPAudioPlayout: @unchecked Sendable {
             pendingPacket = nil
             expectedSequence = nil
             lastDecodedTimestamp = nil
+            receiveTimes.removeAll(keepingCapacity: true)
         }
         let old = lock.withLock { () -> Pipeline? in
             defer { pipeline = nil }
@@ -175,8 +186,48 @@ public final class LSPAudioPlayout: @unchecked Sendable {
     }
 
     private func decode(_ packet: LSPAudioPacket, with decoder: OpusMultistreamDecoder) {
+        let decodeStart = Self.monotonicMicroseconds()
+        let receiveTime = receiveTimes.removeValue(forKey: Self.packetKey(packet))
         decoder.submit(packet: CompressedAudioPacket(data: packet.opusPacket))
+        let renderEnqueue = Self.monotonicMicroseconds()
+        lock.withLock {
+            if let receiveTime, decodeStart >= receiveTime {
+                receiveToDecode.record(decodeStart - receiveTime)
+            } else {
+                receiveToDecode.drop()
+            }
+            if renderEnqueue >= decodeStart {
+                decodeAndRenderEnqueue.record(renderEnqueue - decodeStart)
+            } else {
+                decodeAndRenderEnqueue.drop()
+            }
+        }
         lastDecodedTimestamp = packet.timestamp
+    }
+
+    public func telemetrySnapshot() -> LSPProductTelemetrySnapshot {
+        lock.withLock {
+            .init(
+                completeFrameReceiveToVideoToolboxSubmit: nil,
+                videoToolboxSubmitToDecodeCompletion: nil,
+                completeFrameReceiveToMetalEnqueue: nil,
+                metalEnqueueToCommit: nil,
+                metalCommitToCompletion: nil,
+                audioReceiveToDecode: receiveToDecode.snapshot(),
+                audioDecodeAndRenderEnqueue: decodeAndRenderEnqueue.snapshot(),
+                audioUnderruns: nil,
+                audioRebuffers: nil,
+                reconnectDuration: nil
+            )
+        }
+    }
+
+    private static func packetKey(_ packet: LSPAudioPacket) -> UInt64 {
+        (UInt64(packet.audioGeneration) << 16) | UInt64(packet.sequenceNumber)
+    }
+
+    private static func monotonicMicroseconds() -> UInt64 {
+        max(1, UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000))
     }
 
     private func hold(_ packet: LSPAudioPacket, decoder: OpusMultistreamDecoder) {

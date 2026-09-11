@@ -8,6 +8,24 @@ import XCTest
 
 @MainActor
 final class LiveUmbraClientServiceTests: XCTestCase {
+    func testCorruptLSPHostStoreDoesNotBlockLegacyDiscovery() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("UmbraCorruptLSP-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stores = LSPPersistence.stores(in: directory)
+        try Data("not-json".utf8).write(to: await stores.hosts.fileURL)
+        let product = LSPProductClient(
+            trustStore: stores.trust,
+            hostStore: stores.hosts,
+            identityStore: stores.identity
+        )
+        let fixture = makeFixture(remoteApplications: [], lspProduct: product)
+
+        let hosts = try await fixture.client.discoverHosts()
+        XCTAssertEqual(hosts.map(\.id), [HostID(fixture.hostID)])
+    }
+
     func testReleasedHostIDMutationImmediatelyReplacesVisibleLSPRow() async throws {
         let fixture = makeFixture(remoteApplications: [])
         let originalID = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
@@ -650,7 +668,8 @@ final class LiveUmbraClientServiceTests: XCTestCase {
         remoteApplications: [GameStreamApp],
         failedArtworkIDs: Set<Int> = [],
         artworkDataByID: [Int: Data] = [:],
-        catalogRefreshFailure: CatalogRefreshFailure = .none
+        catalogRefreshFailure: CatalogRefreshFailure = .none,
+        lspProduct: LSPProductClient? = nil
     ) -> LiveServiceFixture {
         let hostID = "host-cache"
         let endpoint = NetworkEndpoint(hostname: "host.local")
@@ -690,7 +709,8 @@ final class LiveUmbraClientServiceTests: XCTestCase {
             preferences: PreferencesStore(defaults: defaults),
             securePorts: SecurePortRegistry(),
             artworkCache: artworkCache,
-            maximumConcurrentArtworkRequests: 4
+            maximumConcurrentArtworkRequests: 4,
+            lspProduct: lspProduct
         )
         return LiveServiceFixture(
             client: client,

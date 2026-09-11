@@ -168,6 +168,33 @@ final class CLIParserTests: XCTestCase {
         XCTAssertEqual(preferences.videoDecoderPreference, .hardware)
     }
 
+    func testStreamParsesExplicitLSPCompetitionAndHighInputRates() {
+        let parsed = parser.parse(arguments: [
+            "stream", "--protocol", "lsp", "--lsp-profile", "competition",
+            "--lsp-capacity-mbps", "2500",
+            "--lsp-pointer-rate", "16000",
+            "--lsp-controller-rate", "2000",
+            "--lsp-sensor-rate", "4000",
+            "--lsp-reconciliation-rate", "1000",
+            "host", "app",
+        ])
+        guard case let .ready(.stream(command), _) = parsed else {
+            return XCTFail("Expected an LSP-configured stream command")
+        }
+        XCTAssertEqual(command.preferences.lspNetworkProfile, .competitionLAN)
+        XCTAssertEqual(command.preferences.lspCompetitionCapacityMbps, 2_500)
+        XCTAssertEqual(command.preferences.lspPointerRate, 16_000)
+        XCTAssertEqual(command.preferences.lspControllerRate, 2_000)
+        XCTAssertEqual(command.preferences.lspSensorRate, 4_000)
+        XCTAssertEqual(command.preferences.lspReconciliationRate, 1_000)
+
+        assertUsageError(
+            parser.parse(arguments: ["stream", "--protocol", "lsp", "--lsp-profile", "competition", "host", "app"]),
+            message: "--lsp-profile competition requires --lsp-capacity-mbps",
+            topic: .stream
+        )
+    }
+
     func testResolutionPresetsAndLastOccurrenceWins() throws {
         let presets: [(String, Int, Int)] = [
             ("720", 1_280, 720),
@@ -360,6 +387,9 @@ final class CLIParserTests: XCTestCase {
           quit            Quit the currently running app
           stream          Start streaming an app
           pair            Pair a new host
+          attach          Reattach an existing LSP stream
+          stop            Stop an owned LSP stream
+          telemetry       Print an LSP telemetry snapshot
           recover-storage Preserve unreadable storage and reset Umbra on next launch
 
         Options:
@@ -408,6 +438,70 @@ final class CLIParserTests: XCTestCase {
             ),
             file: file,
             line: line
+        )
+    }
+}
+
+extension CLIParserTests {
+    func testLSPStreamRequiresExplicitProtocolAndCarriesNativeOptions() throws {
+        let hostID = UUID()
+        let result = parser.parse(arguments: [
+            "stream", "lumen", "Desktop", "--protocol", "lsp",
+            "--lsp-host-id", hostID.uuidString,
+            "--lsp-profile", "competition", "--lsp-capacity-mbps", "2500",
+            "--lsp-pointer-rate", "8000", "--lsp-controller-rate", "2000",
+            "--lsp-sensor-rate", "4000", "--lsp-reconciliation-rate", "1000",
+            "--lsp-microphone", "required", "--lsp-telemetry",
+        ])
+        guard case .ready(.stream(let command), []) = result else {
+            return XCTFail("Expected a validated LSP stream command")
+        }
+        XCTAssertEqual(command.streamingProtocol, .lsp)
+        XCTAssertEqual(command.lsp.hostID, hostID)
+        XCTAssertEqual(command.lsp.microphone, .required)
+        XCTAssertTrue(command.lsp.permissions.contains(.microphone))
+        XCTAssertTrue(command.lsp.emitTelemetry)
+        XCTAssertEqual(command.preferences.lspCompetitionCapacityMbps, 2_500)
+        XCTAssertEqual(command.preferences.lspPointerRate, 8_000)
+    }
+
+    func testLSPFlagCannotSilentlySelectOrDowngradeLegacy() {
+        let result = parser.parse(arguments: [
+            "stream", "lumen", "Desktop", "--lsp-pointer-rate", "8000",
+        ])
+        guard case .terminal(let terminal) = result else { return XCTFail("Expected usage failure") }
+        XCTAssertEqual(terminal.exitCode, CLIExitCode.failure.rawValue)
+        XCTAssertTrue(terminal.standardError.contains("Invalid protocol or LSP option"))
+    }
+
+    func testLSPPairingRejectsCommandLinePINButLegacyPairingKeepsFourDigits() {
+        guard case .terminal(let lsp) = parser.parse(arguments: [
+            "pair", "lumen", "--protocol", "lsp", "--pin", "123456",
+        ]) else { return XCTFail("Expected LSP PIN rejection") }
+        XCTAssertTrue(lsp.standardError.contains("generates a six-digit PIN"))
+
+        XCTAssertEqual(
+            parser.parse(arguments: ["pair", "sunshine", "--pin", "1234"]).command,
+            .pair(PairHostCommand(host: "sunshine", pin: "1234"))
+        )
+    }
+
+    func testAttachStopAndTelemetryAreExplicitLSPCommands() {
+        guard case .terminal(let missingProtocol) = parser.parse(arguments: ["attach", "lumen"]) else {
+            return XCTFail("Attach must require explicit LSP selection")
+        }
+        XCTAssertTrue(missingProtocol.standardError.contains("requires --protocol lsp"))
+        XCTAssertEqual(
+            parser.parse(arguments: ["attach", "lumen", "--protocol", "lsp"]).command,
+            .attach(AttachHostCommand(host: "lumen"))
+        )
+        XCTAssertEqual(
+            parser.parse(arguments: ["stop", "lumen", "--protocol", "lsp"]).command,
+            .stop(StopHostCommand(host: "lumen"))
+        )
+        XCTAssertEqual(
+            parser.parse(arguments: ["telemetry", "lumen", "--protocol", "lsp"]).command,
+            .telemetry(TelemetryHostCommand(host: "lumen"))
         )
     }
 }

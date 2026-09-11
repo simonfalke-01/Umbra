@@ -44,7 +44,11 @@ enum UmbraBootstrap {
                 standardOutput: writeStandardOutput,
                 standardError: writeStandardError
             )
-            let executor = UmbraCLICommandExecutor(service: service, output: output)
+            let executor = UmbraCLICommandExecutor(
+                service: service,
+                output: output,
+                lspService: try? LiveUmbraCLILSPService()
+            )
             let commandResult = parseResult
             let outcome = runAsyncAndWait { await executor.execute(commandResult) }
             switch outcome {

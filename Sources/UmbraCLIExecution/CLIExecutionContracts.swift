@@ -23,6 +23,105 @@ public protocol UmbraCLIExecutionServicing: Sendable {
 
 extension UmbraApplicationService: UmbraCLIExecutionServicing {}
 
+public struct CLILSPHost: Equatable, Sendable {
+    public var id: UUID
+    public var name: String
+    public var address: String
+    public var paired: Bool
+
+    public init(id: UUID, name: String, address: String, paired: Bool) {
+        self.id = id; self.name = name; self.address = address; self.paired = paired
+    }
+}
+
+public struct CLILSPApplication: Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public init(id: String, name: String) { self.id = id; self.name = name }
+}
+
+public struct CLILSPPairingPrompt: Equatable, Sendable {
+    public var host: CLILSPHost
+    public var pin: String
+    public var expiresAtUTCSeconds: UInt64
+    public init(host: CLILSPHost, pin: String, expiresAtUTCSeconds: UInt64) {
+        self.host = host; self.pin = pin; self.expiresAtUTCSeconds = expiresAtUTCSeconds
+    }
+}
+
+public struct CLILSPStartRequest: Equatable, Sendable {
+    public var hostID: UUID
+    public var applicationID: String
+    public var resume: Bool
+    public var preferences: StreamingPreferences
+    public var pointerRate: UInt32
+    public var controllerRate: UInt32
+    public var sensorRate: UInt32
+    public var reconciliationRate: UInt32
+    public var microphone: CLILSPMicrophoneMode
+
+    public init(
+        hostID: UUID, applicationID: String, resume: Bool,
+        preferences: StreamingPreferences, pointerRate: UInt32,
+        controllerRate: UInt32, sensorRate: UInt32,
+        reconciliationRate: UInt32, microphone: CLILSPMicrophoneMode
+    ) {
+        self.hostID = hostID; self.applicationID = applicationID; self.resume = resume
+        self.preferences = preferences; self.pointerRate = pointerRate
+        self.controllerRate = controllerRate; self.sensorRate = sensorRate
+        self.reconciliationRate = reconciliationRate; self.microphone = microphone
+    }
+}
+
+public enum CLILSPStopOutcome: Equatable, Sendable {
+    case notRunning
+    case stopped
+    case rejected(String)
+    case transportFailed(String)
+}
+
+public struct CLILSPTelemetry: Equatable, Sendable {
+    public var lifecycle: String
+    public var receivedDatagrams: UInt64
+    public var transmittedDatagrams: UInt64
+    public var droppedDatagrams: UInt64
+    public var authenticationFailures: UInt64
+    public var currentUDPPayloadSize: UInt16
+    public var reconnectPhase: String?
+
+    public init(
+        lifecycle: String, receivedDatagrams: UInt64, transmittedDatagrams: UInt64,
+        droppedDatagrams: UInt64, authenticationFailures: UInt64,
+        currentUDPPayloadSize: UInt16, reconnectPhase: String?
+    ) {
+        self.lifecycle = lifecycle; self.receivedDatagrams = receivedDatagrams
+        self.transmittedDatagrams = transmittedDatagrams; self.droppedDatagrams = droppedDatagrams
+        self.authenticationFailures = authenticationFailures
+        self.currentUDPPayloadSize = currentUDPPayloadSize; self.reconnectPhase = reconnectPhase
+    }
+}
+
+/// Narrow product seam required for real LSP CLI execution.
+///
+/// Implementations must use `LSPProductClient`; they must not redirect to
+/// GameStream when LSP discovery, authentication, or execution fails.
+public protocol UmbraCLILSPServicing: Sendable {
+    func resolveHost(query: String, exactHostID: UUID?) async throws -> CLILSPHost
+    func applications(hostID: UUID) async throws -> [CLILSPApplication]
+    func beginPairing(hostID: UUID, permissions: CLILSPPermissionSet) async throws -> CLILSPPairingPrompt
+    func completePairing(hostID: UUID) async throws -> CLILSPHost
+    func cancelPairing(hostID: UUID) async
+    func configure(profile: LSPNetworkProfilePreference, competitionCapacityMbps: Int) async throws
+    func start(_ request: CLILSPStartRequest) async throws
+    /// Retains session/process ownership until authenticated remote termination,
+    /// explicit STOP, transport failure, or task cancellation.
+    func runUntilTerminated(hostID: UUID) async -> CLILSPStopOutcome
+    func attach(hostID: UUID) async throws
+    func stop(hostID: UUID) async -> CLILSPStopOutcome
+    func quit(hostID: UUID) async throws
+    func telemetry(hostID: UUID) async throws -> CLILSPTelemetry
+}
+
 /// A semantic progress event suitable for a terminal, a progress view, or tests.
 public enum CLIExecutionProgress: Equatable, Sendable {
     case resolvingHost(String)
@@ -31,6 +130,9 @@ public enum CLIExecutionProgress: Equatable, Sendable {
     case pairingCompleted(String)
     case quittingApplication(host: String, application: String)
     case preparingStream(host: String, application: String)
+    case pairingLSP(host: String, pin: String)
+    case attachingLSP(String)
+    case stoppingLSP(String)
 }
 
 /// Receives progress without coupling the executor to a specific presentation surface.

@@ -1263,6 +1263,49 @@ private struct AdvancedSettingsView: View {
                 )
             }
 
+            SettingsSection("Lumen Streaming Protocol") {
+                SettingsRow(
+                    "Network profile",
+                    message: "Adaptive is safe on ordinary networks. Competition requires an explicit wired-link capacity ceiling."
+                ) {
+                    Picker("Network profile", selection: Binding(
+                        get: { preferences.settings.lspNetworkProfile },
+                        set: { profile in
+                            if profile == .competitionLAN,
+                               preferences.settings.lspCompetitionCapacityMbps == 0 {
+                                preferences.update(\.lspCompetitionCapacityMbps, to: 1_000)
+                            }
+                            preferences.update(\.lspNetworkProfile, to: profile)
+                        }
+                    )) {
+                        Text("Adaptive low latency").tag(LSPNetworkProfilePreference.adaptiveLowLatency)
+                        Text("Competition LAN").tag(LSPNetworkProfilePreference.competitionLAN)
+                    }
+                    .frame(width: 220)
+                }
+                SettingsRow("Competition capacity") {
+                    Stepper(
+                        "\(preferences.settings.lspCompetitionCapacityMbps) Mbps",
+                        value: preferences.binding(for: \.lspCompetitionCapacityMbps),
+                        in: 1...100_000,
+                        step: 100
+                    )
+                    .frame(width: 220)
+                }
+                .disabled(preferences.settings.lspNetworkProfile != .competitionLAN)
+                LSPRateSettingsRows(preferences: preferences)
+                PreferenceToggle(
+                    "Request microphone permission when pairing",
+                    message: "Re-pair an existing host to change its granted permissions.",
+                    binding: preferences.binding(for: \.lspPairMicrophonePermission)
+                )
+                PreferenceToggle(
+                    "Request application quit permission when pairing",
+                    message: "Lets Umbra quit only the application owned by its authenticated LSP session.",
+                    binding: preferences.binding(for: \.lspPairQuitPermission)
+                )
+            }
+
             SettingsSection("Defaults") {
                 SettingsRow(
                     "Umbra settings",
@@ -1288,6 +1331,45 @@ private struct AdvancedSettingsView: View {
         }
     }
 
+}
+
+private struct LSPRateSettingsRows: View {
+    @ObservedObject var preferences: PreferencesStore
+
+    var body: some View {
+        SettingsRow("Pointer network rate") {
+            Stepper(
+                "\(preferences.settings.lspPointerRate) Hz",
+                value: preferences.binding(for: \.lspPointerRate),
+                in: 125...16_000,
+                step: 125
+            ).frame(width: 220)
+        }
+        SettingsRow("Controller state rate") {
+            Stepper(
+                "\(preferences.settings.lspControllerRate) Hz",
+                value: preferences.binding(for: \.lspControllerRate),
+                in: 125...2_000,
+                step: 125
+            ).frame(width: 220)
+        }
+        SettingsRow("Controller sensor rate") {
+            Stepper(
+                "\(preferences.settings.lspSensorRate) Hz",
+                value: preferences.binding(for: \.lspSensorRate),
+                in: 125...4_000,
+                step: 125
+            ).frame(width: 220)
+        }
+        SettingsRow("Input reconciliation rate") {
+            Stepper(
+                "\(preferences.settings.lspReconciliationRate) Hz",
+                value: preferences.binding(for: \.lspReconciliationRate),
+                in: 50...1_000,
+                step: 50
+            ).frame(width: 220)
+        }
+    }
 }
 
 struct PacketSizeField: View {

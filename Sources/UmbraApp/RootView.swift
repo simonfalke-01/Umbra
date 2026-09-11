@@ -78,7 +78,7 @@ struct RootView: View {
             }
         case let .details(id):
             if let host = store.host(id: id) {
-                HostDetailsSheet(host: host)
+                HostDetailsSheet(host: host, store: store)
             }
         case let .networkResult(result):
             NetworkResultSheet(result: result)

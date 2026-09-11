@@ -433,6 +433,186 @@ final class UmbraCLICommandExecutorTests: XCTestCase {
     }
 }
 
+extension UmbraCLICommandExecutorTests {
+    func testExplicitLSPWithoutAdapterFailsWithoutCallingLegacyService() async {
+        let legacy = FakeCLIService(hosts: [])
+        let executor = UmbraCLICommandExecutor(service: legacy)
+        let outcome = await executor.execute(.list(ListAppsCommand(
+            host: "lumen", streamingProtocol: .lsp
+        )))
+        guard case .terminate(let result) = outcome else { return XCTFail("Expected termination") }
+        XCTAssertEqual(result.exitCode, CLIExitCode.failure.rawValue)
+        XCTAssertTrue(result.standardError.contains("no legacy fallback was attempted"))
+        let calls = await legacy.recordedCalls()
+        XCTAssertEqual(calls, .init())
+    }
+
+    func testLSPPairDisplaysSixDigitProductPINAndCompletesPairing() async {
+        let host = CLILSPHost(id: UUID(), name: "Lumen", address: "lumen.local", paired: false)
+        let lsp = FakeLSPCLIService(host: host, applications: [])
+        let executor = UmbraCLICommandExecutor(
+            service: FakeCLIService(hosts: []),
+            lspService: lsp
+        )
+        let outcome = await executor.execute(.pair(PairHostCommand(
+            host: "Lumen",
+            streamingProtocol: .lsp,
+            lsp: .init(permissions: [.browseApplications, .input])
+        )))
+        guard case .terminate(let result) = outcome else { return XCTFail("Expected termination") }
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.standardOutput.contains("654321"))
+        let calls = await lsp.calls
+        XCTAssertEqual(calls.beginPermissions, [.browseApplications, .input])
+        XCTAssertEqual(calls.completedHostIDs, [host.id])
+    }
+
+    func testLSPStreamUsesNativeRatesProfileMicrophoneAndTelemetry() async {
+        let host = CLILSPHost(id: UUID(), name: "Lumen", address: "lumen.local", paired: true)
+        let lsp = FakeLSPCLIService(
+            host: host,
+            applications: [.init(id: "desktop", name: "Desktop")]
+        )
+        var preferences = StreamingPreferences.default
+        preferences.lspNetworkProfile = .competitionLAN
+        preferences.lspCompetitionCapacityMbps = 2_500
+        preferences.lspPointerRate = 8_000
+        let executor = UmbraCLICommandExecutor(service: FakeCLIService(hosts: []), lspService: lsp)
+        let outcome = await executor.execute(.stream(StreamAppCommand(
+            host: "Lumen",
+            applicationName: "Desktop",
+            preferences: preferences,
+            resume: true,
+            streamingProtocol: .lsp,
+            lsp: .init(microphone: .required, emitTelemetry: true)
+        )))
+        guard case .terminate(let result) = outcome else { return XCTFail("Expected termination") }
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.standardOutput.contains("LSP stream active"))
+        XCTAssertTrue(result.standardOutput.contains("LSP stream ended"))
+        XCTAssertTrue(result.standardOutput.contains("lsp.received_datagrams=11"))
+        let calls = await lsp.calls
+        XCTAssertEqual(calls.configuredProfile, .competitionLAN)
+        XCTAssertEqual(calls.configuredCapacity, 2_500)
+        XCTAssertEqual(calls.startRequests.first?.pointerRate, 8_000)
+        XCTAssertEqual(calls.startRequests.first?.microphone, .required)
+        XCTAssertEqual(calls.startRequests.first?.resume, true)
+        XCTAssertEqual(calls.runUntilTerminatedHostIDs, [host.id])
+    }
+
+    func testLSPStreamExecutorRemainsAliveUntilOwnerTerminates() async throws {
+        let host = CLILSPHost(id: UUID(), name: "Lumen", address: "lumen.local", paired: true)
+        let lsp = FakeLSPCLIService(
+            host: host,
+            applications: [.init(id: "desktop", name: "Desktop")],
+            blockRunUntilTerminated: true
+        )
+        let completed = LockedValue(false)
+        let executor = UmbraCLICommandExecutor(service: FakeCLIService(hosts: []), lspService: lsp)
+        let task = Task {
+            let result = await executor.execute(.stream(StreamAppCommand(
+                host: "Lumen",
+                applicationName: "Desktop",
+                preferences: .default,
+                streamingProtocol: .lsp
+            )))
+            completed.set(true)
+            return result
+        }
+        for _ in 0..<100 {
+            if !(await lsp.calls).runUntilTerminatedHostIDs.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertFalse(completed.value)
+        await lsp.finishRun(.stopped)
+        guard case .terminate(let result) = await task.value else { return XCTFail("Expected termination") }
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(completed.value)
+    }
+}
+
+private actor FakeLSPCLIService: UmbraCLILSPServicing {
+    struct Calls: Equatable, Sendable {
+        var beginPermissions: CLILSPPermissionSet?
+        var completedHostIDs: [UUID] = []
+        var configuredProfile: LSPNetworkProfilePreference?
+        var configuredCapacity: Int?
+        var startRequests: [CLILSPStartRequest] = []
+        var runUntilTerminatedHostIDs: [UUID] = []
+    }
+
+    let host: CLILSPHost
+    let applicationValues: [CLILSPApplication]
+    let blockRunUntilTerminated: Bool
+    var calls = Calls()
+    var runContinuation: CheckedContinuation<CLILSPStopOutcome, Never>?
+
+    init(
+        host: CLILSPHost,
+        applications: [CLILSPApplication],
+        blockRunUntilTerminated: Bool = false
+    ) {
+        self.host = host
+        applicationValues = applications
+        self.blockRunUntilTerminated = blockRunUntilTerminated
+    }
+
+    func resolveHost(query: String, exactHostID: UUID?) async throws -> CLILSPHost {
+        guard exactHostID == nil || exactHostID == host.id,
+              query.caseInsensitiveCompare(host.name) == .orderedSame || query == host.id.uuidString
+        else { throw UmbraServiceError.hostNotFound(query) }
+        return host
+    }
+    func applications(hostID: UUID) async throws -> [CLILSPApplication] { applicationValues }
+    func beginPairing(hostID: UUID, permissions: CLILSPPermissionSet) async throws -> CLILSPPairingPrompt {
+        calls.beginPermissions = permissions
+        return .init(host: host, pin: "654321", expiresAtUTCSeconds: UInt64.max)
+    }
+    func completePairing(hostID: UUID) async throws -> CLILSPHost {
+        calls.completedHostIDs.append(hostID)
+        return host
+    }
+    func cancelPairing(hostID: UUID) async {}
+    func configure(profile: LSPNetworkProfilePreference, competitionCapacityMbps: Int) async throws {
+        calls.configuredProfile = profile
+        calls.configuredCapacity = competitionCapacityMbps
+    }
+    func start(_ request: CLILSPStartRequest) async throws { calls.startRequests.append(request) }
+    func runUntilTerminated(hostID: UUID) async -> CLILSPStopOutcome {
+        calls.runUntilTerminatedHostIDs.append(hostID)
+        if blockRunUntilTerminated {
+            return await withCheckedContinuation { runContinuation = $0 }
+        }
+        return .stopped
+    }
+    func finishRun(_ outcome: CLILSPStopOutcome) {
+        let continuation = runContinuation
+        runContinuation = nil
+        continuation?.resume(returning: outcome)
+    }
+    func attach(hostID: UUID) async throws {}
+    func stop(hostID: UUID) async -> CLILSPStopOutcome {
+        finishRun(.stopped)
+        return .stopped
+    }
+    func quit(hostID: UUID) async throws {}
+    func telemetry(hostID: UUID) async throws -> CLILSPTelemetry {
+        .init(
+            lifecycle: "streaming", receivedDatagrams: 11, transmittedDatagrams: 12,
+            droppedDatagrams: 1, authenticationFailures: 0,
+            currentUDPPayloadSize: 1_200, reconnectPhase: nil
+        )
+    }
+}
+
+private final class LockedValue<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+    init(_ value: Value) { stored = value }
+    var value: Value { lock.withLock { stored } }
+    func set(_ value: Value) { lock.withLock { stored = value } }
+}
+
 private actor FakeCLIService: UmbraCLIExecutionServicing {
     struct ApplicationRequest: Equatable, Sendable {
         var hostID: String

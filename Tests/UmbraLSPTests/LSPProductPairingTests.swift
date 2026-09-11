@@ -141,17 +141,79 @@ final class LSPProductPairingTests: XCTestCase {
         XCTAssertEqual(committedHosts.records.first?.port, host.port)
     }
 
+    func testPairedDiscoveryRefreshRequiresStoredSPKIMatch() async throws {
+        let fixture = try PairingProductFixture()
+        defer { fixture.cleanup() }
+        let tracker = PairingOperationTracker(suspendBegin: false, suspendVerification: false)
+        let product = fixture.product(operations: operations(tracker: tracker))
+        let original = candidate(host: "old-target.local", port: 48_030, spkiByte: 0x33, token: 1)
+        let trust = LSPTrustRecord(
+            hostID: original.hostID,
+            hostIdentityKey: Data(repeating: 0x44, count: 32),
+            dtlsSPKISHA256: original.serverSPKISHA256,
+            permissions: [.browseApplications],
+            revocationGeneration: 1
+        )
+        let oldHost = LSPHostRecord(
+            hostID: original.hostID,
+            name: "Saved Name",
+            address: original.host,
+            port: original.port,
+            lastSeen: .distantPast
+        )
+        try await fixture.stores.trust.save(.init(records: [trust]))
+        try await fixture.stores.hosts.save(.init(records: [oldHost]))
+
+        var refreshed = original
+        refreshed.host = "new-target.local"
+        refreshed.port = 49_999
+        refreshed.discoveryChangeToken = 2
+        guard case .matched(let saved, _) = try await product.refreshPairedDiscovery(refreshed) else {
+            return XCTFail("Matching host ID and SPKI must refresh the endpoint")
+        }
+        XCTAssertEqual(saved.name, "Saved Name")
+        XCTAssertEqual(saved.address, "new-target.local")
+        XCTAssertEqual(saved.port, 49_999)
+
+        var changedIdentity = refreshed
+        var stagedTrust = trust
+        stagedTrust.pendingDTLSSPKISHA256 = Data(repeating: 0x77, count: 32)
+        stagedTrust.certificateRotationGeneration = 1
+        try await fixture.stores.trust.save(.init(records: [stagedTrust]))
+        var pendingCertificate = refreshed
+        pendingCertificate.serverSPKISHA256 = stagedTrust.pendingDTLSSPKISHA256!
+        guard case .matched = try await product.refreshPairedDiscovery(pendingCertificate) else {
+            return XCTFail("A durably staged pending SPKI must remain connectable without promotion")
+        }
+
+        changedIdentity.serverSPKISHA256 = Data(repeating: 0x99, count: 32)
+        guard case .identityChanged(let expected, let advertised) =
+            try await product.refreshPairedDiscovery(changedIdentity) else {
+            return XCTFail("A changed SPKI must not refresh paired state")
+        }
+        XCTAssertEqual(expected, original.serverSPKISHA256)
+        XCTAssertEqual(advertised, changedIdentity.serverSPKISHA256)
+        let persistedHosts = try await fixture.stores.hosts.load()
+        XCTAssertEqual(persistedHosts.records.first?.address, "new-target.local")
+    }
+
     private func operations(
         tracker: PairingOperationTracker,
         expiry: UInt64 = 4_000_000_000
     ) -> LSPProductPairingOperations {
         .init(
-            begin: { host in
+            begin: { host, requestedPermissions in
                 await tracker.begin(host)
                 let session = try LSPClientSession(identity: .generate())
                 return .init(
                     session: session,
-                    prompt: .init(host: host, pin: "004200", expiresAtUTCSeconds: expiry)
+                    prompt: .init(
+                        host: host,
+                        pin: "004200",
+                        expiresAtUTCSeconds: expiry,
+                        requestedPermissions: requestedPermissions,
+                        effectivePermissions: requestedPermissions
+                    )
                 )
             },
             verify: { start in

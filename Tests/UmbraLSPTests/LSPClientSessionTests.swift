@@ -68,6 +68,179 @@ final class LSPClientSessionTests: XCTestCase {
         XCTAssertThrowsError(try LSPControlWire.controlError(from: errorEvent, expectedType: .pairResult))
     }
 
+    func testRemainingControlSchemasAreExactAndGenerationBound() throws {
+        let sessionID = UUID()
+        let text = LSPTextInputRequest(
+            sessionID: sessionID,
+            inputGeneration: 7,
+            precedingEdgeID: 99,
+            utf8Length: 5,
+            inlineUTF8: Data("hello".utf8),
+            objectID: nil,
+            sha256: nil
+        )
+        XCTAssertEqual(
+            try DeterministicCBOR.exactMap(
+                DeterministicCBOR.decode(try LSPControlWire.textInput(text)),
+                count: 8
+            )[3],
+            .unsigned(99)
+        )
+        let offer = LSPInputRateOffer(
+            sessionID: sessionID,
+            inputGeneration: 7,
+            kind: .arrived,
+            deviceType: .pointer,
+            deviceID: 1,
+            instanceGeneration: 2,
+            observedCaptureRate: 8_000,
+            minimumStateRate: 1_000,
+            maximumStateRate: 16_000,
+            minimumSensorRate: 0,
+            maximumSensorRate: 0,
+            maximumStatePacketBytes: 128,
+            maximumSensorPacketBytes: 0
+        )
+        XCTAssertEqual(
+            try DeterministicCBOR.exactMap(
+                DeterministicCBOR.decode(try LSPControlWire.inputRateRequest(offer)),
+                count: 13
+            )[8],
+            .unsigned(16_000)
+        )
+        let rateResponsePayload = try DeterministicCBOR.encode(.map([
+            .init(key: 1, value: .unsigned(1)),
+            .init(key: 2, value: .unsigned(0)),
+            .init(key: 3, value: .bytes(LSPControlWire.uuidBytes(sessionID))),
+            .init(key: 4, value: .unsigned(7)),
+            .init(key: 5, value: .unsigned(1)),
+            .init(key: 6, value: .unsigned(1)),
+            .init(key: 7, value: .unsigned(2)),
+            .init(key: 8, value: .unsigned(8_000)),
+            .init(key: 9, value: .unsigned(0)),
+            .init(key: 10, value: .unsigned(8_000)),
+            .init(key: 11, value: .unsigned(500)),
+            .init(key: 12, value: .unsigned(1_000)),
+            .init(key: 13, value: .unsigned(250)),
+            .init(key: 14, value: .unsigned(32_000_000)),
+        ]))
+        let rateSelection = try LSPControlWire.inputRateResponse(
+            from: .init(
+                messageType: LSPControlMessageType.inputRateResponse.rawValue,
+                flags: [.response],
+                connectionGeneration: 1,
+                messageID: 2,
+                requestID: 2,
+                payload: rateResponsePayload
+            ),
+            offer: offer
+        )
+        XCTAssertEqual(rateSelection.pointerRate, 8_000)
+        XCTAssertEqual(rateSelection.reservedInputWireBitsPerSecond, 32_000_000)
+        var removal = offer
+        removal.kind = .removed
+        removal.observedCaptureRate = 0
+        removal.minimumStateRate = 0
+        removal.maximumStateRate = 0
+        removal.minimumSensorRate = 0
+        removal.maximumSensorRate = 0
+        removal.maximumStatePacketBytes = 0
+        removal.maximumSensorPacketBytes = 0
+        XCTAssertNoThrow(try LSPControlWire.inputRateRequest(removal))
+        let chunk = LSPObjectChunk(
+            objectID: UUID(),
+            offset: 0,
+            totalLength: 3,
+            bytes: Data([1, 2, 3]),
+            sha256: Data(repeating: 0x55, count: 32)
+        )
+        XCTAssertEqual(
+            try DeterministicCBOR.exactMap(
+                DeterministicCBOR.decode(try LSPControlWire.objectChunk(chunk)),
+                count: 6
+            )[4],
+            .bytes(Data([1, 2, 3]))
+        )
+        XCTAssertEqual(
+            try DeterministicCBOR.exactMap(
+                DeterministicCBOR.decode(try LSPControlWire.quitApplication(
+                    sessionID: sessionID,
+                    applicationID: "desktop"
+                )),
+                count: 3
+            )[2],
+            .text("desktop")
+        )
+    }
+
+    func testArtworkObjectReferenceRequiresCanonicalBoundsAndLowercaseDigest() throws {
+        let objectID = UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!
+        let digest = String(repeating: "ab", count: 32)
+        let reference = "lsp-object-v1:\(objectID.uuidString.lowercased()):4096:\(digest)"
+        let decoded = try XCTUnwrap(LSPObjectReference.decode(reference))
+        XCTAssertEqual(decoded.objectID, objectID)
+        XCTAssertEqual(decoded.length, 4_096)
+        XCTAssertEqual(decoded.sha256, Data(repeating: 0xab, count: 32))
+        XCTAssertNil(LSPObjectReference.decode(reference.uppercased()))
+        XCTAssertNil(LSPObjectReference.decode(
+            "lsp-object-v1:\(objectID.uuidString.lowercased()):16777217:\(digest)"
+        ))
+    }
+
+    func testCertificateRotationTranscriptBindsOldAndNewSPKIAndGenerations() throws {
+        let rotation = LSPCertificateRotation(
+            hostID: UUID(),
+            connectionGeneration: 9,
+            rotationGeneration: 4,
+            newSPKISHA256: Data(repeating: 0x44, count: 32),
+            hostSignature: Data(repeating: 0x55, count: 64)
+        )
+        let transcript = try DeterministicCBOR.exactMap(
+            DeterministicCBOR.decode(try LSPControlWire.certificateRotationTranscript(
+                rotation: rotation,
+                hostIdentityKey: Data(repeating: 0x11, count: 32),
+                currentSPKISHA256: Data(repeating: 0x22, count: 32)
+            )),
+            count: 8
+        )
+        XCTAssertEqual(transcript[0], .text("lumen-stream/1 certificate rotate"))
+        XCTAssertEqual(transcript[4], .bytes(Data(repeating: 0x22, count: 32)))
+        XCTAssertEqual(transcript[5], .bytes(Data(repeating: 0x44, count: 32)))
+        XCTAssertEqual(transcript[6], .unsigned(9))
+        XCTAssertEqual(transcript[7], .unsigned(4))
+        let acknowledgement = try DeterministicCBOR.exactMap(
+            DeterministicCBOR.decode(try LSPControlWire.certificateRotationAck(
+                status: .success,
+                rotation: rotation
+            )),
+            count: 5
+        )
+        XCTAssertEqual(acknowledgement[3], .unsigned(9))
+        XCTAssertEqual(acknowledgement[4], .unsigned(4))
+    }
+
+    func testAuthenticationRejectsRevocationRollbackAndSameGenerationPermissionChange() {
+        let trust = LSPTrustRecord(
+            hostID: UUID(),
+            hostIdentityKey: Data(repeating: 0x11, count: 32),
+            dtlsSPKISHA256: Data(repeating: 0x22, count: 32),
+            permissions: [.browseApplications, .input],
+            revocationGeneration: 5
+        )
+        func response(generation: UInt32, permissions: LSPPermission) -> LSPAuthenticationResponse {
+            .init(
+                permissions: permissions,
+                revocationGeneration: generation,
+                connectionGeneration: 1,
+                serverSignature: Data(repeating: 0x33, count: 64)
+            )
+        }
+        XCTAssertFalse(response(generation: 4, permissions: trust.permissions).isAllowedTransition(from: trust))
+        XCTAssertFalse(response(generation: 5, permissions: [.browseApplications]).isAllowedTransition(from: trust))
+        XCTAssertTrue(response(generation: 5, permissions: trust.permissions).isAllowedTransition(from: trust))
+        XCTAssertTrue(response(generation: 6, permissions: [.browseApplications]).isAllowedTransition(from: trust))
+    }
+
     func testPINPairingDiscoveryRequiresExactLowercaseIdentityAndSPKI() throws {
         let hostID = "00112233445566778899aabbccddeeff"
         let spki = String(repeating: "ab", count: 32)
@@ -182,6 +355,9 @@ final class LSPClientSessionTests: XCTestCase {
             DeterministicCBOR.decode(try LSPControlWire.start(request)),
             count: 16
         )
+        let intent = try DeterministicCBOR.exactMap(values[1], count: 2)
+        XCTAssertEqual(intent[0], .text("desktop"))
+        XCTAssertEqual(intent[1], .boolean(false))
         guard case .array(let offers) = values[7] else {
             return XCTFail("START audio offers must be an array")
         }
@@ -209,6 +385,21 @@ final class LSPClientSessionTests: XCTestCase {
         excessiveBudget.maximumCaptureToPresentMicroseconds = 50_000
         excessiveBudget.videoOffers = [undersizedBitrate]
         XCTAssertThrowsError(try LSPControlWire.start(excessiveBudget))
+    }
+
+    func testStartResumeIntentUsesExactNestedMapWithoutChangingOuterCardinality() throws {
+        let request = LSPInputStartRequest(
+            applicationID: "desktop",
+            resume: true,
+            audioOffers: LSPAudioOffer.adaptiveDefaults,
+            videoOffers: [Self.h264Offer]
+        )
+        let outer = try DeterministicCBOR.exactMap(
+            DeterministicCBOR.decode(try LSPControlWire.start(request)),
+            count: 16
+        )
+        let intent = try DeterministicCBOR.exactMap(outer[1], count: 2)
+        XCTAssertEqual(intent, [.text("desktop"), .boolean(true)])
     }
 
     func testStartEncodesExactRequiredMicrophoneOffer() throws {
@@ -302,7 +493,7 @@ final class LSPClientSessionTests: XCTestCase {
         )))
     }
 
-    func testVideoConfigV3ParsesExactRepairAndCodecMapsAndEncodesExactFiveKeyAck() throws {
+    func testVideoConfigRevisionThreeParsesExactRepairAndCodecMapsAndEncodesExactFiveKeyAck() throws {
         let sessionID = UUID()
         let selection = DeterministicCBORValue.map((1...30).map { key in
             let value: DeterministicCBORValue = switch key {
@@ -348,7 +539,15 @@ final class LSPClientSessionTests: XCTestCase {
             .init(key: 4, value: selection),
             .init(key: 5, value: .map([
                 .init(key: 1, value: .unsigned(1)),
-                .init(key: 2, value: .array([.bytes(Data([0x67])), .bytes(Data([0x68]))])),
+                .init(key: 2, value: .array([
+                    .bytes(Data([
+                        0x67, 0x64, 0x00, 0x2a, 0xac, 0xd9, 0x40, 0x78,
+                        0x02, 0x27, 0xe5, 0xc0, 0x5a, 0x80, 0x80, 0x80,
+                        0xa0, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00,
+                        0x0f, 0x01, 0xe3, 0x06, 0x32, 0xc0,
+                    ])),
+                    .bytes(Data([0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0])),
+                ])),
             ])),
             .init(key: 6, value: .unsigned(100)),
             .init(key: 7, value: .unsigned(1)),
@@ -432,6 +631,53 @@ final class LSPClientSessionTests: XCTestCase {
         )))
     }
 
+    func testHEVCMain10SPSMustMatchNegotiatedDepthChromaAndH273() throws {
+        let sessionID = UUID()
+        let units = [
+            "40010c01ffff02200000030090000003000003005a959809",
+            "42010102200000030090000003000003005aa005020169365959a4932bc05a808080820000030002000003007810",
+            "4401c172b46240",
+        ].map(Self.hexData)
+        let payload = try DeterministicCBOR.encode(.map([
+            .init(key: 1, value: .unsigned(3)),
+            .init(key: 2, value: .bytes(LSPControlWire.uuidBytes(sessionID))),
+            .init(key: 3, value: .unsigned(7)),
+            .init(key: 4, value: Self.videoSelection(
+                codec: 2, profile: 4, pixelFormat: 2,
+                primaries: 1, transfer: 1, matrix: 1
+            )),
+            .init(key: 5, value: .map([
+                .init(key: 1, value: .unsigned(2)),
+                .init(key: 2, value: .array(units.map(DeterministicCBORValue.bytes))),
+            ])),
+            .init(key: 6, value: .unsigned(100)),
+            .init(key: 7, value: .unsigned(1)),
+            .init(key: 8, value: .null),
+        ]))
+        let event = LSPControlEvent(
+            messageType: LSPControlMessageType.videoConfig.rawValue,
+            flags: [.acknowledgementRequired],
+            connectionGeneration: 1,
+            messageID: 1,
+            requestID: 2,
+            payload: payload
+        )
+        let request = try LSPControlWire.videoConfig(from: event)
+        XCTAssertEqual(request.nativeConfiguration.profile, LSPVideoProfile.hevcMain10.rawValue)
+        XCTAssertEqual(request.nativeConfiguration.pixelFormat, LSPVideoPixelFormat.yuv42010Bit.rawValue)
+
+        var mismatchedSelection = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(payload), count: 8)
+        mismatchedSelection[3] = Self.videoSelection(
+            codec: 2, profile: 3, pixelFormat: 1,
+            primaries: 1, transfer: 1, matrix: 1
+        )
+        var mismatched = event
+        mismatched.payload = try DeterministicCBOR.encode(.map(
+            mismatchedSelection.enumerated().map { .init(key: UInt64($0.offset + 1), value: $0.element) }
+        ))
+        XCTAssertThrowsError(try LSPControlWire.videoConfig(from: mismatched))
+    }
+
     func testPathProbeIntentAndAcknowledgementUseExactThreeKeySchemas() throws {
         let payload = try LSPControlWire.pathProbe(probeID: 77, udpPayloadSize: 1_400)
         let intent = try LSPControlWire.pathProbe(from: LSPControlEvent(
@@ -461,7 +707,8 @@ final class LSPClientSessionTests: XCTestCase {
         let payload = try DeterministicCBOR.encode(.map([
             .init(key: 1, value: .unsigned(1)),
             .init(key: 2, value: .bytes(LSPControlWire.uuidBytes(sessionID))),
-            .init(key: 3, value: .unsigned(2)),
+            .init(key: 3, value: .unsigned(7)),
+            .init(key: 4, value: .unsigned(2)),
         ]))
         let event = LSPControlEvent(
             messageType: LSPControlMessageType.streamEnded.rawValue,
@@ -471,7 +718,10 @@ final class LSPClientSessionTests: XCTestCase {
             requestID: 0,
             payload: payload
         )
-        XCTAssertEqual(try LSPControlWire.streamEnded(from: event), .init(sessionID: sessionID, reason: 2))
+        XCTAssertEqual(
+            try LSPControlWire.streamEnded(from: event),
+            .init(sessionID: sessionID, streamGeneration: 7, reason: 2)
+        )
         var invalid = event
         invalid.requestID = 1
         XCTAssertThrowsError(try LSPControlWire.streamEnded(from: invalid))
@@ -539,6 +789,17 @@ final class LSPClientSessionTests: XCTestCase {
             }
             return .init(key: UInt64(key), value: value)
         })
+    }
+
+    private static func hexData(_ value: String) -> Data {
+        var bytes = Data(capacity: value.count / 2)
+        var index = value.startIndex
+        while index < value.endIndex {
+            let end = value.index(index, offsetBy: 2)
+            bytes.append(UInt8(value[index..<end], radix: 16)!)
+            index = end
+        }
+        return bytes
     }
 }
 

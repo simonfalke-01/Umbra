@@ -384,6 +384,11 @@ public struct EffectiveStreamingPolicy: Equatable, Sendable {
     }
 }
 
+public enum LSPNetworkProfilePreference: String, Codable, CaseIterable, Sendable {
+    case adaptiveLowLatency = "adaptive-low-latency"
+    case competitionLAN = "competition-lan"
+}
+
 public struct StreamingPreferences: Codable, Hashable, Sendable {
     public static let `default` = StreamingPreferences()
     public static let minimumStreamWidth = 320
@@ -415,6 +420,14 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var playAudioOnHost: Bool
     public var clientMicrophoneEnabled: Bool
     public var clientMicrophoneRequired: Bool
+    public var lspNetworkProfile: LSPNetworkProfilePreference
+    public var lspCompetitionCapacityMbps: Int
+    public var lspPointerRate: Int
+    public var lspControllerRate: Int
+    public var lspSensorRate: Int
+    public var lspReconciliationRate: Int
+    public var lspPairMicrophonePermission: Bool
+    public var lspPairQuitPermission: Bool
     public var multiController: Bool
     public var enableMDNS: Bool
     public var quitAppAfter: Bool
@@ -465,6 +478,14 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         playAudioOnHost: Bool = false,
         clientMicrophoneEnabled: Bool = false,
         clientMicrophoneRequired: Bool = false,
+        lspNetworkProfile: LSPNetworkProfilePreference = .adaptiveLowLatency,
+        lspCompetitionCapacityMbps: Int = 0,
+        lspPointerRate: Int = 1_000,
+        lspControllerRate: Int = 250,
+        lspSensorRate: Int = 250,
+        lspReconciliationRate: Int = 250,
+        lspPairMicrophonePermission: Bool = false,
+        lspPairQuitPermission: Bool = false,
         multiController: Bool = true,
         enableMDNS: Bool = true,
         quitAppAfter: Bool = false,
@@ -526,6 +547,14 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.playAudioOnHost = playAudioOnHost
         self.clientMicrophoneEnabled = clientMicrophoneEnabled
         self.clientMicrophoneRequired = clientMicrophoneRequired
+        self.lspNetworkProfile = lspNetworkProfile
+        self.lspCompetitionCapacityMbps = lspCompetitionCapacityMbps
+        self.lspPointerRate = lspPointerRate
+        self.lspControllerRate = lspControllerRate
+        self.lspSensorRate = lspSensorRate
+        self.lspReconciliationRate = lspReconciliationRate
+        self.lspPairMicrophonePermission = lspPairMicrophonePermission
+        self.lspPairQuitPermission = lspPairQuitPermission
         self.multiController = multiController
         self.enableMDNS = enableMDNS
         self.quitAppAfter = quitAppAfter
@@ -576,6 +605,14 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case playAudioOnHost
         case clientMicrophoneEnabled
         case clientMicrophoneRequired
+        case lspNetworkProfile
+        case lspCompetitionCapacityMbps
+        case lspPointerRate
+        case lspControllerRate
+        case lspSensorRate
+        case lspReconciliationRate
+        case lspPairMicrophonePermission
+        case lspPairQuitPermission
         case multiController
         case enableMDNS
         case quitAppAfter
@@ -668,6 +705,26 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             playAudioOnHost: try container.decodeIfPresent(Bool.self, forKey: .playAudioOnHost) ?? defaults.playAudioOnHost,
             clientMicrophoneEnabled: try container.decodeIfPresent(Bool.self, forKey: .clientMicrophoneEnabled) ?? defaults.clientMicrophoneEnabled,
             clientMicrophoneRequired: try container.decodeIfPresent(Bool.self, forKey: .clientMicrophoneRequired) ?? defaults.clientMicrophoneRequired,
+            lspNetworkProfile: try container.decodeIfPresent(
+                LSPNetworkProfilePreference.self,
+                forKey: .lspNetworkProfile
+            ) ?? defaults.lspNetworkProfile,
+            lspCompetitionCapacityMbps: try container.decodeIfPresent(
+                Int.self,
+                forKey: .lspCompetitionCapacityMbps
+            ) ?? defaults.lspCompetitionCapacityMbps,
+            lspPointerRate: try container.decodeIfPresent(Int.self, forKey: .lspPointerRate) ?? defaults.lspPointerRate,
+            lspControllerRate: try container.decodeIfPresent(Int.self, forKey: .lspControllerRate) ?? defaults.lspControllerRate,
+            lspSensorRate: try container.decodeIfPresent(Int.self, forKey: .lspSensorRate) ?? defaults.lspSensorRate,
+            lspReconciliationRate: try container.decodeIfPresent(Int.self, forKey: .lspReconciliationRate) ?? defaults.lspReconciliationRate,
+            lspPairMicrophonePermission: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .lspPairMicrophonePermission
+            ) ?? defaults.lspPairMicrophonePermission,
+            lspPairQuitPermission: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .lspPairQuitPermission
+            ) ?? defaults.lspPairQuitPermission,
             multiController: try container.decodeIfPresent(Bool.self, forKey: .multiController) ?? defaults.multiController,
             enableMDNS: try container.decodeIfPresent(Bool.self, forKey: .enableMDNS) ?? defaults.enableMDNS,
             quitAppAfter: try container.decodeIfPresent(Bool.self, forKey: .quitAppAfter) ?? defaults.quitAppAfter,
@@ -835,6 +892,25 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
                 field: "preferences.clientMicrophoneRequired",
                 reason: "requires client microphone forwarding to be enabled"
             )
+        }
+        guard (0...100_000).contains(lspCompetitionCapacityMbps),
+              lspNetworkProfile != .competitionLAN || lspCompetitionCapacityMbps > 0 else {
+            throw ModelValidationError(
+                field: "preferences.lspCompetitionCapacityMbps",
+                reason: "competition mode requires an explicit positive capacity ceiling"
+            )
+        }
+        guard (125...16_000).contains(lspPointerRate) else {
+            throw ModelValidationError(field: "preferences.lspPointerRate", reason: "must be between 125 and 16000")
+        }
+        guard (125...2_000).contains(lspControllerRate) else {
+            throw ModelValidationError(field: "preferences.lspControllerRate", reason: "must be between 125 and 2000")
+        }
+        guard (125...4_000).contains(lspSensorRate) else {
+            throw ModelValidationError(field: "preferences.lspSensorRate", reason: "must be between 125 and 4000")
+        }
+        guard (50...1_000).contains(lspReconciliationRate) else {
+            throw ModelValidationError(field: "preferences.lspReconciliationRate", reason: "must be between 50 and 1000")
         }
         guard (Self.minimumStreamWidth...Self.maximumStreamWidth).contains(width),
               width.isMultiple(of: 2) else {

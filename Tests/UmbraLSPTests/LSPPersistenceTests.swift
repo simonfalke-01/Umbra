@@ -56,6 +56,27 @@ final class LSPPersistenceTests: XCTestCase {
         XCTAssertThrowsError(try record.validate())
     }
 
+    func testPendingCertificatePinPromotesOnlyAfterThatPinAuthenticates() throws {
+        let active = Data(repeating: 0x11, count: 32)
+        let pending = Data(repeating: 0x22, count: 32)
+        let trust = LSPTrustRecord(
+            hostID: UUID(),
+            hostIdentityKey: Data(repeating: 0x33, count: 32),
+            dtlsSPKISHA256: active,
+            permissions: [.browseApplications],
+            revocationGeneration: 1,
+            certificateRotationGeneration: 2,
+            pendingDTLSSPKISHA256: pending
+        )
+        let stillActive = try XCTUnwrap(trust.promotingAuthenticatedSPKI(active))
+        XCTAssertEqual(stillActive.dtlsSPKISHA256, active)
+        XCTAssertEqual(stillActive.pendingDTLSSPKISHA256, pending)
+        let promoted = try XCTUnwrap(trust.promotingAuthenticatedSPKI(pending))
+        XCTAssertEqual(promoted.dtlsSPKISHA256, pending)
+        XCTAssertNil(promoted.pendingDTLSSPKISHA256)
+        XCTAssertNil(trust.promotingAuthenticatedSPKI(Data(repeating: 0x44, count: 32)))
+    }
+
     func testPairingPersistenceRollsBackTrustAndCanRetryAfterHostWriteFailure() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("UmbraLSPPairingTransaction-\(UUID().uuidString)", isDirectory: true)

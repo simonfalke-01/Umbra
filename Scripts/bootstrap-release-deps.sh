@@ -17,12 +17,14 @@ build_timezone="UTC"
 
 openssl_version="3.5.7"
 openssl_sha256="a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8"
+openssl_license_sha256="7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a"
 openssl_configure_target="darwin64-arm64-cc"
 openssl_configure_flags="no-shared no-tests"
 openssl_cflags="-isysroot $macos_sdk -mmacosx-version-min=$deployment_target"
 openssl_ldflags="-isysroot $macos_sdk -mmacosx-version-min=$deployment_target"
 opus_version="1.6.1"
 opus_sha256="6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1"
+opus_license_sha256="01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551"
 opus_configure_flags="--disable-shared --enable-static"
 opus_cflags="-O2 -isysroot $macos_sdk -mmacosx-version-min=$deployment_target"
 opus_ldflags="-isysroot $macos_sdk -mmacosx-version-min=$deployment_target"
@@ -271,6 +273,14 @@ verify_archive() {
 }
 
 validate_prefix_target
+[[ "$(sha256_file "$repository_root/OPENSSL_LICENSE.txt")" == "$openssl_license_sha256" ]] || {
+    fail "OPENSSL_LICENSE.txt does not match the pinned OpenSSL $openssl_version source release."
+    exit 1
+}
+[[ "$(sha256_file "$repository_root/OPUS_LICENSE.txt")" == "$opus_license_sha256" ]] || {
+    fail "OPUS_LICENSE.txt does not match the pinned Opus $opus_version source release."
+    exit 1
+}
 if [[ "${UMBRA_RELEASE_DEPS_FORCE_REBUILD:-0}" != "1" ]] && validate_prefix "$prefix"; then
     print -r -- "$prefix"
     exit 0

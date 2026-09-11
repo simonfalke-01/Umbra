@@ -16,6 +16,16 @@ final class LSPTransportTests: XCTestCase {
         XCTAssertEqual(telemetry.transmittedDatagrams, 0)
         XCTAssertEqual(telemetry.droppedDatagrams, 0)
         XCTAssertEqual(telemetry.authenticationFailures, 0)
+        XCTAssertNil(try transport.pollDeviceOffer())
+
+        let timing = try transport.nativeTimingSnapshot()
+        XCTAssertEqual(timing.generation, 0)
+        XCTAssertEqual(timing.stages.count, LSPNativeTimingStage.allCases.count)
+        XCTAssertTrue(timing.stages.allSatisfy { $0.count == 0 && $0.drops == 0 })
+        XCTAssertEqual(timing.controllerGenerations, Array(repeating: 0, count: 16))
+        XCTAssertEqual(timing.touchGenerations, Array(repeating: 0, count: 16))
+        XCTAssertEqual(timing.penGenerations, Array(repeating: 0, count: 16))
+        XCTAssertTrue(timing.devices.isEmpty)
     }
 
     func testStartFailsClosedAtFirstMissingSecurityProvider() throws {
@@ -60,6 +70,21 @@ final class LSPTransportTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? LSPTransportError, .invalidConfiguration)
         }
+    }
+
+    func testLifecycleTerminalStatusPreservesTimeoutSocketAndDTLSFailures() {
+        XCTAssertEqual(
+            LSPTransport.terminalError(forNativeStatus: CLSP_STATUS_TIMEOUT),
+            .timeout
+        )
+        XCTAssertEqual(
+            LSPTransport.terminalError(forNativeStatus: CLSP_STATUS_SOCKET_FAILURE),
+            .socketFailure
+        )
+        XCTAssertEqual(
+            LSPTransport.terminalError(forNativeStatus: CLSP_STATUS_DTLS_FAILURE),
+            .dtlsFailure
+        )
     }
 
     func testNativeHandoffAtomicSubmitFailureRemainsDefinitelyNotSubmitted() throws {
@@ -126,6 +151,7 @@ final class LSPTransportTests: XCTestCase {
         )
         XCTAssertEqual(callbacks.reentrantSnapshotStatus, CLSP_STATUS_REENTRANT_CALLBACK)
         XCTAssertEqual(callbacks.reentrantCoreStatus, CLSP_STATUS_REENTRANT_CALLBACK)
+        XCTAssertEqual(callbacks.concurrentCoreStatus, CLSP_STATUS_OK)
         XCTAssertEqual(callbacks.rekeyEvents, 1)
         XCTAssertEqual(callbacks.baselineKinds, [
             UInt32(CLSP_HANDOFF_BASELINE_REQUIRED.rawValue),
@@ -277,6 +303,8 @@ final class LSPTransportTests: XCTestCase {
             clsp_core_wait_input_baseline(core, 1, 1, &snapshot),
             CLSP_STATUS_TIMEOUT
         )
+        var edge = clsp_input_edge_snapshot_t()
+        XCTAssertEqual(clsp_core_copy_input_edge_snapshot(core, &edge), CLSP_STATUS_NOT_AUTHENTICATED)
     }
 
     func testNativePINPairingABIRequiresAuthenticatedBoundAssociation() throws {
@@ -320,6 +348,30 @@ final class LSPTransportTests: XCTestCase {
         )
     }
 
+    func testNativeRuntimeOrdersUrgentReverseVideoAndProductStages() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repository.appendingPathComponent("Vendor/CLSPCore/src/runtime/Runtime.cpp"),
+            encoding: .utf8
+        )
+        let worker = try XCTUnwrap(source.range(of: "void run_worker() noexcept"))
+        let drain = try XCTUnwrap(source.range(of: "status = drain_socket();", range: worker.lowerBound..<source.endIndex))
+        let input = try XCTUnwrap(source.range(of: "status = transmit_input();", range: drain.upperBound..<source.endIndex))
+        let microphone = try XCTUnwrap(source.range(of: "status = transmit_microphone();", range: input.upperBound..<source.endIndex))
+        let video = try XCTUnwrap(source.range(of: "status = process_deferred_video_batch();", range: microphone.upperBound..<source.endIndex))
+        let product = try XCTUnwrap(source.range(of: "deliver_video_frames();", range: video.upperBound..<source.endIndex))
+        XCTAssertLessThan(drain.lowerBound, input.lowerBound)
+        XCTAssertLessThan(input.lowerBound, microphone.lowerBound)
+        XCTAssertLessThan(microphone.lowerBound, video.lowerBound)
+        XCTAssertLessThan(video.lowerBound, product.lowerBound)
+        XCTAssertTrue(source.contains("PendingProtectedMicrophone pending_microphone_"))
+        XCTAssertTrue(source.contains("return transmit_pending_microphone();"))
+        XCTAssertTrue(source.contains("deferred.token = receive_lease.detach();"))
+        XCTAssertTrue(source.contains("receive_lease.adopt(video_receive_pool_, deferred.token)"))
+        XCTAssertFalse(source.contains("std::copy_n(deferred.bytes"))
+    }
+
     func testRollbackBaselineCompletionUsesLatchedEpochAfterSnapshotClearsRollbackGeneration() {
         let snapshot = LSPNativeHandoffSnapshot(
             phase: .authoritative,
@@ -359,7 +411,7 @@ final class LSPTransportTests: XCTestCase {
     }
 }
 
-private final class NativeHandoffCallbackRecorder {
+private final class NativeHandoffCallbackRecorder: @unchecked Sendable {
     private let lock = NSLock()
     var handle: OpaquePointer?
     var core: OpaquePointer?
@@ -373,6 +425,7 @@ private final class NativeHandoffCallbackRecorder {
     private(set) var baselineRollbackGenerations: [UInt32] = []
     private(set) var reentrantSnapshotStatus: clsp_status_t?
     private(set) var reentrantCoreStatus: clsp_status_t?
+    private(set) var concurrentCoreStatus: clsp_status_t?
 
     func retained() {
         lock.lock()
@@ -388,14 +441,39 @@ private final class NativeHandoffCallbackRecorder {
 
     func phase() {
         lock.lock()
-        defer { lock.unlock() }
-        guard reentrantSnapshotStatus == nil, let handle else { return }
-        var snapshot = clsp_handoff_snapshot_t()
-        reentrantSnapshotStatus = clsp_handoff_copy_snapshot(handle, &snapshot)
-        if let core {
-            var telemetry = clsp_telemetry_snapshot_t()
-            reentrantCoreStatus = clsp_core_copy_telemetry(core, &telemetry)
+        guard reentrantSnapshotStatus == nil, let handle else {
+            lock.unlock()
+            return
         }
+        let core = core
+        lock.unlock()
+        var snapshot = clsp_handoff_snapshot_t()
+        let handoffStatus = clsp_handoff_copy_snapshot(handle, &snapshot)
+        if let core {
+            let coreAddress = UInt(bitPattern: core)
+            var telemetry = clsp_telemetry_snapshot_t()
+            let coreStatus = clsp_core_copy_telemetry(core, &telemetry)
+            let semaphore = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async { [weak self] in
+                guard let core = OpaquePointer(bitPattern: coreAddress) else {
+                    semaphore.signal()
+                    return
+                }
+                var concurrent = clsp_telemetry_snapshot_t()
+                let status = clsp_core_copy_telemetry(core, &concurrent)
+                self?.lock.lock()
+                self?.concurrentCoreStatus = status
+                self?.lock.unlock()
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 1)
+            lock.lock()
+            reentrantCoreStatus = coreStatus
+            lock.unlock()
+        }
+        lock.lock()
+        reentrantSnapshotStatus = handoffStatus
+        lock.unlock()
     }
 
     func baseline(_ event: clsp_handoff_baseline_event_t) {

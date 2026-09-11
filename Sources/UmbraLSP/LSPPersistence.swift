@@ -33,21 +33,27 @@ public struct LSPTrustRecord: Codable, Hashable, Identifiable, Sendable {
     public var hostID: UUID
     public var hostIdentityKey: Data
     public var dtlsSPKISHA256: Data
+    public var pendingDTLSSPKISHA256: Data?
     public var permissions: LSPPermission
     public var revocationGeneration: UInt64
+    public var certificateRotationGeneration: UInt32?
 
     public init(
         hostID: UUID,
         hostIdentityKey: Data,
         dtlsSPKISHA256: Data,
         permissions: LSPPermission,
-        revocationGeneration: UInt64
+        revocationGeneration: UInt64,
+        certificateRotationGeneration: UInt32 = 0,
+        pendingDTLSSPKISHA256: Data? = nil
     ) {
         self.hostID = hostID
         self.hostIdentityKey = hostIdentityKey
         self.dtlsSPKISHA256 = dtlsSPKISHA256
+        self.pendingDTLSSPKISHA256 = pendingDTLSSPKISHA256
         self.permissions = permissions
         self.revocationGeneration = revocationGeneration
+        self.certificateRotationGeneration = certificateRotationGeneration
     }
 
     public func validate() throws {
@@ -57,12 +63,33 @@ public struct LSPTrustRecord: Codable, Hashable, Identifiable, Sendable {
         guard dtlsSPKISHA256.count == 32 else {
             throw ModelValidationError(field: "lspTrust.dtlsSPKISHA256", reason: "must contain 32 bytes")
         }
+        if let pendingDTLSSPKISHA256 {
+            guard pendingDTLSSPKISHA256.count == 32,
+                  pendingDTLSSPKISHA256 != dtlsSPKISHA256 else {
+                throw ModelValidationError(
+                    field: "lspTrust.pendingDTLSSPKISHA256",
+                    reason: "must contain a distinct 32-byte staged pin"
+                )
+            }
+        }
         guard permissions.subtracting(.allKnown).isEmpty else {
             throw ModelValidationError(field: "lspTrust.permissions", reason: "contains unknown permission bits")
         }
         guard revocationGeneration > 0 else {
             throw ModelValidationError(field: "lspTrust.revocationGeneration", reason: "must be nonzero")
         }
+    }
+
+    public func promotingAuthenticatedSPKI(_ authenticatedSPKI: Data) -> Self? {
+        guard authenticatedSPKI == dtlsSPKISHA256 || authenticatedSPKI == pendingDTLSSPKISHA256 else {
+            return nil
+        }
+        var updated = self
+        if authenticatedSPKI == pendingDTLSSPKISHA256 {
+            updated.dtlsSPKISHA256 = authenticatedSPKI
+            updated.pendingDTLSSPKISHA256 = nil
+        }
+        return updated
     }
 }
 
@@ -205,7 +232,7 @@ public struct LSPClientIdentitySnapshot: ValidatedPersistenceModel, Equatable, S
     }
 }
 
-/// Factory for LSP-only persistence files that never reuse retired v3 or legacy state.
+/// Factory for LSP-only persistence files that never reuse retired experimental or legacy state.
 public enum LSPPersistence {
     /// LSP-only trust-store filename.
     public static let trustFileName = "lsp-trust-v1.json"

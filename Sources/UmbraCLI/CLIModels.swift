@@ -1,3 +1,4 @@
+import Foundation
 import UmbraCore
 
 /// A command that has been validated and is ready for the application layer to execute.
@@ -9,27 +10,91 @@ public enum UmbraCommand: Equatable, Sendable {
     case pair(PairHostCommand)
     case stream(StreamAppCommand)
     case quit(QuitHostCommand)
+    case attach(AttachHostCommand)
+    case stop(StopHostCommand)
+    case telemetry(TelemetryHostCommand)
+}
+
+public enum CLIStreamingProtocol: String, Equatable, Sendable {
+    case legacyGameStream = "legacy"
+    case lsp
+}
+
+public struct CLILSPPermissionSet: OptionSet, Equatable, Sendable {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+    public static let browseApplications = Self(rawValue: 1 << 0)
+    public static let startOrAttach = Self(rawValue: 1 << 1)
+    public static let input = Self(rawValue: 1 << 2)
+    public static let microphone = Self(rawValue: 1 << 3)
+    public static let stopOwnStream = Self(rawValue: 1 << 4)
+    public static let quitApplication = Self(rawValue: 1 << 5)
+    public static let controllerOutput = Self(rawValue: 1 << 6)
+    public static let standard: Self = [
+        .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput,
+    ]
+}
+
+public enum CLILSPMicrophoneMode: String, Equatable, Sendable {
+    case off
+    case optional
+    case required
+}
+
+public struct CLILSPOptions: Equatable, Sendable {
+    public var hostID: UUID?
+    public var permissions: CLILSPPermissionSet
+    public var microphone: CLILSPMicrophoneMode
+    public var emitTelemetry: Bool
+
+    public init(
+        hostID: UUID? = nil,
+        permissions: CLILSPPermissionSet = .standard,
+        microphone: CLILSPMicrophoneMode = .off,
+        emitTelemetry: Bool = false
+    ) {
+        self.hostID = hostID
+        self.permissions = permissions
+        self.microphone = microphone
+        self.emitTelemetry = emitTelemetry
+    }
 }
 
 public struct ListAppsCommand: Equatable, Sendable {
     public var host: String
     public var csv: Bool
     public var verbose: Bool
+    public var streamingProtocol: CLIStreamingProtocol
+    public var lsp: CLILSPOptions
 
-    public init(host: String, csv: Bool = false, verbose: Bool = false) {
+    public init(
+        host: String, csv: Bool = false, verbose: Bool = false,
+        streamingProtocol: CLIStreamingProtocol = .legacyGameStream,
+        lsp: CLILSPOptions = .init()
+    ) {
         self.host = host
         self.csv = csv
         self.verbose = verbose
+        self.streamingProtocol = streamingProtocol
+        self.lsp = lsp
     }
 }
 
 public struct PairHostCommand: Equatable, Sendable {
     public var host: String
     public var pin: String?
+    public var streamingProtocol: CLIStreamingProtocol
+    public var lsp: CLILSPOptions
 
-    public init(host: String, pin: String? = nil) {
+    public init(
+        host: String, pin: String? = nil,
+        streamingProtocol: CLIStreamingProtocol = .legacyGameStream,
+        lsp: CLILSPOptions = .init()
+    ) {
         self.host = host
         self.pin = pin
+        self.streamingProtocol = streamingProtocol
+        self.lsp = lsp
     }
 }
 
@@ -38,26 +103,61 @@ public struct StreamAppCommand: Equatable, Sendable {
     public var applicationName: String
     public var preferences: StreamingPreferences
     public var quitRunningApplication: Bool
+    public var resume: Bool
+    public var streamingProtocol: CLIStreamingProtocol
+    public var lsp: CLILSPOptions
 
     public init(
         host: String,
         applicationName: String,
         preferences: StreamingPreferences,
-        quitRunningApplication: Bool = false
+        quitRunningApplication: Bool = false,
+        resume: Bool = false,
+        streamingProtocol: CLIStreamingProtocol = .legacyGameStream,
+        lsp: CLILSPOptions = .init()
     ) {
         self.host = host
         self.applicationName = applicationName
         self.preferences = preferences
         self.quitRunningApplication = quitRunningApplication
+        self.resume = resume
+        self.streamingProtocol = streamingProtocol
+        self.lsp = lsp
     }
 }
 
 public struct QuitHostCommand: Equatable, Sendable {
     public var host: String
+    public var streamingProtocol: CLIStreamingProtocol
+    public var lsp: CLILSPOptions
 
-    public init(host: String) {
+    public init(
+        host: String,
+        streamingProtocol: CLIStreamingProtocol = .legacyGameStream,
+        lsp: CLILSPOptions = .init()
+    ) {
         self.host = host
+        self.streamingProtocol = streamingProtocol
+        self.lsp = lsp
     }
+}
+
+public struct AttachHostCommand: Equatable, Sendable {
+    public var host: String
+    public var lsp: CLILSPOptions
+    public init(host: String, lsp: CLILSPOptions = .init()) { self.host = host; self.lsp = lsp }
+}
+
+public struct StopHostCommand: Equatable, Sendable {
+    public var host: String
+    public var lsp: CLILSPOptions
+    public init(host: String, lsp: CLILSPOptions = .init()) { self.host = host; self.lsp = lsp }
+}
+
+public struct TelemetryHostCommand: Equatable, Sendable {
+    public var host: String
+    public var lsp: CLILSPOptions
+    public init(host: String, lsp: CLILSPOptions = .init()) { self.host = host; self.lsp = lsp }
 }
 
 /// Conventional process exit codes used by the Moonlight-compatible command surface.

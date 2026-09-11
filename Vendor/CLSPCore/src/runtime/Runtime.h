@@ -13,14 +13,17 @@
 namespace umbra::lsp {
   /** @brief Non-owning callbacks from the native worker to the C ABI owner. */
   struct RuntimeCallbacks {
-    /** @brief Publish a coarse lifecycle transition. */
-    using Lifecycle = void (*)(void *context, std::uint32_t state) noexcept;
+    /** @brief Publish a coarse lifecycle transition and its first fatal status. */
+    using Lifecycle = void (*)(void *context, std::uint32_t state, clsp_status_t terminal_status) noexcept;
 
     /** @brief Publish one authenticated, de-duplicated LSPC frame. */
     using Control = void (*)(void *context, const clsp_control_event_t &event) noexcept;
 
     /** @brief Increment one thread-owned telemetry counter at snapshot frequency. */
     using Counter = void (*)(void *context, std::uint32_t counter, std::uint64_t amount) noexcept;
+
+    /** @brief Publish one fixed-layout worker-owned timing snapshot at no more than four hertz. */
+    using Timing = void (*)(void *context, const clsp_native_timing_snapshot_t &snapshot) noexcept;
 
     /** @brief Apply one authenticated LSPG payload and return a terminal command status. */
     using ControllerOutput = std::uint8_t (*)(void *context, clsp_const_byte_span_t payload) noexcept;
@@ -44,6 +47,7 @@ namespace umbra::lsp {
     Lifecycle lifecycle {};  ///< Required lifecycle callback.
     Control control {};  ///< Optional authenticated-control callback.
     Counter counter {};  ///< Required telemetry callback.
+    Timing timing {};  ///< Optional coarse timing-distribution callback.
     ControllerOutput controller_output {};  ///< Optional generation-checked GameController output callback.
     InputBaseline input_baseline {};  ///< Optional authenticated baseline-ACK callback.
     AudioPacket audio_packet {};  ///< Optional complete Opus packet callback.
@@ -214,6 +218,62 @@ namespace umbra::lsp {
     /** @brief Install an authenticated input-only START_RESPONSE mapping. */
     [[nodiscard]] clsp_status_t configure_input(const clsp_input_configuration_t &configuration) noexcept;
 
+    /** @brief Apply one exact coarse input-rate renegotiation on the socket worker. */
+    [[nodiscard]] clsp_status_t update_input_rates(const clsp_input_rate_update_t &update) noexcept;
+
+    /** @brief Copy latest authenticated LSPI and effective-rate evidence. */
+    [[nodiscard]] clsp_status_t copy_input_feedback(clsp_input_feedback_snapshot_t &output) noexcept;
+
+    /** @brief Copy newest locally assigned edge identity for text/IME barriers. */
+    [[nodiscard]] clsp_status_t copy_input_edge_snapshot(clsp_input_edge_snapshot_t &output) const noexcept;
+
+    /**
+     * @brief Publish one native device generation for deterministic baseline construction.
+     *
+     * @param device_type One frozen LSP input device type.
+     * @param device_id Nonzero stable device identifier.
+     * @param instance_generation Nonzero hot-plug generation.
+     * @param active Whether the exact generation is active.
+     * @param sensor_mask Controller sensor capability bits one and two, otherwise zero.
+     */
+    void observe_input_device(
+      std::uint8_t device_type,
+      std::uint32_t device_id,
+      std::uint32_t instance_generation,
+      bool active,
+      std::uint8_t sensor_mask
+    ) noexcept;
+
+    /**
+     * @brief Return cumulative bounded capture-ring drops for one exact offered generation.
+     *
+     * @param offer_type One `clsp_device_offer_type_t` value.
+     * @param device_id Pointer source one or controller slot one through sixteen.
+     * @param instance_generation Exact nonzero native generation.
+     * @return Cumulative drops, or zero for an unknown/stale generation.
+     */
+    [[nodiscard]] std::uint64_t input_dropped_samples(
+      std::uint8_t offer_type,
+      std::uint32_t device_id,
+      std::uint32_t instance_generation
+    ) const noexcept;
+
+    /**
+     * @brief Return complete IP bytes attributable to one exact state/sensor generation.
+     *
+     * Shared edge-batch and baseline overhead is intentionally excluded.
+     *
+     * @param offer_type One `clsp_device_offer_type_t` value.
+     * @param device_id Pointer source one or controller slot one through sixteen.
+     * @param instance_generation Exact nonzero native generation.
+     * @return Cumulative attributable complete IP bytes, or zero for a stale generation.
+     */
+    [[nodiscard]] std::uint64_t input_attributed_wire_bytes(
+      std::uint8_t offer_type,
+      std::uint32_t device_id,
+      std::uint32_t instance_generation
+    ) const noexcept;
+
     /** @brief Queue one allocation-free relative-pointer capture record. */
     [[nodiscard]] clsp_status_t submit_pointer(const clsp_pointer_sample_t &sample) noexcept;
 
@@ -246,6 +306,9 @@ namespace umbra::lsp {
 
     /** @brief Return the authenticated confirmed UDP payload ceiling. */
     [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept;
+
+    /** @brief Return the independently confirmed host-to-client UDP payload ceiling. */
+    [[nodiscard]] std::uint16_t current_receive_udp_payload_size() const noexcept;
 
     /** @brief Copy the authenticated association's exact DTLS-SRTP exporter for native transcript binding. */
     [[nodiscard]] clsp_status_t copy_pairing_exporter(

@@ -81,6 +81,8 @@ struct PairingRequest: Hashable, Sendable {
 struct PairingPreparation: Hashable, Sendable {
     let pin: String
     let provisionalSPKIFingerprint: String?
+    let requestedPermissions: [String]
+    let effectivePermissions: [String]
 }
 
 enum NetworkTestOutcome: Hashable, Sendable {

@@ -17,7 +17,7 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(2)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "27c71a42a6613fa2b3c8c9f42c986231311371fd9ece62405b9426e66d2757f6"
+#define CLSP_CORE_SOURCE_DIGEST "72b3a260e9b083d15af34403517965b36f67f008e6624b08bc965c9057f679db"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
@@ -330,6 +330,7 @@ extern "C" {
     uint32_t structure_size;  ///< Size of this event structure.
     uint32_t state;  ///< One `clsp_lifecycle_state_t` value.
     uint32_t reserved_zero;  ///< Reserved and required to be zero.
+    uint32_t terminal_status;  ///< First fatal `clsp_status_t` for FAILED, otherwise `CLSP_STATUS_OK`.
   } clsp_lifecycle_event_t;
 
   /** @brief One authenticated control frame delivered at application frequency. */
@@ -520,6 +521,110 @@ extern "C" {
     uint16_t reserved_zero;  ///< Reserved and required to be zero.
   } clsp_input_configuration_t;
 
+  /** @brief Coarse authenticated LSPI receive/apply/delivery evidence. */
+  typedef struct clsp_input_feedback_snapshot {
+    uint32_t abi_version;  ///< Snapshot ABI version.
+    uint32_t structure_size;  ///< Size of this snapshot.
+    uint32_t stream_generation;  ///< Current stream generation.
+    uint32_t input_generation;  ///< Current input authority generation.
+    uint64_t accepted_baseline_id;  ///< Most recently authenticated accepted baseline.
+    uint64_t contiguous_edge_id;  ///< Greatest contiguously applied edge.
+    uint64_t edge_reception_bitmap;  ///< Forward reception bitmap from LSPI.
+    uint64_t received_at_microseconds;  ///< Kernel-derived local monotonic receive time.
+    uint32_t pointer_rate;  ///< Current negotiated pointer reports/s.
+    uint32_t controller_rate;  ///< Current negotiated controller reports/s.
+    uint32_t sensor_rate;  ///< Current negotiated sensor reports/s.
+    uint32_t reconciliation_rate;  ///< Current reconciliation reports/s.
+    uint64_t reserved_input_wire_bits_per_second;  ///< Current aggregate input reservation.
+    uint8_t baseline_acknowledged;  ///< Boolean current baseline readiness.
+    uint8_t baseline_requested;  ///< Boolean host baseline request evidence.
+    uint8_t reserved_zero[6];  ///< Reserved and zero.
+  } clsp_input_feedback_snapshot_t;
+
+  /** @brief Coarse native newest-edge snapshot used to bind text barriers atomically. */
+  typedef struct clsp_input_edge_snapshot {
+    uint32_t abi_version;  ///< Snapshot ABI version.
+    uint32_t structure_size;  ///< Size of this snapshot.
+    uint32_t stream_generation;  ///< Current stream generation.
+    uint32_t input_generation;  ///< Current input authority generation.
+    uint64_t latest_assigned_edge_id;  ///< Newest locally assigned exactly-once edge ID.
+    uint64_t latest_edge_sample_time_microseconds;  ///< Physical capture time of that edge, or zero.
+  } clsp_input_edge_snapshot_t;
+
+  /** @brief Authenticated coarse input-rate renegotiation applied on the native worker. */
+  typedef struct clsp_input_rate_update {
+    uint32_t abi_version;  ///< Must equal `CLSP_CORE_ABI_VERSION`.
+    uint32_t structure_size;  ///< Must equal `sizeof(clsp_input_rate_update_t)`.
+    uint32_t stream_generation;  ///< Exact active stream generation.
+    uint32_t input_generation;  ///< Exact active input generation.
+    uint32_t pointer_rate;  ///< Selected 125 through 16,000 reports/s.
+    uint32_t controller_rate;  ///< Selected 125 through 2,000 reports/s.
+    uint32_t sensor_rate;  ///< Selected 125 through 4,000 reports/s.
+    uint32_t reconciliation_rate;  ///< Selected 50 through 1,000 reports/s.
+    uint64_t reserved_input_wire_bits_per_second;  ///< Nonzero reservation through 32 Mbps.
+  } clsp_input_rate_update_t;
+
+  /** @brief Low-rate native device-generation offer event kind. */
+  typedef enum clsp_device_offer_kind {
+    CLSP_DEVICE_OFFER_NONE = 0,  ///< No queued event is available.
+    CLSP_DEVICE_OFFER_ARRIVED = 1,  ///< Device generation became available.
+    CLSP_DEVICE_OFFER_REMOVED = 2,  ///< Exact device generation was removed.
+    CLSP_DEVICE_OFFER_RATE_OBSERVED = 3,  ///< Measured capture rate materially changed.
+  } clsp_device_offer_kind_t;
+
+  /** @brief Low-rate device type used for automatic INPUT_RATE renegotiation. */
+  typedef enum clsp_device_offer_type {
+    CLSP_DEVICE_OFFER_POINTER = 1,  ///< Native keyboard/pointer IOHID source.
+    CLSP_DEVICE_OFFER_CONTROLLER = 2,  ///< GameController device generation.
+  } clsp_device_offer_type_t;
+
+  /** @brief Native capture source kind for coarse per-device telemetry. */
+  typedef enum clsp_device_capture_source {
+    CLSP_DEVICE_CAPTURE_IOHID = 1,  ///< Public IOHID callback source.
+    CLSP_DEVICE_CAPTURE_GAME_CONTROLLER = 2,  ///< Public GameController callback source.
+    CLSP_DEVICE_CAPTURE_APPKIT = 3,  ///< Focused-window AppKit fallback source.
+  } clsp_device_capture_source_t;
+
+  /** @brief One bounded coarse hot-plug/rate offer; never emitted per sample. */
+  typedef struct clsp_device_offer_event {
+    uint32_t abi_version;  ///< Event ABI version.
+    uint32_t structure_size;  ///< Size of this event structure.
+    uint64_t event_sequence;  ///< Monotonic nonzero native event identifier.
+    uint32_t device_id;  ///< Pointer source one, or controller slot one through sixteen.
+    uint32_t instance_generation;  ///< Exact nonzero native device generation.
+    uint32_t observed_capture_hz;  ///< Honest measured pointer/controller-state capture rate, or zero when unknown.
+    uint32_t observed_sensor_hz;  ///< Independently measured controller-motion callback rate, or zero.
+    uint32_t minimum_state_rate;  ///< Minimum supported state reports/s.
+    uint32_t maximum_state_rate;  ///< Maximum supported state reports/s.
+    uint32_t minimum_sensor_rate;  ///< Minimum supported sensor reports/s, or zero.
+    uint32_t maximum_sensor_rate;  ///< Maximum supported sensor reports/s, or zero.
+    uint64_t captured_samples;  ///< Cumulative native samples for this device generation.
+    uint64_t dropped_samples;  ///< Cumulative bounded native drops for this device generation.
+    uint64_t attributed_wire_bytes;  ///< Cumulative attributable state/sensor complete IP bytes.
+    uint64_t effective_wire_bits_per_second;  ///< Measured-rate complete wire estimate.
+    uint64_t state_spacing_count;  ///< Cumulative valid pointer/controller-state intervals.
+    uint64_t state_spacing_p50_microseconds;  ///< Fixed-bucket median state interval.
+    uint64_t state_spacing_p95_microseconds;  ///< Fixed-bucket 95th-percentile state interval.
+    uint64_t state_spacing_p99_microseconds;  ///< Fixed-bucket 99th-percentile state interval.
+    uint64_t state_spacing_maximum_microseconds;  ///< Exact greatest state interval.
+    uint64_t state_spacing_drops;  ///< Invalid/nonmonotonic state-spacing observations.
+    uint64_t sensor_spacing_count;  ///< Cumulative valid independent motion intervals.
+    uint64_t sensor_spacing_p50_microseconds;  ///< Fixed-bucket median motion interval.
+    uint64_t sensor_spacing_p95_microseconds;  ///< Fixed-bucket 95th-percentile motion interval.
+    uint64_t sensor_spacing_p99_microseconds;  ///< Fixed-bucket 99th-percentile motion interval.
+    uint64_t sensor_spacing_maximum_microseconds;  ///< Exact greatest motion interval.
+    uint64_t sensor_spacing_drops;  ///< Invalid/nonmonotonic motion-spacing observations.
+    uint32_t minimum_sample_interval_microseconds;  ///< Minimum interval observed in the current window.
+    uint32_t maximum_sample_interval_microseconds;  ///< Maximum interval observed in the current window.
+    uint32_t timing_flags;  ///< `clsp_native_timing_flag_t` clock/availability evidence.
+    uint16_t maximum_state_packet_bytes;  ///< Maximum encoded state packet bytes.
+    uint16_t maximum_sensor_packet_bytes;  ///< Maximum encoded sensor packet bytes, or zero.
+    uint8_t kind;  ///< One `clsp_device_offer_kind_t` value.
+    uint8_t device_type;  ///< One `clsp_device_offer_type_t` value.
+    uint8_t capture_source;  ///< One `clsp_device_capture_source_t` value.
+    uint8_t reserved_zero[5];  ///< Reserved and zero.
+  } clsp_device_offer_event_t;
+
   /** @brief Allocation-free relative-pointer capture record. */
   typedef struct clsp_pointer_sample {
     uint64_t sample_time_microseconds;  ///< Nonzero client monotonic capture time.
@@ -619,9 +724,84 @@ extern "C" {
     uint64_t path_probes_sent;  ///< Exact protected LSPP kernel submissions.
     uint64_t path_probes_acknowledged;  ///< Exact authenticated PATH_PROBE acknowledgements.
     uint64_t path_probe_timeouts;  ///< Candidates exhausted after three PROBE_TIMER sends.
-    uint16_t current_udp_payload_size;  ///< Authenticated confirmed DPLPMTUD ceiling.
-    uint16_t reserved_zero;  ///< Reserved and zero.
+    uint16_t current_udp_payload_size;  ///< Authenticated client-to-host DPLPMTUD ceiling.
+    uint16_t current_receive_udp_payload_size;  ///< Authenticated host-to-client DPLPMTUD ceiling.
   } clsp_telemetry_snapshot_t;
+
+  /** @brief Fixed native timing-stage identifiers in one coarse distribution snapshot. */
+  typedef enum clsp_native_timing_stage {
+    CLSP_NATIVE_TIMING_INPUT_CALLBACK_TO_COMPOSE = 0,  ///< Local captured timestamp to worker composition.
+    CLSP_NATIVE_TIMING_INPUT_COMPOSE_TO_PROTECT = 1,  ///< Worker composition to SRTP protection completion.
+    CLSP_NATIVE_TIMING_INPUT_PROTECT_TO_SUBMIT = 2,  ///< SRTP completion to successful socket submission.
+    CLSP_NATIVE_TIMING_INPUT_ACK_AGE = 3,  ///< First edge submission to authenticated host acknowledgement.
+    CLSP_NATIVE_TIMING_RECEIVE_TO_AUTH = 4,  ///< Kernel/userspace receive timestamp to SRTP authentication.
+    CLSP_NATIVE_TIMING_AUTH_TO_HANDOFF = 5,  ///< SRTP authentication to complete audio/frame callback handoff.
+    CLSP_NATIVE_TIMING_SOCKET_BATCH_DRAIN = 6,  ///< Time spent draining one nonempty bounded socket batch.
+    CLSP_NATIVE_TIMING_SOCKET_BATCH_OLDEST_AGE = 7,  ///< Oldest datagram age when its socket batch finished draining.
+  } clsp_native_timing_stage_t;
+
+  /** @brief Fixed native timing-array cardinalities. */
+  enum {
+    CLSP_NATIVE_TIMING_STAGE_COUNT = 8,  ///< Number of `clsp_native_timing_stage_t` entries.
+    CLSP_NATIVE_TIMING_DEVICE_COUNT = 17,  ///< One pointer source plus sixteen controller generations.
+  };
+
+  /** @brief Availability and clock-domain evidence attached to one native distribution. */
+  typedef enum clsp_native_timing_flag {
+    CLSP_NATIVE_TIMING_AVAILABLE = 1U << 0U,  ///< The endpoint can observe both stage boundaries.
+    CLSP_NATIVE_TIMING_CLIENT_MONOTONIC = 1U << 1U,  ///< Values use the client monotonic clock domain.
+    CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED = 1U << 2U,  ///< At least one sample used kernel monotonic ancillary time.
+    CLSP_NATIVE_TIMING_SAME_ENDPOINT = 1U << 3U,  ///< Both timestamps belong to this macOS endpoint.
+    CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT = 1U << 4U,  ///< Some samples used callback/userspace fallback time.
+    CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES = 1U << 5U,  ///< Byte totals exclude unattributable shared edge/baseline overhead.
+  } clsp_native_timing_flag_t;
+
+  /** @brief Allocation-free fixed-bucket distribution summarized at no more than four hertz. */
+  typedef struct clsp_native_distribution {
+    uint64_t count;  ///< Cumulative recorded sample count.
+    uint64_t p50_microseconds;  ///< Approximate fixed-bucket median upper bound.
+    uint64_t p95_microseconds;  ///< Approximate fixed-bucket 95th-percentile upper bound.
+    uint64_t p99_microseconds;  ///< Approximate fixed-bucket 99th-percentile upper bound.
+    uint64_t maximum_microseconds;  ///< Exact greatest observed value.
+    uint64_t drops;  ///< Cumulative unavailable/correlation/invalid-time samples.
+    uint32_t flags;  ///< `clsp_native_timing_flag_t` mask.
+    uint32_t reserved_zero;  ///< Reserved and required to be zero.
+  } clsp_native_distribution_t;
+
+  /** @brief Coarse per-device capture distribution and exact generation counters. */
+  typedef struct clsp_native_device_telemetry {
+    clsp_native_distribution_t state_spacing;  ///< Pointer/controller-state callback spacing.
+    clsp_native_distribution_t sensor_spacing;  ///< Independent controller-motion callback spacing.
+    uint64_t captured_samples;  ///< Cumulative capture callbacks in this exact generation.
+    uint64_t dropped_samples;  ///< Cumulative bounded native record drops in this generation.
+    uint64_t attributed_wire_bytes;  ///< Cumulative complete IP bytes attributable to this device state/sensor lane.
+    uint32_t device_id;  ///< Pointer one or controller slot one through sixteen.
+    uint32_t instance_generation;  ///< Exact active or most recently removed generation.
+    uint32_t observed_state_hz;  ///< Latest honest state/pointer callback rate.
+    uint32_t observed_sensor_hz;  ///< Latest independently measured motion callback rate.
+    uint8_t device_type;  ///< One `clsp_device_offer_type_t` value.
+    uint8_t capture_source;  ///< One `clsp_device_capture_source_t` value.
+    uint8_t active;  ///< Boolean generation-active marker.
+    uint8_t reserved_zero[5];  ///< Reserved and zero.
+  } clsp_native_device_telemetry_t;
+
+  /** @brief Coarse fixed-layout native timing snapshot with no cross-machine fabrication. */
+  typedef struct clsp_native_timing_snapshot {
+    uint32_t abi_version;  ///< Snapshot ABI version.
+    uint32_t structure_size;  ///< Exact `sizeof(clsp_native_timing_snapshot_t)`.
+    uint64_t snapshot_generation;  ///< Monotonic nonzero worker publication generation.
+    uint64_t snapshot_time_microseconds;  ///< Client monotonic publication time.
+    uint32_t stream_generation;  ///< Active stream generation, or zero.
+    uint32_t input_generation;  ///< Active input generation, or zero.
+    uint32_t video_generation;  ///< Active video generation, or zero.
+    uint32_t audio_generation;  ///< Active audio generation, or zero.
+    uint32_t pointer_generation;  ///< Active logical pointer generation.
+    uint32_t controller_generations[16];  ///< Active controller generations by slot.
+    uint32_t touch_generations[16];  ///< Active touch-device generations by slot.
+    uint32_t pen_generations[16];  ///< Active pen-device generations by slot.
+    clsp_native_distribution_t stages[CLSP_NATIVE_TIMING_STAGE_COUNT];  ///< Fixed stage order.
+    clsp_native_device_telemetry_t devices[CLSP_NATIVE_TIMING_DEVICE_COUNT];  ///< Pointer then controllers.
+  } clsp_native_timing_snapshot_t;
 
   /** @brief Secret-free snapshot of one native reconnect/rekey owner. */
   typedef struct clsp_handoff_snapshot {
@@ -1209,6 +1389,30 @@ extern "C" {
     const clsp_input_configuration_t *configuration
   );
 
+  /** @brief Apply one exact coarse input-rate renegotiation on the native worker. */
+  clsp_status_t clsp_core_update_input_rates(
+    clsp_core_t *core,
+    const clsp_input_rate_update_t *update
+  );
+
+  /** @brief Copy latest authenticated LSPI and effective-rate evidence. */
+  clsp_status_t clsp_core_copy_input_feedback(
+    const clsp_core_t *core,
+    clsp_input_feedback_snapshot_t *output
+  );
+
+  /** @brief Copy the newest locally assigned edge ID for an atomic text/IME barrier. */
+  clsp_status_t clsp_core_copy_input_edge_snapshot(
+    const clsp_core_t *core,
+    clsp_input_edge_snapshot_t *output
+  );
+
+  /** @brief Drain one coarse native hot-plug/rate-offer event, or kind `NONE`. */
+  clsp_status_t clsp_core_poll_device_offer(
+    clsp_core_t *core,
+    clsp_device_offer_event_t *output
+  );
+
   /** @brief Submit one relative-pointer sample to the native cumulative composer. */
   clsp_status_t clsp_core_submit_pointer(
     clsp_core_t *core,
@@ -1239,6 +1443,9 @@ extern "C" {
   /** @brief Stop accepting samples and release native capture authority state. */
   clsp_status_t clsp_core_neutralize_input(clsp_core_t *core);
 
+  /** @brief Restart unchanged input authority with an internally generated fresh neutral baseline. */
+  clsp_status_t clsp_core_restart_input_baseline(clsp_core_t *core);
+
   /**
    * @brief Start preferred IOHID capture on a dedicated native dispatch queue.
    *
@@ -1263,6 +1470,18 @@ extern "C" {
   clsp_status_t clsp_core_copy_telemetry(
     const clsp_core_t *core,
     clsp_telemetry_snapshot_t *output
+  );
+
+  /**
+   * @brief Copy the latest no-more-than-four-hertz native timing publication.
+   *
+   * @param core Core handle.
+   * @param output Caller-owned fixed-layout destination.
+   * @return Typed status.
+   */
+  clsp_status_t clsp_core_copy_native_timing(
+    const clsp_core_t *core,
+    clsp_native_timing_snapshot_t *output
   );
 
   /**

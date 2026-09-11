@@ -144,6 +144,22 @@ final class PreferencesTests: XCTestCase {
         XCTAssertNoThrow(try preferences.validate())
     }
 
+    func testLSPProfileAndInputRateValidationRequiresExplicitCompetitionCapacity() {
+        var preferences = StreamingPreferences.default
+        preferences.lspNetworkProfile = .competitionLAN
+        XCTAssertThrowsError(try preferences.validate())
+
+        preferences.lspCompetitionCapacityMbps = 2_500
+        preferences.lspPointerRate = 16_000
+        preferences.lspControllerRate = 2_000
+        preferences.lspSensorRate = 4_000
+        preferences.lspReconciliationRate = 1_000
+        XCTAssertNoThrow(try preferences.validate())
+
+        preferences.lspPointerRate = 16_001
+        XCTAssertThrowsError(try preferences.validate())
+    }
+
     func testReferenceAutomaticBitrateCanExceedManualSliderLimit() {
         var preferences = StreamingPreferences(
             width: 3_840,

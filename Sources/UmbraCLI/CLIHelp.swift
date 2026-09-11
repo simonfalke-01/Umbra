@@ -5,12 +5,15 @@ public enum CLIHelpTopic: String, CaseIterable, Equatable, Sendable {
     case pair
     case stream
     case quit
+    case attach
+    case stop
+    case telemetry
 }
 
 /// Stable, dependency-free help text for the Moonlight-compatible CLI surface.
 public enum CLIHelp {
     public static func text(for topic: CLIHelpTopic, applicationName: String = "umbra") -> String {
-        switch topic {
+        return switch topic {
         case .global:
             """
             Usage: \(applicationName) [options] <action>
@@ -22,6 +25,9 @@ public enum CLIHelp {
               quit            Quit the currently running app
               stream          Start streaming an app
               pair            Pair a new host
+              attach          Reattach an existing LSP stream
+              stop            Stop an owned LSP stream
+              telemetry       Print an LSP telemetry snapshot
               recover-storage Preserve unreadable storage and reset Umbra on next launch
 
             Options:
@@ -59,6 +65,10 @@ public enum CLIHelp {
             Options:
               -csv, --csv         Print as CSV with additional information
               -verbose, --verbose Display connection progress
+              --protocol <legacy|lsp>
+                                  Select GameStream or LSP explicitly
+              --lsp-host-id <uuid> Select an exact persisted LSP host
+              --lsp-telemetry     Include an LSP telemetry snapshot
               -h, --help          Display this help text
               -v, --version       Display version information
             """
@@ -73,6 +83,12 @@ public enum CLIHelp {
 
             Options:
               -pin, --pin <pin>   Use a predefined 4-digit pairing PIN
+              --protocol <legacy|lsp>
+                                  LSP generates and displays its own six-digit PIN
+              --lsp-host-id <uuid> Select an exact discovered LSP host
+              --lsp-permissions <browse,start,input,microphone,stop,quit,controller-output>
+                                  Request an explicit LSP permission set
+              --lsp-microphone <off|optional|required>
               -h, --help          Display this help text
               -v, --version       Display version information
             """
@@ -102,6 +118,16 @@ public enum CLIHelp {
             Audio and input options:
               -audio-config, --audio-config <stereo|5.1-surround|7.1-surround>
               -capture-system-keys, --capture-system-keys <never|fullscreen|always>
+              -lsp-profile, --lsp-profile <adaptive|competition>
+              -lsp-capacity-mbps, --lsp-capacity-mbps <mbps>
+              -lsp-pointer-rate, --lsp-pointer-rate <125...16000>
+              -lsp-controller-rate, --lsp-controller-rate <125...2000>
+              -lsp-sensor-rate, --lsp-sensor-rate <125...4000>
+              -lsp-reconciliation-rate, --lsp-reconciliation-rate <50...1000>
+              --protocol <legacy|lsp>          Select the transport explicitly
+              --lsp-host-id <uuid>             Select an exact persisted LSP host
+              --lsp-microphone <off|optional|required>
+              --lsp-telemetry                  Print telemetry after startup
 
             Boolean options (prefix with no- to disable):
               vsync, multi-controller, quit-after, absolute-mouse
@@ -110,9 +136,13 @@ public enum CLIHelp {
               reverse-scroll-direction, swap-gamepad-buttons, keep-awake
               performance-overlay, hdr
 
+            For LSP streams, performance-overlay includes native transport,
+            media, path-MTU, authentication, drop, and reconnect statistics.
+
             General options:
               -quit-running-app, --quit-running-app
                                               Quit a different running app before launch
+              --resume                        Attach to the selected running application intent
               -h, --help                      Display this help text
               -v, --version                   Display version information
             """
@@ -126,9 +156,34 @@ public enum CLIHelp {
               host            Host computer name, UUID, or IP address
 
             Options:
+              --protocol <legacy|lsp>
+                                  Select GameStream or LSP explicitly
+              --lsp-host-id <uuid> Select an exact persisted LSP host
+              --lsp-telemetry     Include an LSP telemetry snapshot
               -h, --help      Display this help text
               -v, --version   Display version information
             """
+        case .attach:
+            lspLifecycleHelp(action: "attach", summary: "Reattach an existing authenticated LSP stream.", applicationName: applicationName)
+        case .stop:
+            lspLifecycleHelp(action: "stop", summary: "Stop an owned LSP stream and await its authenticated response.", applicationName: applicationName)
+        case .telemetry:
+            lspLifecycleHelp(action: "telemetry", summary: "Print the current low-rate LSP telemetry snapshot.", applicationName: applicationName)
         }
+    }
+
+    private static func lspLifecycleHelp(action: String, summary: String, applicationName: String) -> String {
+        """
+        Usage: \(applicationName) \(action) [options] <host>
+
+        \(summary)
+
+        Options:
+          --protocol lsp             Required explicit protocol selection
+          --lsp-host-id <uuid>       Select an exact persisted LSP host ID
+          --lsp-telemetry            Include telemetry after the operation
+          -h, --help                 Display this help text
+          -v, --version              Display version information
+        """
     }
 }

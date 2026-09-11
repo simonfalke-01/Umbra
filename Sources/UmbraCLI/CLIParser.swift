@@ -1,3 +1,4 @@
+import Foundation
 import UmbraCore
 
 /// Parses Moonlight-compatible arguments without performing I/O or terminating the process.
@@ -75,7 +76,13 @@ public struct UmbraCLIParser: Sendable {
         case .stream:
             return parseStream(operands: operands, tokenized: tokenized)
         case .quit:
-            return parseQuit(operands: operands)
+            return parseQuit(operands: operands, tokenized: tokenized)
+        case .attach:
+            return parseLSPHostAction(operands: operands, tokenized: tokenized, topic: .attach)
+        case .stop:
+            return parseLSPHostAction(operands: operands, tokenized: tokenized, topic: .stop)
+        case .telemetry:
+            return parseLSPHostAction(operands: operands, tokenized: tokenized, topic: .telemetry)
         }
     }
 
@@ -137,11 +144,14 @@ private extension UmbraCLIParser {
 
         flag(
             "help", "version", "csv", "verbose", "720", "1080", "1440", "4K",
-            "quit-running-app"
+            "quit-running-app", "resume", "lsp-telemetry"
         )
         value(
             "pin", "resolution", "fps", "bitrate", "packet-size", "display-mode",
-            "audio-config", "capture-system-keys", "video-codec", "video-decoder"
+            "audio-config", "capture-system-keys", "video-codec", "video-decoder",
+            "lsp-profile", "lsp-capacity-mbps", "lsp-pointer-rate", "lsp-controller-rate",
+            "lsp-sensor-rate", "lsp-reconciliation-rate", "protocol", "lsp-host-id",
+            "lsp-permissions", "lsp-microphone"
         )
 
         for toggle in Self.toggleOptionNames {
@@ -262,16 +272,22 @@ private extension UmbraCLIParser {
         case .recoverStorage:
             return common
         case .list:
-            return common.union(["csv", "verbose"])
+            return common.union(["csv", "verbose", "protocol", "lsp-host-id", "lsp-telemetry"])
         case .pair:
-            return common.union(["pin"])
+            return common.union(["pin", "protocol", "lsp-host-id", "lsp-permissions", "lsp-microphone"])
         case .quit:
-            return common
+            return common.union(["protocol", "lsp-host-id", "lsp-telemetry"])
+        case .attach, .stop, .telemetry:
+            return common.union(["protocol", "lsp-host-id", "lsp-telemetry"])
         case .stream:
             var stream = Set([
                 "720", "1080", "1440", "4K", "resolution", "fps", "bitrate",
                 "packet-size", "display-mode", "audio-config", "capture-system-keys",
                 "video-codec", "video-decoder", "quit-running-app",
+                "resume",
+                "lsp-profile", "lsp-capacity-mbps", "lsp-pointer-rate", "lsp-controller-rate",
+                "lsp-sensor-rate", "lsp-reconciliation-rate",
+                "protocol", "lsp-host-id", "lsp-microphone", "lsp-telemetry",
             ])
             for toggle in Self.toggleOptionNames {
                 stream.insert(toggle)
@@ -289,6 +305,9 @@ private extension UmbraCLIParser {
         case "pair": return .pair
         case "stream": return .stream
         case "quit": return .quit
+        case "attach": return .attach
+        case "stop": return .stop
+        case "telemetry": return .telemetry
         default: return nil
         }
     }
@@ -307,12 +326,17 @@ private extension UmbraCLIParser {
         guard operands.count == 1 else {
             return usageError("Unexpected argument: \(operands[1])", topic: .list)
         }
+        guard let selection = parseProtocolAndLSPOptions(tokenized, topic: .list) else {
+            return usageError("Invalid protocol or LSP option", topic: .list)
+        }
         return .ready(
             command: .list(
                 ListAppsCommand(
                     host: host,
                     csv: tokenized.hasOption("csv"),
-                    verbose: tokenized.hasOption("verbose")
+                    verbose: tokenized.hasOption("verbose"),
+                    streamingProtocol: selection.protocol,
+                    lsp: selection.lsp
                 )
             ),
             warnings: []
@@ -327,21 +351,34 @@ private extension UmbraCLIParser {
             return usageError("Unexpected argument: \(operands[1])", topic: .pair)
         }
 
+        guard let selection = parseProtocolAndLSPOptions(tokenized, topic: .pair) else {
+            return usageError("Invalid protocol or LSP option", topic: .pair)
+        }
         let pin = tokenized.lastOption("pin")?.value
-        if let pin, !isFourDigitPIN(pin) {
+        if selection.protocol == .lsp, pin != nil {
+            return usageError("LSP generates a six-digit PIN; do not pass it on the command line", topic: .pair)
+        }
+        if selection.protocol == .legacyGameStream, let pin, !isFourDigitPIN(pin) {
             return usageError("PIN must be 4 digits", topic: .pair)
         }
-        return .ready(command: .pair(PairHostCommand(host: host, pin: pin)), warnings: [])
+        return .ready(command: .pair(PairHostCommand(
+            host: host, pin: pin, streamingProtocol: selection.protocol, lsp: selection.lsp
+        )), warnings: [])
     }
 
-    func parseQuit(operands: [String]) -> CLIParseResult {
+    func parseQuit(operands: [String], tokenized: TokenizedArguments) -> CLIParseResult {
         guard let host = operands.first, !host.isEmpty else {
             return usageError("Host not provided", topic: .quit)
         }
         guard operands.count == 1 else {
             return usageError("Unexpected argument: \(operands[1])", topic: .quit)
         }
-        return .ready(command: .quit(QuitHostCommand(host: host)), warnings: [])
+        guard let selection = parseProtocolAndLSPOptions(tokenized, topic: .quit) else {
+            return usageError("Invalid protocol or LSP option", topic: .quit)
+        }
+        return .ready(command: .quit(QuitHostCommand(
+            host: host, streamingProtocol: selection.protocol, lsp: selection.lsp
+        )), warnings: [])
     }
 
     func parseStream(operands: [String], tokenized: TokenizedArguments) -> CLIParseResult {
@@ -358,6 +395,15 @@ private extension UmbraCLIParser {
         var preferences = defaultStreamingPreferences
         var warnings: [String] = []
         var shouldRecalculateBitrate = false
+        guard let selection = parseProtocolAndLSPOptions(tokenized, topic: .stream) else {
+            return usageError("Invalid protocol or LSP option", topic: .stream)
+        }
+        if selection.protocol == .lsp, tokenized.hasOption("quit-running-app") {
+            return usageError(
+                "LSP cannot quit an unrelated application during START; use the explicit quit action",
+                topic: .stream
+            )
+        }
 
         let resolutionNames: Set<String> = ["720", "1080", "1440", "4K", "resolution"]
         if let resolutionOption = tokenized.lastOption(named: resolutionNames) {
@@ -523,6 +569,41 @@ private extension UmbraCLIParser {
             }
         }
 
+        if let option = tokenized.lastOption("lsp-profile") {
+            guard let value = option.value else {
+                return usageError("Missing value after --lsp-profile", topic: .stream)
+            }
+            switch value.lowercased() {
+            case "adaptive", "adaptive-low-latency":
+                preferences.lspNetworkProfile = .adaptiveLowLatency
+            case "competition", "competition-lan":
+                preferences.lspNetworkProfile = .competitionLAN
+            default:
+                return invalidChoice(name: "lsp-profile", value: value)
+            }
+        }
+        let lspIntegerOptions: [(String, WritableKeyPath<StreamingPreferences, Int>, ClosedRange<Int>)] = [
+            ("lsp-capacity-mbps", \.lspCompetitionCapacityMbps, 0...100_000),
+            ("lsp-pointer-rate", \.lspPointerRate, 125...16_000),
+            ("lsp-controller-rate", \.lspControllerRate, 125...2_000),
+            ("lsp-sensor-rate", \.lspSensorRate, 125...4_000),
+            ("lsp-reconciliation-rate", \.lspReconciliationRate, 50...1_000),
+        ]
+        for (name, keyPath, range) in lspIntegerOptions {
+            guard let option = tokenized.lastOption(name) else { continue }
+            guard let value = parseInteger(option), range.contains(value) else {
+                return usageError("Invalid --\(name) value: \(option.value ?? "")", topic: .stream)
+            }
+            preferences[keyPath: keyPath] = value
+        }
+        if preferences.lspNetworkProfile == .competitionLAN,
+           preferences.lspCompetitionCapacityMbps == 0 {
+            return usageError(
+                "--lsp-profile competition requires --lsp-capacity-mbps",
+                topic: .stream
+            )
+        }
+
         if let option = tokenized.lastOption("bitrate") {
             guard let value = parseInteger(option) else {
                 return usageError("Invalid bitrate value: \(option.value ?? "")", topic: .stream)
@@ -552,10 +633,98 @@ private extension UmbraCLIParser {
                     host: host,
                     applicationName: operands[1],
                     preferences: preferences,
-                    quitRunningApplication: tokenized.hasOption("quit-running-app")
+                    quitRunningApplication: tokenized.hasOption("quit-running-app"),
+                    resume: tokenized.hasOption("resume"),
+                    streamingProtocol: selection.protocol,
+                    lsp: selection.lsp
                 )
             ),
             warnings: warnings
+        )
+    }
+
+    func parseLSPHostAction(
+        operands: [String], tokenized: TokenizedArguments, topic: CLIHelpTopic
+    ) -> CLIParseResult {
+        guard let host = operands.first, !host.isEmpty else { return usageError("Host not provided", topic: topic) }
+        guard operands.count == 1 else { return usageError("Unexpected argument: \(operands[1])", topic: topic) }
+        guard let selection = parseProtocolAndLSPOptions(tokenized, topic: topic), selection.protocol == .lsp else {
+            return usageError("\(topic.rawValue) requires --protocol lsp", topic: topic)
+        }
+        let command: UmbraCommand
+        switch topic {
+        case .attach: command = .attach(AttachHostCommand(host: host, lsp: selection.lsp))
+        case .stop: command = .stop(StopHostCommand(host: host, lsp: selection.lsp))
+        case .telemetry: command = .telemetry(TelemetryHostCommand(host: host, lsp: selection.lsp))
+        default: return usageError("Invalid LSP action", topic: topic)
+        }
+        return .ready(command: command, warnings: [])
+    }
+
+    func parseProtocolAndLSPOptions(
+        _ tokenized: TokenizedArguments,
+        topic: CLIHelpTopic
+    ) -> (protocol: CLIStreamingProtocol, lsp: CLILSPOptions)? {
+        let selectedProtocol: CLIStreamingProtocol
+        if let value = tokenized.lastOption("protocol")?.value?.lowercased() {
+            switch value {
+            case "legacy", "gamestream": selectedProtocol = .legacyGameStream
+            case "lsp": selectedProtocol = .lsp
+            default: return nil
+            }
+        } else {
+            selectedProtocol = .legacyGameStream
+        }
+        let lspNames: Set<String> = [
+            "lsp-host-id", "lsp-permissions", "lsp-microphone", "lsp-telemetry",
+            "lsp-profile", "lsp-capacity-mbps", "lsp-pointer-rate", "lsp-controller-rate",
+            "lsp-sensor-rate", "lsp-reconciliation-rate",
+        ]
+        let usesLSPOption = tokenized.options.contains { lspNames.contains($0.name) }
+        guard selectedProtocol == .lsp || !usesLSPOption else { return nil }
+
+        let hostID: UUID?
+        if let value = tokenized.lastOption("lsp-host-id")?.value {
+            guard let parsed = UUID(uuidString: value) else { return nil }
+            hostID = parsed
+        } else {
+            hostID = nil
+        }
+        var permissions = CLILSPPermissionSet.standard
+        if let value = tokenized.lastOption("lsp-permissions")?.value {
+            permissions = []
+            for name in value.lowercased().split(separator: ",").map(String.init) {
+                switch name {
+                case "browse": permissions.insert(.browseApplications)
+                case "start", "attach": permissions.insert(.startOrAttach)
+                case "input": permissions.insert(.input)
+                case "microphone": permissions.insert(.microphone)
+                case "stop": permissions.insert(.stopOwnStream)
+                case "quit": permissions.insert(.quitApplication)
+                case "controller-output": permissions.insert(.controllerOutput)
+                default: return nil
+                }
+            }
+            guard !permissions.isEmpty else { return nil }
+        }
+        let microphone: CLILSPMicrophoneMode
+        if let value = tokenized.lastOption("lsp-microphone")?.value?.lowercased(),
+           let parsed = CLILSPMicrophoneMode(rawValue: value) {
+            microphone = parsed
+        } else if tokenized.lastOption("lsp-microphone") != nil {
+            return nil
+        } else {
+            microphone = .off
+        }
+        if microphone != .off { permissions.insert(.microphone) }
+        return (
+            selectedProtocol,
+            CLILSPOptions(
+                hostID: hostID,
+                permissions: permissions,
+                microphone: microphone,
+                emitTelemetry: tokenized.hasOption("lsp-telemetry")
+            )
         )
     }
 

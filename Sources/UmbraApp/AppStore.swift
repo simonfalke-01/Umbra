@@ -209,7 +209,12 @@ final class AppStore: ObservableObject {
                 Task { await service.cancelPairing(hostID: prior.hostID) }
             }
             let pin = String(format: "%04d", Int.random(in: 0...9_999))
-            pairingPreparations[host.id] = .init(pin: pin, provisionalSPKIFingerprint: nil)
+            pairingPreparations[host.id] = .init(
+                pin: pin,
+                provisionalSPKIFingerprint: nil,
+                requestedPermissions: [],
+                effectivePermissions: []
+            )
             presentedSheet = .pair(host.id, pin: pin)
             return
         }

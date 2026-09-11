@@ -85,6 +85,20 @@ public enum LSPClientSessionTermination: Equatable, Sendable {
     case failed(LSPTransportError)
 }
 
+/// Product-visible remote STOP outcome; local teardown always completes.
+public enum LSPRemoteStopResult: Equatable, Sendable {
+    case notRunning
+    case stopped
+    case remoteRejected(LSPControlStatus)
+    case transportFailed(LSPTransportError)
+}
+
+private struct LSPIncomingObject {
+    var totalLength: UInt32
+    var sha256: Data
+    var bytes: Data
+}
+
 final class LSPTerminationObserver: @unchecked Sendable {
     private let lock = NSLock()
     private var handler: (@Sendable (LSPClientSessionTermination) -> Void)?
@@ -160,6 +174,16 @@ public actor LSPClientSession {
     private var captureTransferred = true
     private var pendingNativeHandoff: LSPNativeHandoff?
     private var pairingContext: LSPPairingContext?
+    private var authenticatedTrust: LSPTrustRecord?
+    private var effectivePermissions: LSPPermission = []
+    private var certificateRotationHandler: (@Sendable (LSPTrustRecord) async -> LSPControlStatus)?
+    private var incomingObjects: [UUID: LSPIncomingObject] = [:]
+    private var completedObjects: [UUID: Data] = [:]
+    private var bufferedObjectBytes = 0
+    private var deviceRateTelemetry: [String: LSPDeviceRateTelemetry] = [:]
+    private var pendingDeviceOffers: [LSPNativeDeviceOffer] = []
+    private var reconnectDuration = LSPFixedDurationWindow()
+    private var reconnectStartedAtMicroseconds: UInt64?
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -258,7 +282,13 @@ public actor LSPClientSession {
                 pending: pending,
                 native: native
             )
-            return .init(host: host, pin: material.pin, expiresAtUTCSeconds: pending.expiresAtUTCSeconds)
+            return .init(
+                host: host,
+                pin: material.pin,
+                expiresAtUTCSeconds: pending.expiresAtUTCSeconds,
+                requestedPermissions: requestedPermissions,
+                effectivePermissions: pending.permissions
+            )
         } catch {
             try? native.cancel()
             state = .failed(.pairingFailed)
@@ -360,13 +390,17 @@ public actor LSPClientSession {
             }
             self.pairingContext = nil
             state = .authenticated
-            return LSPTrustRecord(
+            let trust = LSPTrustRecord(
                 hostID: pairingContext.host.hostID,
                 hostIdentityKey: pairingContext.serverHello.hostIdentityKey,
                 dtlsSPKISHA256: pairingContext.host.serverSPKISHA256,
                 permissions: result.permissions,
                 revocationGeneration: UInt64(result.revocationGeneration)
             )
+            authenticatedTrust = trust
+            effectivePermissions = trust.permissions
+            installControlHandlerIfNeeded()
+            return trust
         } catch {
             try? pairingContext.native.cancel()
             self.pairingContext = nil
@@ -385,17 +419,25 @@ public actor LSPClientSession {
     }
 
     /// Reconnects and authenticates a previously paired LSP identity.
-    public func authenticate(host: LSPHostRecord, trust: LSPTrustRecord) async throws -> LSPTrustRecord {
+    public func authenticate(
+        host: LSPHostRecord,
+        trust: LSPTrustRecord,
+        serverSPKISHA256: Data? = nil
+    ) async throws -> LSPTrustRecord {
         guard host.hostID == trust.hostID else { throw LSPTransportError.invalidEndpoint }
+        let selectedSPKI = serverSPKISHA256 ?? trust.pendingDTLSSPKISHA256 ?? trust.dtlsSPKISHA256
+        guard selectedSPKI == trust.dtlsSPKISHA256 || selectedSPKI == trust.pendingDTLSSPKISHA256 else {
+            throw LSPTransportError.spkiMismatch
+        }
         let endpoint = LSPTransportEndpoint(
             host: host.address,
             port: host.port,
-            serverSPKISHA256: trust.dtlsSPKISHA256
+            serverSPKISHA256: selectedSPKI
         )
         let serverHello = try await connect(endpoint: endpoint)
         guard serverHello.hostID == trust.hostID,
               serverHello.hostIdentityKey == trust.hostIdentityKey,
-              serverHello.serverSPKISHA256 == trust.dtlsSPKISHA256,
+              serverHello.serverSPKISHA256 == selectedSPKI,
               let clientNonce
         else {
             throw LSPControlStatus.authenticationFailed
@@ -419,23 +461,27 @@ public actor LSPClientSession {
         let response = try LSPControlWire.authResponse(from: event)
         let hostPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: trust.hostIdentityKey)
         guard response.connectionGeneration == serverHello.connectionGeneration,
-              hostPublicKey.isValidSignature(response.serverSignature, for: transcript)
+              hostPublicKey.isValidSignature(response.serverSignature, for: transcript),
+              response.isAllowedTransition(from: trust)
         else {
             throw LSPControlStatus.authenticationFailed
         }
         state = .authenticated
-        return LSPTrustRecord(
-            hostID: trust.hostID,
-            hostIdentityKey: trust.hostIdentityKey,
-            dtlsSPKISHA256: trust.dtlsSPKISHA256,
-            permissions: response.permissions,
-            revocationGeneration: UInt64(response.revocationGeneration)
-        )
+        guard var updated = trust.promotingAuthenticatedSPKI(selectedSPKI) else {
+            throw LSPTransportError.spkiMismatch
+        }
+        updated.permissions = response.permissions
+        updated.revocationGeneration = UInt64(response.revocationGeneration)
+        authenticatedTrust = updated
+        effectivePermissions = updated.permissions
+        installControlHandlerIfNeeded()
+        return updated
     }
 
     /// Lists applications after pairing or reconnect authentication grants browse permission.
     public func listApplications() async throws -> [LSPApplication] {
         guard state == .authenticated || state == .inputActive else { throw LSPTransportError.notAuthenticated }
+        guard effectivePermissions.contains(.browseApplications) else { throw LSPControlStatus.permissionDenied }
         let event = try await transport.request(
             messageType: LSPControlMessageType.listApplications.rawValue,
             payload: try LSPControlWire.listApplications()
@@ -446,6 +492,12 @@ public actor LSPClientSession {
     /// Starts the exact input-only vertical slice and installs its native SRTP mapping.
     public func startInput(_ request: LSPInputStartRequest) async throws -> LSPInputStartResponse {
         guard state == .authenticated else { throw LSPTransportError.notAuthenticated }
+        guard effectivePermissions.contains([.startOrAttach, .input]) else {
+            throw LSPControlStatus.permissionDenied
+        }
+        if request.microphoneOffer != nil, !effectivePermissions.contains(.microphone) {
+            throw LSPControlStatus.permissionDenied
+        }
         installControlHandlerIfNeeded()
         var resolvedRequest = request
         resolvedRequest.networkProfile = switch transportProfile {
@@ -513,6 +565,243 @@ public actor LSPClientSession {
         }
         state = .inputActive
         return response
+    }
+
+    /// Sends one reliable UTF-8/IME commit behind the exact applied-edge barrier.
+    public func sendText(_ text: String, precedingEdgeID: UInt64) async throws {
+        guard state == .inputActive, let authority = inputAuthority else {
+            throw LSPTransportError.invalidState
+        }
+        guard effectivePermissions.contains(.input) else { throw LSPControlStatus.permissionDenied }
+        let utf8 = Data(text.utf8)
+        guard !utf8.isEmpty, utf8.count <= 16_384, let length = UInt16(exactly: utf8.count) else {
+            throw DeterministicCBORError.malformed
+        }
+        let request: LSPTextInputRequest
+        if utf8.count <= 768 {
+            request = .init(
+                sessionID: authority.sessionID,
+                inputGeneration: authority.nativeConfiguration.inputGeneration,
+                precedingEdgeID: precedingEdgeID,
+                utf8Length: length,
+                inlineUTF8: utf8,
+                objectID: nil,
+                sha256: nil
+            )
+        } else {
+            let objectID = UUID()
+            let digest = Data(SHA256.hash(data: utf8))
+            try await uploadObject(objectID: objectID, bytes: utf8, sha256: digest)
+            request = .init(
+                sessionID: authority.sessionID,
+                inputGeneration: authority.nativeConfiguration.inputGeneration,
+                precedingEdgeID: precedingEdgeID,
+                utf8Length: length,
+                inlineUTF8: nil,
+                objectID: objectID,
+                sha256: digest
+            )
+        }
+        let event = try await transport.request(
+            messageType: LSPControlMessageType.textInput.rawValue,
+            payload: try LSPControlWire.textInput(request)
+        )
+        try LSPControlWire.requireTextInputResponse(event, request: request)
+    }
+
+    /// Sends text behind the newest locally assigned exactly-once input edge.
+    public func sendText(_ text: String) async throws {
+        guard let authority = inputAuthority else { throw LSPTransportError.invalidState }
+        let snapshot = try transport.inputEdgeSnapshot()
+        guard snapshot.streamGeneration == authority.nativeConfiguration.streamGeneration,
+              snapshot.inputGeneration == authority.nativeConfiguration.inputGeneration else {
+            throw LSPTransportError.invalidState
+        }
+        try await sendText(text, precedingEdgeID: snapshot.latestAssignedEdgeID)
+    }
+
+    /// Requests generation-scoped hot-plug input rates without resetting device state.
+    public func renegotiateInputRate(_ offer: LSPInputRateOffer) async throws -> LSPInputRateSelection {
+        guard state == .inputActive, let authority = inputAuthority,
+              offer.sessionID == authority.sessionID,
+              offer.inputGeneration == authority.nativeConfiguration.inputGeneration else {
+            throw LSPTransportError.invalidState
+        }
+        guard effectivePermissions.contains(.input) else { throw LSPControlStatus.permissionDenied }
+        let event = try await transport.request(
+            messageType: LSPControlMessageType.inputRateRequest.rawValue,
+            payload: try LSPControlWire.inputRateRequest(offer)
+        )
+        let selection = try LSPControlWire.inputRateResponse(from: event, offer: offer)
+        var updated = authority.nativeConfiguration
+        updated.pointerRate = selection.pointerRate
+        updated.controllerRate = selection.controllerRate
+        updated.sensorRate = selection.aggregateSensorRate
+        updated.reconciliationRate = selection.reconciliationRate
+        updated.reservedInputWireBitsPerSecond = selection.reservedInputWireBitsPerSecond
+        try transport.updateInputRates(updated)
+        inputAuthority?.nativeConfiguration = updated
+        let key = "\(offer.deviceType.rawValue):\(offer.deviceID):\(offer.instanceGeneration)"
+        if offer.kind == .removed {
+            deviceRateTelemetry.removeValue(forKey: key)
+        } else {
+            deviceRateTelemetry[key] = .init(
+                kind: offer.kind,
+                deviceType: offer.deviceType,
+                deviceID: offer.deviceID,
+                instanceGeneration: offer.instanceGeneration,
+                observedCaptureRate: offer.observedCaptureRate,
+                selectedStateRate: selection.stateRate,
+                selectedSensorRate: selection.sensorRate
+            )
+        }
+        return selection
+    }
+
+    /// Drains every currently queued low-rate native hot-plug/rate event.
+    public func drainDeviceOffers() async throws {
+        guard state == .inputActive, let authority = inputAuthority else { return }
+        while pendingDeviceOffers.count < 32, let offer = try transport.pollDeviceOffer() {
+            pendingDeviceOffers.append(offer)
+        }
+        while let native = pendingDeviceOffers.first {
+            guard let deviceType = LSPInputRateDeviceType(rawValue: native.deviceType.rawValue),
+                  native.deviceID != 0 else {
+                throw LSPTransportError.internalFailure
+            }
+            let kind: LSPInputRateOffer.Kind = switch native.kind {
+            case .arrived: .arrived
+            case .removed: .removed
+            case .rateObserved: .rateObserved
+            }
+            let offer = LSPInputRateOffer(
+                sessionID: authority.sessionID,
+                inputGeneration: authority.nativeConfiguration.inputGeneration,
+                kind: kind,
+                deviceType: deviceType,
+                deviceID: native.deviceID,
+                instanceGeneration: native.instanceGeneration,
+                observedCaptureRate: native.observedCaptureHz,
+                minimumStateRate: native.minimumStateRate,
+                maximumStateRate: native.maximumStateRate,
+                minimumSensorRate: native.minimumSensorRate,
+                maximumSensorRate: native.maximumSensorRate,
+                maximumStatePacketBytes: native.maximumStatePacketBytes,
+                maximumSensorPacketBytes: native.maximumSensorPacketBytes
+            )
+            let selection = try await renegotiateInputRate(offer)
+            if offer.kind != .removed {
+                let key = "\(offer.deviceType.rawValue):\(offer.deviceID):\(offer.instanceGeneration)"
+                deviceRateTelemetry[key] = .init(
+                    kind: offer.kind,
+                    deviceType: offer.deviceType,
+                    deviceID: offer.deviceID,
+                    instanceGeneration: offer.instanceGeneration,
+                    observedCaptureRate: offer.observedCaptureRate,
+                    selectedStateRate: selection.stateRate,
+                    selectedSensorRate: selection.sensorRate,
+                    captureSource: String(describing: native.captureSource),
+                    observedSensorRate: native.observedSensorHz,
+                    capturedSamples: native.capturedSamples,
+                    droppedSamples: native.droppedSamples,
+                    attributedWireBytes: native.attributedWireBytes,
+                    effectiveWireBitsPerSecond: native.effectiveWireBitsPerSecond,
+                    stateSpacing: Self.distribution(native.stateSpacing),
+                    sensorSpacing: Self.distribution(native.sensorSpacing)
+                )
+            }
+            pendingDeviceOffers.removeFirst()
+        }
+    }
+
+    public func deviceRateTelemetrySnapshot() -> [LSPDeviceRateTelemetry] {
+        deviceRateTelemetry.values.sorted {
+            ($0.deviceType.rawValue, $0.deviceID, $0.instanceGeneration) <
+                ($1.deviceType.rawValue, $1.deviceID, $1.instanceGeneration)
+        }
+    }
+
+    public func productTelemetrySnapshot() -> LSPProductTelemetrySnapshot {
+        let video = videoPipeline?.telemetrySnapshot()
+        let audio = audioPlayout.telemetrySnapshot()
+        return .init(
+            completeFrameReceiveToVideoToolboxSubmit: video?.completeFrameReceiveToVideoToolboxSubmit,
+            videoToolboxSubmitToDecodeCompletion: video?.videoToolboxSubmitToDecodeCompletion,
+            completeFrameReceiveToMetalEnqueue: video?.completeFrameReceiveToMetalEnqueue,
+            metalEnqueueToCommit: video?.metalEnqueueToCommit,
+            metalCommitToCompletion: video?.metalCommitToCompletion,
+            audioReceiveToDecode: audio.audioReceiveToDecode,
+            audioDecodeAndRenderEnqueue: audio.audioDecodeAndRenderEnqueue,
+            audioUnderruns: audio.audioUnderruns,
+            audioRebuffers: audio.audioRebuffers,
+            reconnectDuration: reconnectDuration.snapshot()
+        )
+    }
+
+    private static func distribution(_ native: LSPNativeDistribution) -> LSPDistributionSnapshot? {
+        guard native.flags.contains(.available), native.count > 0 else { return nil }
+        let domain: String
+        if native.flags.contains(.clientMonotonic) {
+            domain = native.flags.contains(.kernelTimestamped)
+                ? "client-monotonic/kernel-timestamped" : "client-monotonic"
+        } else {
+            domain = "unknown"
+        }
+        return .init(
+            count: Int(clamping: native.count),
+            p50Microseconds: native.p50Microseconds,
+            p95Microseconds: native.p95Microseconds,
+            p99Microseconds: native.p99Microseconds,
+            maximumMicroseconds: native.maximumMicroseconds,
+            drops: native.drops,
+            clockDomain: domain
+        )
+    }
+
+    /// Quits only the application owned by this authenticated session.
+    public func quitApplication(applicationID: String) async throws {
+        guard state == .inputActive, let authority = inputAuthority else {
+            throw LSPTransportError.invalidState
+        }
+        guard effectivePermissions.contains(.quitApplication) else {
+            throw LSPControlStatus.permissionDenied
+        }
+        let event = try await transport.request(
+            messageType: LSPControlMessageType.quitApplication.rawValue,
+            payload: try LSPControlWire.quitApplication(
+                sessionID: authority.sessionID,
+                applicationID: applicationID
+            )
+        )
+        try LSPControlWire.requireQuitApplicationResponse(event, sessionID: authority.sessionID)
+    }
+
+    /// Returns one fully authenticated bounded object and removes it from session memory.
+    public func takeObject(_ objectID: UUID) -> Data? {
+        guard let bytes = completedObjects.removeValue(forKey: objectID) else { return nil }
+        bufferedObjectBytes -= bytes.count
+        return bytes
+    }
+
+    private func uploadObject(objectID: UUID, bytes: Data, sha256: Data) async throws {
+        var offset = 0
+        while offset < bytes.count {
+            try Task.checkCancellation()
+            let end = min(offset + 768, bytes.count)
+            let chunk = LSPObjectChunk(
+                objectID: objectID,
+                offset: UInt32(offset),
+                totalLength: UInt32(bytes.count),
+                bytes: bytes.subdata(in: offset..<end),
+                sha256: sha256
+            )
+            let event = try await transport.request(
+                messageType: LSPControlMessageType.objectChunk.rawValue,
+                payload: try LSPControlWire.objectChunk(chunk)
+            )
+            _ = try LSPControlWire.objectChunkAcknowledgement(from: event, chunk: chunk)
+            offset = end
+        }
     }
 
     /// Transfers an existing input session to this freshly authenticated association.
@@ -832,6 +1121,11 @@ public actor LSPClientSession {
         try transport.neutralizeInput()
     }
 
+    /// Restarts the unchanged input mapping with one fresh neutral baseline.
+    public nonisolated func restartInputBaseline() throws {
+        try transport.restartInputBaseline()
+    }
+
     /// Starts preferred IOHID capture without actor work on physical callbacks.
     public nonisolated func startAppleInputCapture() throws -> LSPAppleInputCapture {
         try transport.startAppleInputCapture()
@@ -857,6 +1151,7 @@ public actor LSPClientSession {
             pendingAudioConfigurations.removeAll(keepingCapacity: true)
             pendingMicrophoneConfigurations.removeAll(keepingCapacity: true)
             pendingVideoConfigurations.removeAll(keepingCapacity: true)
+            resetBulkObjects()
             audioPlayout.stop()
             microphoneUplink.stop(transport: transport)
             state = .stopped
@@ -865,6 +1160,7 @@ public actor LSPClientSession {
             videoPipeline?.stop()
             audioPlayout.stop()
             microphoneUplink.stop(transport: transport)
+            resetBulkObjects()
             state = .failed(error)
             throw error
         } catch {
@@ -872,8 +1168,24 @@ public actor LSPClientSession {
             videoPipeline?.stop()
             audioPlayout.stop()
             microphoneUplink.stop(transport: transport)
+            resetBulkObjects()
             state = .failed(.internalFailure)
             throw error
+        }
+    }
+
+    /// Stops remotely when possible and always completes local teardown with a typed outcome.
+    public func stopWithResult() async -> LSPRemoteStopResult {
+        guard state == .authenticated || state == .inputActive else { return .notRunning }
+        do {
+            try await stop()
+            return .stopped
+        } catch let status as LSPControlStatus {
+            return .remoteRejected(status)
+        } catch let error as LSPTransportError {
+            return .transportFailed(error)
+        } catch {
+            return .transportFailed(.internalFailure)
         }
     }
 
@@ -885,6 +1197,7 @@ public actor LSPClientSession {
         pendingAudioConfigurations.removeAll(keepingCapacity: true)
         pendingMicrophoneConfigurations.removeAll(keepingCapacity: true)
         pendingVideoConfigurations.removeAll(keepingCapacity: true)
+        resetBulkObjects()
         audioPlayout.stop()
         microphoneUplink.stop(transport: transport)
         hello = nil
@@ -914,11 +1227,212 @@ public actor LSPClientSession {
                 Task { await self?.receivePathProbeIntent(event) }
             } else if event.messageType == LSPControlMessageType.streamEnded.rawValue {
                 Task { await self?.receiveStreamEnded(event) }
+            } else if event.messageType == LSPControlMessageType.objectChunk.rawValue {
+                Task { await self?.receiveObjectChunk(event) }
+            } else if event.messageType == LSPControlMessageType.certificateRotate.rawValue {
+                Task { await self?.receiveCertificateRotation(event) }
             }
         }
         transport.setPathProbeHandler { [weak self] event in
             Task { await self?.handlePathProbeEvent(event) }
         }
+    }
+
+    /// Installs the product-owned atomic trust persistence step for signed certificate rotation.
+    public func setCertificateRotationHandler(
+        _ handler: (@Sendable (LSPTrustRecord) async -> LSPControlStatus)?
+    ) {
+        certificateRotationHandler = handler
+    }
+
+    private func receiveCertificateRotation(_ event: LSPControlEvent) async {
+        let rotation: LSPCertificateRotation
+        do {
+            rotation = try LSPControlWire.certificateRotation(from: event)
+        } catch {
+            rejectControl(event, responseType: .certificateRotateAck, status: .malformed)
+            return
+        }
+        guard let hello, let trust = authenticatedTrust else {
+            rejectControl(event, responseType: .certificateRotateAck, status: .authenticationFailed)
+            return
+        }
+        var status = LSPControlStatus.authenticationFailed
+        if rotation.hostID == trust.hostID,
+           rotation.connectionGeneration == hello.connectionGeneration,
+           (trust.certificateRotationGeneration ?? 0) < UInt32.max,
+           rotation.rotationGeneration == (trust.certificateRotationGeneration ?? 0) + 1,
+           trust.pendingDTLSSPKISHA256 == nil,
+           rotation.newSPKISHA256 != trust.dtlsSPKISHA256,
+           let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: trust.hostIdentityKey),
+           let transcript = try? LSPControlWire.certificateRotationTranscript(
+                rotation: rotation,
+                hostIdentityKey: trust.hostIdentityKey,
+                currentSPKISHA256: trust.dtlsSPKISHA256
+           ),
+           publicKey.isValidSignature(rotation.hostSignature, for: transcript),
+           let certificateRotationHandler {
+            var updated = trust
+            updated.pendingDTLSSPKISHA256 = rotation.newSPKISHA256
+            updated.certificateRotationGeneration = rotation.rotationGeneration
+            status = await certificateRotationHandler(updated)
+            if status == .success {
+                authenticatedTrust = updated
+            }
+        }
+        do {
+            try transport.sendControlResponse(
+                messageType: LSPControlMessageType.certificateRotateAck.rawValue,
+                requestID: event.requestID,
+                payload: status == .success
+                    ? try LSPControlWire.certificateRotationAck(status: status, rotation: rotation)
+                    : try LSPControlWire.errorResponse(status),
+                errorResponse: status != .success
+            )
+        } catch {
+            failSession(.internalFailure)
+        }
+    }
+
+    private func receiveObjectChunk(_ event: LSPControlEvent) async {
+        let chunk: LSPObjectChunk
+        do {
+            chunk = try LSPControlWire.objectChunk(from: event)
+        } catch {
+            rejectControl(event, responseType: .objectChunk, status: .malformed)
+            return
+        }
+        guard effectivePermissions.contains(.browseApplications) else {
+            do {
+                try sendObjectChunkResponse(
+                    event: event,
+                    chunk: chunk,
+                    status: .permissionDenied,
+                    nextOffset: chunk.offset
+                )
+            } catch {
+                failSession((error as? LSPTransportError) ?? .internalFailure)
+            }
+            return
+        }
+        var status = LSPControlStatus.success
+        var nextOffset = chunk.offset
+        if completedObjects[chunk.objectID] != nil {
+            nextOffset = chunk.totalLength
+            do {
+                try sendObjectChunkResponse(
+                    event: event,
+                    chunk: chunk,
+                    status: .success,
+                    nextOffset: nextOffset
+                )
+            } catch {
+                failSession((error as? LSPTransportError) ?? .internalFailure)
+            }
+            return
+        } else if chunk.offset == 0 {
+            if incomingObjects[chunk.objectID] != nil {
+                status = .staleGeneration
+            } else if incomingObjects.count >= 16 ||
+                        bufferedObjectBytes + Int(chunk.totalLength) > 32 * 1_024 * 1_024 {
+                status = .busy
+            } else {
+                incomingObjects[chunk.objectID] = .init(
+                    totalLength: chunk.totalLength,
+                    sha256: chunk.sha256,
+                    bytes: Data()
+                )
+                bufferedObjectBytes += Int(chunk.totalLength)
+            }
+        }
+        if status == .success, var object = incomingObjects[chunk.objectID] {
+            guard object.totalLength == chunk.totalLength,
+                  object.sha256 == chunk.sha256,
+                  object.bytes.count == Int(chunk.offset) else {
+                status = .staleGeneration
+                incomingObjects.removeValue(forKey: chunk.objectID)
+                bufferedObjectBytes -= Int(object.totalLength)
+                do {
+                    try sendObjectChunkResponse(
+                        event: event,
+                        chunk: chunk,
+                        status: status,
+                        nextOffset: nextOffset
+                    )
+                } catch {
+                    failSession((error as? LSPTransportError) ?? .internalFailure)
+                }
+                return
+            }
+            object.bytes.append(chunk.bytes)
+            nextOffset = UInt32(object.bytes.count)
+            if nextOffset == chunk.totalLength {
+                let digest = Data(SHA256.hash(data: object.bytes))
+                if digest == object.sha256 {
+                    completedObjects[chunk.objectID] = object.bytes
+                } else {
+                    status = .authenticationFailed
+                    bufferedObjectBytes -= Int(object.totalLength)
+                }
+                incomingObjects.removeValue(forKey: chunk.objectID)
+            } else {
+                incomingObjects[chunk.objectID] = object
+            }
+        } else if status == .success {
+            status = .staleGeneration
+        }
+        do {
+            try sendObjectChunkResponse(
+                event: event,
+                chunk: chunk,
+                status: status,
+                nextOffset: nextOffset
+            )
+        } catch {
+            failSession((error as? LSPTransportError) ?? .internalFailure)
+        }
+    }
+
+    private func rejectControl(
+        _ event: LSPControlEvent,
+        responseType: LSPControlMessageType,
+        status: LSPControlStatus
+    ) {
+        guard event.requestID != 0 else {
+            failSession(.internalFailure)
+            return
+        }
+        do {
+            try transport.sendControlResponse(
+                messageType: responseType.rawValue,
+                requestID: event.requestID,
+                payload: try LSPControlWire.errorResponse(status),
+                errorResponse: true
+            )
+        } catch {
+            failSession((error as? LSPTransportError) ?? .internalFailure)
+        }
+    }
+
+    private func sendObjectChunkResponse(
+        event: LSPControlEvent,
+        chunk: LSPObjectChunk,
+        status: LSPControlStatus,
+        nextOffset: UInt32
+    ) throws {
+        try transport.sendControlResponse(
+            messageType: LSPControlMessageType.objectChunk.rawValue,
+            requestID: event.requestID,
+            payload: status == .success
+                ? try LSPControlWire.objectChunkAcknowledgement(
+                    status: status,
+                    objectID: chunk.objectID,
+                    nextOffset: nextOffset,
+                    totalLength: chunk.totalLength
+                )
+                : try LSPControlWire.errorResponse(status),
+            errorResponse: status != .success
+        )
     }
 
     private func receiveVideoConfiguration(_ event: LSPControlEvent) async {
@@ -1389,7 +1903,8 @@ public actor LSPClientSession {
     private func receiveStreamEnded(_ event: LSPControlEvent) {
         guard !terminationObserver.hasTerminalEvent else { return }
         guard let ended = try? LSPControlWire.streamEnded(from: event),
-              ended.sessionID == inputAuthority?.sessionID else {
+              ended.sessionID == inputAuthority?.sessionID,
+              ended.streamGeneration == inputAuthority?.nativeConfiguration.streamGeneration else {
             failSession(.internalFailure)
             return
         }
@@ -1399,6 +1914,7 @@ public actor LSPClientSession {
         audioPlayout.stop()
         microphoneUplink.stop(transport: transport)
         inputAuthority = nil
+        resetBulkObjects()
         state = .stopped
         terminationObserver.emit(.streamEnded(reason: ended.reason))
     }
@@ -1415,11 +1931,30 @@ public actor LSPClientSession {
         videoPipeline?.stop()
         audioPlayout.stop()
         microphoneUplink.stop(transport: transport)
+        resetBulkObjects()
         state = .failed(error)
         terminationObserver.emit(.failed(error))
     }
 
+    private func resetBulkObjects() {
+        incomingObjects.removeAll(keepingCapacity: true)
+        completedObjects.removeAll(keepingCapacity: true)
+        bufferedObjectBytes = 0
+        pendingDeviceOffers.removeAll(keepingCapacity: true)
+        deviceRateTelemetry.removeAll(keepingCapacity: true)
+    }
+
     private func setReconnectPhase(_ phase: LSPReconnectPhase, attemptID: UUID? = nil) {
+        let now = max(1, UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000))
+        if phase == .candidateHandshake {
+            reconnectStartedAtMicroseconds = now
+        } else if phase == .oldRetired, let started = reconnectStartedAtMicroseconds, now >= started {
+            reconnectDuration.record(now - started)
+            reconnectStartedAtMicroseconds = nil
+        } else if phase == .failed {
+            reconnectDuration.drop()
+            reconnectStartedAtMicroseconds = nil
+        }
         reconnectSnapshot = .init(
             phase: phase,
             attemptID: attemptID ?? reconnectSnapshot.attemptID,
@@ -1450,6 +1985,10 @@ public actor LSPClientSession {
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {
         try transport.telemetrySnapshot()
+    }
+
+    public func nativeTimingSnapshot() throws -> LSPNativeTimingSnapshot {
+        try transport.nativeTimingSnapshot()
     }
 
     private func connect(endpoint: LSPTransportEndpoint) async throws -> LSPServerHello {

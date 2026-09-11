@@ -2,7 +2,7 @@ import CLSPCore
 import Foundation
 
 /// Congestion profile selected for an LSP connection.
-public enum LSPTransportProfile: Sendable {
+public enum LSPTransportProfile: Equatable, Sendable {
     /// Safe delay-adaptive behavior for ordinary networks.
     case adaptiveLowLatency
 
@@ -11,7 +11,7 @@ public enum LSPTransportProfile: Sendable {
 }
 
 /// Coarse native transport construction settings.
-public struct LSPTransportConfiguration: Sendable {
+public struct LSPTransportConfiguration: Equatable, Sendable {
     /// LSP UDP application port.
     public var port: UInt16
 
@@ -143,6 +143,89 @@ public struct LSPNativeInputBaselineSnapshot: Sendable, Equatable {
     public var inputAuthorityEpoch: UInt32
     public var eventGeneration: UInt64
     public var acknowledged: Bool
+}
+
+/// Coarse authenticated LSPI delivery and effective-rate evidence.
+public struct LSPNativeInputFeedbackSnapshot: Sendable, Equatable {
+    public var streamGeneration: UInt32
+    public var inputGeneration: UInt32
+    public var acceptedBaselineID: UInt64
+    public var contiguousEdgeID: UInt64
+    public var edgeReceptionBitmap: UInt64
+    public var receivedAtMicroseconds: UInt64
+    public var pointerRate: UInt32
+    public var controllerRate: UInt32
+    public var sensorRate: UInt32
+    public var reconciliationRate: UInt32
+    public var reservedInputWireBitsPerSecond: UInt64
+    public var baselineAcknowledged: Bool
+    public var baselineRequested: Bool
+}
+
+/// Newest locally assigned edge identity used for atomic text/IME barriers.
+public struct LSPNativeInputEdgeSnapshot: Sendable, Equatable {
+    public var streamGeneration: UInt32
+    public var inputGeneration: UInt32
+    public var latestAssignedEdgeID: UInt64
+    public var latestEdgeSampleTimeMicroseconds: UInt64
+}
+
+/// Clock-domain and availability evidence attached to native timing samples.
+public struct LSPNativeTimingFlags: OptionSet, Sendable, Equatable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+
+    public static let available = Self(rawValue: 1 << 0)
+    public static let clientMonotonic = Self(rawValue: 1 << 1)
+    public static let kernelTimestamped = Self(rawValue: 1 << 2)
+    public static let sameEndpoint = Self(rawValue: 1 << 3)
+    public static let unknownComponent = Self(rawValue: 1 << 4)
+    public static let partialWireBytes = Self(rawValue: 1 << 5)
+    public static let allKnown: Self = [
+        .available, .clientMonotonic, .kernelTimestamped,
+        .sameEndpoint, .unknownComponent, .partialWireBytes,
+    ]
+}
+
+/// Allocation-free native fixed-bucket distribution published at coarse cadence.
+public struct LSPNativeDistribution: Sendable, Equatable {
+    public var count: UInt64
+    public var p50Microseconds: UInt64
+    public var p95Microseconds: UInt64
+    public var p99Microseconds: UInt64
+    public var maximumMicroseconds: UInt64
+    public var drops: UInt64
+    public var flags: LSPNativeTimingFlags
+}
+
+/// Low-rate native device-generation offer for automatic INPUT_RATE negotiation.
+public struct LSPNativeDeviceOffer: Sendable, Equatable {
+    public enum Kind: UInt8, Sendable { case arrived = 1, removed = 2, rateObserved = 3 }
+    public enum DeviceType: UInt8, Sendable { case pointer = 1, controller = 2 }
+    public enum CaptureSource: UInt8, Sendable { case ioHID = 1, gameController = 2, appKit = 3 }
+    public var sequence: UInt64
+    public var kind: Kind
+    public var deviceType: DeviceType
+    public var captureSource: CaptureSource
+    public var deviceID: UInt32
+    public var instanceGeneration: UInt32
+    public var observedCaptureHz: UInt32
+    public var observedSensorHz: UInt32
+    public var minimumStateRate: UInt32
+    public var maximumStateRate: UInt32
+    public var minimumSensorRate: UInt32
+    public var maximumSensorRate: UInt32
+    public var capturedSamples: UInt64
+    public var droppedSamples: UInt64
+    public var attributedWireBytes: UInt64
+    public var effectiveWireBitsPerSecond: UInt64
+    public var stateSpacing: LSPNativeDistribution
+    public var sensorSpacing: LSPNativeDistribution
+    public var minimumSampleIntervalMicroseconds: UInt32
+    public var maximumSampleIntervalMicroseconds: UInt32
+    public var maximumStatePacketBytes: UInt16
+    public var maximumSensorPacketBytes: UInt16
 }
 
 /// Client-side native PIN-pairing lifecycle copied only at control frequency.
@@ -522,6 +605,51 @@ public struct LSPTelemetrySnapshot: Equatable, Sendable {
     public var pathProbesAcknowledged: UInt64
     public var pathProbeTimeouts: UInt64
     public var currentUDPPayloadSize: UInt16
+    public var currentReceiveUDPPayloadSize: UInt16
+}
+
+/// Fixed order of same-endpoint native timing stages.
+public enum LSPNativeTimingStage: Int, CaseIterable, Sendable {
+    case inputCallbackToCompose = 0
+    case inputComposeToProtect
+    case inputProtectToSubmit
+    case inputAcknowledgementAge
+    case receiveToAuthentication
+    case authenticationToHandoff
+    case socketBatchDrain
+    case socketBatchOldestAge
+}
+
+/// Coarse per-device capture and attributable-wire telemetry.
+public struct LSPNativeDeviceTelemetry: Sendable, Equatable {
+    public var deviceType: LSPNativeDeviceOffer.DeviceType
+    public var captureSource: LSPNativeDeviceOffer.CaptureSource
+    public var deviceID: UInt32
+    public var instanceGeneration: UInt32
+    public var active: Bool
+    public var observedStateHz: UInt32
+    public var observedSensorHz: UInt32
+    public var capturedSamples: UInt64
+    public var droppedSamples: UInt64
+    public var attributedWireBytes: UInt64
+    public var stateSpacing: LSPNativeDistribution
+    public var sensorSpacing: LSPNativeDistribution
+}
+
+/// Latest worker-published timing distributions and active native generations.
+public struct LSPNativeTimingSnapshot: Sendable, Equatable {
+    public var generation: UInt64
+    public var snapshotTimeMicroseconds: UInt64
+    public var streamGeneration: UInt32
+    public var inputGeneration: UInt32
+    public var videoGeneration: UInt32
+    public var audioGeneration: UInt32
+    public var pointerGeneration: UInt32
+    public var controllerGenerations: [UInt32]
+    public var touchGenerations: [UInt32]
+    public var penGenerations: [UInt32]
+    public var stages: [LSPNativeDistribution]
+    public var devices: [LSPNativeDeviceTelemetry]
 }
 
 /// Stable typed failure returned by the coarse LSP transport façade.
@@ -620,7 +748,7 @@ public final class LSPTransport: @unchecked Sendable {
     public static let abiVersion: UInt32 = 2
 
     /// Expected source digest for the pinned Photon portable protocol core.
-    public static let sourceDigest = "27c71a42a6613fa2b3c8c9f42c986231311371fd9ece62405b9426e66d2757f6"
+    public static let sourceDigest = "72b3a260e9b083d15af34403517965b36f67f008e6624b08bc965c9057f679db"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {
@@ -777,7 +905,92 @@ public final class LSPTransport: @unchecked Sendable {
             pathProbesSent: native.path_probes_sent,
             pathProbesAcknowledged: native.path_probes_acknowledged,
             pathProbeTimeouts: native.path_probe_timeouts,
-            currentUDPPayloadSize: native.current_udp_payload_size
+            currentUDPPayloadSize: native.current_udp_payload_size,
+            currentReceiveUDPPayloadSize: native.current_receive_udp_payload_size
+        )
+    }
+
+    /// Copies the latest worker-published local native timing distributions.
+    ///
+    /// No cross-machine duration is synthesized; flags expose kernel fallback
+    /// and partial per-device wire attribution explicitly.
+    public func nativeTimingSnapshot() throws -> LSPNativeTimingSnapshot {
+        var native = clsp_native_timing_snapshot_t()
+        try Self.requireSuccess(clsp_core_copy_native_timing(core, &native))
+        guard native.abi_version == Self.abiVersion,
+              native.structure_size == MemoryLayout<clsp_native_timing_snapshot_t>.size else {
+            throw LSPTransportError.internalFailure
+        }
+        func distribution(_ value: clsp_native_distribution_t) throws -> LSPNativeDistribution {
+            let flags = LSPNativeTimingFlags(rawValue: value.flags)
+            guard value.reserved_zero == 0, flags.subtracting(.allKnown).isEmpty else {
+                throw LSPTransportError.internalFailure
+            }
+            return .init(
+                count: value.count,
+                p50Microseconds: value.p50_microseconds,
+                p95Microseconds: value.p95_microseconds,
+                p99Microseconds: value.p99_microseconds,
+                maximumMicroseconds: value.maximum_microseconds,
+                drops: value.drops,
+                flags: flags
+            )
+        }
+        let nativeStages = withUnsafeBytes(of: &native.stages) { raw in
+            Array(raw.bindMemory(to: clsp_native_distribution_t.self).prefix(Int(CLSP_NATIVE_TIMING_STAGE_COUNT)))
+        }
+        let stages = try nativeStages.map(distribution)
+        guard stages.count == LSPNativeTimingStage.allCases.count else {
+            throw LSPTransportError.internalFailure
+        }
+        let controllerGenerations = withUnsafeBytes(of: &native.controller_generations) { raw in
+            Array(raw.bindMemory(to: UInt32.self).prefix(16))
+        }
+        let touchGenerations = withUnsafeBytes(of: &native.touch_generations) { raw in
+            Array(raw.bindMemory(to: UInt32.self).prefix(16))
+        }
+        let penGenerations = withUnsafeBytes(of: &native.pen_generations) { raw in
+            Array(raw.bindMemory(to: UInt32.self).prefix(16))
+        }
+        let nativeDevices = withUnsafeBytes(of: &native.devices) { raw in
+            Array(raw.bindMemory(to: clsp_native_device_telemetry_t.self).prefix(Int(CLSP_NATIVE_TIMING_DEVICE_COUNT)))
+        }
+        let devices = try nativeDevices.compactMap { value -> LSPNativeDeviceTelemetry? in
+            if value.device_id == 0 { return nil }
+            guard let deviceType = LSPNativeDeviceOffer.DeviceType(rawValue: value.device_type),
+                  let captureSource = LSPNativeDeviceOffer.CaptureSource(rawValue: value.capture_source),
+                  value.instance_generation != 0, value.active <= 1,
+                  withUnsafeBytes(of: value.reserved_zero, { $0.allSatisfy { $0 == 0 } }) else {
+                throw LSPTransportError.internalFailure
+            }
+            return .init(
+                deviceType: deviceType,
+                captureSource: captureSource,
+                deviceID: value.device_id,
+                instanceGeneration: value.instance_generation,
+                active: value.active != 0,
+                observedStateHz: value.observed_state_hz,
+                observedSensorHz: value.observed_sensor_hz,
+                capturedSamples: value.captured_samples,
+                droppedSamples: value.dropped_samples,
+                attributedWireBytes: value.attributed_wire_bytes,
+                stateSpacing: try distribution(value.state_spacing),
+                sensorSpacing: try distribution(value.sensor_spacing)
+            )
+        }
+        return .init(
+            generation: native.snapshot_generation,
+            snapshotTimeMicroseconds: native.snapshot_time_microseconds,
+            streamGeneration: native.stream_generation,
+            inputGeneration: native.input_generation,
+            videoGeneration: native.video_generation,
+            audioGeneration: native.audio_generation,
+            pointerGeneration: native.pointer_generation,
+            controllerGenerations: controllerGenerations,
+            touchGenerations: touchGenerations,
+            penGenerations: penGenerations,
+            stages: stages,
+            devices: devices
         )
     }
 
@@ -1130,6 +1343,135 @@ public final class LSPTransport: @unchecked Sendable {
         try Self.requireSuccess(clsp_core_configure_input(core, &native))
     }
 
+    /// Applies one authenticated coarse input-rate renegotiation.
+    public func updateInputRates(_ configuration: LSPNativeInputConfiguration) throws {
+        var update = clsp_input_rate_update_t()
+        update.abi_version = Self.abiVersion
+        update.structure_size = UInt32(MemoryLayout<clsp_input_rate_update_t>.size)
+        update.stream_generation = configuration.streamGeneration
+        update.input_generation = configuration.inputGeneration
+        update.pointer_rate = configuration.pointerRate
+        update.controller_rate = configuration.controllerRate
+        update.sensor_rate = configuration.sensorRate
+        update.reconciliation_rate = configuration.reconciliationRate
+        update.reserved_input_wire_bits_per_second = configuration.reservedInputWireBitsPerSecond
+        try Self.requireSuccess(clsp_core_update_input_rates(core, &update))
+    }
+
+    /// Copies the latest authenticated LSPI delivery and effective-rate evidence.
+    public func inputFeedbackSnapshot() throws -> LSPNativeInputFeedbackSnapshot {
+        var native = clsp_input_feedback_snapshot_t()
+        try Self.requireSuccess(clsp_core_copy_input_feedback(core, &native))
+        guard native.abi_version == Self.abiVersion,
+              native.structure_size == MemoryLayout<clsp_input_feedback_snapshot_t>.size,
+              withUnsafeBytes(of: native.reserved_zero, { $0.allSatisfy { $0 == 0 } }) else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            streamGeneration: native.stream_generation,
+            inputGeneration: native.input_generation,
+            acceptedBaselineID: native.accepted_baseline_id,
+            contiguousEdgeID: native.contiguous_edge_id,
+            edgeReceptionBitmap: native.edge_reception_bitmap,
+            receivedAtMicroseconds: native.received_at_microseconds,
+            pointerRate: native.pointer_rate,
+            controllerRate: native.controller_rate,
+            sensorRate: native.sensor_rate,
+            reconciliationRate: native.reconciliation_rate,
+            reservedInputWireBitsPerSecond: native.reserved_input_wire_bits_per_second,
+            baselineAcknowledged: native.baseline_acknowledged != 0,
+            baselineRequested: native.baseline_requested != 0
+        )
+    }
+
+    /// Copies the newest local exactly-once edge for a text/IME barrier.
+    public func inputEdgeSnapshot() throws -> LSPNativeInputEdgeSnapshot {
+        var native = clsp_input_edge_snapshot_t()
+        try Self.requireSuccess(clsp_core_copy_input_edge_snapshot(core, &native))
+        guard native.abi_version == Self.abiVersion,
+              native.structure_size == MemoryLayout<clsp_input_edge_snapshot_t>.size else {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            streamGeneration: native.stream_generation,
+            inputGeneration: native.input_generation,
+            latestAssignedEdgeID: native.latest_assigned_edge_id,
+            latestEdgeSampleTimeMicroseconds: native.latest_edge_sample_time_microseconds
+        )
+    }
+
+    /// Drains one coarse native hot-plug/rate offer; returns nil when the queue is empty.
+    public func pollDeviceOffer() throws -> LSPNativeDeviceOffer? {
+        var native = clsp_device_offer_event_t()
+        try Self.requireSuccess(clsp_core_poll_device_offer(core, &native))
+        guard native.abi_version == Self.abiVersion,
+              native.structure_size == MemoryLayout<clsp_device_offer_event_t>.size,
+              withUnsafeBytes(of: native.reserved_zero, { $0.allSatisfy { $0 == 0 } }) else {
+            throw LSPTransportError.internalFailure
+        }
+        if native.kind == 0 { return nil }
+        guard let kind = LSPNativeDeviceOffer.Kind(rawValue: native.kind),
+              let deviceType = LSPNativeDeviceOffer.DeviceType(rawValue: native.device_type),
+              let captureSource = LSPNativeDeviceOffer.CaptureSource(rawValue: native.capture_source),
+              native.event_sequence != 0, native.device_id != 0, native.instance_generation != 0 else {
+            throw LSPTransportError.internalFailure
+        }
+        let timingFlags = LSPNativeTimingFlags(rawValue: native.timing_flags)
+        guard timingFlags.subtracting(.allKnown).isEmpty else {
+            throw LSPTransportError.internalFailure
+        }
+        if kind == .removed,
+           native.observed_capture_hz != 0 || native.observed_sensor_hz != 0 ||
+           native.minimum_state_rate != 0 || native.maximum_state_rate != 0 ||
+           native.minimum_sensor_rate != 0 || native.maximum_sensor_rate != 0 ||
+           native.effective_wire_bits_per_second != 0 ||
+           native.minimum_sample_interval_microseconds != 0 ||
+           native.maximum_sample_interval_microseconds != 0 ||
+           native.maximum_state_packet_bytes != 0 || native.maximum_sensor_packet_bytes != 0 {
+            throw LSPTransportError.internalFailure
+        }
+        return .init(
+            sequence: native.event_sequence,
+            kind: kind,
+            deviceType: deviceType,
+            captureSource: captureSource,
+            deviceID: native.device_id,
+            instanceGeneration: native.instance_generation,
+            observedCaptureHz: native.observed_capture_hz,
+            observedSensorHz: native.observed_sensor_hz,
+            minimumStateRate: native.minimum_state_rate,
+            maximumStateRate: native.maximum_state_rate,
+            minimumSensorRate: native.minimum_sensor_rate,
+            maximumSensorRate: native.maximum_sensor_rate,
+            capturedSamples: native.captured_samples,
+            droppedSamples: native.dropped_samples,
+            attributedWireBytes: native.attributed_wire_bytes,
+            effectiveWireBitsPerSecond: native.effective_wire_bits_per_second,
+            stateSpacing: .init(
+                count: native.state_spacing_count,
+                p50Microseconds: native.state_spacing_p50_microseconds,
+                p95Microseconds: native.state_spacing_p95_microseconds,
+                p99Microseconds: native.state_spacing_p99_microseconds,
+                maximumMicroseconds: native.state_spacing_maximum_microseconds,
+                drops: native.state_spacing_drops,
+                flags: timingFlags
+            ),
+            sensorSpacing: .init(
+                count: native.sensor_spacing_count,
+                p50Microseconds: native.sensor_spacing_p50_microseconds,
+                p95Microseconds: native.sensor_spacing_p95_microseconds,
+                p99Microseconds: native.sensor_spacing_p99_microseconds,
+                maximumMicroseconds: native.sensor_spacing_maximum_microseconds,
+                drops: native.sensor_spacing_drops,
+                flags: native.maximum_sensor_rate != 0 || native.sensor_spacing_count != 0 ? timingFlags : []
+            ),
+            minimumSampleIntervalMicroseconds: native.minimum_sample_interval_microseconds,
+            maximumSampleIntervalMicroseconds: native.maximum_sample_interval_microseconds,
+            maximumStatePacketBytes: native.maximum_state_packet_bytes,
+            maximumSensorPacketBytes: native.maximum_sensor_packet_bytes
+        )
+    }
+
     /// Installs exact native host-audio admission before AUDIO_CONFIG_ACK.
     public func configureAudio(_ configuration: LSPNativeAudioConfiguration) throws {
         guard configuration.mapping.count == Int(configuration.channels), configuration.mapping.count <= 8 else {
@@ -1236,6 +1578,11 @@ public final class LSPTransport: @unchecked Sendable {
     /// Stops native input capture after queued release edges are retained for LSPI ACK.
     public func neutralizeInput() throws {
         try Self.requireSuccess(clsp_core_neutralize_input(core))
+    }
+
+    /// Restarts unchanged input authority behind a fresh native neutral baseline.
+    public func restartInputBaseline() throws {
+        try Self.requireSuccess(clsp_core_restart_input_baseline(core))
     }
 
     /// Starts preferred public IOHID capture on its dedicated native queue.
@@ -1358,6 +1705,17 @@ public final class LSPTransport: @unchecked Sendable {
             throw LSPTransportError.pairingConfirmationFailed
         default:
             throw LSPTransportError.unknownStatus(Int32(status.rawValue))
+        }
+    }
+
+    static func terminalError(forNativeStatus status: clsp_status_t) -> LSPTransportError {
+        do {
+            try requireSuccess(status)
+            return .invalidState
+        } catch let error as LSPTransportError {
+            return error
+        } catch {
+            return .internalFailure
         }
     }
 
@@ -1908,8 +2266,27 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
         }
     }
 
-    func receiveLifecycle(_ lifecycle: LSPTransportLifecycle) {
-        let handler = lock.withLock { lifecycleHandler }
+    func receiveLifecycle(
+        _ lifecycle: LSPTransportLifecycle,
+        terminalStatus: clsp_status_t
+    ) {
+        let result = lock.withLock { () -> ((@Sendable (LSPTransportLifecycle) -> Void)?, [Completion]) in
+            let pending: [Completion]
+            if lifecycle == .failed || lifecycle == .stopped {
+                pending = Array(completions.values)
+                completions.removeAll(keepingCapacity: true)
+            } else {
+                pending = []
+            }
+            return (lifecycleHandler, pending)
+        }
+        let terminalError: LSPTransportError = lifecycle == .failed
+            ? LSPTransport.terminalError(forNativeStatus: terminalStatus)
+            : .invalidState
+        for completion in result.1 {
+            completion(.failure(terminalError))
+        }
+        let handler = result.0
         handler?(lifecycle)
     }
 
@@ -1972,10 +2349,29 @@ private let lspLifecycleCallback: @convention(c) (
     UnsafeMutableRawPointer?,
     UnsafePointer<clsp_lifecycle_event_t>?
 ) -> Void = { context, event in
-    guard let context, let event,
+    guard let context else { return }
+    let state = Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue()
+    guard let event,
+          event.pointee.abi_version == LSPTransport.abiVersion,
+          event.pointee.structure_size == UInt32(MemoryLayout<clsp_lifecycle_event_t>.size),
+          event.pointee.reserved_zero == 0,
           let lifecycle = LSPTransportLifecycle(rawValue: event.pointee.state)
-    else { return }
-    Unmanaged<LSPNativeCallbackState>.fromOpaque(context).takeUnretainedValue().receiveLifecycle(lifecycle)
+    else {
+        state.receiveLifecycle(.failed, terminalStatus: CLSP_STATUS_INTERNAL_FAILURE)
+        return
+    }
+    let rawStatus = event.pointee.terminal_status
+    let terminalStatus = clsp_status_t(rawValue: rawStatus)
+    let assignedStatus = rawStatus >= CLSP_STATUS_OK.rawValue &&
+        rawStatus <= CLSP_STATUS_PAIRING_CONFIRMATION_FAILED.rawValue
+    let validStatus = assignedStatus && (lifecycle == .failed
+        ? terminalStatus != CLSP_STATUS_OK
+        : terminalStatus == CLSP_STATUS_OK)
+    guard validStatus else {
+        state.receiveLifecycle(.failed, terminalStatus: CLSP_STATUS_INTERNAL_FAILURE)
+        return
+    }
+    state.receiveLifecycle(lifecycle, terminalStatus: terminalStatus)
 }
 
 private let lspControlCallback: @convention(c) (

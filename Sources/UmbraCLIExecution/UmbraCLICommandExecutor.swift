@@ -8,17 +8,20 @@ public struct UmbraCLICommandExecutor: Sendable {
     private let progress: CLIProgressSink
     private let output: CLIOutputSink
     private let pinGenerator: any CLIPINGenerating
+    private let lspService: (any UmbraCLILSPServicing)?
 
     public init(
         service: any UmbraCLIExecutionServicing,
         progress: CLIProgressSink = CLIProgressSink(),
         output: CLIOutputSink = CLIOutputSink(),
-        pinGenerator: any CLIPINGenerating = RandomCLIPINGenerator()
+        pinGenerator: any CLIPINGenerating = RandomCLIPINGenerator(),
+        lspService: (any UmbraCLILSPServicing)? = nil
     ) {
         self.service = service
         self.progress = progress
         self.output = output
         self.pinGenerator = pinGenerator
+        self.lspService = lspService
     }
 
     /// Executes a parser result without writing to global process streams or terminating the process.
@@ -58,15 +61,198 @@ public struct UmbraCLICommandExecutor: Sendable {
             return await executeQuit(command, transcript: transcript)
         case let .stream(command):
             return await executeStream(command, transcript: transcript)
+        case let .attach(command):
+            return await executeLSPAttach(command, transcript: transcript)
+        case let .stop(command):
+            return await executeLSPStop(command, transcript: transcript)
+        case let .telemetry(command):
+            return await executeLSPTelemetry(command, transcript: transcript)
         }
     }
 }
 
 private extension UmbraCLICommandExecutor {
+    func executeLSPList(
+        _ command: ListAppsCommand,
+        transcript: ExecutionTranscript
+    ) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            let applications = try await lspService.applications(hostID: host.id)
+            if command.csv {
+                transcript.writeStandardOutput("id,name\n")
+                for application in applications {
+                    transcript.writeStandardOutput("\(csv(application.id)),\(csv(application.name))\n")
+                }
+            } else {
+                for application in applications { transcript.writeStandardOutput("\(application.name)\n") }
+            }
+            if command.lsp.emitTelemetry { try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript) }
+            return .terminate(transcript.result(exitCode: .success))
+        } catch { return terminate(error, transcript: transcript, hostResolution: true) }
+    }
+
+    func executeLSPPair(
+        _ command: PairHostCommand,
+        transcript: ExecutionTranscript
+    ) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        var pairingHostID: UUID?
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            pairingHostID = host.id
+            let prompt = try await lspService.beginPairing(hostID: host.id, permissions: command.lsp.permissions)
+            guard prompt.pin.count == 6, prompt.pin.allSatisfy(\.isNumber) else {
+                await lspService.cancelPairing(hostID: host.id)
+                throw CLIExecutionError.invalidLSPPairingPIN
+            }
+            transcript.writeStandardOutput(
+                "LSP pairing PIN for \(prompt.host.name): \(prompt.pin)\n"
+                + "Confirm this six-digit PIN on the Lumen host.\n"
+            )
+            progress.report(.pairingLSP(host: prompt.host.name, pin: prompt.pin))
+            _ = try await lspService.completePairing(hostID: host.id)
+            transcript.writeStandardOutput("LSP pairing completed successfully\n")
+            return .terminate(transcript.result(exitCode: .success))
+        } catch {
+            if let pairingHostID { await lspService.cancelPairing(hostID: pairingHostID) }
+            return terminate(error, transcript: transcript)
+        }
+    }
+
+    func executeLSPStream(
+        _ command: StreamAppCommand,
+        transcript: ExecutionTranscript
+    ) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            let applications = try await lspService.applications(hostID: host.id)
+            guard let application = applications.first(where: {
+                $0.name.caseInsensitiveCompare(command.applicationName) == .orderedSame ||
+                $0.id.caseInsensitiveCompare(command.applicationName) == .orderedSame
+            }) else { throw CLIExecutionError.lspApplicationNotFound(command.applicationName) }
+            try await lspService.configure(
+                profile: command.preferences.lspNetworkProfile,
+                competitionCapacityMbps: command.preferences.lspCompetitionCapacityMbps
+            )
+            try await lspService.start(CLILSPStartRequest(
+                hostID: host.id,
+                applicationID: application.id,
+                resume: command.resume,
+                preferences: command.preferences,
+                pointerRate: UInt32(command.preferences.lspPointerRate),
+                controllerRate: UInt32(command.preferences.lspControllerRate),
+                sensorRate: UInt32(command.preferences.lspSensorRate),
+                reconciliationRate: UInt32(command.preferences.lspReconciliationRate),
+                microphone: command.lsp.microphone
+            ))
+            transcript.writeStandardOutput("LSP stream active for \(application.name) on \(host.name).\n")
+            if command.lsp.emitTelemetry { try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript) }
+            let terminal = await withTaskCancellationHandler {
+                await lspService.runUntilTerminated(hostID: host.id)
+            } onCancel: {
+                Task.detached { _ = await lspService.stop(hostID: host.id) }
+            }
+            if Task.isCancelled { throw CancellationError() }
+            switch terminal {
+            case .stopped:
+                transcript.writeStandardOutput("LSP stream ended.\n")
+                return .terminate(transcript.result(exitCode: .success))
+            case .notRunning:
+                throw CLIExecutionError.lspStreamNotRunning
+            case .rejected(let reason):
+                throw CLIExecutionError.lspStopRejected(reason)
+            case .transportFailed(let reason):
+                throw CLIExecutionError.lspTransportFailed(reason)
+            }
+        } catch { return terminate(error, transcript: transcript) }
+    }
+
+    func executeLSPAttach(_ command: AttachHostCommand, transcript: ExecutionTranscript) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            progress.report(.attachingLSP(host.name))
+            try await lspService.attach(hostID: host.id)
+            transcript.writeStandardOutput("Attached LSP stream on \(host.name).\n")
+            if command.lsp.emitTelemetry { try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript) }
+            return .terminate(transcript.result(exitCode: .success))
+        } catch { return terminate(error, transcript: transcript) }
+    }
+
+    func executeLSPStop(_ command: StopHostCommand, transcript: ExecutionTranscript) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            progress.report(.stoppingLSP(host.name))
+            switch await lspService.stop(hostID: host.id) {
+            case .stopped: transcript.writeStandardOutput("Stopped LSP stream on \(host.name).\n")
+            case .notRunning: throw CLIExecutionError.lspStreamNotRunning
+            case .rejected(let reason): throw CLIExecutionError.lspStopRejected(reason)
+            case .transportFailed(let reason): throw CLIExecutionError.lspTransportFailed(reason)
+            }
+            if command.lsp.emitTelemetry { try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript) }
+            return .terminate(transcript.result(exitCode: .success))
+        } catch { return terminate(error, transcript: transcript) }
+    }
+
+    func executeLSPQuit(_ command: QuitHostCommand, transcript: ExecutionTranscript) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            try await lspService.quit(hostID: host.id)
+            transcript.writeStandardOutput("Quit the owned LSP application on \(host.name).\n")
+            if command.lsp.emitTelemetry { try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript) }
+            return .terminate(transcript.result(exitCode: .success))
+        } catch { return terminate(error, transcript: transcript) }
+    }
+
+    func executeLSPTelemetry(_ command: TelemetryHostCommand, transcript: ExecutionTranscript) async -> CLIExecutionOutcome {
+        guard let lspService else { return missingLSPService(transcript) }
+        do {
+            let host = try await lspService.resolveHost(query: command.host, exactHostID: command.lsp.hostID)
+            try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript)
+            return .terminate(transcript.result(exitCode: .success))
+        } catch { return terminate(error, transcript: transcript) }
+    }
+
+    func emitLSPTelemetry(
+        hostID: UUID,
+        service: any UmbraCLILSPServicing,
+        transcript: ExecutionTranscript
+    ) async throws {
+        let value = try await service.telemetry(hostID: hostID)
+        transcript.writeStandardOutput(
+            "lsp.lifecycle=\(value.lifecycle)\n"
+            + "lsp.received_datagrams=\(value.receivedDatagrams)\n"
+            + "lsp.transmitted_datagrams=\(value.transmittedDatagrams)\n"
+            + "lsp.dropped_datagrams=\(value.droppedDatagrams)\n"
+            + "lsp.authentication_failures=\(value.authenticationFailures)\n"
+            + "lsp.udp_payload_size=\(value.currentUDPPayloadSize)\n"
+            + (value.reconnectPhase.map { "lsp.reconnect_phase=\($0)\n" } ?? "")
+        )
+    }
+
+    func missingLSPService(_ transcript: ExecutionTranscript) -> CLIExecutionOutcome {
+        transcript.writeStandardError(
+            "LSP CLI execution is unavailable because the LSP product adapter was not installed; no legacy fallback was attempted.\n"
+        )
+        return .terminate(transcript.result(exitCode: .failure))
+    }
+
+    func csv(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+    }
+
     func executeList(
         _ command: ListAppsCommand,
         transcript: ExecutionTranscript
     ) async -> CLIExecutionOutcome {
+        if command.streamingProtocol == .lsp {
+            return await executeLSPList(command, transcript: transcript)
+        }
         let connectionMessage = CLIListOutputFormatter.verboseMessage(
             for: .establishingConnection,
             command: command
@@ -104,6 +290,9 @@ private extension UmbraCLICommandExecutor {
         _ command: PairHostCommand,
         transcript: ExecutionTranscript
     ) async -> CLIExecutionOutcome {
+        if command.streamingProtocol == .lsp {
+            return await executeLSPPair(command, transcript: transcript)
+        }
         transcript.writeStandardOutput("Establishing connection to PC...\n")
         progress.report(.resolvingHost(command.host))
 
@@ -147,6 +336,9 @@ private extension UmbraCLICommandExecutor {
         _ command: QuitHostCommand,
         transcript: ExecutionTranscript
     ) async -> CLIExecutionOutcome {
+        if command.streamingProtocol == .lsp {
+            return await executeLSPQuit(command, transcript: transcript)
+        }
         transcript.writeStandardOutput("Establishing connection to PC...\n")
         progress.report(.resolvingHost(command.host))
 
@@ -184,6 +376,9 @@ private extension UmbraCLICommandExecutor {
         _ command: StreamAppCommand,
         transcript: ExecutionTranscript
     ) async -> CLIExecutionOutcome {
+        if command.streamingProtocol == .lsp {
+            return await executeLSPStream(command, transcript: transcript)
+        }
         progress.report(.resolvingHost(command.host))
         var host: StreamHost
         do {
@@ -250,7 +445,7 @@ private extension UmbraCLICommandExecutor {
             let intent = SessionIntent(
                 hostID: host.uuid,
                 applicationID: application.id,
-                kind: host.currentGameID == application.id ? .resume : .launch,
+                kind: command.resume || host.currentGameID == application.id ? .resume : .launch,
                 preferences: command.preferences,
                 effectivePolicy: .resolve(for: command.preferences),
                 gamepadMask: command.preferences.multiController ? 0 : 1,
@@ -326,6 +521,24 @@ private extension UmbraCLICommandExecutor {
         }
         if !result.standardError.isEmpty {
             output.writeStandardError(result.standardError)
+        }
+    }
+}
+
+private enum CLIExecutionError: Error, LocalizedError {
+    case invalidLSPPairingPIN
+    case lspApplicationNotFound(String)
+    case lspStreamNotRunning
+    case lspStopRejected(String)
+    case lspTransportFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidLSPPairingPIN: "LSP pairing did not produce a valid six-digit PIN."
+        case .lspApplicationNotFound(let name): "Failed to find LSP application \(name)."
+        case .lspStreamNotRunning: "No owned LSP stream is running."
+        case .lspStopRejected(let reason): "The host rejected LSP STOP: \(reason)"
+        case .lspTransportFailed(let reason): "LSP STOP transport failed: \(reason)"
         }
     }
 }

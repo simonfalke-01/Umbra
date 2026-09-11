@@ -54,6 +54,21 @@ final class LSPAppKitInputCapture {
         try startSourcesThrowing()
     }
 
+    /// Pauses all capture, neutralizes held state, commits text, then restarts with a fresh baseline.
+    func performTextCommit(_ operation: () async throws -> Void) async throws {
+        guard session != nil else { throw LSPTransportError.invalidState }
+        stopSources()
+        do {
+            try await operation()
+            try session?.restartInputBaseline()
+            try startSourcesThrowing()
+        } catch {
+            try? session?.restartInputBaseline()
+            try? startSourcesThrowing()
+            throw error
+        }
+    }
+
     private func startSources() {
         do {
             try startSourcesThrowing()
@@ -112,6 +127,7 @@ final class LSPAppKitInputCapture {
         if let nativeCapture {
             nativeCapture.stop()
             self.nativeCapture = nil
+            try? session?.neutralizeInput()
         }
         guard appKitActive, let session else { return }
         let timestamp = Self.monotonicMicroseconds()

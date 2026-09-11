@@ -129,6 +129,38 @@ final class BonjourDiscoveryTests: XCTestCase {
             service: service
         ))
     }
+
+    func testResolvedIPv4NeverReceivesAnInterfaceZone() throws {
+        let service = DiscoveredHostService(
+            name: "Gaming PC",
+            type: "_lumen-stream._udp",
+            domain: "local.",
+            interfaceName: "en7"
+        )
+        let address = try XCTUnwrap(IPv4Address("192.168.1.236"))
+
+        let resolved = try NetworkBonjourDiscovery.resolvedEndpoint(
+            from: .hostPort(host: .ipv4(address), port: 48_030),
+            service: service
+        )
+
+        XCTAssertEqual(resolved.targetHost, "192.168.1.236")
+        XCTAssertEqual(resolved.interfaceName, "en7")
+    }
+
+    func testResolvedIPv6UsesAZoneOnlyForScopedAddresses() throws {
+        let linkLocal = try XCTUnwrap(IPv6Address("fe80::1234"))
+        let global = try XCTUnwrap(IPv6Address("2001:db8::1234"))
+
+        XCTAssertEqual(
+            try NetworkBonjourDiscovery.endpointHost(from: .ipv6(linkLocal), interfaceName: "en7"),
+            "fe80::1234%en7"
+        )
+        XCTAssertEqual(
+            try NetworkBonjourDiscovery.endpointHost(from: .ipv6(global), interfaceName: "en7"),
+            "2001:db8::1234"
+        )
+    }
 }
 
 private final class RecordingBonjourBrowserFactory: BonjourBrowserCreating, @unchecked Sendable {

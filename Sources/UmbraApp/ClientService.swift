@@ -56,7 +56,9 @@ extension UmbraClientServicing {
     func preparePairing(hostID: HostID) async throws -> PairingPreparation {
         .init(
             pin: String(format: "%04d", Int.random(in: 0...9_999)),
-            provisionalSPKIFingerprint: nil
+            provisionalSPKIFingerprint: nil,
+            requestedPermissions: [],
+            effectivePermissions: []
         )
     }
 

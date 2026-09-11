@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import UmbraCore
 import UmbraLSPTransport
@@ -9,7 +10,7 @@ struct LSPProductPairingStart: Sendable {
 }
 
 struct LSPProductPairingOperations: Sendable {
-    var begin: @Sendable (LSPDiscoveredPairingHost) async throws -> LSPProductPairingStart
+    var begin: @Sendable (LSPDiscoveredPairingHost, LSPPermission) async throws -> LSPProductPairingStart
     var verify: @Sendable (LSPProductPairingStart) async throws -> LSPTrustRecord
     var cancel: @Sendable (LSPProductPairingStart) async -> Void
 }
@@ -18,6 +19,12 @@ struct LSPProductPairingOperations: Sendable {
 public enum LSPPairingDiscoveryMutation: Equatable, Sendable {
     case replaced(oldHostID: UUID, host: LSPDiscoveredPairingHost)
     case removed(hostID: UUID)
+}
+
+public enum LSPPairedDiscoveryRefresh: Sendable {
+    case unpaired
+    case matched(host: LSPHostRecord, trust: LSPTrustRecord)
+    case identityChanged(expectedSPKI: Data, advertisedSPKI: Data)
 }
 
 /// Coarse product owner for LSP persistence, pairing, auth, and application browsing.
@@ -34,6 +41,7 @@ public actor LSPProductClient {
     private struct PairingAttempt {
         var id: UUID
         var candidate: LSPDiscoveredPairingHost
+        var requestedPermissions: LSPPermission
         var beginTask: Task<LSPProductPairingStart, Error>
         var verificationTask: Task<VerifiedPairing, Error>?
         var verified: VerifiedPairing?
@@ -57,6 +65,7 @@ public actor LSPProductClient {
     private let pairingOperations: LSPProductPairingOperations
     private let afterPairingTrustWrite: @Sendable () throws -> Void
     private var pairingDiscoveryMutationHandler: (@Sendable (LSPPairingDiscoveryMutation) -> Void)?
+    private var transportConfiguration = LSPTransportConfiguration()
 
     public init(
         trustStore: JSONFileStore<LSPTrustSnapshot>,
@@ -105,6 +114,61 @@ public actor LSPProductClient {
     /// Returns persisted native hosts without contacting legacy GameStream services.
     public func hosts() async throws -> [LSPHostRecord] {
         try await hostStore.load().records
+    }
+
+    public func trust(hostID: UUID) async throws -> LSPTrustRecord? {
+        try await trustStore.load().records.first { $0.hostID == hostID }
+    }
+
+    /// Refreshes a paired endpoint only when both stable host ID and stored SPKI match discovery.
+    public func refreshPairedDiscovery(
+        _ candidate: LSPDiscoveredPairingHost
+    ) async throws -> LSPPairedDiscoveryRefresh {
+        let trustSnapshot = try await trustStore.load()
+        guard let trust = trustSnapshot.records.first(where: { $0.hostID == candidate.hostID }) else {
+            return .unpaired
+        }
+        guard trust.dtlsSPKISHA256 == candidate.serverSPKISHA256 ||
+                trust.pendingDTLSSPKISHA256 == candidate.serverSPKISHA256 else {
+            return .identityChanged(
+                expectedSPKI: trust.dtlsSPKISHA256,
+                advertisedSPKI: candidate.serverSPKISHA256
+            )
+        }
+        let hostSnapshot = try await hostStore.load()
+        let prior = hostSnapshot.records.first(where: { $0.hostID == candidate.hostID })
+        let refreshed = LSPHostRecord(
+            hostID: candidate.hostID,
+            name: prior?.name ?? candidate.name,
+            address: candidate.host,
+            port: candidate.port,
+            lastSeen: Date(),
+            discoveryDomain: candidate.domain,
+            interfaceName: candidate.interfaceName
+        )
+        _ = try await hostStore.update { snapshot in
+            var next = snapshot
+            next.records.removeAll { $0.hostID == candidate.hostID }
+            next.records.append(refreshed)
+            return next
+        }
+        return .matched(host: refreshed, trust: trust)
+    }
+
+    /// Selects the next association's explicit congestion profile and capacity policy.
+    public func configureTransport(_ configuration: LSPTransportConfiguration) async throws {
+        guard configuration != transportConfiguration else { return }
+        for session in sessions.values {
+            if await session.state == .inputActive { throw LSPTransportError.invalidState }
+        }
+        let retiring = Array(sessions.values)
+        sessions.removeAll(keepingCapacity: true)
+        for session in retiring {
+            if await session.state == .authenticated {
+                _ = await session.stopWithResult()
+            }
+        }
+        transportConfiguration = configuration
     }
 
     /// Installs the coarse product callback for quarantined discovery changes released at terminal state.
@@ -156,9 +220,17 @@ public actor LSPProductClient {
     }
 
     /// Starts one discovered-host PIN transaction and returns its six digits for local display.
-    public func beginPairing(hostID: UUID) async throws -> LSPPairingPrompt {
+    public func beginPairing(
+        hostID: UUID,
+        requestedPermissions: LSPPermission = [
+            .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput,
+        ]
+    ) async throws -> LSPPairingPrompt {
         if let existing = pairingAttempts[hostID] {
             guard !existing.cancelling else { throw CancellationError() }
+            guard existing.requestedPermissions == requestedPermissions else {
+                throw LSPControlStatus.busy
+            }
             return try await resolvePairingBegin(
                 hostID: hostID,
                 attemptID: existing.id,
@@ -170,10 +242,11 @@ public actor LSPProductClient {
         }
         let attemptID = UUID()
         let operation = pairingOperations.begin
-        let task = Task { try await operation(host) }
+        let task = Task { try await operation(host, requestedPermissions) }
         pairingAttempts[hostID] = .init(
             id: attemptID,
             candidate: host,
+            requestedPermissions: requestedPermissions,
             beginTask: task,
             verificationTask: nil,
             verified: nil,
@@ -269,6 +342,7 @@ public actor LSPProductClient {
         }
         do {
             let host = try await persistenceTask.value
+            await configureSessionHandlers(verified.start.session, hostID: host.hostID)
             sessions[host.hostID] = verified.start.session
             finishPairingAttempt(hostID: hostID, attemptID: attempt.id)
             return host
@@ -293,8 +367,8 @@ public actor LSPProductClient {
         if let start = try? await attempt.beginTask.value,
            pairingAttempts[hostID]?.id == attempt.id {
             await pairingOperations.cancel(start)
-            finishPairingAttempt(hostID: hostID, attemptID: attempt.id)
         }
+        finishPairingAttempt(hostID: hostID, attemptID: attempt.id)
     }
 
     private func resolvePairingBegin(
@@ -415,12 +489,18 @@ public actor LSPProductClient {
         videoRenderer: (any MetalVideoRendering)?
     ) -> LSPProductPairingOperations {
         .init(
-            begin: { host in
+            begin: { host, requestedPermissions in
                 let session = try await LSPClientSession.persistent(
                     identityStore: identityStore,
                     videoRenderer: videoRenderer
                 )
-                return .init(session: session, prompt: try await session.beginPairing(host: host))
+                return .init(
+                    session: session,
+                    prompt: try await session.beginPairing(
+                        host: host,
+                        requestedPermissions: requestedPermissions
+                    )
+                )
             },
             verify: { start in
                 try await start.session.completePairing()
@@ -444,25 +524,48 @@ public actor LSPProductClient {
         if let existing = sessions[hostID], [.authenticated, .inputActive].contains(await existing.state) {
             session = existing
         } else {
-            let created = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
-            let updatedTrust = try await created.authenticate(host: host, trust: trust)
+            let (created, updatedTrust) = try await authenticatedSession(host: host, trust: trust)
             _ = try await trustStore.update { snapshot in
                 var snapshot = snapshot
                 snapshot.records.removeAll { $0.hostID == hostID }
                 snapshot.records.append(updatedTrust)
                 return snapshot
             }
+            await configureSessionHandlers(created, hostID: hostID)
             sessions[hostID] = created
             session = created
         }
         return try await session.listApplications()
     }
 
+    /// Waits for one bounded authenticated artwork object referenced by APPLICATIONS.
+    public func applicationObject(hostID: UUID, reference: String) async throws -> Data {
+        guard let object = LSPObjectReference.decode(reference), let session = sessions[hostID] else {
+            throw LSPTransportError.invalidConfiguration
+        }
+        for _ in 0..<100 {
+            try Task.checkCancellation()
+            if let bytes = await session.takeObject(object.objectID) {
+                guard bytes.count == Int(object.length),
+                      Data(SHA256.hash(data: bytes)) == object.sha256 else {
+                    throw LSPControlStatus.authenticationFailed
+                }
+                return bytes
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw LSPTransportError.timeout
+    }
+
     /// Starts the negotiated input-only session for one authenticated native application.
     public func startInput(
         hostID: UUID,
         applicationID: String,
+        resume: Bool = false,
         pointerRate: UInt32 = 1_000,
+        controllerRate: UInt32 = 250,
+        sensorRate: UInt32 = 250,
+        reconciliationRate: UInt32 = 250,
         microphoneOffer: LSPMicrophoneOffer? = nil,
         capabilities: AppleStreamingCapabilities,
         preferences: StreamingPreferences,
@@ -493,7 +596,11 @@ public actor LSPProductClient {
         return try await startInput(
             hostID: hostID,
             applicationID: applicationID,
+            resume: resume,
             pointerRate: pointerRate,
+            controllerRate: controllerRate,
+            sensorRate: sensorRate,
+            reconciliationRate: reconciliationRate,
             microphoneOffer: microphoneOffer,
             videoOffers: offers,
             receiveBatchCapacity: receiveBatchCapacity,
@@ -506,7 +613,11 @@ public actor LSPProductClient {
     func startInput(
         hostID: UUID,
         applicationID: String,
+        resume: Bool = false,
         pointerRate: UInt32 = 1_000,
+        controllerRate: UInt32 = 250,
+        sensorRate: UInt32 = 250,
+        reconciliationRate: UInt32 = 250,
         microphoneOffer: LSPMicrophoneOffer? = nil,
         videoOffers: [LSPVideoOffer],
         receiveBatchCapacity: UInt8 = 64,
@@ -519,7 +630,11 @@ public actor LSPProductClient {
         }
         _ = try await session.startInput(LSPInputStartRequest(
             applicationID: applicationID,
+            resume: resume,
             pointerRate: pointerRate,
+            controllerRate: controllerRate,
+            sensorRate: sensorRate,
+            reconciliationRate: reconciliationRate,
             microphoneOffer: microphoneOffer,
             videoOffers: videoOffers,
             receiveBatchCapacity: receiveBatchCapacity,
@@ -607,6 +722,7 @@ public actor LSPProductClient {
                     nativeHandoff: nativeHandoff
                 )
                 try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                await configureSessionHandlers(replacement, hostID: hostID)
                 sessions[hostID] = replacement
                 return replacement
             } catch let ambiguous as LSPAmbiguousAttachFailure {
@@ -636,6 +752,7 @@ public actor LSPProductClient {
                         try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
                         await replacement.invalidateAuthorityAfterAmbiguousAttach()
                         try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        await configureSessionHandlers(forward, hostID: hostID)
                         sessions[hostID] = forward
                         return forward
                     } catch let status as LSPControlStatus
@@ -665,6 +782,7 @@ public actor LSPProductClient {
                         try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
                         await replacement.invalidateAuthorityAfterAmbiguousAttach()
                         try ensureAttemptCurrent(hostID: hostID, attemptID: attemptID)
+                        await configureSessionHandlers(fallback, hostID: hostID)
                         sessions[hostID] = fallback
                         return fallback
                     }
@@ -682,11 +800,11 @@ public actor LSPProductClient {
         attemptID: UUID
     ) async throws -> LSPClientSession {
         try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
-        let candidate = try await LSPClientSession.persistent(identityStore: identityStore, videoRenderer: videoRenderer)
-        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
-        await candidate.beginReconnect(attemptID: attemptID)
-        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
-        let updatedTrust = try await candidate.authenticate(host: host, trust: trust)
+        let (candidate, updatedTrust) = try await authenticatedSession(
+            host: host,
+            trust: trust,
+            attemptID: attemptID
+        )
         try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
         await candidate.markCandidateAuthenticated()
         try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
@@ -698,6 +816,43 @@ public actor LSPProductClient {
         }
         try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
         return candidate
+    }
+
+    private func authenticatedSession(
+        host: LSPHostRecord,
+        trust: LSPTrustRecord,
+        attemptID: UUID? = nil
+    ) async throws -> (LSPClientSession, LSPTrustRecord) {
+        var pins: [Data] = []
+        if let pending = trust.pendingDTLSSPKISHA256 { pins.append(pending) }
+        if !pins.contains(trust.dtlsSPKISHA256) { pins.append(trust.dtlsSPKISHA256) }
+        var finalError: Error = LSPControlStatus.authenticationFailed
+        for pin in pins {
+            if let attemptID {
+                try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+            } else {
+                try Task.checkCancellation()
+            }
+            let candidate = try await LSPClientSession.persistent(
+                configuration: transportConfiguration,
+                identityStore: identityStore,
+                videoRenderer: videoRenderer
+            )
+            do {
+                if let attemptID {
+                    await candidate.beginReconnect(attemptID: attemptID)
+                }
+                let updated = try await candidate.authenticate(
+                    host: host,
+                    trust: trust,
+                    serverSPKISHA256: pin
+                )
+                return (candidate, updated)
+            } catch {
+                finalError = error
+            }
+        }
+        throw finalError
     }
 
     private func ensureAttemptCurrent(hostID: UUID, attemptID: UUID) throws {
@@ -741,6 +896,48 @@ public actor LSPProductClient {
         sessions[hostID]
     }
 
+    public func activeApplicationID(hostID: UUID) async throws -> String {
+        guard let session = sessions[hostID] else { throw LSPTransportError.invalidState }
+        return try await session.activeInputAuthority().applicationID
+    }
+
+    /// Removes terminal LSP authority so product/UI cannot reuse a failed session.
+    public func failSession(hostID: UUID) async {
+        reconnectAttempts.removeValue(forKey: hostID)?.task.cancel()
+        guard let session = sessions.removeValue(forKey: hostID) else { return }
+        await session.invalidateAuthorityAfterAmbiguousAttach()
+    }
+
+    private func configureSessionHandlers(_ session: LSPClientSession, hostID: UUID) async {
+        let trustStore = self.trustStore
+        await session.setCertificateRotationHandler { updated in
+            do {
+                _ = try await trustStore.update { snapshot in
+                    guard let current = snapshot.records.first(where: { $0.hostID == hostID }),
+                          current.hostIdentityKey == updated.hostIdentityKey,
+                          (current.certificateRotationGeneration ?? 0) < UInt32.max,
+                          (current.certificateRotationGeneration ?? 0) + 1 ==
+                            (updated.certificateRotationGeneration ?? 0),
+                          current.dtlsSPKISHA256 == updated.dtlsSPKISHA256,
+                          current.pendingDTLSSPKISHA256 == nil,
+                          updated.pendingDTLSSPKISHA256 != nil,
+                          updated.pendingDTLSSPKISHA256 != current.dtlsSPKISHA256 else {
+                        throw LSPControlStatus.staleGeneration
+                    }
+                    var next = snapshot
+                    next.records.removeAll { $0.hostID == hostID }
+                    next.records.append(updated)
+                    return next
+                }
+                return .success
+            } catch let status as LSPControlStatus {
+                return status
+            } catch {
+                return .internalFailure
+            }
+        }
+    }
+
     public func reconnectTelemetry(hostID: UUID) async -> LSPReconnectSnapshot? {
         guard let session = sessions[hostID] else { return nil }
         return await session.reconnectTelemetry()
@@ -751,10 +948,66 @@ public actor LSPProductClient {
         try await reconnectInput(hostID: hostID, reason: .plannedRekey)
     }
 
-    public func stop(hostID: UUID) async {
+    public func stop(hostID: UUID) async -> LSPRemoteStopResult {
         reconnectAttempts.removeValue(forKey: hostID)?.task.cancel()
-        guard let session = sessions[hostID], [.authenticated, .inputActive].contains(await session.state) else { return }
-        try? await session.stop()
+        guard let session = sessions[hostID], [.authenticated, .inputActive].contains(await session.state) else {
+            return .notRunning
+        }
+        return await session.stopWithResult()
+    }
+
+    /// Quits the application owned by the current authenticated LSP stream.
+    public func quitApplication(hostID: UUID, applicationID: String) async throws {
+        guard let session = sessions[hostID], await session.state == .inputActive else {
+            throw LSPTransportError.invalidState
+        }
+        try await session.quitApplication(applicationID: applicationID)
+    }
+
+    /// Sends one reliable UTF-8/IME commit through the current input authority.
+    public func sendText(hostID: UUID, text: String, precedingEdgeID: UInt64) async throws {
+        guard let session = sessions[hostID], await session.state == .inputActive else {
+            throw LSPTransportError.invalidState
+        }
+        try await session.sendText(text, precedingEdgeID: precedingEdgeID)
+    }
+
+    public func sendText(hostID: UUID, text: String) async throws {
+        guard let session = sessions[hostID], await session.state == .inputActive else {
+            throw LSPTransportError.invalidState
+        }
+        try await session.sendText(text)
+    }
+
+    /// Applies one authenticated hot-plug input-rate negotiation.
+    public func renegotiateInputRate(
+        hostID: UUID,
+        offer: LSPInputRateOffer
+    ) async throws -> LSPInputRateSelection {
+        guard let session = sessions[hostID], await session.state == .inputActive else {
+            throw LSPTransportError.invalidState
+        }
+        return try await session.renegotiateInputRate(offer)
+    }
+
+    public func drainDeviceOffers(hostID: UUID) async throws {
+        guard let session = sessions[hostID], await session.state == .inputActive else { return }
+        try await session.drainDeviceOffers()
+    }
+
+    public func deviceRateTelemetry(hostID: UUID) async -> [LSPDeviceRateTelemetry] {
+        guard let session = sessions[hostID] else { return [] }
+        return await session.deviceRateTelemetrySnapshot()
+    }
+
+    public func productTelemetry(hostID: UUID) async -> LSPProductTelemetrySnapshot? {
+        guard let session = sessions[hostID] else { return nil }
+        return await session.productTelemetrySnapshot()
+    }
+
+    public func nativeTimingTelemetry(hostID: UUID) async throws -> LSPNativeTimingSnapshot? {
+        guard let session = sessions[hostID] else { return nil }
+        return try await session.nativeTimingSnapshot()
     }
 
     /// Removes only native LSP host/trust state and stops its session.

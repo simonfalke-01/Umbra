@@ -18,6 +18,25 @@ CERTIFICATE_SHA256 = hashlib.sha256(CERTIFICATE).hexdigest()
 EMPTY_ENTITLEMENTS_SHA256 = hashlib.sha256(
     plistlib.dumps({}, fmt=plistlib.FMT_BINARY, sort_keys=True)
 ).hexdigest()
+REQUIRED_LEGAL_RESOURCES = {
+    "LICENSE": REPOSITORY_ROOT / "LICENSE",
+    "NOTICE.md": REPOSITORY_ROOT / "NOTICE.md",
+    "THIRD_PARTY_NOTICES.md": REPOSITORY_ROOT / "THIRD_PARTY_NOTICES.md",
+    "MOONLIGHT_PROVENANCE.md": (
+        REPOSITORY_ROOT / "Vendor/MoonlightCommon/PROVENANCE.md"
+    ),
+    "OpenSSL-Apache-2.0.txt": REPOSITORY_ROOT / "OPENSSL_LICENSE.txt",
+    "Opus-BSD-3-Clause.txt": REPOSITORY_ROOT / "OPUS_LICENSE.txt",
+    "moonlight-common-c-GPL-3.0.txt": (
+        REPOSITORY_ROOT / "Vendor/MoonlightCommon/Upstream/LICENSE.txt"
+    ),
+    "ENet-MIT.txt": (
+        REPOSITORY_ROOT / "Vendor/MoonlightCommon/Upstream/enet/LICENSE"
+    ),
+    "nanors-MIT.txt": (
+        REPOSITORY_ROOT / "Vendor/MoonlightCommon/Upstream/nanors/LICENSE"
+    ),
+}
 
 
 def write_executable(path: Path, contents: str) -> None:
@@ -58,6 +77,9 @@ class PackageAppQualifyingTests(unittest.TestCase):
         executable.write_bytes(b"Mach-O fixture")
         executable.chmod(0o755)
         (self.app / "Contents" / "Info.plist").write_text("fixture", encoding="utf-8")
+        resources.mkdir(parents=True)
+        for name, source in REQUIRED_LEGAL_RESOURCES.items():
+            (resources / name).write_bytes(source.read_bytes())
         for base in (resources, resources / "Umbra_UmbraApp.bundle"):
             localization = base / "en.lproj"
             localization.mkdir(parents=True)
@@ -174,6 +196,38 @@ class PackageAppQualifyingTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn("explicit non-ad-hoc", completed.stderr)
 
+    def test_missing_legal_resource_is_rejected(self) -> None:
+        resources = self.app / "Contents" / "Resources"
+        for name in REQUIRED_LEGAL_RESOURCES:
+            with self.subTest(name=name):
+                resource = resources / name
+                contents = resource.read_bytes()
+                resource.unlink()
+                completed = self.run_validation()
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("packaged legal resources are incomplete", completed.stderr)
+                resource.write_bytes(contents)
+
+    def test_modified_legal_resource_is_rejected(self) -> None:
+        resource = (
+            self.app / "Contents" / "Resources" / "OpenSSL-Apache-2.0.txt"
+        )
+        resource.write_text("not the reviewed license\n", encoding="utf-8")
+        completed = self.run_validation()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("differs from its reviewed source", completed.stderr)
+
+    def test_third_party_notice_retains_lsp_security_attribution(self) -> None:
+        notice = (REPOSITORY_ROOT / "THIRD_PARTY_NOTICES.md").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "wolfSSL 5.9.2",
+            "Copyright (c) 2001-2017 Cisco Systems, Inc.",
+            "Copyright (c) 2026 LizardByte project contributors.",
+        ):
+            self.assertIn(required, notice)
+
     def test_certificate_and_entitlements_mismatch_are_rejected(self) -> None:
         completed = self.run_validation(
             UMBRA_APPROVED_SIGNING_CERTIFICATE_SHA256="f" * 64
@@ -206,6 +260,14 @@ class PackageAppQualifyingTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("non-system dynamic dependencies", completed.stderr)
+
+        for dependency in ("libwolfssl.dylib", "libsrtp2.dylib"):
+            with self.subTest(dependency=dependency):
+                completed = self.run_validation(
+                    STUB_OTOOL_OUTPUT=f"/tmp/{dependency}"
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("non-system dynamic dependencies", completed.stderr)
 
 
 if __name__ == "__main__":

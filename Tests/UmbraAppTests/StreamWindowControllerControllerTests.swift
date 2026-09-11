@@ -4,6 +4,8 @@ import CoreVideo
 import Foundation
 import UmbraCore
 import UmbraIntegration
+@testable import UmbraLSP
+@testable import UmbraLSPTransport
 import UmbraMedia
 import UmbraPlatform
 import UmbraServices
@@ -12,6 +14,18 @@ import XCTest
 
 @MainActor
 final class StreamWindowControllerControllerTests: XCTestCase {
+    func testLSPPreparationExcludesLegacyGameControllerServiceUntilFinish() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let controller = try StreamWindowController(device: device)
+        try await controller.prepareLSPVideo(
+            applicationName: "LSP",
+            preferences: .default
+        )
+        XCTAssertTrue(controller.nativeLSPControllerOwnershipForTesting)
+        await controller.finish()
+        XCTAssertFalse(controller.nativeLSPControllerOwnershipForTesting)
+    }
+
     func testInstalledInputSinkIsRetainedAndReceivesKeyboardReleaseBeforeUninstall() throws {
         let controller = try StreamWindowController(device: nil)
         weak var weakSink: RecordingPlatformInputSink?
@@ -191,6 +205,83 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         XCTAssertEqual(presentation[.audioQueue], "10 ms")
         XCTAssertEqual(presentation[.videoPackets], "200")
         XCTAssertEqual(presentation[.audioPackets], "100")
+    }
+
+    func testStatisticsPresenterSurfacesLSPTransportAndReconnectState() {
+        let telemetry = LSPTelemetrySnapshot(
+            lifecycle: .authenticated,
+            providers: [.wolfSSL, .libSRTP],
+            receivedDatagrams: 900,
+            transmittedDatagrams: 700,
+            droppedDatagrams: 3,
+            authenticationFailures: 2,
+            videoReceivedIPBytes: 1_000,
+            congestionFeedbackIPBytes: 200,
+            congestionFeedbackPackets: 20,
+            videoECNUnknownPackets: 0,
+            videoECNCEPackets: 1,
+            pathProbesSent: 3,
+            pathProbesAcknowledged: 2,
+            pathProbeTimeouts: 1,
+            currentUDPPayloadSize: 1_400,
+            currentReceiveUDPPayloadSize: 1_400
+        )
+        let reconnect = LSPReconnectSnapshot(
+            phase: .candidateAuthenticated,
+            attemptID: UUID(),
+            phaseStartedAtUptime: 10,
+            native: nil
+        )
+        let product = LSPProductTelemetrySnapshot(
+            completeFrameReceiveToVideoToolboxSubmit: .init(
+                count: 10,
+                p50Microseconds: 100,
+                p95Microseconds: 200,
+                p99Microseconds: 250,
+                maximumMicroseconds: 300,
+                drops: 1,
+                clockDomain: "client-monotonic"
+            ),
+            videoToolboxSubmitToDecodeCompletion: nil,
+            completeFrameReceiveToMetalEnqueue: nil,
+            metalEnqueueToCommit: nil,
+            metalCommitToCompletion: nil,
+            audioReceiveToDecode: nil,
+            audioDecodeAndRenderEnqueue: nil,
+            audioUnderruns: nil,
+            audioRebuffers: nil,
+            reconnectDuration: nil
+        )
+        let presentation = StreamStatisticsPresenter.make(
+            renderer: nil,
+            decoder: nil,
+            transport: nil,
+            lsp: telemetry,
+            reconnect: reconnect,
+            devices: [
+                .init(
+                    kind: .rateObserved,
+                    deviceType: .pointer,
+                    deviceID: 1,
+                    instanceGeneration: 3,
+                    observedCaptureRate: 8_000,
+                    selectedStateRate: 8_000,
+                    selectedSensorRate: 0
+                ),
+            ],
+            product: product
+        )
+        XCTAssertEqual(presentation[.lspLifecycle], "authenticated")
+        XCTAssertEqual(presentation[.lspDatagrams], "RX 900 / TX 700")
+        XCTAssertEqual(presentation[.lspDrops], "3")
+        XCTAssertEqual(presentation[.lspAuthenticationFailures], "2")
+        XCTAssertEqual(presentation[.lspPathMTU], "TX 1400 / RX 1400 bytes")
+        XCTAssertEqual(presentation[.lspReconnect], "candidateAuthenticated")
+        XCTAssertTrue(presentation[.lspInputDevices].contains("capture 8000 Hz"))
+        XCTAssertEqual(
+            presentation[.lspFrameToDecoder],
+            "n=10 p50=100µs p95=200µs p99=250µs max=300µs drops=1 [client-monotonic]"
+        )
     }
 
     func testStatisticsPresenterDistinguishesUnavailableMetricsFromValidZero() {

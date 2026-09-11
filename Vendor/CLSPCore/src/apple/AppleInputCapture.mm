@@ -5,6 +5,7 @@
 
 #include "CLSPCore.h"
 #include "../input_plane/feedback.h"
+#include "../runtime/FixedTelemetry.h"
 
 #import <IOKit/hid/IOHIDManager.h>
 #import <GameController/GameController.h>
@@ -21,6 +22,15 @@
 
 extern "C" bool clsp_core_register_apple_capture(clsp_core_t *, clsp_apple_input_capture_t *);
 extern "C" void clsp_core_unregister_apple_capture(clsp_core_t *, clsp_apple_input_capture_t *);
+extern "C" void clsp_core_publish_device_offer(clsp_core_t *, clsp_device_offer_event_t);
+extern "C" void clsp_core_observe_input_device(
+  clsp_core_t *,
+  std::uint8_t,
+  std::uint32_t,
+  std::uint32_t,
+  bool,
+  std::uint8_t
+);
 
 /** @brief Opaque native Apple capture owner declared by the public C ABI. */
 struct clsp_apple_input_capture {
@@ -34,9 +44,33 @@ struct clsp_apple_input_capture {
   bool activated {};  ///< Whether dispatch-queue activation requires cancellation.
   std::array<bool, 256> keyboard {};  ///< Current keyboard-page usage state.
   std::array<bool, 6> pointer_buttons {};  ///< Pointer buttons one through five.
+  std::uint32_t pointer_generation {};  ///< Aggregate pointer-source arrival generation.
+  std::uint64_t pointer_rate_window_start {};  ///< First motion timestamp in current measurement window.
+  std::uint64_t pointer_last_offer {};  ///< Last coarse pointer-rate publication time.
+  std::uint64_t pointer_samples {};  ///< Cumulative pointer samples in this generation.
+  std::uint64_t pointer_window_samples {};  ///< Samples in current pointer-rate window.
+  std::uint64_t pointer_previous_sample {};  ///< Previous pointer timestamp for interval distribution.
+  std::uint32_t pointer_minimum_interval {UINT32_MAX};  ///< Window minimum pointer interval.
+  std::uint32_t pointer_maximum_interval {};  ///< Window maximum pointer interval.
+  umbra::lsp::FixedTelemetryDistribution pointer_spacing;  ///< Cumulative pointer callback spacing.
   __strong GCController *controllers[16] {};  ///< Controller slots owned on the native queue.
   std::array<std::uint32_t, 16> controller_generations {};  ///< Per-slot instance generations.
   std::array<std::uint32_t, 16> controller_buttons {};  ///< Last emitted digital-button masks.
+  std::array<std::uint64_t, 16> controller_rate_window_start {};  ///< Controller state-rate window origins.
+  std::array<std::uint64_t, 16> controller_last_offer {};  ///< Last controller-rate offer time.
+  std::array<std::uint64_t, 16> controller_samples {};  ///< Cumulative controller-state samples.
+  std::array<std::uint64_t, 16> controller_window_samples {};  ///< Current controller-rate samples.
+  std::array<std::uint64_t, 16> controller_previous_sample {};  ///< Previous controller-state timestamps.
+  std::array<std::uint32_t, 16> controller_minimum_interval {};  ///< Window minimum controller intervals.
+  std::array<std::uint32_t, 16> controller_maximum_interval {};  ///< Window maximum controller intervals.
+  std::array<umbra::lsp::FixedTelemetryDistribution, 16> controller_spacing {};  ///< Controller-state spacing.
+  std::array<std::uint64_t, 16> controller_sensor_rate_window_start {};  ///< Motion-callback rate window origins.
+  std::array<std::uint64_t, 16> controller_sensor_samples {};  ///< Cumulative motion callbacks per generation.
+  std::array<std::uint64_t, 16> controller_sensor_window_samples {};  ///< Motion callbacks in the current window.
+  std::array<std::uint64_t, 16> controller_sensor_previous_sample {};  ///< Previous motion callback timestamps.
+  std::array<std::uint32_t, 16> controller_sensor_minimum_interval {};  ///< Window minimum motion intervals.
+  std::array<std::uint32_t, 16> controller_sensor_maximum_interval {};  ///< Window maximum motion intervals.
+  std::array<umbra::lsp::FixedTelemetryDistribution, 16> controller_sensor_spacing {};  ///< Motion spacing.
   std::array<std::uint64_t, 16> latest_output_sequences {};  ///< Applied replaceable output sequences.
   std::array<std::uint64_t, 64> command_sequences {};  ///< Retry-safe terminal command cache keys.
   std::array<std::uint32_t, 64> command_controller_ids {};  ///< Cached controller IDs.
@@ -69,6 +103,193 @@ namespace {
       return std::max<std::uint64_t>(1, static_cast<std::uint64_t>(timestamp * 1'000'000.0));
     }
     return timestamp_microseconds(capture, mach_absolute_time());
+  }
+
+  /** @brief Publish one honest <=4 Hz measured native capture-rate offer. */
+  void publish_measured_rate(
+    clsp_apple_input_capture &capture,
+    const std::uint8_t device_type,
+    const std::uint32_t device_id,
+    const std::uint32_t generation,
+    const std::uint64_t timestamp,
+    std::uint64_t &window_start,
+    std::uint64_t &last_offer,
+    std::uint64_t &window_samples,
+    std::uint64_t &previous_sample,
+    std::uint32_t &minimum_interval,
+    std::uint32_t &maximum_interval,
+    umbra::lsp::FixedTelemetryDistribution &spacing,
+    const std::uint64_t captured_samples,
+    const std::uint32_t maximum_state_rate,
+    const std::uint32_t maximum_sensor_rate,
+    const std::uint16_t maximum_state_packet_bytes,
+    const std::uint16_t maximum_sensor_packet_bytes,
+    const std::uint8_t capture_source
+  ) noexcept {
+    if (window_start == 0U) window_start = timestamp;
+    if (previous_sample != 0U && timestamp > previous_sample) {
+      const auto interval = static_cast<std::uint32_t>(std::min<std::uint64_t>(UINT32_MAX, timestamp - previous_sample));
+      minimum_interval = std::min(minimum_interval, interval);
+      maximum_interval = std::max(maximum_interval, interval);
+      spacing.record(interval);
+    } else if (previous_sample != 0U) {
+      spacing.drop(CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT);
+    }
+    previous_sample = timestamp;
+    ++window_samples;
+    if (timestamp <= window_start || timestamp - last_offer < 250'000U) return;
+    const auto elapsed = timestamp - window_start;
+    const auto measured = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      maximum_state_rate,
+      window_samples * 1'000'000U / elapsed
+    ));
+    const auto packet_bytes = static_cast<std::uint64_t>(maximum_state_packet_bytes) + 12U + 16U + 28U;
+    const auto spacing_snapshot = spacing.snapshot(
+      CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+      CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES
+    );
+    clsp_core_publish_device_offer(capture.core, {
+      .device_id = device_id,
+      .instance_generation = generation,
+      .observed_capture_hz = measured,
+      .observed_sensor_hz = 0U,
+      .minimum_state_rate = 125,
+      .maximum_state_rate = maximum_state_rate,
+      .minimum_sensor_rate = maximum_sensor_rate == 0U ? 0U : 125U,
+      .maximum_sensor_rate = maximum_sensor_rate,
+      .captured_samples = captured_samples,
+      .effective_wire_bits_per_second = measured * packet_bytes * 8U,
+      .state_spacing_count = spacing_snapshot.count,
+      .state_spacing_p50_microseconds = spacing_snapshot.p50_microseconds,
+      .state_spacing_p95_microseconds = spacing_snapshot.p95_microseconds,
+      .state_spacing_p99_microseconds = spacing_snapshot.p99_microseconds,
+      .state_spacing_maximum_microseconds = spacing_snapshot.maximum_microseconds,
+      .state_spacing_drops = spacing_snapshot.drops,
+      .minimum_sample_interval_microseconds = minimum_interval == UINT32_MAX ? 0U : minimum_interval,
+      .maximum_sample_interval_microseconds = maximum_interval,
+      .timing_flags = spacing_snapshot.flags,
+      .maximum_state_packet_bytes = maximum_state_packet_bytes,
+      .maximum_sensor_packet_bytes = maximum_sensor_packet_bytes,
+      .kind = CLSP_DEVICE_OFFER_RATE_OBSERVED,
+      .device_type = device_type,
+      .capture_source = capture_source,
+    });
+    last_offer = timestamp;
+    window_start = timestamp;
+    window_samples = 0;
+    minimum_interval = UINT32_MAX;
+    maximum_interval = 0;
+  }
+
+  /** @brief Record one independently clocked state or motion callback sample. */
+  void record_rate_sample(
+    const std::uint64_t timestamp,
+    std::uint64_t &window_start,
+    std::uint64_t &window_samples,
+    std::uint64_t &previous_sample,
+    std::uint32_t &minimum_interval,
+    std::uint32_t &maximum_interval,
+    umbra::lsp::FixedTelemetryDistribution &spacing
+  ) noexcept {
+    if (window_start == 0U) window_start = timestamp;
+    if (previous_sample != 0U && timestamp > previous_sample) {
+      const auto interval = static_cast<std::uint32_t>(std::min<std::uint64_t>(UINT32_MAX, timestamp - previous_sample));
+      minimum_interval = std::min(minimum_interval, interval);
+      maximum_interval = std::max(maximum_interval, interval);
+      spacing.record(interval);
+    } else if (previous_sample != 0U) {
+      spacing.drop(CLSP_NATIVE_TIMING_UNKNOWN_COMPONENT);
+    }
+    previous_sample = timestamp;
+    ++window_samples;
+  }
+
+  /** @brief Publish one combined controller offer with independently measured state and sensor rates. */
+  void publish_controller_rates(
+    clsp_apple_input_capture &capture,
+    const std::size_t slot,
+    const std::uint64_t timestamp,
+    const bool has_motion
+  ) noexcept {
+    if (timestamp - capture.controller_last_offer[slot] < 250'000U) return;
+    const auto state_elapsed = capture.controller_rate_window_start[slot] == 0U ? 0U :
+      timestamp - capture.controller_rate_window_start[slot];
+    const auto sensor_elapsed = capture.controller_sensor_rate_window_start[slot] == 0U ? 0U :
+      timestamp - capture.controller_sensor_rate_window_start[slot];
+    const auto state_rate = state_elapsed == 0U ? 0U : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      2'000U,
+      capture.controller_window_samples[slot] * 1'000'000U / state_elapsed
+    ));
+    const auto sensor_rate = sensor_elapsed == 0U ? 0U : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      4'000U,
+      capture.controller_sensor_window_samples[slot] * 1'000'000U / sensor_elapsed
+    ));
+    if (state_rate == 0U && sensor_rate == 0U) return;
+    const auto state_wire_bytes = std::uint64_t {88U + 12U + 16U + 28U};
+    const auto sensor_wire_bytes = std::uint64_t {36U + 12U + 16U + 28U};
+    const auto state_interval = capture.controller_minimum_interval[slot] != UINT32_MAX;
+    const auto timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                              CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES;
+    const auto state_spacing = capture.controller_spacing[slot].snapshot(timing_flags);
+    const auto sensor_spacing = capture.controller_sensor_spacing[slot].snapshot(timing_flags);
+    clsp_core_publish_device_offer(capture.core, {
+      .device_id = static_cast<std::uint32_t>(slot + 1U),
+      .instance_generation = capture.controller_generations[slot],
+      .observed_capture_hz = state_rate,
+      .observed_sensor_hz = sensor_rate,
+      .minimum_state_rate = 125U,
+      .maximum_state_rate = 2'000U,
+      .minimum_sensor_rate = has_motion ? 125U : 0U,
+      .maximum_sensor_rate = has_motion ? 4'000U : 0U,
+      .captured_samples = capture.controller_samples[slot] + capture.controller_sensor_samples[slot],
+      .effective_wire_bits_per_second =
+        (static_cast<std::uint64_t>(state_rate) * state_wire_bytes +
+         static_cast<std::uint64_t>(sensor_rate) * sensor_wire_bytes * 2U) * 8U,
+      .state_spacing_count = state_spacing.count,
+      .state_spacing_p50_microseconds = state_spacing.p50_microseconds,
+      .state_spacing_p95_microseconds = state_spacing.p95_microseconds,
+      .state_spacing_p99_microseconds = state_spacing.p99_microseconds,
+      .state_spacing_maximum_microseconds = state_spacing.maximum_microseconds,
+      .state_spacing_drops = state_spacing.drops,
+      .sensor_spacing_count = sensor_spacing.count,
+      .sensor_spacing_p50_microseconds = sensor_spacing.p50_microseconds,
+      .sensor_spacing_p95_microseconds = sensor_spacing.p95_microseconds,
+      .sensor_spacing_p99_microseconds = sensor_spacing.p99_microseconds,
+      .sensor_spacing_maximum_microseconds = sensor_spacing.maximum_microseconds,
+      .sensor_spacing_drops = sensor_spacing.drops,
+      .minimum_sample_interval_microseconds = state_interval ?
+        capture.controller_minimum_interval[slot] :
+        capture.controller_sensor_minimum_interval[slot] == UINT32_MAX ? 0U :
+          capture.controller_sensor_minimum_interval[slot],
+      .maximum_sample_interval_microseconds = state_interval ?
+        capture.controller_maximum_interval[slot] : capture.controller_sensor_maximum_interval[slot],
+      .timing_flags = timing_flags,
+      .maximum_state_packet_bytes = 88U,
+      .maximum_sensor_packet_bytes = has_motion ? std::uint16_t {36U} : std::uint16_t {0U},
+      .kind = CLSP_DEVICE_OFFER_RATE_OBSERVED,
+      .device_type = CLSP_DEVICE_OFFER_CONTROLLER,
+      .capture_source = CLSP_DEVICE_CAPTURE_GAME_CONTROLLER,
+    });
+    capture.controller_last_offer[slot] = timestamp;
+    capture.controller_rate_window_start[slot] = timestamp;
+    capture.controller_window_samples[slot] = 0U;
+    capture.controller_minimum_interval[slot] = UINT32_MAX;
+    capture.controller_maximum_interval[slot] = 0U;
+    capture.controller_sensor_rate_window_start[slot] = timestamp;
+    capture.controller_sensor_window_samples[slot] = 0U;
+    capture.controller_sensor_minimum_interval[slot] = UINT32_MAX;
+    capture.controller_sensor_maximum_interval[slot] = 0U;
+  }
+
+  /** @brief Rebuild one neutral authority baseline after a native hot-plug set changes. */
+  [[nodiscard]] bool restart_device_baseline(clsp_apple_input_capture &capture) noexcept {
+    if (clsp_core_neutralize_input(capture.core) != CLSP_STATUS_OK ||
+        clsp_core_restart_input_baseline(capture.core) != CLSP_STATUS_OK) return false;
+    std::fill(capture.keyboard.begin(), capture.keyboard.end(), false);
+    std::fill(capture.pointer_buttons.begin(), capture.pointer_buttons.end(), false);
+    std::fill(capture.controller_buttons.begin(), capture.controller_buttons.end(), 0U);
+    std::fill(capture.touch_active.begin(), capture.touch_active.end(), false);
+    return true;
   }
 
   /** @brief Convert one IOHID absolute timestamp to nonzero monotonic microseconds. */
@@ -120,15 +341,29 @@ namespace {
 
   /** @brief Return the frozen digital-button mask for one extended profile. */
   [[nodiscard]] std::uint32_t controller_button_mask(GCExtendedGamepad *gamepad) noexcept {
+    using lumen::lsp::input_plane::controller_button_bit;
     std::uint32_t mask = 0;
     auto set = [&mask](const unsigned bit, GCControllerButtonInput *button) noexcept {
       if (button != nil && button.isPressed) mask |= std::uint32_t {1} << bit;
     };
-    set(0, gamepad.buttonA); set(1, gamepad.buttonB); set(2, gamepad.buttonX); set(3, gamepad.buttonY);
-    set(4, gamepad.dpad.up); set(5, gamepad.dpad.down); set(6, gamepad.dpad.left); set(7, gamepad.dpad.right);
-    set(8, gamepad.leftShoulder); set(9, gamepad.rightShoulder);
-    set(10, gamepad.leftThumbstickButton); set(11, gamepad.rightThumbstickButton);
-    set(12, gamepad.buttonMenu); set(13, gamepad.buttonOptions); set(14, gamepad.buttonHome);
+    auto bit = [](const controller_button_bit value) noexcept {
+      return static_cast<unsigned>(value);
+    };
+    set(bit(controller_button_bit::south), gamepad.buttonA);
+    set(bit(controller_button_bit::east), gamepad.buttonB);
+    set(bit(controller_button_bit::west), gamepad.buttonX);
+    set(bit(controller_button_bit::north), gamepad.buttonY);
+    set(bit(controller_button_bit::left_shoulder), gamepad.leftShoulder);
+    set(bit(controller_button_bit::right_shoulder), gamepad.rightShoulder);
+    set(bit(controller_button_bit::left_stick), gamepad.leftThumbstickButton);
+    set(bit(controller_button_bit::right_stick), gamepad.rightThumbstickButton);
+    set(bit(controller_button_bit::menu), gamepad.buttonMenu);
+    set(bit(controller_button_bit::view), gamepad.buttonOptions);
+    set(bit(controller_button_bit::guide), gamepad.buttonHome);
+    set(bit(controller_button_bit::dpad_up), gamepad.dpad.up);
+    set(bit(controller_button_bit::dpad_down), gamepad.dpad.down);
+    set(bit(controller_button_bit::dpad_left), gamepad.dpad.left);
+    set(bit(controller_button_bit::dpad_right), gamepad.dpad.right);
     return mask;
   }
 
@@ -266,12 +501,58 @@ namespace {
     capture.controllers[slot] = controller;
     capture.controller_generations[slot] = capture.controller_generations[slot] == UINT32_MAX ? 1U : capture.controller_generations[slot] + 1U;
     capture.controller_buttons[slot] = 0;
+    capture.controller_rate_window_start[slot] = 0;
+    capture.controller_last_offer[slot] = 0;
+    capture.controller_samples[slot] = 0;
+    capture.controller_window_samples[slot] = 0;
+    capture.controller_previous_sample[slot] = 0;
+    capture.controller_minimum_interval[slot] = UINT32_MAX;
+    capture.controller_maximum_interval[slot] = 0;
+    capture.controller_spacing[slot] = {};
+    capture.controller_sensor_rate_window_start[slot] = 0;
+    capture.controller_sensor_samples[slot] = 0;
+    capture.controller_sensor_window_samples[slot] = 0;
+    capture.controller_sensor_previous_sample[slot] = 0;
+    capture.controller_sensor_minimum_interval[slot] = UINT32_MAX;
+    capture.controller_sensor_maximum_interval[slot] = 0;
+    capture.controller_sensor_spacing[slot] = {};
     capture.latest_output_sequences[slot] = 0;
     controller.handlerQueue = capture.queue;
     GCExtendedGamepad *gamepad = controller.extendedGamepad;
+    GCControllerTouchpad *touchpad = gamepad.allTouchpads.anyObject;
     const auto arrival_time = controller_timestamp(capture, gamepad.lastEventTimestamp);
+    const auto generation = capture.controller_generations[slot];
+    const auto device_id = static_cast<std::uint32_t>(slot + 1U);
+    clsp_core_observe_input_device(
+      capture.core,
+      3U,
+      device_id,
+      generation,
+      true,
+      controller.motion == nil ? 0U : 3U
+    );
+    if (touchpad != nil) {
+      clsp_core_observe_input_device(capture.core, 4U, device_id, generation, true, 0U);
+    }
     submit_controller_edge(capture, slot, arrival_time, 5, 1);
     prepare_haptics(capture, slot, controller);
+    clsp_core_publish_device_offer(capture.core, {
+      .device_id = static_cast<std::uint32_t>(slot + 1U),
+      .instance_generation = capture.controller_generations[slot],
+      .captured_samples = capture.controller_samples[slot],
+      .observed_capture_hz = 0,
+      .minimum_state_rate = 125,
+      .maximum_state_rate = 2'000,
+      .minimum_sensor_rate = controller.motion == nil ? 0U : 125U,
+      .maximum_sensor_rate = controller.motion == nil ? 0U : 4'000U,
+      .timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                      CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES,
+      .maximum_state_packet_bytes = 88,
+      .maximum_sensor_packet_bytes = controller.motion == nil ? std::uint16_t {0} : std::uint16_t {36},
+      .kind = CLSP_DEVICE_OFFER_ARRIVED,
+      .device_type = CLSP_DEVICE_OFFER_CONTROLLER,
+      .capture_source = CLSP_DEVICE_CAPTURE_GAME_CONTROLLER,
+    });
 
     gamepad.valueChangedHandler = ^(GCExtendedGamepad *profile, GCControllerElement *element) {
       (void)element;
@@ -296,6 +577,17 @@ namespace {
         .right_stick_x = axis(profile.rightThumbstick.xAxis.value),
         .right_stick_y = axis(profile.rightThumbstick.yAxis.value),
       };
+      ++capture.controller_samples[slot];
+      record_rate_sample(
+        timestamp,
+        capture.controller_rate_window_start[slot],
+        capture.controller_window_samples[slot],
+        capture.controller_previous_sample[slot],
+        capture.controller_minimum_interval[slot],
+        capture.controller_maximum_interval[slot],
+        capture.controller_spacing[slot]
+      );
+      publish_controller_rates(capture, slot, timestamp, controller.motion != nil);
       (void)clsp_core_submit_controller_state(capture.core, &state);
     };
 
@@ -304,6 +596,17 @@ namespace {
       controller.motion.valueChangedHandler = ^(GCMotion *motion) {
         if (!capture.active.load(std::memory_order_acquire) || capture.controllers[slot] != controller) return;
         const auto timestamp = controller_timestamp(capture, 0);
+        ++capture.controller_sensor_samples[slot];
+        record_rate_sample(
+          timestamp,
+          capture.controller_sensor_rate_window_start[slot],
+          capture.controller_sensor_window_samples[slot],
+          capture.controller_sensor_previous_sample[slot],
+          capture.controller_sensor_minimum_interval[slot],
+          capture.controller_sensor_maximum_interval[slot],
+          capture.controller_sensor_spacing[slot]
+        );
+        publish_controller_rates(capture, slot, timestamp, true);
         const auto rotation = motion.rotationRate;
         clsp_controller_sensor_t gyro {
           .sample_time_microseconds = timestamp,
@@ -324,7 +627,6 @@ namespace {
         (void)clsp_core_submit_controller_sensor(capture.core, &accel);
       };
     }
-    GCControllerTouchpad *touchpad = gamepad.allTouchpads.anyObject;
     if (touchpad != nil) {
       touchpad.reportsAbsoluteTouchSurfaceValues = YES;
       touchpad.touchDown = ^(GCControllerTouchpad *pad, float x, float y, float button, BOOL pressed) {
@@ -376,6 +678,37 @@ namespace {
       capture.touch_active[slot] = false;
     }
     submit_controller_edge(capture, slot, timestamp, 6, 0);
+    const auto device_id = static_cast<std::uint32_t>(slot + 1U);
+    const auto generation = capture.controller_generations[slot];
+    if (controller.extendedGamepad.allTouchpads.count != 0U) {
+      clsp_core_observe_input_device(capture.core, 4U, device_id, generation, false, 0U);
+    }
+    clsp_core_observe_input_device(capture.core, 3U, device_id, generation, false, 0U);
+    const auto timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                              CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES;
+    const auto state_spacing = capture.controller_spacing[slot].snapshot(timing_flags);
+    const auto sensor_spacing = capture.controller_sensor_spacing[slot].snapshot(timing_flags);
+    clsp_core_publish_device_offer(capture.core, {
+      .device_id = device_id,
+      .instance_generation = generation,
+      .captured_samples = capture.controller_samples[slot] + capture.controller_sensor_samples[slot],
+      .state_spacing_count = state_spacing.count,
+      .state_spacing_p50_microseconds = state_spacing.p50_microseconds,
+      .state_spacing_p95_microseconds = state_spacing.p95_microseconds,
+      .state_spacing_p99_microseconds = state_spacing.p99_microseconds,
+      .state_spacing_maximum_microseconds = state_spacing.maximum_microseconds,
+      .state_spacing_drops = state_spacing.drops,
+      .sensor_spacing_count = sensor_spacing.count,
+      .sensor_spacing_p50_microseconds = sensor_spacing.p50_microseconds,
+      .sensor_spacing_p95_microseconds = sensor_spacing.p95_microseconds,
+      .sensor_spacing_p99_microseconds = sensor_spacing.p99_microseconds,
+      .sensor_spacing_maximum_microseconds = sensor_spacing.maximum_microseconds,
+      .sensor_spacing_drops = sensor_spacing.drops,
+      .timing_flags = timing_flags,
+      .kind = CLSP_DEVICE_OFFER_REMOVED,
+      .device_type = CLSP_DEVICE_OFFER_CONTROLLER,
+      .capture_source = CLSP_DEVICE_CAPTURE_GAME_CONTROLLER,
+    });
     if (capture.haptic_players[slot] != nil) {
       [capture.haptic_players[slot] stopAtTime:0 error:nil];
       capture.haptic_players[slot] = nil;
@@ -561,7 +894,64 @@ namespace {
     } else {
       return;
     }
+    ++capture->pointer_samples;
+    publish_measured_rate(
+      *capture,
+      CLSP_DEVICE_OFFER_POINTER,
+      1,
+      std::max<std::uint32_t>(1U, capture->pointer_generation),
+      timestamp,
+      capture->pointer_rate_window_start,
+      capture->pointer_last_offer,
+      capture->pointer_window_samples,
+      capture->pointer_previous_sample,
+      capture->pointer_minimum_interval,
+      capture->pointer_maximum_interval,
+      capture->pointer_spacing,
+      capture->pointer_samples,
+      16'000,
+      0,
+      56,
+      0,
+      CLSP_DEVICE_CAPTURE_IOHID
+    );
     (void)clsp_core_submit_pointer(capture->core, &sample);
+  }
+
+  /** @brief Publish a real IOHID aggregate source arrival generation. */
+  void device_arrived_callback(
+    void *context,
+    const IOReturn result,
+    void *sender,
+    IOHIDDeviceRef device
+  ) noexcept {
+    (void)sender;
+    auto *capture = static_cast<clsp_apple_input_capture *>(context);
+    if (capture == nullptr || device == nullptr || result != kIOReturnSuccess ||
+        !capture->active.load(std::memory_order_acquire)) return;
+    if (capture->pointer_generation != 0U) return;
+    capture->pointer_generation = 1U;
+    capture->pointer_samples = 0;
+    capture->pointer_window_samples = 0;
+    capture->pointer_rate_window_start = 0;
+    capture->pointer_last_offer = 0;
+    capture->pointer_previous_sample = 0;
+    capture->pointer_minimum_interval = UINT32_MAX;
+    capture->pointer_maximum_interval = 0;
+    capture->pointer_spacing = {};
+    clsp_core_observe_input_device(capture->core, 2U, 1U, capture->pointer_generation, true, 0U);
+    clsp_core_publish_device_offer(capture->core, {
+      .device_id = 1,
+      .instance_generation = capture->pointer_generation,
+      .minimum_state_rate = 125,
+      .maximum_state_rate = 16'000,
+      .timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                      CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES,
+      .maximum_state_packet_bytes = 56,
+      .kind = CLSP_DEVICE_OFFER_ARRIVED,
+      .device_type = CLSP_DEVICE_OFFER_POINTER,
+      .capture_source = CLSP_DEVICE_CAPTURE_IOHID,
+    });
   }
 
   /** @brief Neutralize held state when any owned device leaves the native capture set. */
@@ -690,6 +1080,7 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
   IOHIDManagerSetDeviceMatchingMultiple(capture->manager, matches);
   CFRelease(matches);
   IOHIDManagerRegisterInputValueCallback(capture->manager, input_value_callback, capture);
+  IOHIDManagerRegisterDeviceMatchingCallback(capture->manager, device_arrived_callback, capture);
   IOHIDManagerRegisterDeviceRemovalCallback(capture->manager, device_removed_callback, capture);
   IOHIDManagerSetDispatchQueue(capture->manager, capture->queue);
   IOHIDManagerSetCancelHandler(capture->manager, ^{
@@ -711,17 +1102,48 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
     delete capture;
     return CLSP_STATUS_INPUT_UNAVAILABLE;
   }
+  capture->pointer_generation = 1U;
+  capture->pointer_minimum_interval = UINT32_MAX;
+  clsp_core_observe_input_device(capture->core, 2U, 1U, capture->pointer_generation, true, 0U);
+  clsp_core_publish_device_offer(capture->core, {
+    .device_id = 1U,
+    .instance_generation = capture->pointer_generation,
+    .minimum_state_rate = 125U,
+    .maximum_state_rate = 16'000U,
+    .timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                    CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES,
+    .maximum_state_packet_bytes = 56U,
+    .kind = CLSP_DEVICE_OFFER_ARRIVED,
+    .device_type = CLSP_DEVICE_OFFER_POINTER,
+    .capture_source = CLSP_DEVICE_CAPTURE_IOHID,
+  });
+  const auto neutralize_status = clsp_core_neutralize_input(core);
+  if (neutralize_status != CLSP_STATUS_OK) {
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return neutralize_status;
+  }
   IOHIDManagerActivate(capture->manager);
   capture->activated = true;
-  capture->active.store(true, std::memory_order_release);
   NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
   capture->connect_observer = [center addObserverForName:GCControllerDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *notification) {
     GCController *controller = static_cast<GCController *>(notification.object);
-    dispatch_async(capture->queue, ^{ connect_controller(*capture, controller); });
+    dispatch_async(capture->queue, ^{
+      connect_controller(*capture, controller);
+      if (capture->active.load(std::memory_order_acquire) && !restart_device_baseline(*capture)) {
+        capture->active.store(false, std::memory_order_release);
+      }
+    });
   }];
   capture->disconnect_observer = [center addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification *notification) {
     GCController *controller = static_cast<GCController *>(notification.object);
-    dispatch_async(capture->queue, ^{ disconnect_controller(*capture, controller); });
+    dispatch_async(capture->queue, ^{
+      disconnect_controller(*capture, controller);
+      if (capture->active.load(std::memory_order_acquire) && !restart_device_baseline(*capture)) {
+        capture->active.store(false, std::memory_order_release);
+      }
+    });
   }];
   dispatch_sync(capture->queue, ^{
     for (GCController *controller in GCController.controllers) connect_controller(*capture, controller);
@@ -732,6 +1154,15 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
     delete capture;
     return CLSP_STATUS_INVALID_STATE;
   }
+  const auto baseline_status = clsp_core_restart_input_baseline(core);
+  if (baseline_status != CLSP_STATUS_OK) {
+    clsp_core_unregister_apple_capture(core, capture);
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return baseline_status;
+  }
+  capture->active.store(true, std::memory_order_release);
   *output = capture;
   return CLSP_STATUS_OK;
 }
@@ -772,6 +1203,28 @@ extern "C" void clsp_apple_input_capture_release(clsp_apple_input_capture_t *cap
 extern "C" void clsp_apple_input_capture_stop(clsp_apple_input_capture_t *capture) {
   if (capture == nullptr) {
     return;
+  }
+  if (capture->pointer_generation != 0U) {
+    clsp_core_observe_input_device(capture->core, 2U, 1U, capture->pointer_generation, false, 0U);
+    const auto spacing = capture->pointer_spacing.snapshot(
+      CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+      CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES
+    );
+    clsp_core_publish_device_offer(capture->core, {
+      .device_id = 1,
+      .instance_generation = capture->pointer_generation,
+      .captured_samples = capture->pointer_samples,
+      .state_spacing_count = spacing.count,
+      .state_spacing_p50_microseconds = spacing.p50_microseconds,
+      .state_spacing_p95_microseconds = spacing.p95_microseconds,
+      .state_spacing_p99_microseconds = spacing.p99_microseconds,
+      .state_spacing_maximum_microseconds = spacing.maximum_microseconds,
+      .state_spacing_drops = spacing.drops,
+      .timing_flags = spacing.flags,
+      .kind = CLSP_DEVICE_OFFER_REMOVED,
+      .device_type = CLSP_DEVICE_OFFER_POINTER,
+      .capture_source = CLSP_DEVICE_CAPTURE_IOHID,
+    });
   }
   clsp_core_unregister_apple_capture(capture->core, capture);
   quiesce(*capture);
