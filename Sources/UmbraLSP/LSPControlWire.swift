@@ -112,6 +112,9 @@ public struct LSPApplication: Equatable, Identifiable, Sendable {
     public var id: String
     public var name: String
     public var imagePath: String
+    public var isRunning: Bool
+    public var resumeAvailable: Bool
+    public var processGeneration: UInt64
 }
 
 /// Requested input-only START rates and aggregate wire budget.
@@ -930,11 +933,22 @@ public enum LSPControlWire {
             throw DeterministicCBORError.malformed
         }
         return try encodedApplications.map { encoded in
-            let fields = try DeterministicCBOR.exactMap(encoded, count: 3)
+            let fields = try DeterministicCBOR.exactMap(encoded, count: 6)
             let id = try text(fields[0], maximum: 128, allowEmpty: false)
             let name = try text(fields[1], maximum: 256, allowEmpty: false)
             let imagePath = try text(fields[2], maximum: 512, allowEmpty: true)
-            return LSPApplication(id: id, name: name, imagePath: imagePath)
+            let isRunning = try boolean(fields[3])
+            let resumeAvailable = try boolean(fields[4])
+            let processGeneration = try uint(fields[5])
+            guard isRunning ? processGeneration != 0 : (!resumeAvailable && processGeneration == 0),
+                  !resumeAvailable || isRunning else {
+                throw DeterministicCBORError.malformed
+            }
+            return LSPApplication(
+                id: id, name: name, imagePath: imagePath,
+                isRunning: isRunning, resumeAvailable: resumeAvailable,
+                processGeneration: processGeneration
+            )
         }
     }
 

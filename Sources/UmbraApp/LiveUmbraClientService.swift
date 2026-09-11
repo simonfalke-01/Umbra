@@ -457,7 +457,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         if let hostID = lspHostID(id), let lspProduct {
             try await configureLSPTransport(lspProduct)
             let applications = try await lspProduct.applications(hostID: hostID)
-            let runningApplicationID = try? await lspProduct.activeApplicationID(hostID: hostID)
             var wireIDs: [Int: String] = [:]
             var artworkReferences: [Int: String] = [:]
             var display: [ApplicationDisplayModel] = []
@@ -476,13 +475,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     hostID: id,
                     name: application.name,
                     artworkURL: nil,
-                    isRunning: application.id == runningApplicationID,
+                    isRunning: application.isRunning,
                     isHidden: false,
                     isDirectLaunch: false
                 ))
             }
             lspApplicationIDs[id] = wireIDs
             lspApplicationArtworkReferences[id] = artworkReferences
+            markLSPHostSession(hostID: hostID, runningApplicationID: display.first(where: \.isRunning)?.id)
             if !artworkReferences.isEmpty {
                 let immutableArtworkReferences = artworkReferences
                 startArtworkLoading(
