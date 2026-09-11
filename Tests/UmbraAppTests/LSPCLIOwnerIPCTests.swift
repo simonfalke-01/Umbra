@@ -40,4 +40,56 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
         XCTAssertEqual(lstat(socket, &socketStatus), 0)
         XCTAssertEqual(socketStatus.st_mode & 0o077, 0)
     }
+
+    func testResponseSentHandlerRunsOnlyAfterReplyIsWritableToClient() async throws {
+        let hostID = UUID()
+        let gate = OwnerResponseSentGate()
+        let endpoint = try LSPCLIOwnerEndpoint(
+            hostID: hostID,
+            handler: { _ in
+                .init(error: nil, stopKind: "stopped", telemetry: nil)
+            },
+            responseSentHandler: { _, _ in
+                await gate.enterAndWait()
+            }
+        )
+        defer { endpoint.stop() }
+
+        let request = Task {
+            try await LSPCLIOwnerEndpoint.request(hostID: hostID, command: .stop)
+        }
+        await gate.waitUntilEntered()
+
+        let response = try await request.value
+        XCTAssertEqual(response.stopKind, "stopped")
+        await gate.open()
+    }
+}
+
+private actor OwnerResponseSentGate {
+    private var entered = false
+    private var isOpen = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var openWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !isOpen else { return }
+        await withCheckedContinuation { openWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let waiters = openWaiters
+        openWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }

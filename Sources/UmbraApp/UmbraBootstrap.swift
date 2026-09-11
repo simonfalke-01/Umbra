@@ -10,7 +10,7 @@ import UmbraServices
 
 enum UmbraLaunchRequest: Sendable {
     case launchApplication
-    case stream(SessionIntent)
+    case stream(CLIStreamLaunchRequest)
 }
 
 enum UmbraBootstrap {
@@ -55,7 +55,7 @@ enum UmbraBootstrap {
             case .launchApplication:
                 return .launchApplication
             case let .stream(request):
-                return .stream(request.intent)
+                return .stream(request)
             case let .terminate(result):
                 exit(result.exitCode)
             }

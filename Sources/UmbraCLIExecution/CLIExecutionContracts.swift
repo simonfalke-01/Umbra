@@ -99,6 +99,17 @@ public struct CLILSPTelemetry: Equatable, Sendable {
         self.authenticationFailures = authenticationFailures
         self.currentUDPPayloadSize = currentUDPPayloadSize; self.reconnectPhase = reconnectPhase
     }
+
+    /// Stable command-line representation shared by direct commands and native-app handoffs.
+    public var commandLineOutput: String {
+        "lsp.lifecycle=\(lifecycle)\n"
+            + "lsp.received_datagrams=\(receivedDatagrams)\n"
+            + "lsp.transmitted_datagrams=\(transmittedDatagrams)\n"
+            + "lsp.dropped_datagrams=\(droppedDatagrams)\n"
+            + "lsp.authentication_failures=\(authenticationFailures)\n"
+            + "lsp.udp_payload_size=\(currentUDPPayloadSize)\n"
+            + (reconnectPhase.map { "lsp.reconnect_phase=\($0)\n" } ?? "")
+    }
 }
 
 /// Narrow product seam required for real LSP CLI execution.
@@ -188,19 +199,47 @@ public struct RandomCLIPINGenerator: CLIPINGenerating, Sendable {
 /// This request deliberately has no exit code: resolving a host and application is not equivalent
 /// to successfully starting a streaming session. The application must dispatch the intent to the
 /// real streaming surface and own its eventual session result.
+public struct CLILSPStreamLaunchTarget: Equatable, Sendable {
+    public var hostID: UUID
+    public var applicationID: String
+    public var hostName: String
+    public var applicationName: String
+    public var microphone: CLILSPMicrophoneMode
+    public var emitTelemetry: Bool
+
+    public init(
+        hostID: UUID,
+        applicationID: String,
+        hostName: String,
+        applicationName: String,
+        microphone: CLILSPMicrophoneMode,
+        emitTelemetry: Bool
+    ) {
+        self.hostID = hostID
+        self.applicationID = applicationID
+        self.hostName = hostName
+        self.applicationName = applicationName
+        self.microphone = microphone
+        self.emitTelemetry = emitTelemetry
+    }
+}
+
 public struct CLIStreamLaunchRequest: Equatable, Sendable {
     public var intent: SessionIntent
     public var standardOutput: String
     public var standardError: String
+    public var lsp: CLILSPStreamLaunchTarget?
 
     public init(
         intent: SessionIntent,
         standardOutput: String = "",
-        standardError: String = ""
+        standardError: String = "",
+        lsp: CLILSPStreamLaunchTarget? = nil
     ) {
         self.intent = intent
         self.standardOutput = standardOutput
         self.standardError = standardError
+        self.lsp = lsp
     }
 }
 

@@ -133,40 +133,27 @@ private extension UmbraCLICommandExecutor {
                 $0.name.caseInsensitiveCompare(command.applicationName) == .orderedSame ||
                 $0.id.caseInsensitiveCompare(command.applicationName) == .orderedSame
             }) else { throw CLIExecutionError.lspApplicationNotFound(command.applicationName) }
-            try await lspService.configure(
-                profile: command.preferences.lspNetworkProfile,
-                competitionCapacityMbps: command.preferences.lspCompetitionCapacityMbps
-            )
-            try await lspService.start(CLILSPStartRequest(
-                hostID: host.id,
-                applicationID: application.id,
-                resume: command.resume,
-                preferences: command.preferences,
-                pointerRate: UInt32(command.preferences.lspPointerRate),
-                controllerRate: UInt32(command.preferences.lspControllerRate),
-                sensorRate: UInt32(command.preferences.lspSensorRate),
-                reconciliationRate: UInt32(command.preferences.lspReconciliationRate),
-                microphone: command.lsp.microphone
+            progress.report(.preparingStream(host: host.name, application: application.name))
+            return .stream(CLIStreamLaunchRequest(
+                intent: SessionIntent(
+                    hostID: "lsp:\(host.id.uuidString.lowercased())",
+                    applicationID: stableLSPApplicationID(application.id),
+                    kind: command.resume ? .resume : .launch,
+                    preferences: command.preferences,
+                    gamepadMask: command.preferences.multiController ? 0 : 1,
+                    persistGameControllers: !command.preferences.multiController
+                ),
+                standardOutput: transcript.standardOutput,
+                standardError: transcript.standardError,
+                lsp: CLILSPStreamLaunchTarget(
+                    hostID: host.id,
+                    applicationID: application.id,
+                    hostName: host.name,
+                    applicationName: application.name,
+                    microphone: command.lsp.microphone,
+                    emitTelemetry: command.lsp.emitTelemetry
+                )
             ))
-            transcript.writeStandardOutput("LSP stream active for \(application.name) on \(host.name).\n")
-            if command.lsp.emitTelemetry { try await emitLSPTelemetry(hostID: host.id, service: lspService, transcript: transcript) }
-            let terminal = await withTaskCancellationHandler {
-                await lspService.runUntilTerminated(hostID: host.id)
-            } onCancel: {
-                Task.detached { _ = await lspService.stop(hostID: host.id) }
-            }
-            if Task.isCancelled { throw CancellationError() }
-            switch terminal {
-            case .stopped:
-                transcript.writeStandardOutput("LSP stream ended.\n")
-                return .terminate(transcript.result(exitCode: .success))
-            case .notRunning:
-                throw CLIExecutionError.lspStreamNotRunning
-            case .rejected(let reason):
-                throw CLIExecutionError.lspStopRejected(reason)
-            case .transportFailed(let reason):
-                throw CLIExecutionError.lspTransportFailed(reason)
-            }
         } catch { return terminate(error, transcript: transcript) }
     }
 
@@ -224,15 +211,7 @@ private extension UmbraCLICommandExecutor {
         transcript: ExecutionTranscript
     ) async throws {
         let value = try await service.telemetry(hostID: hostID)
-        transcript.writeStandardOutput(
-            "lsp.lifecycle=\(value.lifecycle)\n"
-            + "lsp.received_datagrams=\(value.receivedDatagrams)\n"
-            + "lsp.transmitted_datagrams=\(value.transmittedDatagrams)\n"
-            + "lsp.dropped_datagrams=\(value.droppedDatagrams)\n"
-            + "lsp.authentication_failures=\(value.authenticationFailures)\n"
-            + "lsp.udp_payload_size=\(value.currentUDPPayloadSize)\n"
-            + (value.reconnectPhase.map { "lsp.reconnect_phase=\($0)\n" } ?? "")
-        )
+        transcript.writeStandardOutput(value.commandLineOutput)
     }
 
     func missingLSPService(_ transcript: ExecutionTranscript) -> CLIExecutionOutcome {
@@ -244,6 +223,15 @@ private extension UmbraCLICommandExecutor {
 
     func csv(_ value: String) -> String {
         "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+    }
+
+    func stableLSPApplicationID(_ value: String) -> Int {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return max(1, Int(hash & UInt64(Int.max)))
     }
 
     func executeList(

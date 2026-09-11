@@ -50,6 +50,10 @@ enum LSPCLIOwnerIPCError: Error, LocalizedError {
 
 final class LSPCLIOwnerEndpoint: @unchecked Sendable {
     typealias Handler = @Sendable (LSPCLIOwnerRequest) async -> LSPCLIOwnerResponse
+    typealias ResponseSentHandler = @Sendable (
+        LSPCLIOwnerRequest,
+        LSPCLIOwnerResponse
+    ) async -> Void
 
     private let path: String
     private let descriptor: Int32
@@ -58,18 +62,28 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
 
-    init(hostID: UUID, handler: @escaping Handler) throws {
+    init(
+        hostID: UUID,
+        handler: @escaping Handler,
+        responseSentHandler: ResponseSentHandler? = nil
+    ) throws {
         path = try Self.endpointPath(hostID: hostID, createParent: true)
         self.handler = handler
         descriptor = try Self.makeListener(path: path)
-        task = Task.detached(priority: .utility) { [path, descriptor, handler] in
+        task = Task.detached(priority: .utility) {
+            [path, descriptor, handler, responseSentHandler] in
             while !Task.isCancelled {
                 let client = Darwin.accept(descriptor, nil, nil)
                 if client < 0 {
                     if errno == EINTR { continue }
                     return
                 }
-                await Self.serve(client: client, expectedHostID: hostID, handler: handler)
+                await Self.serve(
+                    client: client,
+                    expectedHostID: hostID,
+                    handler: handler,
+                    responseSentHandler: responseSentHandler
+                )
             }
             _ = unlink(path)
         }
@@ -123,7 +137,8 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
     private static func serve(
         client: Int32,
         expectedHostID: UUID,
-        handler: Handler
+        handler: Handler,
+        responseSentHandler: ResponseSentHandler?
     ) async {
         defer { _ = Darwin.close(client) }
         var peerUID: uid_t = 0
@@ -135,6 +150,10 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
             guard request.hostID == expectedHostID else { throw LSPCLIOwnerIPCError.invalidMessage }
             let response = await handler(request)
             try writeAll(try JSONEncoder().encode(response), descriptor: client)
+            guard Darwin.shutdown(client, SHUT_WR) == 0 else {
+                throw LSPCLIOwnerIPCError.system(errno)
+            }
+            await responseSentHandler?(request, response)
         } catch {
             let response = LSPCLIOwnerResponse(error: error.localizedDescription, stopKind: nil, telemetry: nil)
             if let data = try? JSONEncoder().encode(response) { try? writeAll(data, descriptor: client) }

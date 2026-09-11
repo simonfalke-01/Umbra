@@ -2,6 +2,7 @@ import Darwin
 import AppKit
 import SwiftUI
 import UmbraCLI
+import UmbraCLIExecution
 import UmbraServices
 
 @MainActor
@@ -55,14 +56,14 @@ struct UmbraApp: App {
     init() {
         let launchRequest = UmbraBootstrap.resolveLaunchRequest()
         let terminateAfterStream: Bool
-        let requestedIntent: SessionIntent?
+        let requestedStream: CLIStreamLaunchRequest?
         switch launchRequest {
         case .launchApplication:
             terminateAfterStream = false
-            requestedIntent = nil
-        case let .stream(intent):
+            requestedStream = nil
+        case let .stream(request):
             terminateAfterStream = true
-            requestedIntent = intent
+            requestedStream = request
         }
         do {
             let composition = try LiveApplicationComposition()
@@ -76,20 +77,24 @@ struct UmbraApp: App {
                 await composition?.stopForApplicationTermination()
             }
             if terminateAfterStream {
+                let isLSP = requestedStream?.lsp != nil
                 composition.clientService.onSessionTerminated = { succeeded in
+                    if isLSP, succeeded {
+                        writeCLIStandardOutput("LSP stream ended.\n")
+                    }
                     exit(succeeded ? CLIExitCode.success.rawValue : CLIExitCode.failure.rawValue)
                 }
             }
-            if var intent = requestedIntent {
+            if var request = requestedStream {
                 let runtimeResolution = composition.runtimePreferenceResolver.resolveForStreaming(
-                    intent.preferences,
+                    request.intent.preferences,
                     uiScreen: NSApp.keyWindow?.screen
                 )
-                intent = runtimeResolution.applying(to: intent)
+                request.intent = runtimeResolution.applying(to: request.intent)
                 composition.supportLog?.record(
                     source: "Application",
                     level: .info,
-                    message: "Starting requested \(intent.kind.rawValue) stream for host \(intent.hostID), application \(intent.applicationID)."
+                    message: "Starting requested \(request.intent.kind.rawValue) stream for host \(request.intent.hostID), application \(request.intent.applicationID)."
                 )
                 Task { @MainActor [weak store] in
                     composition.supportLog?.record(
@@ -99,7 +104,15 @@ struct UmbraApp: App {
                     )
                     do {
                         await composition.clientService.waitUntilReady()
-                        _ = try await composition.applicationService.beginSession(intent)
+                        let telemetry = try await composition.clientService.beginCLIStream(request)
+                        if let target = request.lsp {
+                            writeCLIStandardOutput(
+                                "LSP stream active for \(target.applicationName) on \(target.hostName).\n"
+                            )
+                            if let telemetry {
+                                writeCLIStandardOutput(telemetry.commandLineOutput)
+                            }
+                        }
                         composition.supportLog?.record(
                             source: "Application",
                             level: .info,
@@ -113,7 +126,10 @@ struct UmbraApp: App {
                             level: .error,
                             message: "The requested streaming session failed: \(error.localizedDescription)"
                         )
-                        if terminateAfterStream { exit(CLIExitCode.failure.rawValue) }
+                        if terminateAfterStream {
+                            writeCLIStandardError("\(error.localizedDescription)\n")
+                            exit(CLIExitCode.failure.rawValue)
+                        }
                         store?.failure = PresentedFailure(
                             title: "Couldn’t Start Stream",
                             message: error.localizedDescription
@@ -147,4 +163,14 @@ struct UmbraApp: App {
         }
     }
 
+}
+
+private func writeCLIStandardOutput(_ value: String) {
+    guard let data = value.data(using: .utf8) else { return }
+    FileHandle.standardOutput.write(data)
+}
+
+private func writeCLIStandardError(_ value: String) {
+    guard let data = value.data(using: .utf8) else { return }
+    FileHandle.standardError.write(data)
 }

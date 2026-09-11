@@ -467,7 +467,7 @@ extension UmbraCLICommandExecutorTests {
         XCTAssertEqual(calls.completedHostIDs, [host.id])
     }
 
-    func testLSPStreamUsesNativeRatesProfileMicrophoneAndTelemetry() async {
+    func testLSPStreamHandsResolvedTargetToNativeApplicationWithoutStartingHeadlessSession() async {
         let host = CLILSPHost(id: UUID(), name: "Lumen", address: "lumen.local", paired: true)
         let lsp = FakeLSPCLIService(
             host: host,
@@ -486,48 +486,45 @@ extension UmbraCLICommandExecutorTests {
             streamingProtocol: .lsp,
             lsp: .init(microphone: .required, emitTelemetry: true)
         )))
-        guard case .terminate(let result) = outcome else { return XCTFail("Expected termination") }
-        XCTAssertTrue(result.succeeded)
-        XCTAssertTrue(result.standardOutput.contains("LSP stream active"))
-        XCTAssertTrue(result.standardOutput.contains("LSP stream ended"))
-        XCTAssertTrue(result.standardOutput.contains("lsp.received_datagrams=11"))
+        guard case .stream(let request) = outcome else {
+            return XCTFail("Expected a native application stream handoff")
+        }
+        XCTAssertEqual(request.intent.hostID, "lsp:\(host.id.uuidString.lowercased())")
+        XCTAssertEqual(request.intent.kind, .resume)
+        XCTAssertEqual(request.intent.preferences, preferences)
+        XCTAssertEqual(request.lsp, CLILSPStreamLaunchTarget(
+            hostID: host.id,
+            applicationID: "desktop",
+            hostName: "Lumen",
+            applicationName: "Desktop",
+            microphone: .required,
+            emitTelemetry: true
+        ))
         let calls = await lsp.calls
-        XCTAssertEqual(calls.configuredProfile, .competitionLAN)
-        XCTAssertEqual(calls.configuredCapacity, 2_500)
-        XCTAssertEqual(calls.startRequests.first?.pointerRate, 8_000)
-        XCTAssertEqual(calls.startRequests.first?.microphone, .required)
-        XCTAssertEqual(calls.startRequests.first?.resume, true)
-        XCTAssertEqual(calls.runUntilTerminatedHostIDs, [host.id])
+        XCTAssertNil(calls.configuredProfile)
+        XCTAssertNil(calls.configuredCapacity)
+        XCTAssertTrue(calls.startRequests.isEmpty)
+        XCTAssertTrue(calls.runUntilTerminatedHostIDs.isEmpty)
     }
 
-    func testLSPStreamExecutorRemainsAliveUntilOwnerTerminates() async throws {
+    func testLSPStreamExecutorReturnsImmediatelyForAppLifecycleHandoff() async throws {
         let host = CLILSPHost(id: UUID(), name: "Lumen", address: "lumen.local", paired: true)
         let lsp = FakeLSPCLIService(
             host: host,
-            applications: [.init(id: "desktop", name: "Desktop")],
-            blockRunUntilTerminated: true
+            applications: [.init(id: "desktop", name: "Desktop")]
         )
-        let completed = LockedValue(false)
         let executor = UmbraCLICommandExecutor(service: FakeCLIService(hosts: []), lspService: lsp)
-        let task = Task {
-            let result = await executor.execute(.stream(StreamAppCommand(
-                host: "Lumen",
-                applicationName: "Desktop",
-                preferences: .default,
-                streamingProtocol: .lsp
-            )))
-            completed.set(true)
-            return result
-        }
-        for _ in 0..<100 {
-            if !(await lsp.calls).runUntilTerminatedHostIDs.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(1))
-        }
-        XCTAssertFalse(completed.value)
-        await lsp.finishRun(.stopped)
-        guard case .terminate(let result) = await task.value else { return XCTFail("Expected termination") }
-        XCTAssertTrue(result.succeeded)
-        XCTAssertTrue(completed.value)
+        let outcome = await executor.execute(.stream(StreamAppCommand(
+            host: "Lumen",
+            applicationName: "Desktop",
+            preferences: .default,
+            streamingProtocol: .lsp
+        )))
+
+        guard case .stream = outcome else { return XCTFail("Expected immediate native handoff") }
+        let calls = await lsp.calls
+        XCTAssertTrue(calls.startRequests.isEmpty)
+        XCTAssertTrue(calls.runUntilTerminatedHostIDs.isEmpty)
     }
 }
 
@@ -543,18 +540,14 @@ private actor FakeLSPCLIService: UmbraCLILSPServicing {
 
     let host: CLILSPHost
     let applicationValues: [CLILSPApplication]
-    let blockRunUntilTerminated: Bool
     var calls = Calls()
-    var runContinuation: CheckedContinuation<CLILSPStopOutcome, Never>?
 
     init(
         host: CLILSPHost,
-        applications: [CLILSPApplication],
-        blockRunUntilTerminated: Bool = false
+        applications: [CLILSPApplication]
     ) {
         self.host = host
         applicationValues = applications
-        self.blockRunUntilTerminated = blockRunUntilTerminated
     }
 
     func resolveHost(query: String, exactHostID: UUID?) async throws -> CLILSPHost {
@@ -580,19 +573,10 @@ private actor FakeLSPCLIService: UmbraCLILSPServicing {
     func start(_ request: CLILSPStartRequest) async throws { calls.startRequests.append(request) }
     func runUntilTerminated(hostID: UUID) async -> CLILSPStopOutcome {
         calls.runUntilTerminatedHostIDs.append(hostID)
-        if blockRunUntilTerminated {
-            return await withCheckedContinuation { runContinuation = $0 }
-        }
         return .stopped
-    }
-    func finishRun(_ outcome: CLILSPStopOutcome) {
-        let continuation = runContinuation
-        runContinuation = nil
-        continuation?.resume(returning: outcome)
     }
     func attach(hostID: UUID) async throws {}
     func stop(hostID: UUID) async -> CLILSPStopOutcome {
-        finishRun(.stopped)
         return .stopped
     }
     func quit(hostID: UUID) async throws {}
