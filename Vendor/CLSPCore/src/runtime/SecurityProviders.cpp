@@ -286,7 +286,11 @@ public:
     if (session_ == nullptr || authenticated_) {
       return CLSP_STATUS_OK;
     }
-    return complete_or_wait(wolfSSL_dtls_got_timeout(session_));
+    // Timeout success means retransmission processing succeeded, not that
+    // the peer completed its handshake. Only wolfSSL_connect may trigger
+    // negotiated-policy validation and exporter installation.
+    const auto result = wolfSSL_dtls_got_timeout(session_);
+    return result == WOLFSSL_SUCCESS ? CLSP_STATUS_OK : operation_status(result);
   }
 
   /** @brief Return wolfSSL's current timeout. */
@@ -344,14 +348,19 @@ private:
     if (sent == size) {
       return size;
     }
-    return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)
-               ? WOLFSSL_CBIO_ERR_WANT_WRITE
-               : WOLFSSL_CBIO_ERR_GENERAL;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return WOLFSSL_CBIO_ERR_WANT_WRITE;
+    }
+    self->socket_failed_ = true;
+    return WOLFSSL_CBIO_ERR_GENERAL;
   }
 
   /** @brief Convert a wolfSSL result into a fail-closed provider status. */
   [[nodiscard]] clsp_status_t
   operation_status(const int result) const noexcept {
+    if (socket_failed_) {
+      return CLSP_STATUS_SOCKET_FAILURE;
+    }
     const auto error = wolfSSL_get_error(session_, result);
     return error == WOLFSSL_ERROR_WANT_READ || error == WOLFSSL_ERROR_WANT_WRITE
                ? CLSP_STATUS_OK
@@ -485,6 +494,7 @@ private:
   WOLFSSL_CTX *context_{}; ///< Exact DTLS 1.3 client context.
   WOLFSSL *session_{};     ///< One peer-bound DTLS association.
   int socket_{-1};         ///< Connected nonblocking UDP socket.
+  bool socket_failed_{};   ///< Terminal UDP send error, distinct from DTLS policy.
   std::span<const std::uint8_t>
       pending_input_{}; ///< One complete incoming DTLS datagram.
   DtlsApplicationDataCallback

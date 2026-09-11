@@ -1,4 +1,5 @@
 import CLSPCore
+import Darwin
 import XCTest
 @testable import UmbraLSPTransport
 
@@ -62,6 +63,53 @@ final class LSPTransportTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? LSPTransportError, .invalidConfiguration)
         }
+    }
+
+    func testHandshakeRetransmissionDoesNotAuthenticateSilentPeer() throws {
+        guard LSPTransport.availableProviders.contains([.wolfSSL, .libSRTP]) else {
+            throw XCTSkip("The DTLS retransmission regression requires the native security providers.")
+        }
+        let listener = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(listener, 0)
+        guard listener >= 0 else { return }
+        defer { Darwin.close(listener) }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        XCTAssertEqual(bound, 0)
+        guard bound == 0 else { return }
+        var addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let resolved = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(listener, $0, &addressLength)
+            }
+        }
+        XCTAssertEqual(resolved, 0)
+        guard resolved == 0 else { return }
+
+        let transport = try LSPTransport(configuration: .init(handshakeTimeout: .seconds(2)))
+        XCTAssertThrowsError(try transport.start(endpoint: .init(
+            host: "127.0.0.1",
+            port: UInt16(bigEndian: address.sin_port),
+            serverSPKISHA256: Data(repeating: 0x55, count: 32)
+        ))) { error in
+            XCTAssertEqual(error as? LSPTransportError, .timeout)
+        }
+
+        var packet = [UInt8](repeating: 0, count: 2_048)
+        var clientHelloCount = 0
+        while recv(listener, &packet, packet.count, MSG_DONTWAIT) > 0 {
+            if packet[0] == 22 { clientHelloCount += 1 }
+        }
+        XCTAssertGreaterThanOrEqual(clientHelloCount, 2, "Exercise a real ClientHello retransmission.")
+        XCTAssertEqual(try transport.telemetrySnapshot().authenticationFailures, 0)
     }
 
     func testTelemetryIntervalRejectsSub250MillisecondPublication() {

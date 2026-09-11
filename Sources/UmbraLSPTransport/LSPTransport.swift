@@ -706,9 +706,9 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
         case .invalidEndpoint:
             "The LSP endpoint or server SPKI pin is invalid."
         case .socketFailure:
-            "The LSP UDP socket or kqueue worker failed."
+            "The LSP UDP connection failed. Check the host address, network reachability, and Local Network access."
         case .dtlsFailure:
-            "The required wolfSSL DTLS 1.3 policy failed."
+            "The LSP DTLS 1.3 handshake or security-policy validation failed."
         case .spkiMismatch:
             "The server certificate does not match the paired LSP SPKI pin."
         case .srtpFailure:

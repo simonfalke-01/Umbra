@@ -86,7 +86,10 @@ namespace umbra::lsp {
      */
     [[nodiscard]] clsp_status_t send_application_data(std::span<const std::uint8_t> plaintext) noexcept;
 
-    /** @brief Process one expired wolfSSL DTLS retransmission timer. */
+    /**
+     * @brief Process one expired retransmission timer without authenticating the peer.
+     * @return Retransmission status; success does not mean handshake completion.
+     */
     [[nodiscard]] clsp_status_t handle_timeout() noexcept;
 
     /** @brief Return the current whole-second DTLS timeout, or zero when unavailable. */
