@@ -198,8 +198,10 @@ validate_packaged_app() {
         || "$dynamic_dependencies" == *"libsrtp2"* ]]; then
         fail "Refusing to package an executable with non-system dynamic dependencies."
     fi
+    # wolfSSL exports this internal context finalizer under an SSL_ name;
+    # it is not the dormant libssl facade this check rejects.
     if nm -gU "$executable" \
-        | awk '$3 ~ /^_SSL_/ || $3 ~ /^_umbra_tls_client_/ { found = 1 }
+        | awk '($3 ~ /^_SSL_/ && $3 != "_SSL_CtxResourceFree") || $3 ~ /^_umbra_tls_client_/ { found = 1 }
                END { exit(found ? 0 : 1) }'; then
         fail "Refusing to package dormant TLS facade or libssl symbols before integration review."
     fi
