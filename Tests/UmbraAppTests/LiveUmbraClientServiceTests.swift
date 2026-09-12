@@ -8,6 +8,40 @@ import XCTest
 
 @MainActor
 final class LiveUmbraClientServiceTests: XCTestCase {
+    func testSavedLSPHostIsOfflineUntilDiscoveredAndReadySurvivesRefresh() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("UmbraLSPPresence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stores = LSPPersistence.stores(in: directory)
+        let host = LSPHostRecord(
+            hostID: UUID(), name: "Gaming PC", address: "gaming.local", lastSeen: Date()
+        )
+        let trust = LSPTrustRecord(
+            hostID: host.hostID,
+            hostIdentityKey: Data(repeating: 1, count: 32),
+            dtlsSPKISHA256: Data(repeating: 2, count: 32),
+            permissions: [.browseApplications, .startOrAttach, .input],
+            revocationGeneration: 1
+        )
+        try await stores.hosts.save(.init(records: [host]))
+        try await stores.trust.save(.init(records: [trust]))
+        let product = LSPProductClient(
+            trustStore: stores.trust, hostStore: stores.hosts, identityStore: stores.identity
+        )
+        let fixture = makeFixture(remoteApplications: [], lspProduct: product)
+        let displayID = HostID("lsp:\(host.hostID.uuidString.lowercased())")
+        let initial = try await fixture.client.discoverHosts()
+        XCTAssertEqual(initial.first(where: { $0.id == displayID })?.status, .offline)
+
+        fixture.client.applyMatchedLSPHost(host, trust: trust)
+        for _ in 0..<2 {
+            let refreshed = try await fixture.client.discoverHosts()
+            let row = try XCTUnwrap(refreshed.first(where: { $0.id == displayID }))
+            XCTAssertEqual(row.status, .online)
+            XCTAssertTrue(row.canBrowseApplications)
+        }
+    }
+
     func testCorruptLSPHostStoreDoesNotBlockLegacyDiscovery() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("UmbraCorruptLSP-\(UUID().uuidString)", isDirectory: true)

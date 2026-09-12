@@ -246,6 +246,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lastLegacyHosts: [HostDisplayModel] = []
     private var lastLSPHosts: [HostDisplayModel] = []
     private var discoveredLSPHosts: [UUID: HostDisplayModel] = [:]
+    private var onlineLSPHostIDs: Set<UUID> = []
     private var identityChangedLSPHostIDs: Set<UUID> = []
     private var latestLSPDiscoveryTokens: [String: UInt64] = [:]
     private var lspDiscoveryHostIDsByServiceID: [String: UUID] = [:]
@@ -342,8 +343,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     func discoverHosts() async throws -> [HostDisplayModel] {
         let initial = try await service.startMonitoring()
-        let hosts = initial.isEmpty ? initial : try await service.refreshHosts()
-        lastLegacyHosts = hosts.map(displayHost)
+        lastLegacyHosts = initial.map(displayHost)
         do {
             try await refreshPersistedLSPHosts()
         } catch {
@@ -351,6 +351,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
             eventHandler?(.sessionWarning(
                 "LSP host storage is unavailable; legacy GameStream discovery remains active."
             ))
+        }
+        eventHandler?(.hosts(combinedHosts()))
+        // Retry resolution on an explicit refresh even when Bonjour's service
+        // set has not changed. A previous timeout must not strand a saved host.
+        for discovered in lspDiscovery.discoveredServices {
+            await handleLSPDiscovery(.added(discovered))
+        }
+        if !initial.isEmpty {
+            lastLegacyHosts = try await service.refreshHosts().map(displayHost)
         }
         return combinedHosts()
     }
@@ -406,6 +415,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 trust: try await lspProduct.trust(hostID: nativeHostID)
             )
             identityChangedLSPHostIDs.remove(nativeHostID)
+            onlineLSPHostIDs.insert(nativeHostID)
             discoveredLSPHosts.removeValue(forKey: nativeHostID)
             upsertLSPHost(display)
             eventHandler?(.hosts(combinedHosts()))
@@ -436,6 +446,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         if let hostID = lspHostID(id), let lspProduct {
             try await lspProduct.remove(hostID: hostID)
             lastLSPHosts.removeAll { $0.id == id }
+            onlineLSPHostIDs.remove(hostID)
             discoveredLSPHosts.removeValue(forKey: hostID)
             lspApplicationIDs.removeValue(forKey: id)
             lspApplicationArtworkReferences.removeValue(forKey: id)
@@ -1300,7 +1311,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         return HostDisplayModel(
             id: HostID("lsp:\(host.hostID.uuidString.lowercased())"),
             name: host.name,
-            status: online && !identityChanged ? .online : .unknown,
+            status: online && !identityChanged ? .online : .offline,
             isPaired: paired && !identityChanged,
             hasActiveSession: false,
             canWake: false,
@@ -1557,16 +1568,21 @@ final class LiveUmbraClientService: UmbraClientServicing {
             lastLSPHosts = []
             return
         }
-        var persisted: [HostDisplayModel] = []
+        var persisted: [(LSPHostRecord, LSPTrustRecord?)] = []
         for host in try await lspProduct.hosts() {
-            persisted.append(displayLSPHost(
-                host,
-                paired: true,
-                online: false,
-                trust: try await lspProduct.trust(hostID: host.hostID)
-            ))
+            persisted.append((host, try await lspProduct.trust(hostID: host.hostID)))
         }
-        lastLSPHosts = persisted
+        // Read presence only after storage awaits finish: discovery may have
+        // marked a host online while the saved records were being loaded.
+        lastLSPHosts = persisted.map { host, trust in
+            displayLSPHost(
+                host,
+                paired: trust != nil,
+                online: onlineLSPHostIDs.contains(host.hostID),
+                trust: trust,
+                identityChanged: identityChangedLSPHostIDs.contains(host.hostID)
+            )
+        }
     }
 
     private func upsertLSPHost(_ host: HostDisplayModel) {
@@ -1613,21 +1629,16 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     ))
                     return
                 }
+                guard latestLSPDiscoveryTokens[service.id] == service.changeToken else { return }
                 _ = await lspProduct.registerDiscoveredPairingHost(candidate)
+                guard latestLSPDiscoveryTokens[service.id] == service.changeToken else { return }
                 switch refresh {
                 case .matched(let host, let trust):
-                    identityChangedLSPHostIDs.remove(candidate.hostID)
-                    discoveredLSPHosts.removeValue(forKey: candidate.hostID)
-                    upsertLSPHost(displayLSPHost(
-                        host,
-                        paired: true,
-                        online: true,
-                        trust: trust
-                    ))
-                    eventHandler?(.hosts(combinedHosts()))
+                    applyMatchedLSPHost(host, trust: trust)
                     return
                 case .identityChanged(let expected, let advertised):
                     identityChangedLSPHostIDs.insert(candidate.hostID)
+                    onlineLSPHostIDs.remove(candidate.hostID)
                     let record = LSPHostRecord(
                         hostID: candidate.hostID,
                         name: candidate.name,
@@ -1694,6 +1705,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 if canRemove {
                     discoveredLSPHosts.removeValue(forKey: hostID)
                 }
+                if lspDiscoveryHostIDsByServiceID.values.contains(hostID) { return }
+                onlineLSPHostIDs.remove(hostID)
                 identityChangedLSPHostIDs.remove(hostID)
                 await markPersistedLSPHostOffline(hostID)
                 eventHandler?(.hosts(combinedHosts()))
@@ -1701,6 +1714,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
         case .failed:
             break
         }
+    }
+
+    /// Publishes a discovery record whose stable host ID and SPKI matched saved trust.
+    func applyMatchedLSPHost(_ host: LSPHostRecord, trust: LSPTrustRecord) {
+        identityChangedLSPHostIDs.remove(host.hostID)
+        onlineLSPHostIDs.insert(host.hostID)
+        discoveredLSPHosts.removeValue(forKey: host.hostID)
+        upsertLSPHost(displayLSPHost(host, paired: true, online: true, trust: trust))
+        eventHandler?(.hosts(combinedHosts()))
     }
 
     func handleLSPPairingDiscoveryMutation(_ mutation: LSPPairingDiscoveryMutation) {

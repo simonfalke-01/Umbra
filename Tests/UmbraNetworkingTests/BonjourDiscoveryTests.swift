@@ -105,6 +105,38 @@ final class BonjourDiscoveryTests: XCTestCase {
         discovery.stop()
     }
 
+    func testDiscoveredServicesReflectCurrentBrowserSnapshot() throws {
+        let factory = RecordingBonjourBrowserFactory()
+        let discovery = NetworkBonjourDiscovery(
+            queue: DispatchQueue(label: "test.umbra.bonjour-snapshot"),
+            browserFactory: factory,
+            retryScheduler: ManualBonjourRetryScheduler(),
+            serviceKind: .lumenStreamingProtocol
+        )
+        let first = DiscoveredHostService(
+            name: "First",
+            type: "_lumen-stream._udp",
+            domain: "local."
+        )
+        let second = DiscoveredHostService(
+            name: "Second",
+            type: "_lumen-stream._udp",
+            domain: "local."
+        )
+
+        discovery.start { _ in }
+        let browser = try XCTUnwrap(factory.browser(at: 0))
+        browser.send(services: [first, second])
+
+        XCTAssertEqual(Set(discovery.discoveredServices), [first, second])
+
+        browser.send(services: [second])
+
+        XCTAssertEqual(discovery.discoveredServices, [second])
+        discovery.stop()
+        XCTAssertTrue(discovery.discoveredServices.isEmpty)
+    }
+
     func testResolvedServiceUsesSRVTargetPortAndInterfaceMetadata() throws {
         let service = DiscoveredHostService(
             name: "Gaming PC",

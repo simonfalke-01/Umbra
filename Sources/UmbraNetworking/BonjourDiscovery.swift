@@ -165,7 +165,7 @@ private final class NWBonjourBrowser: BonjourBrowsing, @unchecked Sendable {
             descriptor = .bonjour(type: "_nvstream._tcp", domain: "local.")
         case .lumenStreamingProtocol:
             parameters = .udp
-            descriptor = .bonjour(type: "_lumen-stream._udp", domain: "local.")
+            descriptor = .bonjourWithTXTRecord(type: "_lumen-stream._udp", domain: "local.")
         }
         parameters.includePeerToPeer = true
         browser = NWBrowser(for: descriptor, using: parameters)
@@ -265,6 +265,11 @@ public final class NetworkBonjourDiscovery: BonjourDiscovering, @unchecked Senda
     private var retryToken: UInt64 = 0
     private var consecutiveFailures = 0
     private var isRunning = false
+
+    /// Services currently published by the active Bonjour browser.
+    public var discoveredServices: [DiscoveredHostService] {
+        lock.withLock { Array(knownServices.values) }
+    }
 
     public convenience init(queue: DispatchQueue = DispatchQueue(label: "app.umbra.bonjour-discovery")) {
         self.init(
