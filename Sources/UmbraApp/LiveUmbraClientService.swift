@@ -235,6 +235,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var plannedLSPRekeyTask: Task<Void, Never>?
     private var lspTelemetryTask: Task<Void, Never>?
     private var lspDeviceOfferTask: Task<Void, Never>?
+    private var lspHostStatusTask: Task<Void, Never>?
+    private var lspHostCheckInFlight = false
+    private var lspHostCheckErrors: [UUID: String] = [:]
     private var latestLSPTelemetry: LSPTelemetrySnapshot?
     private var latestLSPReconnectTelemetry: LSPReconnectSnapshot?
     private var lspReconnectTasks: [UUID: Task<Void, Error>] = [:]
@@ -335,6 +338,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         serviceEventTask?.cancel()
         discoveryPreferenceTask?.cancel()
         lspPairingDiscoveryHandlerTask?.cancel()
+        lspHostStatusTask?.cancel()
         lspDiscovery.stop()
         lspOwnerEndpoint?.stop()
         for task in artworkLoadingTasks.values { task.cancel() }
@@ -362,6 +366,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
         eventHandler?(.hosts(combinedHosts()))
         await refreshLSPReachability()
+        startLSPHostStatusMonitoring()
         // Retry resolution on an explicit refresh even when Bonjour's service
         // set has not changed. A previous timeout must not strand a saved host.
         for discovered in lspDiscovery.discoveredServices {
@@ -1604,26 +1609,49 @@ final class LiveUmbraClientService: UmbraClientServicing {
     /// Checks saved paired hosts through authenticated LSP, independently of Bonjour resolution.
     /// APPLICATIONS is read-only and reuses an existing session without issuing START or ATTACH.
     private func refreshLSPReachability() async {
+        guard !lspHostCheckInFlight, lspOwnerEndpoint == nil, lspReconnectTasks.isEmpty else { return }
+        lspHostCheckInFlight = true
+        defer { lspHostCheckInFlight = false }
         let hostIDs = lastLSPHosts.filter(\.isPaired).compactMap { lspHostID($0.id) }
         for hostID in hostIDs {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, lspOwnerEndpoint == nil else { return }
             let reachable: Bool
             do {
                 try await lspHostProbe(hostID)
                 reachable = true
+                lspHostCheckErrors.removeValue(forKey: hostID)
             } catch {
                 guard !Task.isCancelled else { return }
                 reachable = false
-                lspFailureHandler("LSP host check failed for \(hostID): \(error.localizedDescription)")
+                let message = error.localizedDescription
+                if lspHostCheckErrors[hostID] != message {
+                    lspHostCheckErrors[hostID] = message
+                    lspFailureHandler("LSP host check failed for \(hostID): \(message)")
+                }
             }
+            guard lspOwnerEndpoint == nil else { return }
             guard let index = lastLSPHosts.firstIndex(where: { lspHostID($0.id) == hostID }) else { continue }
             if reachable {
                 onlineLSPHostIDs.insert(hostID)
             } else {
                 onlineLSPHostIDs.remove(hostID)
             }
-            lastLSPHosts[index].status = reachable ? .online : .offline
-            eventHandler?(.hosts(combinedHosts()))
+            let status: HostConnectionStatus = reachable ? .online : .offline
+            if lastLSPHosts[index].status != status {
+                lastLSPHosts[index].status = status
+                eventHandler?(.hosts(combinedHosts()))
+            }
+        }
+    }
+
+    /// Retries idle-host checks at the existing legacy monitor's three-second cadence.
+    private func startLSPHostStatusMonitoring() {
+        guard lspHostStatusTask == nil else { return }
+        lspHostStatusTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                await self?.refreshLSPReachability()
+            }
         }
     }
 

@@ -34,10 +34,17 @@ final class LiveUmbraClientServiceTests: XCTestCase {
             if !availability.reachable { throw URLError(.notConnectedToInternet) }
         })
         let displayID = HostID("lsp:\(host.hostID.uuidString.lowercased())")
+        fixture.client.setEventHandler { event in
+            if case .hosts(let hosts) = event {
+                availability.status = hosts.first(where: { $0.id == displayID })?.status
+            }
+        }
         let initial = try await fixture.client.discoverHosts()
         XCTAssertEqual(initial.first(where: { $0.id == displayID })?.status, .offline)
 
         availability.reachable = true
+        try await Task.sleep(for: .milliseconds(3_250))
+        XCTAssertEqual(availability.status, .online, "Recovery must not require manual refresh.")
         for _ in 0..<2 {
             let refreshed = try await fixture.client.discoverHosts()
             let row = try XCTUnwrap(refreshed.first(where: { $0.id == displayID }))
@@ -782,6 +789,7 @@ final class LiveUmbraClientServiceTests: XCTestCase {
 @MainActor
 private final class LSPReachabilityState {
     var reachable = false
+    var status: HostConnectionStatus?
 }
 
 private final class RecordingBonjourDiscovery: BonjourDiscovering, @unchecked Sendable {
