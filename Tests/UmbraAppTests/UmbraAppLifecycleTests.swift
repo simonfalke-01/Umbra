@@ -6,6 +6,19 @@ import UmbraCore
 
 @MainActor
 final class UmbraAppLifecycleTests: XCTestCase {
+    func testRawBuildLaunchIsRejectedBeforeNetworkServicesAreCreated() {
+        let failure = UmbraBootstrap.unpackagedLaunchFailure(
+            bundleURL: URL(fileURLWithPath: "/repo/.build/debug", isDirectory: true),
+            bundleIdentifier: "Umbra-random-build-identity"
+        )
+        XCTAssertEqual(failure?.exitCode, CLIExitCode.failure.rawValue)
+        XCTAssertTrue(failure?.standardError.contains("signed Umbra.app") == true)
+        XCTAssertNil(UmbraBootstrap.unpackagedLaunchFailure(
+            bundleURL: URL(fileURLWithPath: "/Applications/Umbra.app", isDirectory: true),
+            bundleIdentifier: "app.umbra.Umbra"
+        ))
+    }
+
     func testStorageRecoveryBootstrapReturnsExactBackupBeforeServiceExecution() throws {
         let backupURL = URL(fileURLWithPath: "/tmp/app.umbra.Umbra.recovery-fixture")
         var recoveryCallCount = 0

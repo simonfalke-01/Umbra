@@ -8,7 +8,7 @@ import XCTest
 
 @MainActor
 final class LiveUmbraClientServiceTests: XCTestCase {
-    func testSavedLSPHostIsOfflineUntilDiscoveredAndReadySurvivesRefresh() async throws {
+    func testAuthenticatedLSPProbeControlsReadyWithoutBonjourAndSurvivesRefresh() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("UmbraLSPPresence-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -28,18 +28,25 @@ final class LiveUmbraClientServiceTests: XCTestCase {
         let product = LSPProductClient(
             trustStore: stores.trust, hostStore: stores.hosts, identityStore: stores.identity
         )
-        let fixture = makeFixture(remoteApplications: [], lspProduct: product)
+        let availability = LSPReachabilityState()
+        let fixture = makeFixture(remoteApplications: [], lspProduct: product, lspHostProbe: { checkedID in
+            XCTAssertEqual(checkedID, host.hostID)
+            if !availability.reachable { throw URLError(.notConnectedToInternet) }
+        })
         let displayID = HostID("lsp:\(host.hostID.uuidString.lowercased())")
         let initial = try await fixture.client.discoverHosts()
         XCTAssertEqual(initial.first(where: { $0.id == displayID })?.status, .offline)
 
-        fixture.client.applyMatchedLSPHost(host, trust: trust)
+        availability.reachable = true
         for _ in 0..<2 {
             let refreshed = try await fixture.client.discoverHosts()
             let row = try XCTUnwrap(refreshed.first(where: { $0.id == displayID }))
             XCTAssertEqual(row.status, .online)
             XCTAssertTrue(row.canBrowseApplications)
         }
+        availability.reachable = false
+        let disconnected = try await fixture.client.discoverHosts()
+        XCTAssertEqual(disconnected.first(where: { $0.id == displayID })?.status, .offline)
     }
 
     func testCorruptLSPHostStoreDoesNotBlockLegacyDiscovery() async throws {
@@ -703,7 +710,8 @@ final class LiveUmbraClientServiceTests: XCTestCase {
         failedArtworkIDs: Set<Int> = [],
         artworkDataByID: [Int: Data] = [:],
         catalogRefreshFailure: CatalogRefreshFailure = .none,
-        lspProduct: LSPProductClient? = nil
+        lspProduct: LSPProductClient? = nil,
+        lspHostProbe: LiveUmbraClientService.LSPHostProbe? = nil
     ) -> LiveServiceFixture {
         let hostID = "host-cache"
         let endpoint = NetworkEndpoint(hostname: "host.local")
@@ -738,13 +746,16 @@ final class LiveUmbraClientServiceTests: XCTestCase {
         let defaults = UserDefaults(suiteName: defaultsName)!
         addTeardownBlock { defaults.removePersistentDomain(forName: defaultsName) }
         let artworkCache = ApplicationArtworkCache(rootDirectory: cacheRoot)
+        let preferences = PreferencesStore(defaults: defaults)
+        preferences.update(\.enableMDNS, to: false)
         let client = LiveUmbraClientService(
             service: applicationService,
-            preferences: PreferencesStore(defaults: defaults),
+            preferences: preferences,
             securePorts: SecurePortRegistry(),
             artworkCache: artworkCache,
             maximumConcurrentArtworkRequests: 4,
-            lspProduct: lspProduct
+            lspProduct: lspProduct,
+            lspHostProbe: lspHostProbe
         )
         return LiveServiceFixture(
             client: client,
@@ -766,6 +777,11 @@ final class LiveUmbraClientServiceTests: XCTestCase {
         }
         XCTFail("Condition was not satisfied", file: file, line: line)
     }
+}
+
+@MainActor
+private final class LSPReachabilityState {
+    var reachable = false
 }
 
 private final class RecordingBonjourDiscovery: BonjourDiscovering, @unchecked Sendable {

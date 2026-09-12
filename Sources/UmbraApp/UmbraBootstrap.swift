@@ -23,6 +23,18 @@ enum UmbraBootstrap {
             writeStandardError(recoveryResult.standardError)
             exit(recoveryResult.exitCode)
         }
+        if case let .terminal(result) = parseResult {
+            writeStandardOutput(result.standardOutput)
+            writeStandardError(result.standardError)
+            exit(result.exitCode)
+        }
+        if let failure = unpackagedLaunchFailure(
+            bundleURL: Bundle.main.bundleURL,
+            bundleIdentifier: Bundle.main.bundleIdentifier
+        ) {
+            writeStandardError(failure.standardError)
+            exit(failure.exitCode)
+        }
         try? ObsoleteStreamingStateCleanup.performDefaultIfNeeded()
         if case .ready(command: .stream, warnings: _) = parseResult,
            let store: JSONFileStore<UmbraSnapshot> = try? .applicationSupport(),
@@ -63,6 +75,21 @@ enum UmbraBootstrap {
             writeStandardError("\(error.localizedDescription)\n")
             exit(CLIExitCode.failure.rawValue)
         }
+    }
+
+    /// Prevents raw build executables from acquiring separate macOS network-privacy identities.
+    /// Help/version and explicit local storage recovery are handled before this guard.
+    static func unpackagedLaunchFailure(
+        bundleURL: URL,
+        bundleIdentifier: String?
+    ) -> CLIExecutionResult? {
+        guard bundleURL.pathExtension == "app", bundleIdentifier == "app.umbra.Umbra" else {
+            return .failure(
+                "Run the signed Umbra.app, not the raw build executable. "
+                    + "Use open /Applications/Umbra.app, or its Contents/MacOS/Umbra executable for CLI commands.\n"
+            )
+        }
+        return nil
     }
 
     static func storageRecoveryResult(

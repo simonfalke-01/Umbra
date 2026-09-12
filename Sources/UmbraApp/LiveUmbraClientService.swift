@@ -210,6 +210,8 @@ struct SessionWarningDeliveryState {
 
 @MainActor
 final class LiveUmbraClientService: UmbraClientServicing {
+    typealias LSPHostProbe = @MainActor @Sendable (UUID) async throws -> Void
+
     var onSessionTerminated: (@MainActor @Sendable (Bool) -> Void)?
     private let service: UmbraApplicationService
     private let preferences: PreferencesStore
@@ -224,6 +226,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private weak var streamWindow: StreamWindowController?
     private let lspMediaCapabilities: AppleStreamingCapabilities
     private let lspFailureHandler: @Sendable (String) -> Void
+    private let lspHostProbe: LSPHostProbe
     private var activeLSPHostID: UUID?
     private var activeLSPApplicationID: String?
     private var lspOwnerEndpoint: LSPCLIOwnerEndpoint?
@@ -266,7 +269,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lspProduct: LSPProductClient? = nil,
         streamWindow: StreamWindowController? = nil,
         lspMediaCapabilities: AppleStreamingCapabilities = .probe(),
-        lspFailureHandler: @escaping @Sendable (String) -> Void = { _ in }
+        lspFailureHandler: @escaping @Sendable (String) -> Void = { _ in },
+        lspHostProbe: LSPHostProbe? = nil
     ) {
         self.service = service
         self.preferences = preferences
@@ -280,6 +284,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.lspInputCapture = LSPAppKitInputCapture(targetWindow: streamWindow?.inputCaptureWindow)
         self.lspMediaCapabilities = lspMediaCapabilities
         self.lspFailureHandler = lspFailureHandler
+        self.lspHostProbe = lspHostProbe ?? { hostID in
+            guard let lspProduct else { throw LSPTransportError.invalidState }
+            _ = try await lspProduct.applications(hostID: hostID)
+        }
         let (events, continuation) = AsyncStream<HostServiceEvent>.makeStream()
         handlerInstallationTask = Task { [service, continuation] in
             await service.setEventHandler { event in
@@ -353,9 +361,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
             ))
         }
         eventHandler?(.hosts(combinedHosts()))
+        await refreshLSPReachability()
         // Retry resolution on an explicit refresh even when Bonjour's service
         // set has not changed. A previous timeout must not strand a saved host.
         for discovered in lspDiscovery.discoveredServices {
+            if let advertisedID = discovered.txtRecord["id"].flatMap(Self.uuid(fromLowercaseHex:)),
+               onlineLSPHostIDs.contains(advertisedID) { continue }
             await handleLSPDiscovery(.added(discovered))
         }
         if !initial.isEmpty {
@@ -1588,6 +1599,32 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private func upsertLSPHost(_ host: HostDisplayModel) {
         lastLSPHosts.removeAll { $0.id == host.id }
         lastLSPHosts.append(host)
+    }
+
+    /// Checks saved paired hosts through authenticated LSP, independently of Bonjour resolution.
+    /// APPLICATIONS is read-only and reuses an existing session without issuing START or ATTACH.
+    private func refreshLSPReachability() async {
+        let hostIDs = lastLSPHosts.filter(\.isPaired).compactMap { lspHostID($0.id) }
+        for hostID in hostIDs {
+            guard !Task.isCancelled else { return }
+            let reachable: Bool
+            do {
+                try await lspHostProbe(hostID)
+                reachable = true
+            } catch {
+                guard !Task.isCancelled else { return }
+                reachable = false
+                lspFailureHandler("LSP host check failed for \(hostID): \(error.localizedDescription)")
+            }
+            guard let index = lastLSPHosts.firstIndex(where: { lspHostID($0.id) == hostID }) else { continue }
+            if reachable {
+                onlineLSPHostIDs.insert(hostID)
+            } else {
+                onlineLSPHostIDs.remove(hostID)
+            }
+            lastLSPHosts[index].status = reachable ? .online : .offline
+            eventHandler?(.hosts(combinedHosts()))
+        }
     }
 
     private func markLSPHostSession(
