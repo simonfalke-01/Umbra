@@ -38,6 +38,7 @@
   #include <mach/mach_time.h>
   #include <netdb.h>
   #include <netinet/in.h>
+  #include <os/log.h>
   #include <pthread.h>
   #include <sys/event.h>
   #include <sys/socket.h>
@@ -3849,11 +3850,17 @@ namespace umbra::lsp {
         }
         const auto descriptor = ::socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
         if (descriptor < 0) {
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP socket creation failed: errno=%{public}d", errno);
           continue;
         }
         const auto flags = fcntl(descriptor, F_GETFL, 0);
-        if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0 ||
-            ::connect(descriptor, candidate->ai_addr, candidate->ai_addrlen) != 0) {
+        if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP nonblocking setup failed: errno=%{public}d", errno);
+          ::close(descriptor);
+          continue;
+        }
+        if (::connect(descriptor, candidate->ai_addr, candidate->ai_addrlen) != 0) {
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP connect failed: family=%{public}d errno=%{public}d", candidate->ai_family, errno);
           ::close(descriptor);
           continue;
         }
@@ -3876,6 +3883,7 @@ namespace umbra::lsp {
       const int do_not_fragment = 1;
       if (socket_family_ == AF_INET) {
         if (setsockopt(socket_, IPPROTO_IP, IP_DONTFRAG, &do_not_fragment, sizeof(do_not_fragment)) != 0) {
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP IPv4 fragmentation setup failed: errno=%{public}d", errno);
           return CLSP_STATUS_SOCKET_FAILURE;
         }
   #ifdef IP_RECVTOS
@@ -3894,6 +3902,7 @@ namespace umbra::lsp {
         constexpr int ipv6_do_not_fragment_option = 62;
   #endif
         if (setsockopt(socket_, IPPROTO_IPV6, ipv6_do_not_fragment_option, &do_not_fragment, sizeof(do_not_fragment)) != 0) {
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP IPv6 fragmentation setup failed: errno=%{public}d", errno);
           return CLSP_STATUS_SOCKET_FAILURE;
         }
   #ifdef IPV6_RECVTCLASS
@@ -3913,6 +3922,7 @@ namespace umbra::lsp {
       receive_udp_payload_size_.store(1'200U, std::memory_order_release);
       kqueue_ = kqueue();
       if (kqueue_ < 0) {
+        os_log_error(OS_LOG_DEFAULT, "LSP UDP kqueue setup failed: errno=%{public}d", errno);
         return CLSP_STATUS_SOCKET_FAILURE;
       }
       std::array<struct kevent, 2> registrations {};
