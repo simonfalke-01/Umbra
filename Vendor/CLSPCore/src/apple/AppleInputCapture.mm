@@ -1162,8 +1162,10 @@ namespace {
       CFRelease(result);
       return nullptr;
     }
-    CFDictionarySetValue(result, kIOHIDDeviceUsagePageKey, page_value);
-    CFDictionarySetValue(result, kIOHIDDeviceUsageKey, usage_value);
+    // IOHID's key macros are C string literals; CFType dictionary callbacks
+    // require CFString objects and would otherwise message raw string bytes.
+    CFDictionarySetValue(result, CFSTR(kIOHIDDeviceUsagePageKey), page_value);
+    CFDictionarySetValue(result, CFSTR(kIOHIDDeviceUsageKey), usage_value);
     CFRelease(page_value);
     CFRelease(usage_value);
     return result;
