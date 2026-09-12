@@ -1369,10 +1369,6 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
   IOHIDManagerRegisterInputValueCallback(capture->manager, input_value_callback, capture);
   IOHIDManagerRegisterDeviceMatchingCallback(capture->manager, device_arrived_callback, capture);
   IOHIDManagerRegisterDeviceRemovalCallback(capture->manager, device_removed_callback, capture);
-  IOHIDManagerSetDispatchQueue(capture->manager, capture->queue);
-  IOHIDManagerSetCancelHandler(capture->manager, ^{
-    dispatch_semaphore_signal(capture->cancelled);
-  });
   const auto open_result = IOHIDManagerOpen(capture->manager, kIOHIDOptionsTypeNone);
   if (open_result != kIOReturnSuccess) {
     quiesce(*capture);
@@ -1397,6 +1393,13 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
     delete capture;
     return neutralize_status;
   }
+  // Queue assignment requires activation and completed cancellation before
+  // release, even when opening devices fails. Defer it until all fallible
+  // preparation above succeeds so early cleanup owns an unscheduled manager.
+  IOHIDManagerSetDispatchQueue(capture->manager, capture->queue);
+  IOHIDManagerSetCancelHandler(capture->manager, ^{
+    dispatch_semaphore_signal(capture->cancelled);
+  });
   IOHIDManagerActivate(capture->manager);
   capture->activated = true;
   install_controller_sources(*capture);

@@ -4,6 +4,25 @@ import XCTest
 @testable import UmbraLSPTransport
 
 final class LSPTransportTests: XCTestCase {
+    func testNativeAppleInputCaptureFailedStartupCanBeRetriedWithoutAbort() throws {
+        let core = try makeInactiveNativeCore()
+        defer { clsp_core_release(core) }
+
+        // Exercise real HID matching and early teardown. Without input-monitoring
+        // access, Open fails; with access, the inactive core rejects preparation.
+        // Neither path may release an inactive dispatch-backed IOHIDManager.
+        for _ in 0..<2 {
+            var capture: OpaquePointer?
+            let status = clsp_core_start_apple_input_capture(core, &capture)
+            XCTAssertTrue([
+                CLSP_STATUS_INPUT_PERMISSION_DENIED,
+                CLSP_STATUS_INPUT_UNAVAILABLE,
+                CLSP_STATUS_NOT_AUTHENTICATED,
+            ].contains(status), "Unexpected native capture status: \(status)")
+            XCTAssertNil(capture)
+        }
+    }
+
     func testABIVersionDigestAndInitialTelemetryMatchNativeCore() throws {
         XCTAssertEqual(clsp_core_abi_version(), 2)
         XCTAssertEqual(String(cString: clsp_core_source_digest()), LSPTransport.sourceDigest)
