@@ -1,12 +1,13 @@
 /**
  * @file AppleInputCapture.mm
- * @brief Preferred public IOHID keyboard and mouse capture for native LSP input.
+ * @brief Native IOHID and focused-window AppKit capture for LSP input.
  */
 
 #include "CLSPCore.h"
 #include "../input_plane/feedback.h"
 #include "../runtime/FixedTelemetry.h"
 
+#import <AppKit/AppKit.h>
 #import <IOKit/hid/IOHIDManager.h>
 #import <GameController/GameController.h>
 #import <CoreHaptics/CoreHaptics.h>
@@ -42,8 +43,17 @@ struct clsp_apple_input_capture {
   dispatch_semaphore_t cancelled {};  ///< Cancellation barrier for callback quiescence.
   std::atomic<bool> active {false};  ///< Callback admission gate.
   bool activated {};  ///< Whether dispatch-queue activation requires cancellation.
+  __strong id appkit_monitor {};  ///< Focused-window fallback monitor owned entirely in Objective-C++.
+  __strong NSWindow *appkit_window {};  ///< Exact key window allowed to produce fallback events.
+  bool prior_mouse_coalescing {};  ///< Mouse-coalescing state restored when AppKit capture stops.
+  bool appkit_coalescing_owned {};  ///< Whether this owner changed the process-wide coalescing state.
+  std::uint8_t capture_source {CLSP_DEVICE_CAPTURE_IOHID};  ///< Active pointer/keyboard adapter kind.
   std::array<bool, 256> keyboard {};  ///< Current keyboard-page usage state.
   std::array<bool, 6> pointer_buttons {};  ///< Pointer buttons one through five.
+  double pointer_x_remainder {};  ///< AppKit sub-integer relative X carried to the next event.
+  double pointer_y_remainder {};  ///< AppKit sub-integer relative Y carried to the next event.
+  double vertical_scroll_remainder {};  ///< AppKit sub-integer vertical scroll carried forward.
+  double horizontal_scroll_remainder {};  ///< AppKit sub-integer horizontal scroll carried forward.
   std::uint32_t pointer_generation {};  ///< Aggregate pointer-source arrival generation.
   std::uint64_t pointer_rate_window_start {};  ///< First motion timestamp in current measurement window.
   std::uint64_t pointer_last_offer {};  ///< Last coarse pointer-rate publication time.
@@ -336,6 +346,188 @@ namespace {
         capture.pointer_buttons[button] = false;
         submit_edge(capture, timestamp, static_cast<std::uint16_t>(button), CLSP_INPUT_EDGE_POINTER_BUTTON_UP);
       }
+    }
+  }
+
+  /** @brief Convert a macOS virtual key code to one USB HID keyboard-page usage. */
+  [[nodiscard]] std::uint16_t appkit_hid_usage(const unsigned short key_code) noexcept {
+    switch (key_code) {
+      case 0: return 0x04; case 11: return 0x05; case 8: return 0x06; case 2: return 0x07;
+      case 14: return 0x08; case 3: return 0x09; case 5: return 0x0A; case 4: return 0x0B;
+      case 34: return 0x0C; case 38: return 0x0D; case 40: return 0x0E; case 37: return 0x0F;
+      case 46: return 0x10; case 45: return 0x11; case 31: return 0x12; case 35: return 0x13;
+      case 12: return 0x14; case 15: return 0x15; case 1: return 0x16; case 17: return 0x17;
+      case 32: return 0x18; case 9: return 0x19; case 13: return 0x1A; case 7: return 0x1B;
+      case 16: return 0x1C; case 6: return 0x1D;
+      case 18: return 0x1E; case 19: return 0x1F; case 20: return 0x20; case 21: return 0x21;
+      case 23: return 0x22; case 22: return 0x23; case 26: return 0x24; case 28: return 0x25;
+      case 25: return 0x26; case 29: return 0x27;
+      case 36: return 0x28; case 53: return 0x29; case 51: return 0x2A; case 48: return 0x2B;
+      case 49: return 0x2C; case 27: return 0x2D; case 24: return 0x2E; case 33: return 0x2F;
+      case 30: return 0x30; case 42: return 0x31; case 41: return 0x33; case 39: return 0x34;
+      case 50: return 0x35; case 43: return 0x36; case 47: return 0x37; case 44: return 0x38;
+      case 57: return 0x39;
+      case 122: return 0x3A; case 120: return 0x3B; case 99: return 0x3C; case 118: return 0x3D;
+      case 96: return 0x3E; case 97: return 0x3F; case 98: return 0x40; case 100: return 0x41;
+      case 101: return 0x42; case 109: return 0x43; case 103: return 0x44; case 111: return 0x45;
+      case 123: return 0x50; case 124: return 0x4F; case 125: return 0x51; case 126: return 0x52;
+      case 56: return 0xE1; case 60: return 0xE5; case 59: return 0xE0; case 62: return 0xE4;
+      case 58: return 0xE2; case 61: return 0xE6; case 55: return 0xE3; case 54: return 0xE7;
+      default: return 0;
+    }
+  }
+
+  /** @brief Convert one AppKit uptime timestamp to nonzero monotonic microseconds. */
+  [[nodiscard]] std::uint64_t appkit_timestamp(const clsp_apple_input_capture &capture, NSEvent *event) noexcept {
+    const auto seconds = event.timestamp;
+    if (seconds > 0) {
+      return std::max<std::uint64_t>(1U, static_cast<std::uint64_t>(seconds * 1'000'000.0));
+    }
+    return timestamp_microseconds(capture, mach_absolute_time());
+  }
+
+  /** @brief Record one native pointer callback and publish measured source-rate telemetry. */
+  void record_pointer_sample(clsp_apple_input_capture &capture, const std::uint64_t timestamp) noexcept {
+    ++capture.pointer_samples;
+    publish_measured_rate(
+      capture,
+      CLSP_DEVICE_OFFER_POINTER,
+      1U,
+      std::max<std::uint32_t>(1U, capture.pointer_generation),
+      timestamp,
+      capture.pointer_rate_window_start,
+      capture.pointer_last_offer,
+      capture.pointer_window_samples,
+      capture.pointer_previous_sample,
+      capture.pointer_minimum_interval,
+      capture.pointer_maximum_interval,
+      capture.pointer_spacing,
+      capture.pointer_samples,
+      16'000U,
+      0U,
+      56U,
+      0U,
+      capture.capture_source
+    );
+  }
+
+  /** @brief Submit one AppKit keyboard transition using native held-state ownership. */
+  void handle_appkit_key(
+    clsp_apple_input_capture &capture,
+    NSEvent *event,
+    const std::uint64_t timestamp
+  ) noexcept {
+    const auto usage = appkit_hid_usage(event.keyCode);
+    if (usage == 0U || usage >= capture.keyboard.size()) return;
+    if (event.type == NSEventTypeFlagsChanged) {
+      if (usage == 0x39U) {
+        submit_edge(capture, timestamp, usage, CLSP_INPUT_EDGE_KEY_DOWN);
+        submit_edge(capture, timestamp, usage, CLSP_INPUT_EDGE_KEY_UP);
+        return;
+      }
+      const auto pressed = !capture.keyboard[usage];
+      capture.keyboard[usage] = pressed;
+      submit_edge(
+        capture,
+        timestamp,
+        usage,
+        pressed ? CLSP_INPUT_EDGE_KEY_DOWN : CLSP_INPUT_EDGE_KEY_UP
+      );
+      return;
+    }
+    const auto pressed = event.type == NSEventTypeKeyDown;
+    if ((pressed && event.isARepeat) || capture.keyboard[usage] == pressed) return;
+    capture.keyboard[usage] = pressed;
+    submit_edge(
+      capture,
+      timestamp,
+      usage,
+      pressed ? CLSP_INPUT_EDGE_KEY_DOWN : CLSP_INPUT_EDGE_KEY_UP
+    );
+  }
+
+  /** @brief Submit one AppKit pointer-button transition using native held-state ownership. */
+  void handle_appkit_button(
+    clsp_apple_input_capture &capture,
+    NSEvent *event,
+    const std::uint64_t timestamp,
+    const bool pressed
+  ) noexcept {
+    const auto native_button = event.buttonNumber;
+    if (native_button < 0 || native_button >= 5) return;
+    const auto button = static_cast<std::size_t>(native_button + 1);
+    if (capture.pointer_buttons[button] == pressed) return;
+    capture.pointer_buttons[button] = pressed;
+    submit_edge(
+      capture,
+      timestamp,
+      static_cast<std::uint16_t>(button),
+      pressed ? CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN : CLSP_INPUT_EDGE_POINTER_BUTTON_UP
+    );
+  }
+
+  /** @brief Submit one accumulated AppKit motion or scroll sample to the native composer. */
+  void handle_appkit_pointer(
+    clsp_apple_input_capture &capture,
+    NSEvent *event,
+    const std::uint64_t timestamp,
+    const bool scroll
+  ) noexcept {
+    record_pointer_sample(capture, timestamp);
+    clsp_pointer_sample_t sample {.sample_time_microseconds = timestamp};
+    if (scroll) {
+      capture.vertical_scroll_remainder += event.scrollingDeltaY;
+      capture.horizontal_scroll_remainder += event.scrollingDeltaX;
+      sample.vertical_scroll = static_cast<std::int64_t>(capture.vertical_scroll_remainder);
+      sample.horizontal_scroll = static_cast<std::int64_t>(capture.horizontal_scroll_remainder);
+      capture.vertical_scroll_remainder -= static_cast<double>(sample.vertical_scroll);
+      capture.horizontal_scroll_remainder -= static_cast<double>(sample.horizontal_scroll);
+    } else {
+      capture.pointer_x_remainder += event.deltaX;
+      capture.pointer_y_remainder += event.deltaY;
+      sample.delta_x = static_cast<std::int64_t>(capture.pointer_x_remainder);
+      sample.delta_y = static_cast<std::int64_t>(capture.pointer_y_remainder);
+      capture.pointer_x_remainder -= static_cast<double>(sample.delta_x);
+      capture.pointer_y_remainder -= static_cast<double>(sample.delta_y);
+    }
+    if (sample.delta_x != 0 || sample.delta_y != 0 ||
+        sample.vertical_scroll != 0 || sample.horizontal_scroll != 0) {
+      (void)clsp_core_submit_pointer(capture.core, &sample);
+    }
+  }
+
+  /** @brief Handle one focused-window AppKit event without crossing the Swift ABI. */
+  void handle_appkit_event(clsp_apple_input_capture &capture, NSEvent *event) noexcept {
+    if (event == nil || capture.appkit_window == nil || event.window != capture.appkit_window ||
+        !capture.appkit_window.isKeyWindow || !capture.active.load(std::memory_order_acquire)) return;
+    const auto timestamp = appkit_timestamp(capture, event);
+    switch (event.type) {
+      case NSEventTypeMouseMoved:
+      case NSEventTypeLeftMouseDragged:
+      case NSEventTypeRightMouseDragged:
+      case NSEventTypeOtherMouseDragged:
+        handle_appkit_pointer(capture, event, timestamp, false);
+        return;
+      case NSEventTypeScrollWheel:
+        handle_appkit_pointer(capture, event, timestamp, true);
+        return;
+      case NSEventTypeLeftMouseDown:
+      case NSEventTypeRightMouseDown:
+      case NSEventTypeOtherMouseDown:
+        handle_appkit_button(capture, event, timestamp, true);
+        return;
+      case NSEventTypeLeftMouseUp:
+      case NSEventTypeRightMouseUp:
+      case NSEventTypeOtherMouseUp:
+        handle_appkit_button(capture, event, timestamp, false);
+        return;
+      case NSEventTypeKeyDown:
+      case NSEventTypeKeyUp:
+      case NSEventTypeFlagsChanged:
+        handle_appkit_key(capture, event, timestamp);
+        return;
+      default:
+        return;
     }
   }
 
@@ -894,27 +1086,7 @@ namespace {
     } else {
       return;
     }
-    ++capture->pointer_samples;
-    publish_measured_rate(
-      *capture,
-      CLSP_DEVICE_OFFER_POINTER,
-      1,
-      std::max<std::uint32_t>(1U, capture->pointer_generation),
-      timestamp,
-      capture->pointer_rate_window_start,
-      capture->pointer_last_offer,
-      capture->pointer_window_samples,
-      capture->pointer_previous_sample,
-      capture->pointer_minimum_interval,
-      capture->pointer_maximum_interval,
-      capture->pointer_spacing,
-      capture->pointer_samples,
-      16'000,
-      0,
-      56,
-      0,
-      CLSP_DEVICE_CAPTURE_IOHID
-    );
+    record_pointer_sample(*capture, timestamp);
     (void)clsp_core_submit_pointer(capture->core, &sample);
   }
 
@@ -950,7 +1122,7 @@ namespace {
       .maximum_state_packet_bytes = 56,
       .kind = CLSP_DEVICE_OFFER_ARRIVED,
       .device_type = CLSP_DEVICE_OFFER_POINTER,
-      .capture_source = CLSP_DEVICE_CAPTURE_IOHID,
+      .capture_source = capture->capture_source,
     });
   }
 
@@ -997,10 +1169,123 @@ namespace {
     return result;
   }
 
+  /** @brief Publish the aggregate pointer source owned by this native adapter. */
+  void publish_pointer_arrival(clsp_apple_input_capture &capture) noexcept {
+    capture.pointer_generation = 1U;
+    capture.pointer_minimum_interval = UINT32_MAX;
+    clsp_core_observe_input_device(capture.core, 2U, 1U, capture.pointer_generation, true, 0U);
+    clsp_core_publish_device_offer(capture.core, {
+      .device_id = 1U,
+      .instance_generation = capture.pointer_generation,
+      .minimum_state_rate = 125U,
+      .maximum_state_rate = 16'000U,
+      .timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
+                      CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES,
+      .maximum_state_packet_bytes = 56U,
+      .kind = CLSP_DEVICE_OFFER_ARRIVED,
+      .device_type = CLSP_DEVICE_OFFER_POINTER,
+      .capture_source = capture.capture_source,
+    });
+  }
+
+  /** @brief Install native GameController sources shared by IOHID and AppKit pointer capture. */
+  void install_controller_sources(clsp_apple_input_capture &capture) noexcept {
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    auto *capture_pointer = &capture;
+    capture.connect_observer = [center
+      addObserverForName:GCControllerDidConnectNotification
+      object:nil
+      queue:nil
+      usingBlock:^(NSNotification *notification) {
+        GCController *controller = static_cast<GCController *>(notification.object);
+        dispatch_async(capture_pointer->queue, ^{
+          connect_controller(*capture_pointer, controller);
+          if (capture_pointer->active.load(std::memory_order_acquire) &&
+              !restart_device_baseline(*capture_pointer)) {
+            capture_pointer->active.store(false, std::memory_order_release);
+          }
+        });
+      }];
+    capture.disconnect_observer = [center
+      addObserverForName:GCControllerDidDisconnectNotification
+      object:nil
+      queue:nil
+      usingBlock:^(NSNotification *notification) {
+        GCController *controller = static_cast<GCController *>(notification.object);
+        dispatch_async(capture_pointer->queue, ^{
+          disconnect_controller(*capture_pointer, controller);
+          if (capture_pointer->active.load(std::memory_order_acquire) &&
+              !restart_device_baseline(*capture_pointer)) {
+            capture_pointer->active.store(false, std::memory_order_release);
+          }
+        });
+      }];
+    dispatch_sync(capture.queue, ^{
+      for (GCController *controller in GCController.controllers) connect_controller(capture, controller);
+    });
+  }
+
+  /** @brief Install the focused-window local monitor and disable mouse coalescing. */
+  [[nodiscard]] bool install_appkit_monitor(clsp_apple_input_capture &capture) noexcept {
+    if (!NSThread.isMainThread) return false;
+    capture.appkit_window = NSApp.keyWindow;
+    if (capture.appkit_window == nil || !capture.appkit_window.isKeyWindow) return false;
+    capture.prior_mouse_coalescing = NSEvent.isMouseCoalescingEnabled;
+    NSEvent.mouseCoalescingEnabled = NO;
+    capture.appkit_coalescing_owned = true;
+    auto *capture_pointer = &capture;
+    const NSEventMask mask = NSEventMaskMouseMoved |
+                             NSEventMaskLeftMouseDragged |
+                             NSEventMaskRightMouseDragged |
+                             NSEventMaskOtherMouseDragged |
+                             NSEventMaskLeftMouseDown |
+                             NSEventMaskLeftMouseUp |
+                             NSEventMaskRightMouseDown |
+                             NSEventMaskRightMouseUp |
+                             NSEventMaskOtherMouseDown |
+                             NSEventMaskOtherMouseUp |
+                             NSEventMaskScrollWheel |
+                             NSEventMaskKeyDown |
+                             NSEventMaskKeyUp |
+                             NSEventMaskFlagsChanged;
+    capture.appkit_monitor = [NSEvent
+      addLocalMonitorForEventsMatchingMask:mask
+      handler:^NSEvent *(NSEvent *event) {
+        handle_appkit_event(*capture_pointer, event);
+        return event;
+      }];
+    if (capture.appkit_monitor != nil) return true;
+    NSEvent.mouseCoalescingEnabled = capture.prior_mouse_coalescing;
+    capture.appkit_coalescing_owned = false;
+    capture.appkit_window = nil;
+    return false;
+  }
+
+  /** @brief Remove the local monitor and restore the exact process coalescing state. */
+  void remove_appkit_monitor(clsp_apple_input_capture &capture) noexcept {
+    if (capture.appkit_monitor == nil && !capture.appkit_coalescing_owned) return;
+    __strong id monitor = capture.appkit_monitor;
+    const auto restore_coalescing = capture.appkit_coalescing_owned;
+    const auto prior_coalescing = capture.prior_mouse_coalescing;
+    capture.appkit_monitor = nil;
+    capture.appkit_window = nil;
+    capture.appkit_coalescing_owned = false;
+    void (^remove)(void) = ^{
+      if (monitor != nil) [NSEvent removeMonitor:monitor];
+      if (restore_coalescing) NSEvent.mouseCoalescingEnabled = prior_coalescing;
+    };
+    if (NSThread.isMainThread) {
+      remove();
+    } else {
+      dispatch_sync(dispatch_get_main_queue(), remove);
+    }
+  }
+
   /** @brief Fully quiesce an initialized or partially initialized capture owner. */
   void quiesce(clsp_apple_input_capture &capture) noexcept {
     std::lock_guard quiesce_lock(capture.quiesce_mutex);
     const auto was_active = capture.active.exchange(false, std::memory_order_acq_rel);
+    remove_appkit_monitor(capture);
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     if (capture.connect_observer != nil) [center removeObserver:capture.connect_observer];
     if (capture.disconnect_observer != nil) [center removeObserver:capture.disconnect_observer];
@@ -1102,21 +1387,7 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
     delete capture;
     return CLSP_STATUS_INPUT_UNAVAILABLE;
   }
-  capture->pointer_generation = 1U;
-  capture->pointer_minimum_interval = UINT32_MAX;
-  clsp_core_observe_input_device(capture->core, 2U, 1U, capture->pointer_generation, true, 0U);
-  clsp_core_publish_device_offer(capture->core, {
-    .device_id = 1U,
-    .instance_generation = capture->pointer_generation,
-    .minimum_state_rate = 125U,
-    .maximum_state_rate = 16'000U,
-    .timing_flags = CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
-                    CLSP_NATIVE_TIMING_SAME_ENDPOINT | CLSP_NATIVE_TIMING_PARTIAL_WIRE_BYTES,
-    .maximum_state_packet_bytes = 56U,
-    .kind = CLSP_DEVICE_OFFER_ARRIVED,
-    .device_type = CLSP_DEVICE_OFFER_POINTER,
-    .capture_source = CLSP_DEVICE_CAPTURE_IOHID,
-  });
+  publish_pointer_arrival(*capture);
   const auto neutralize_status = clsp_core_neutralize_input(core);
   if (neutralize_status != CLSP_STATUS_OK) {
     quiesce(*capture);
@@ -1126,28 +1397,59 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
   }
   IOHIDManagerActivate(capture->manager);
   capture->activated = true;
-  NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
-  capture->connect_observer = [center addObserverForName:GCControllerDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *notification) {
-    GCController *controller = static_cast<GCController *>(notification.object);
-    dispatch_async(capture->queue, ^{
-      connect_controller(*capture, controller);
-      if (capture->active.load(std::memory_order_acquire) && !restart_device_baseline(*capture)) {
-        capture->active.store(false, std::memory_order_release);
-      }
-    });
-  }];
-  capture->disconnect_observer = [center addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification *notification) {
-    GCController *controller = static_cast<GCController *>(notification.object);
-    dispatch_async(capture->queue, ^{
-      disconnect_controller(*capture, controller);
-      if (capture->active.load(std::memory_order_acquire) && !restart_device_baseline(*capture)) {
-        capture->active.store(false, std::memory_order_release);
-      }
-    });
-  }];
-  dispatch_sync(capture->queue, ^{
-    for (GCController *controller in GCController.controllers) connect_controller(*capture, controller);
-  });
+  install_controller_sources(*capture);
+  if (!clsp_core_register_apple_capture(core, capture)) {
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return CLSP_STATUS_INVALID_STATE;
+  }
+  const auto baseline_status = clsp_core_restart_input_baseline(core);
+  if (baseline_status != CLSP_STATUS_OK) {
+    clsp_core_unregister_apple_capture(core, capture);
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return baseline_status;
+  }
+  capture->active.store(true, std::memory_order_release);
+  *output = capture;
+  return CLSP_STATUS_OK;
+}
+
+extern "C" clsp_status_t clsp_core_start_apple_appkit_input_capture(
+  clsp_core_t *core,
+  clsp_apple_input_capture_t **output
+) {
+  if (core == nullptr || output == nullptr) return CLSP_STATUS_INVALID_ARGUMENT;
+  *output = nullptr;
+  if (!NSThread.isMainThread) return CLSP_STATUS_INVALID_STATE;
+  auto *capture = new (std::nothrow) clsp_apple_input_capture_t;
+  if (capture == nullptr) return CLSP_STATUS_RESOURCE_EXHAUSTED;
+  capture->core = core;
+  capture->capture_source = CLSP_DEVICE_CAPTURE_APPKIT;
+  clsp_core_retain(core);
+  if (mach_timebase_info(&capture->timebase) != KERN_SUCCESS || capture->timebase.denom == 0) {
+    clsp_core_release(core);
+    delete capture;
+    return CLSP_STATUS_INPUT_UNAVAILABLE;
+  }
+  capture->queue = dispatch_queue_create("app.umbra.lsp-appkit", DISPATCH_QUEUE_SERIAL);
+  if (capture->queue == nullptr || !install_appkit_monitor(*capture)) {
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return CLSP_STATUS_RESOURCE_EXHAUSTED;
+  }
+  publish_pointer_arrival(*capture);
+  const auto neutralize_status = clsp_core_neutralize_input(core);
+  if (neutralize_status != CLSP_STATUS_OK) {
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return neutralize_status;
+  }
+  install_controller_sources(*capture);
   if (!clsp_core_register_apple_capture(core, capture)) {
     quiesce(*capture);
     clsp_core_release(core);
@@ -1223,7 +1525,7 @@ extern "C" void clsp_apple_input_capture_stop(clsp_apple_input_capture_t *captur
       .timing_flags = spacing.flags,
       .kind = CLSP_DEVICE_OFFER_REMOVED,
       .device_type = CLSP_DEVICE_OFFER_POINTER,
-      .capture_source = CLSP_DEVICE_CAPTURE_IOHID,
+      .capture_source = capture->capture_source,
     });
   }
   clsp_core_unregister_apple_capture(capture->core, capture);

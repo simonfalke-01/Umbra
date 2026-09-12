@@ -748,7 +748,7 @@ public final class LSPTransport: @unchecked Sendable {
     public static let abiVersion: UInt32 = 2
 
     /// Expected source digest for the pinned Photon portable protocol core.
-    public static let sourceDigest = "72b3a260e9b083d15af34403517965b36f67f008e6624b08bc965c9057f679db"
+    public static let sourceDigest = "d565644e8c3a00d6c474d6c118b8b8eccd3140d35eda54dbb0bba7c42f1ca7f0"
 
     /// Providers compiled into the native target.
     public static var availableProviders: LSPTransportProviders {
@@ -1594,6 +1594,14 @@ public final class LSPTransport: @unchecked Sendable {
         return LSPAppleInputCapture(handle: output)
     }
 
+    /// Starts focused-window AppKit fallback capture entirely inside the native adapter.
+    public func startAppleAppKitInputCapture() throws -> LSPAppleInputCapture {
+        var output: OpaquePointer?
+        try Self.requireSuccess(clsp_core_start_apple_appkit_input_capture(core, &output))
+        guard let output else { throw LSPTransportError.internalFailure }
+        return LSPAppleInputCapture(handle: output)
+    }
+
     private static func makeNativeConfiguration(
         _ configuration: LSPTransportConfiguration
     ) throws -> clsp_configuration_t {
@@ -2187,7 +2195,7 @@ public final class LSPNativeHandoff: @unchecked Sendable {
     }
 }
 
-/// Owning Swift boundary for one preferred native Apple capture source.
+/// Owning Swift boundary for one preferred or focused-window native Apple capture source.
 public final class LSPAppleInputCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
@@ -2200,7 +2208,7 @@ public final class LSPAppleInputCapture: @unchecked Sendable {
         stop()
     }
 
-    /// Synchronously quiesces IOHID callbacks before releasing native ownership.
+    /// Synchronously quiesces native callbacks before releasing capture ownership.
     public func stop() {
         let owned = lock.withLock { () -> OpaquePointer? in
             defer { handle = nil }

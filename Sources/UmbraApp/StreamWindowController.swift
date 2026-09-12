@@ -321,6 +321,8 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     var onControllerMouseModeChanged: ((Bool) -> Void)?
     var onTextCommit: ((String) -> Void)?
     var isStreamWindowVisible: Bool { window.isVisible }
+    /// Exact stream window used for coarse native input-capture focus ownership.
+    var inputCaptureWindow: NSWindow { window }
     var nativeLSPControllerOwnershipForTesting: Bool { nativeLSPControllerOwnership }
 
     private let window: NSWindow

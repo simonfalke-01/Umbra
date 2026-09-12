@@ -1131,6 +1131,11 @@ public actor LSPClientSession {
         try transport.startAppleInputCapture()
     }
 
+    /// Starts focused-window AppKit fallback without Swift work on physical callbacks.
+    public nonisolated func startAppleAppKitInputCapture() throws -> LSPAppleInputCapture {
+        try transport.startAppleAppKitInputCapture()
+    }
+
     /// Stops and destroys transport authority.
     public func stop() async throws {
         guard state == .authenticated || state == .inputActive else { throw LSPTransportError.invalidState }

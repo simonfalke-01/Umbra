@@ -80,6 +80,42 @@ public enum CLILSPStopOutcome: Equatable, Sendable {
     case transportFailed(String)
 }
 
+/// A bounded-window distribution for one coarse LSP media-processing stage.
+///
+/// The sample count is the number of values retained in the current bounded window. It is not a
+/// lifetime frame or packet count, and the duration does not represent physical presentation.
+public struct CLILSPTimingDistribution: Equatable, Sendable {
+    public var boundedWindowSampleCount: Int
+    public var p50Microseconds: UInt64
+    public var p95Microseconds: UInt64
+    public var p99Microseconds: UInt64
+    public var maximumMicroseconds: UInt64
+    public var measurementDrops: UInt64
+    public var clockDomain: String
+
+    public init(
+        boundedWindowSampleCount: Int,
+        p50Microseconds: UInt64,
+        p95Microseconds: UInt64,
+        p99Microseconds: UInt64,
+        maximumMicroseconds: UInt64,
+        measurementDrops: UInt64,
+        clockDomain: String
+    ) {
+        self.boundedWindowSampleCount = boundedWindowSampleCount
+        self.p50Microseconds = p50Microseconds
+        self.p95Microseconds = p95Microseconds
+        self.p99Microseconds = p99Microseconds
+        self.maximumMicroseconds = maximumMicroseconds
+        self.measurementDrops = measurementDrops
+        self.clockDomain = clockDomain
+    }
+}
+
+/// Transport counters and optional live media-stage timing for an LSP session.
+///
+/// A `nil` media value means that measurement is unavailable. A present zero counter remains a
+/// measured zero and must not be collapsed into the unavailable state.
 public struct CLILSPTelemetry: Equatable, Sendable {
     public var lifecycle: String
     public var receivedDatagrams: UInt64
@@ -88,27 +124,85 @@ public struct CLILSPTelemetry: Equatable, Sendable {
     public var authenticationFailures: UInt64
     public var currentUDPPayloadSize: UInt16
     public var reconnectPhase: String?
+    public var completeFrameReceiveToVideoToolboxSubmit: CLILSPTimingDistribution?
+    public var videoToolboxSubmitToDecodeCompletion: CLILSPTimingDistribution?
+    public var completeFrameReceiveToMetalEnqueue: CLILSPTimingDistribution?
+    public var metalEnqueueToCommit: CLILSPTimingDistribution?
+    public var audioReceiveToDecode: CLILSPTimingDistribution?
+    public var audioDecodeAndRenderEnqueue: CLILSPTimingDistribution?
+    public var audioUnderruns: UInt64?
+    public var audioRebuffers: UInt64?
 
     public init(
         lifecycle: String, receivedDatagrams: UInt64, transmittedDatagrams: UInt64,
         droppedDatagrams: UInt64, authenticationFailures: UInt64,
-        currentUDPPayloadSize: UInt16, reconnectPhase: String?
+        currentUDPPayloadSize: UInt16, reconnectPhase: String?,
+        completeFrameReceiveToVideoToolboxSubmit: CLILSPTimingDistribution? = nil,
+        videoToolboxSubmitToDecodeCompletion: CLILSPTimingDistribution? = nil,
+        completeFrameReceiveToMetalEnqueue: CLILSPTimingDistribution? = nil,
+        metalEnqueueToCommit: CLILSPTimingDistribution? = nil,
+        audioReceiveToDecode: CLILSPTimingDistribution? = nil,
+        audioDecodeAndRenderEnqueue: CLILSPTimingDistribution? = nil,
+        audioUnderruns: UInt64? = nil,
+        audioRebuffers: UInt64? = nil
     ) {
         self.lifecycle = lifecycle; self.receivedDatagrams = receivedDatagrams
         self.transmittedDatagrams = transmittedDatagrams; self.droppedDatagrams = droppedDatagrams
         self.authenticationFailures = authenticationFailures
         self.currentUDPPayloadSize = currentUDPPayloadSize; self.reconnectPhase = reconnectPhase
+        self.completeFrameReceiveToVideoToolboxSubmit = completeFrameReceiveToVideoToolboxSubmit
+        self.videoToolboxSubmitToDecodeCompletion = videoToolboxSubmitToDecodeCompletion
+        self.completeFrameReceiveToMetalEnqueue = completeFrameReceiveToMetalEnqueue
+        self.metalEnqueueToCommit = metalEnqueueToCommit
+        self.audioReceiveToDecode = audioReceiveToDecode
+        self.audioDecodeAndRenderEnqueue = audioDecodeAndRenderEnqueue
+        self.audioUnderruns = audioUnderruns
+        self.audioRebuffers = audioRebuffers
     }
 
     /// Stable command-line representation shared by direct commands and native-app handoffs.
     public var commandLineOutput: String {
-        "lsp.lifecycle=\(lifecycle)\n"
+        var output = "lsp.lifecycle=\(lifecycle)\n"
             + "lsp.received_datagrams=\(receivedDatagrams)\n"
             + "lsp.transmitted_datagrams=\(transmittedDatagrams)\n"
             + "lsp.dropped_datagrams=\(droppedDatagrams)\n"
             + "lsp.authentication_failures=\(authenticationFailures)\n"
             + "lsp.udp_payload_size=\(currentUDPPayloadSize)\n"
             + (reconnectPhase.map { "lsp.reconnect_phase=\($0)\n" } ?? "")
+        output += Self.timingOutput(
+            "complete_frame_receive_to_videotoolbox_submit",
+            completeFrameReceiveToVideoToolboxSubmit
+        )
+        output += Self.timingOutput(
+            "videotoolbox_submit_to_decode_completion",
+            videoToolboxSubmitToDecodeCompletion
+        )
+        output += Self.timingOutput(
+            "complete_frame_receive_to_metal_enqueue",
+            completeFrameReceiveToMetalEnqueue
+        )
+        output += Self.timingOutput("metal_enqueue_to_commit", metalEnqueueToCommit)
+        output += Self.timingOutput("audio_receive_to_decode", audioReceiveToDecode)
+        output += Self.timingOutput("audio_decode_and_render_enqueue", audioDecodeAndRenderEnqueue)
+        output += "lsp.media.audio_underruns=\(audioUnderruns.map(String.init) ?? "unavailable")\n"
+        output += "lsp.media.audio_rebuffers=\(audioRebuffers.map(String.init) ?? "unavailable")\n"
+        return output
+    }
+
+    private static func timingOutput(
+        _ stage: String,
+        _ distribution: CLILSPTimingDistribution?
+    ) -> String {
+        let prefix = "lsp.media.\(stage)"
+        guard let distribution else { return "\(prefix).availability=unavailable\n" }
+        return "\(prefix).availability=available\n"
+            + "\(prefix).bounded_window_samples=\(distribution.boundedWindowSampleCount)\n"
+            + "\(prefix).p50_microseconds=\(distribution.p50Microseconds)\n"
+            + "\(prefix).p95_microseconds=\(distribution.p95Microseconds)\n"
+            + "\(prefix).p99_microseconds=\(distribution.p99Microseconds)\n"
+            + "\(prefix).maximum_microseconds=\(distribution.maximumMicroseconds)\n"
+            + "\(prefix).measurement_drops=\(distribution.measurementDrops)\n"
+            + "\(prefix).clock_domain=\(distribution.clockDomain)\n"
     }
 }
 

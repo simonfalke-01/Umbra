@@ -137,6 +137,20 @@ final class MediaHardwareTests: XCTestCase {
         XCTAssertEqual(limiter.release(generation: 12), 0)
     }
 
+    func testRendererPreservingDecoderCleanupLeavesSharedRendererUntouched() {
+        let renderer = RealDecodeRecordingRenderer()
+        let retiringDecoder = VideoToolboxDecoder(
+            renderer: renderer,
+            policy: .softwareOnly
+        )
+
+        retiringDecoder.cleanUpPreservingRenderer()
+        XCTAssertEqual(renderer.flushCount, 0)
+
+        retiringDecoder.cleanUp()
+        XCTAssertEqual(renderer.flushCount, 1)
+    }
+
     func testStaleDecodeCompletionCannotCorruptReopenedLimiterOrTelemetry() throws {
         let limiter = VideoDecodeInFlightLimiter(maximumCount: 1)
         let decoder = VideoToolboxDecoder(
@@ -863,15 +877,17 @@ private final class RealDecodeRecordingRenderer: MetalVideoRendering, @unchecked
 
     private let lock = NSLock()
     private var storedFrame: DecodedVideoFrame?
+    private var storedFlushCount = 0
 
     var frame: DecodedVideoFrame? { lock.withLock { storedFrame } }
+    var flushCount: Int { lock.withLock { storedFlushCount } }
 
     func enqueue(_ frame: DecodedVideoFrame) {
         lock.withLock { storedFrame = frame }
         decoded.signal()
     }
 
-    func flush() {}
+    func flush() { lock.withLock { storedFlushCount += 1 } }
 }
 
 private func makeRealH264AnnexBKeyFrame(width: Int32, height: Int32) throws -> Data {

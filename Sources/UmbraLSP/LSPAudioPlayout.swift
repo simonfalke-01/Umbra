@@ -1,4 +1,5 @@
 import Dispatch
+import Darwin
 import Foundation
 import UmbraMedia
 import UmbraOpus
@@ -227,7 +228,7 @@ public final class LSPAudioPlayout: @unchecked Sendable {
     }
 
     private static func monotonicMicroseconds() -> UInt64 {
-        max(1, UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000))
+        max(1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1_000)
     }
 
     private func hold(_ packet: LSPAudioPacket, decoder: OpusMultistreamDecoder) {

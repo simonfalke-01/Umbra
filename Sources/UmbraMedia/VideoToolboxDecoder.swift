@@ -688,10 +688,10 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
     public func stop() {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
-        stopUnderLifecycleLock()
+        stopUnderLifecycleLock(flushRenderer: true)
     }
 
-    private func stopUnderLifecycleLock() {
+    private func stopUnderLifecycleLock(flushRenderer: Bool) {
         lock.lock()
         let stoppingGeneration = state.decodeGeneration
         state.running = false
@@ -706,13 +706,24 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             inFlightLimiter.reset(generation: state.decodeGeneration)
         }
         lock.unlock()
-        renderer?.flush()
+        if flushRenderer {
+            renderer?.flush()
+        }
     }
 
     public func cleanUp() {
+        cleanUp(flushRenderer: true)
+    }
+
+    /// Drains and invalidates this decoder without flushing a renderer shared with another generation.
+    public func cleanUpPreservingRenderer() {
+        cleanUp(flushRenderer: false)
+    }
+
+    private func cleanUp(flushRenderer: Bool) {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
-        stopUnderLifecycleLock()
+        stopUnderLifecycleLock(flushRenderer: flushRenderer)
         lock.lock()
         state.format = nil
         state.profile = nil

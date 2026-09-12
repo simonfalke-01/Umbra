@@ -234,15 +234,7 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
             let response = try await LSPCLIOwnerEndpoint.request(hostID: hostID, command: .telemetry)
             if let error = response.error { throw LSPCLIOwnerIPCError.remote(error) }
             guard let value = response.telemetry else { throw LSPCLIOwnerIPCError.invalidMessage }
-            return .init(
-                lifecycle: value.lifecycle,
-                receivedDatagrams: value.receivedDatagrams,
-                transmittedDatagrams: value.transmittedDatagrams,
-                droppedDatagrams: value.droppedDatagrams,
-                authenticationFailures: value.authenticationFailures,
-                currentUDPPayloadSize: value.currentUDPPayloadSize,
-                reconnectPhase: value.reconnectPhase
-            )
+            return value.cliValue
         }
         return try await telemetryLocal(hostID: hostID)
     }
@@ -253,6 +245,7 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
         }
         let value = try await session.telemetrySnapshot()
         let reconnect = await product.reconnectTelemetry(hostID: hostID)
+        let media = await product.productTelemetry(hostID: hostID)
         return .init(
             lifecycle: String(describing: value.lifecycle),
             receivedDatagrams: value.receivedDatagrams,
@@ -260,7 +253,27 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
             droppedDatagrams: value.droppedDatagrams,
             authenticationFailures: value.authenticationFailures,
             currentUDPPayloadSize: value.currentUDPPayloadSize,
-            reconnectPhase: reconnect.map { String(describing: $0.phase) }
+            reconnectPhase: reconnect.map { String(describing: $0.phase) },
+            completeFrameReceiveToVideoToolboxSubmit: media
+                .flatMap(\.completeFrameReceiveToVideoToolboxSubmit)
+                .map(CLILSPTimingDistribution.init),
+            videoToolboxSubmitToDecodeCompletion: media
+                .flatMap(\.videoToolboxSubmitToDecodeCompletion)
+                .map(CLILSPTimingDistribution.init),
+            completeFrameReceiveToMetalEnqueue: media
+                .flatMap(\.completeFrameReceiveToMetalEnqueue)
+                .map(CLILSPTimingDistribution.init),
+            metalEnqueueToCommit: media
+                .flatMap(\.metalEnqueueToCommit)
+                .map(CLILSPTimingDistribution.init),
+            audioReceiveToDecode: media
+                .flatMap(\.audioReceiveToDecode)
+                .map(CLILSPTimingDistribution.init),
+            audioDecodeAndRenderEnqueue: media
+                .flatMap(\.audioDecodeAndRenderEnqueue)
+                .map(CLILSPTimingDistribution.init),
+            audioUnderruns: media?.audioUnderruns,
+            audioRebuffers: media?.audioRebuffers
         )
     }
 
@@ -349,15 +362,7 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
                 return .init(
                     error: nil,
                     stopKind: nil,
-                    telemetry: .init(
-                        lifecycle: value.lifecycle,
-                        receivedDatagrams: value.receivedDatagrams,
-                        transmittedDatagrams: value.transmittedDatagrams,
-                        droppedDatagrams: value.droppedDatagrams,
-                        authenticationFailures: value.authenticationFailures,
-                        currentUDPPayloadSize: value.currentUDPPayloadSize,
-                        reconnectPhase: value.reconnectPhase
-                    )
+                    telemetry: .init(value)
                 )
             }
         } catch {

@@ -35,6 +35,7 @@
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
   #include <arpa/inet.h>
   #include <fcntl.h>
+  #include <mach/mach_time.h>
   #include <netdb.h>
   #include <netinet/in.h>
   #include <pthread.h>
@@ -62,6 +63,12 @@ namespace umbra::lsp {
       lumen::lsp::input_plane::common_header_size - lumen::lsp::input_plane::baseline_part_header_size;
     constexpr std::size_t microphone_queue_capacity = 3;  ///< Two live packets plus one SPSC sentinel slot.
     constexpr std::size_t maximum_microphone_opus_bytes = 1'172;  ///< 1,200 minus RTP and SRTP tag.
+    constexpr std::size_t input_feedback_ledger_capacity = 65'536;  ///< One exact slot per RTP sequence value.
+    constexpr std::uint64_t input_feedback_freshness_microseconds = 1'000'000;  ///< Bounded high-rate feedback age.
+    constexpr std::size_t microphone_feedback_ledger_capacity = 512;  ///< More than ten seconds at 20-ms cadence.
+    constexpr std::uint64_t microphone_feedback_freshness_microseconds = 5'000'000;  ///< Maximum sent-ledger age.
+    constexpr std::uint64_t microphone_compound_freshness_microseconds = 5'000'000;  ///< RFC 5506 authority lifetime.
+    constexpr std::uint8_t microphone_minimum_failure_intervals = 8;  ///< Sustained minimum-capacity failure threshold.
     constexpr std::size_t video_delivery_queue_capacity =
       4;  ///< Maximum negotiated hardware submissions.
     constexpr std::size_t maximum_depacketized_video_bytes =
@@ -90,6 +97,8 @@ namespace umbra::lsp {
     constexpr std::uint64_t path_probe_smoothed_rtt_microseconds = 20'000U;  ///< Local-path initial SRTT estimate.
     constexpr std::uint8_t maximum_path_probe_attempts = 3;  ///< RFC 8899 default MAX_PROBES.
     constexpr std::uint64_t compound_rtcp_interval_microseconds = 1'000'000U;  ///< Regular RR/SDES cadence.
+    constexpr std::uint64_t active_stream_peer_silence_timeout_microseconds =
+      3U * compound_rtcp_interval_microseconds;  ///< Three missed authenticated streaming report intervals.
     constexpr std::uint64_t path_mtu_raise_interval_microseconds = 600'000'000U;  ///< RFC 8899 PMTU_RAISE_TIMER.
     constexpr std::uint64_t recovery_lspv_repeat_interval_microseconds = 20'000U;  ///< Recovery evidence repeat cadence.
     constexpr std::size_t video_frame_state_extension_bytes = 12;  ///< Encrypted frame ID plus epoch bytes.
@@ -180,11 +189,11 @@ namespace umbra::lsp {
       return distance <= 64U && (bitmap & (std::uint64_t {1} << (distance - 1U))) != 0;
     }
 
-    /** @brief Return monotonic microseconds with saturation on clock failure. */
+    /** @brief Return awake-only uptime microseconds, matching Apple input and socket timestamps. */
     [[nodiscard]] std::uint64_t monotonic_microseconds() noexcept {
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       timespec value {};
-      if (clock_gettime(CLOCK_MONOTONIC, &value) != 0 || value.tv_sec < 0 || value.tv_nsec < 0) {
+      if (clock_gettime(CLOCK_UPTIME_RAW, &value) != 0 || value.tv_sec < 0 || value.tv_nsec < 0) {
         return 0;
       }
       const auto seconds = static_cast<std::uint64_t>(value.tv_sec);
@@ -196,6 +205,36 @@ namespace umbra::lsp {
       return 0;
 #endif
     }
+
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+    /** @brief Scale raw Mach ticks without intermediate overflow; zero means unavailable. */
+    [[nodiscard]] constexpr std::uint64_t mach_ticks_microseconds(
+      const std::uint64_t ticks,
+      const std::uint32_t numerator,
+      const std::uint32_t denominator
+    ) noexcept {
+      if (numerator == 0 || denominator == 0) {
+        return 0;
+      }
+      const auto value = static_cast<__uint128_t>(ticks) * numerator /
+                         (static_cast<std::uint64_t>(denominator) * 1'000U);
+      return value > std::numeric_limits<std::uint64_t>::max() ?
+               std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(value);
+    }
+
+    static_assert(mach_ticks_microseconds(24'000'000U, 125U, 3U) == 1'000'000U);
+    static_assert(mach_ticks_microseconds(1'000'000U, 1U, 1U) == 1'000U);
+
+    /** @brief Decode Darwin SCM_TIMESTAMP_MONOTONIC, whose payload is mach_absolute_time ticks. */
+    [[nodiscard]] std::uint64_t kernel_timestamp_microseconds(const std::uint64_t ticks) noexcept {
+      static const auto timebase = []() noexcept {
+        mach_timebase_info_data_t value {};
+        (void) mach_timebase_info(&value);
+        return value;
+      }();
+      return mach_ticks_microseconds(ticks, timebase.numer, timebase.denom);
+    }
+#endif
 
     /** @brief Saturating addition used for frame age deadlines. */
     [[nodiscard]] constexpr std::uint64_t
@@ -1542,13 +1581,31 @@ namespace umbra::lsp {
       microphone_read_.store(0, std::memory_order_release);
       microphone_write_.store(0, std::memory_order_release);
       microphone_sequence_ = static_cast<std::uint16_t>(arc4random());
+      microphone_next_extended_sequence_ = microphone_sequence_;
       microphone_timestamp_ = arc4random();
       microphone_marker_.store(true, std::memory_order_release);
       microphone_packet_count_ = 0;
       microphone_octet_count_ = 0;
       microphone_last_report_us_ = 0;
       microphone_last_credit_us_ = monotonic_microseconds();
-      microphone_tokens_bits_ = microphone_credit_capacity(configuration);
+      microphone_congestion_.reset();
+      reverse_controller_includes_microphone_ = false;
+      microphone_congestion_rate_bits_per_second_ = microphone_pacing_rate(configuration);
+      microphone_tokens_bits_ = microphone_credit_capacity(
+        configuration,
+        microphone_congestion_rate_bits_per_second_
+      );
+      microphone_sent_packets_ = {};
+      microphone_sender_report_timings_ = {};
+      microphone_sender_report_timing_index_ = 0;
+      microphone_bytes_in_flight_ = 0;
+      microphone_delivered_bytes_ = 0;
+      microphone_lost_bytes_ = 0;
+      microphone_ecn_ce_bytes_ = 0;
+      microphone_last_delay_send_microseconds_ = 0;
+      microphone_last_delay_arrival_timestamp_ = 0;
+      microphone_minimum_failure_count_ = 0;
+      microphone_has_delay_sample_ = false;
       microphone_prepared_.store(true, std::memory_order_release);
       pthread_mutex_unlock(&mutex_);
       return CLSP_STATUS_OK;
@@ -1782,6 +1839,7 @@ namespace umbra::lsp {
       authenticated_repair_abuse_window_start_ = 0;
       authenticated_repair_abuse_count_ = 0;
       video_delivery_active_.store(false, std::memory_order_release);
+      last_authenticated_inbound_microseconds_.store(0U, std::memory_order_release);
       video_feedback_.reset(monotonic_microseconds());
       flexfec_feedback_.reset(monotonic_microseconds());
       rtx_feedback_.reset(monotonic_microseconds());
@@ -1831,6 +1889,7 @@ namespace umbra::lsp {
       const auto matches = video_configured_.load(std::memory_order_acquire) &&
                            video_configuration_.video_generation == video_generation;
       if (matches) {
+        last_authenticated_inbound_microseconds_.store(monotonic_microseconds(), std::memory_order_release);
         video_delivery_active_.store(true, std::memory_order_release);
       }
       pthread_mutex_unlock(&mutex_);
@@ -1950,6 +2009,10 @@ namespace umbra::lsp {
         inbound_path_probe_intent_ = {};
         last_received_probe_id_ = probe_id;
         last_received_probe_size_ = udp_payload_size;
+        // Publish the same proved receive ceiling when the protected probe
+        // arrived before its coarse control-intent callback. Otherwise ACKing
+        // this match makes the host send packets that we still reject as large.
+        receive_udp_payload_size_.store(udp_payload_size, std::memory_order_release);
       }
       pthread_mutex_unlock(&mutex_);
       wake_worker();
@@ -2801,6 +2864,8 @@ namespace umbra::lsp {
       native_feedback_write_result audio_feedback {};  ///< Audio commit watermark for CCFB.
       std::size_t length {};  ///< Exact protected datagram length.
       std::uint64_t created_microseconds {};  ///< Report timestamp and successful commit time.
+      std::uint32_t input_lsr {};  ///< Middle-NTP identity for a pending input SR.
+      std::uint32_t microphone_lsr {};  ///< Middle-NTP identity for a pending microphone SR.
 
       /** @brief Return whether exact protected bytes await submission. */
       [[nodiscard]] explicit operator bool() const noexcept {
@@ -2815,7 +2880,56 @@ namespace umbra::lsp {
       std::size_t queue_index {};  ///< Source Opus queue slot committed only after send.
       std::size_t opus_bytes {};  ///< Source payload bytes for sender counters.
       std::uint64_t charged_bits {};  ///< Aggregate reverse-controller debit on success.
+      std::uint64_t extended_sequence {};  ///< Exact RTP sequence incarnation retained for CCFB.
+      std::uint32_t microphone_generation {};  ///< Generation owning this immutable packet.
       bool occupied {};  ///< Whether exact bytes await first/retry submission.
+    };
+
+    /** @brief Terminal RFC 8888 disposition for one successfully submitted microphone packet. */
+    enum class MicrophoneFeedbackState : std::uint8_t {
+      unreported,  ///< Final socket submission has no receiver disposition.
+      lost,  ///< A valid report declared the packet lost.
+      received,  ///< A valid report declared the packet received.
+    };
+
+    /** @brief Worker-owned sent-packet correlation retained for bounded microphone CCFB. */
+    struct MicrophoneSentPacket {
+      std::uint64_t extended_sequence {};  ///< Exact sequence incarnation, including wrap generation.
+      std::uint64_t sent_microseconds {};  ///< Successful socket-submission time.
+      std::uint32_t complete_ip_bytes {};  ///< Exact IP/UDP/protected-RTP byte count.
+      std::uint32_t arrival_timestamp {};  ///< Reconstructed middle-NTP arrival timestamp.
+      std::uint32_t microphone_generation {};  ///< Negotiated microphone generation.
+      MicrophoneFeedbackState state {MicrophoneFeedbackState::unreported};  ///< Current overlap-safe disposition.
+      std::uint8_t ecn {};  ///< Latest authenticated RFC 8888 ECN echo.
+      bool arrival_timestamp_valid {};  ///< Whether a bounded ATO established arrival identity.
+      bool occupied {};  ///< Whether this slot retains one successful send.
+    };
+
+    /** @brief Successful microphone SR timing retained for authenticated RR LSR/DLSR RTT. */
+    struct MicrophoneSenderReportTiming {
+      std::uint64_t sent_microseconds {};  ///< Final socket-submission time.
+      std::uint32_t lsr {};  ///< Exact middle-NTP sender-report identity.
+    };
+
+    /** @brief Terminal feedback disposition for one protect-consumed input RTP sequence. */
+    enum class InputFeedbackState : std::uint8_t {
+      unreported,  ///< Successful socket submission has no receiver disposition.
+      lost,  ///< A valid report declared a successful submission lost.
+      received,  ///< A valid report declared a successful submission received.
+      local_unsent,  ///< Protection consumed the sequence but no UDP datagram was submitted.
+    };
+
+    /** @brief O(1) generation-qualified input sent/tombstone correlation. */
+    struct InputSentPacket {
+      std::uint64_t extended_sequence {};  ///< Exact sequence incarnation across 16-bit wrap.
+      std::uint64_t terminal_microseconds {};  ///< Successful send or local-unsent time.
+      std::uint32_t complete_ip_bytes {};  ///< Exact successful IP bytes, zero for a tombstone.
+      std::uint32_t arrival_timestamp {};  ///< Reconstructed middle-NTP arrival identity.
+      std::uint32_t input_generation {};  ///< Negotiated input authority generation.
+      InputFeedbackState state {InputFeedbackState::local_unsent};  ///< Current overlap-safe disposition.
+      std::uint8_t ecn {};  ///< Latest authenticated RFC 8888 ECN echo.
+      bool arrival_timestamp_valid {};  ///< Whether bounded ATO established arrival identity.
+      bool occupied {};  ///< Whether this sequence value has a current incarnation.
     };
 
     /** @brief One protected video RTP datagram deferred behind urgent reverse work. */
@@ -3276,6 +3390,7 @@ namespace umbra::lsp {
     void release_video_state() noexcept {
       video_configured_.store(false, std::memory_order_release);
       video_delivery_active_.store(false, std::memory_order_release);
+      last_authenticated_inbound_microseconds_.store(0U, std::memory_order_release);
       path_discovery_enabled_.store(false, std::memory_order_release);
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
       if (mutex_ready_) {
@@ -3417,12 +3532,129 @@ namespace umbra::lsp {
       return std::max<std::uint64_t>(64'000U, static_cast<std::uint64_t>(value.bitrate) * 3U / 2U);
     }
 
-    [[nodiscard]] static std::uint64_t microphone_credit_capacity(
+    /** @brief Return the IP/UDP bytes outside one protected UDP payload for the active family. */
+    [[nodiscard]] std::uint32_t ip_udp_overhead_bytes() const noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      return socket_family_ == AF_INET6 ? 48U : 28U;
+#else
+      return 0;  // No active socket in a provider-disabled build.
+#endif
+    }
+
+    /** @brief Return the minimum complete-wire rate required by negotiated microphone media. */
+    [[nodiscard]] std::uint64_t microphone_minimum_wire_rate(
       const clsp_microphone_configuration_t &value
-    ) noexcept {
-      const auto two_frame_quanta = microphone_pacing_rate(value) / 25U;
-      const auto two_path_packets = static_cast<std::uint64_t>(value.udp_payload_size + 28U) * 8U * 2U;
+    ) const noexcept {
+      constexpr std::uint64_t packets_per_second = 50U;
+      const auto per_packet_overhead = static_cast<std::uint64_t>(12U + 16U + ip_udp_overhead_bytes());
+      return static_cast<std::uint64_t>(value.bitrate) + per_packet_overhead * 8U * packets_per_second;
+    }
+
+    /** @brief Return bounded microphone credit for a selected feedback-controlled rate. */
+    [[nodiscard]] std::uint64_t microphone_credit_capacity(
+      const clsp_microphone_configuration_t &value,
+      const std::uint64_t pacing_rate
+    ) const noexcept {
+      const auto two_frame_quanta = pacing_rate / 25U;
+      const auto two_path_packets =
+        static_cast<std::uint64_t>(value.udp_payload_size + ip_udp_overhead_bytes()) * 8U * 2U;
       return std::max(two_frame_quanta, two_path_packets);
+    }
+
+    /** @brief Add two rates without permitting an arithmetic wrap. */
+    [[nodiscard]] static std::uint64_t saturating_rate_add(
+      const std::uint64_t left,
+      const std::uint64_t right
+    ) noexcept {
+      return left > std::numeric_limits<std::uint64_t>::max() - right ?
+               std::numeric_limits<std::uint64_t>::max() :
+               left + right;
+    }
+
+    /** @brief Return the feedback-selected microphone pacing rate, or its safe initial value. */
+    [[nodiscard]] std::uint64_t current_microphone_pacing_rate() const noexcept {
+      return microphone_congestion_rate_bits_per_second_ != 0 ?
+               microphone_congestion_rate_bits_per_second_ :
+               microphone_pacing_rate(microphone_configuration_);
+    }
+
+    /** @brief Initialize one aggregate reverse controller while preserving the input minimum. */
+    [[nodiscard]] bool reset_reverse_congestion_controller(
+      const bool include_prepared_microphone = false
+    ) noexcept {
+      if (!input_configured_) {
+        microphone_congestion_.reset();
+        reverse_congestion_rate_bits_per_second_ = 0;
+        reverse_controller_includes_microphone_ = false;
+        return false;
+      }
+      const auto input_rate = input_configuration_.reserved_input_wire_bits_per_second;
+      const auto microphone_selected =
+        microphone_active_.load(std::memory_order_acquire) || include_prepared_microphone;
+      if (microphone_selected &&
+          (!microphone_prepared_.load(std::memory_order_acquire) ||
+           input_configuration_.stream_generation != microphone_configuration_.stream_generation)) {
+        microphone_congestion_.reset();
+        reverse_congestion_rate_bits_per_second_ = 0;
+        reverse_controller_includes_microphone_ = false;
+        return false;
+      }
+      const auto microphone_minimum = microphone_selected ?
+        microphone_minimum_wire_rate(microphone_configuration_) : 0U;
+      const auto microphone_initial = microphone_selected ?
+        std::max(microphone_minimum, microphone_pacing_rate(microphone_configuration_)) : 0U;
+      const auto minimum_rate = saturating_rate_add(input_rate, microphone_minimum);
+      const auto initial_rate = saturating_rate_add(input_rate, microphone_initial);
+      auto maximum_rate = initial_rate;
+      auto competition_rate = std::uint64_t {0};
+      const auto competition = configuration_.profile == CLSP_PROFILE_COMPETITION_LAN;
+      const auto control_srtt = rto_.sampled() ? rto_.smoothed_microseconds() : rto_.timeout_microseconds();
+      const auto initial_srtt = microphone_smoothed_rtt_microseconds_ != 0 ?
+        static_cast<std::uint64_t>(microphone_smoothed_rtt_microseconds_) : control_srtt;
+      if (competition) {
+        competition_rate = static_cast<std::uint64_t>(configuration_.competition_capacity_mbps) * 1'000'000U;
+        maximum_rate = competition_rate;
+      }
+      microphone_congestion_.emplace(lumen::lsp::transport::controller_config {
+        .profile = competition ?
+          lumen::lsp::transport::controller_profile::competition_lan :
+          lumen::lsp::transport::controller_profile::adaptive_low_latency,
+        .initial_pacing_bits_per_second = initial_rate,
+        .minimum_pacing_bits_per_second = minimum_rate,
+        .maximum_pacing_bits_per_second = maximum_rate,
+        .competition_capacity_bits_per_second = competition_rate,
+        .reserved_overhead_bits_per_second = 0,
+        .maximum_rtt_microseconds = competition ?
+          static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            UINT32_MAX,
+            std::max<std::uint64_t>(10'000U, initial_srtt)
+          )) :
+          100'000U,
+        .queue_delay_budget_microseconds = competition ? 2'000U : 10'000U,
+      });
+      if (microphone_congestion_->error() != lumen::lsp::transport::controller_error::none) {
+        microphone_congestion_.reset();
+        reverse_congestion_rate_bits_per_second_ = 0;
+        microphone_congestion_rate_bits_per_second_ = 0;
+        reverse_controller_includes_microphone_ = false;
+        return false;
+      }
+      reverse_congestion_rate_bits_per_second_ = initial_rate;
+      microphone_congestion_rate_bits_per_second_ = microphone_initial;
+      reverse_controller_includes_microphone_ = microphone_selected;
+      if (microphone_smoothed_rtt_microseconds_ == 0) {
+        const auto control_variation = rto_.sampled() ? rto_.variation_microseconds() : control_srtt / 2U;
+        microphone_smoothed_rtt_microseconds_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          UINT32_MAX,
+          control_srtt
+        ));
+        microphone_rtt_variation_microseconds_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          UINT32_MAX,
+          control_variation
+        ));
+      }
+      microphone_minimum_failure_count_ = 0;
+      return true;
     }
 
     /** @brief Retain one exact host request until Swift installs and responds. */
@@ -3781,7 +4013,7 @@ namespace umbra::lsp {
         }
         status = retry_control();
         if (status != CLSP_STATUS_OK) {
-          fail_worker(status);
+          fail_worker(status, "control retransmission");
           return;
         }
         status = process_input_configuration();
@@ -3801,7 +4033,7 @@ namespace umbra::lsp {
         }
         status = transmit_input();
         if (status != CLSP_STATUS_OK) {
-          fail_worker(status);
+          fail_worker(status, "input transmission");
           return;
         }
         status = transmit_pending_controller_ack();
@@ -3817,6 +4049,11 @@ namespace umbra::lsp {
         status = process_deferred_video_batch();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
+          return;
+        }
+        const auto peer_liveness_now = monotonic_microseconds();
+        if (active_stream_peer_timed_out(peer_liveness_now)) {
+          fail_worker(CLSP_STATUS_TIMEOUT, "authenticated peer silence");
           return;
         }
         deliver_path_probe_events();
@@ -3910,10 +4147,11 @@ namespace umbra::lsp {
 #ifdef SCM_TIMESTAMP_MONOTONIC
           if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_TIMESTAMP_MONOTONIC &&
               header->cmsg_len >= CMSG_LEN(sizeof(std::uint64_t))) {
-            std::uint64_t timestamp_nanoseconds = 0;
-            std::memcpy(&timestamp_nanoseconds, CMSG_DATA(header), sizeof(timestamp_nanoseconds));
-            if (timestamp_nanoseconds != 0U) {
-              arrival_microseconds = timestamp_nanoseconds / 1'000U;
+            std::uint64_t timestamp_ticks = 0;
+            std::memcpy(&timestamp_ticks, CMSG_DATA(header), sizeof(timestamp_ticks));
+            const auto timestamp_microseconds = kernel_timestamp_microseconds(timestamp_ticks);
+            if (timestamp_microseconds != 0U) {
+              arrival_microseconds = timestamp_microseconds;
               kernel_timestamped = true;
             }
             continue;
@@ -4088,6 +4326,7 @@ namespace umbra::lsp {
               break;
             }
             if (path_probe == PathProbePacketResult::accepted) {
+              note_authenticated_inbound(authenticated_microseconds);
               break;
             }
             if (!rtcp && use_video_context) {
@@ -4148,6 +4387,8 @@ namespace umbra::lsp {
             }
             if (!handled) {
               increment(RuntimeCounter::dropped);
+            } else {
+              note_authenticated_inbound(authenticated_microseconds);
             }
             break;
             }
@@ -4289,6 +4530,8 @@ namespace umbra::lsp {
               receive_lease.token()
             )) {
           increment(RuntimeCounter::dropped);
+        } else {
+          note_authenticated_inbound(authenticated_microseconds);
         }
         if (realtime_failure_status_ != CLSP_STATUS_OK) {
           const auto failure = realtime_failure_status_;
@@ -4469,6 +4712,33 @@ namespace umbra::lsp {
       next_state_sequence_ = 2;
       if (!restoring_same_mapping) {
         rtp_sequence_ = static_cast<std::uint16_t>(arc4random());
+        input_next_extended_sequence_ = rtp_sequence_;
+        for (auto &record : input_sent_packets_) {
+          record = {};
+        }
+        input_sender_report_timings_ = {};
+        input_sender_report_timing_index_ = 0;
+        input_bytes_in_flight_ = 0;
+        input_delivered_bytes_ = 0;
+        input_lost_bytes_ = 0;
+        input_ecn_ce_bytes_ = 0;
+        input_last_delay_send_microseconds_ = 0;
+        input_last_delay_arrival_timestamp_ = 0;
+        input_last_rtp_send_microseconds_ = 0;
+        input_last_rtp_timestamp_ = 0;
+        input_packet_count_ = 0;
+        input_octet_count_ = 0;
+        input_has_delay_sample_ = false;
+        microphone_feedback_cname_length_ = 0;
+        microphone_last_compound_microseconds_ = 0;
+        microphone_last_feedback_microseconds_ = 0;
+        microphone_last_feedback_timestamp_ = 0;
+        microphone_smoothed_rtt_microseconds_ = 0;
+        microphone_rtt_variation_microseconds_ = 0;
+        microphone_has_feedback_timestamp_ = false;
+        microphone_congestion_.reset();
+        reverse_controller_includes_microphone_ = false;
+        reverse_congestion_rate_bits_per_second_ = selected.reserved_input_wire_bits_per_second;
       }
       if (compound_cname_length_ == 0) {
         constexpr std::array<std::uint8_t, 16> hexadecimal {
@@ -4547,6 +4817,24 @@ namespace umbra::lsp {
         input_tokens_bits_,
         selected.reserved_input_wire_bits_per_second / 500U
       );
+      if (!reset_reverse_congestion_controller()) {
+        return CLSP_STATUS_INVALID_CONFIGURATION;
+      }
+      if (microphone_active_.load(std::memory_order_acquire)) {
+        microphone_tokens_bits_ = std::min(
+          microphone_tokens_bits_,
+          microphone_credit_capacity(
+            microphone_configuration_,
+            microphone_congestion_rate_bits_per_second_
+          )
+        );
+      }
+      const auto reverse_capacity = std::max<std::uint64_t>(
+        selected.reserved_input_wire_bits_per_second / 500U +
+          microphone_congestion_rate_bits_per_second_ / 25U,
+        2U * static_cast<std::uint64_t>(maximum_udp_payload + ip_udp_overhead_bytes()) * 8U
+      );
+      reverse_tokens_bits_ = std::min(reverse_tokens_bits_, reverse_capacity);
       pthread_mutex_lock(&mutex_);
       input_feedback_snapshot_.pointer_rate = selected.pointer_rate;
       input_feedback_snapshot_.controller_rate = selected.controller_rate;
@@ -5381,6 +5669,35 @@ namespace umbra::lsp {
       return status;
     }
 
+    /** @brief Record one successful or protect-consumed-unsent input sequence in O(1). */
+    [[nodiscard]] bool record_input_terminal(
+      const std::uint64_t extended_sequence,
+      const std::uint64_t terminal_microseconds,
+      const std::uint32_t complete_ip_bytes,
+      const InputFeedbackState state
+    ) noexcept {
+      if (input_configuration_.input_generation == 0 || terminal_microseconds == 0 ||
+          (state == InputFeedbackState::local_unsent) != (complete_ip_bytes == 0)) {
+        return false;
+      }
+      auto &record = input_sent_packets_[static_cast<std::uint16_t>(extended_sequence)];
+      if (record.occupied && record.state == InputFeedbackState::unreported) {
+        return false;
+      }
+      record = {
+        .extended_sequence = extended_sequence,
+        .terminal_microseconds = terminal_microseconds,
+        .complete_ip_bytes = complete_ip_bytes,
+        .input_generation = input_configuration_.input_generation,
+        .state = state,
+        .occupied = true,
+      };
+      if (state == InputFeedbackState::unreported) {
+        input_bytes_in_flight_ = saturating_rate_add(input_bytes_in_flight_, complete_ip_bytes);
+      }
+      return true;
+    }
+
     /** @brief Wrap one checked input payload in RTP, protect in place, pace, and send. */
     [[nodiscard]] clsp_status_t send_input_packet(
       const lumen::lsp::input_plane::common_header &header,
@@ -5408,7 +5725,9 @@ namespace umbra::lsp {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
       auto length = rtp_result.bytes_written + lumen::lsp::input_plane::common_header_size + payload.size();
-      const auto charged_bits = static_cast<std::uint64_t>(length + 16U + 28U) * 8U;
+      const auto charged_bits = static_cast<std::uint64_t>(
+        length + 16U + ip_udp_overhead_bytes()
+      ) * 8U;
       if (charged_bits > input_tokens_bits_ || charged_bits > reverse_tokens_bits_) {
         return CLSP_STATUS_OK;
       }
@@ -5427,27 +5746,49 @@ namespace umbra::lsp {
           protected_microseconds
         );
       }
+      const auto extended_sequence = input_next_extended_sequence_++;
       const auto sent = ::send(socket_, packet.data(), length, 0);
       ++rtp_sequence_;
       if (sent != static_cast<ssize_t>(length)) {
         timing_distributions_[CLSP_NATIVE_TIMING_INPUT_PROTECT_TO_SUBMIT].drop();
+        if (!record_input_terminal(
+              extended_sequence,
+              monotonic_microseconds(),
+              0,
+              InputFeedbackState::local_unsent
+            )) {
+          return CLSP_STATUS_RESOURCE_EXHAUSTED;
+        }
         if (sent < 0 && errno == EMSGSIZE) {
           current_udp_payload_size_.store(1'200U, std::memory_order_release);
           return CLSP_STATUS_OK;
         }
-        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
+        return sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) ?
+                 CLSP_STATUS_OK : CLSP_STATUS_SOCKET_FAILURE;
       }
+      const auto submitted_microseconds = monotonic_microseconds();
+      const auto complete_ip_bytes = static_cast<std::uint32_t>(length) + ip_udp_overhead_bytes();
+      const auto ledger_accepted = record_input_terminal(
+        extended_sequence,
+        submitted_microseconds,
+        complete_ip_bytes,
+        InputFeedbackState::unreported
+      );
       input_tokens_bits_ -= charged_bits;
       reverse_tokens_bits_ -= charged_bits;
       submitted = true;
-      const auto submitted_microseconds = monotonic_microseconds();
+      input_last_rtp_send_microseconds_ = submitted_microseconds;
+      input_last_rtp_timestamp_ = rtp.timestamp;
+      ++input_packet_count_;
+      input_octet_count_ += static_cast<std::uint32_t>(
+        lumen::lsp::input_plane::common_header_size + payload.size()
+      );
       record_timing_stage(
         CLSP_NATIVE_TIMING_INPUT_PROTECT_TO_SUBMIT,
         protected_microseconds,
         submitted_microseconds
       );
       if (attributable_device_state) {
-        const auto complete_ip_bytes = static_cast<std::uint64_t>(length) + 28U;
         if (header.kind == lumen::lsp::input_plane::packet_kind::pointer_motion) {
           pointer_attributed_wire_bytes_.fetch_add(complete_ip_bytes, std::memory_order_relaxed);
         } else if (header.kind == lumen::lsp::input_plane::packet_kind::device_state ||
@@ -5463,7 +5804,7 @@ namespace umbra::lsp {
       }
       increment(RuntimeCounter::transmitted);
       (void)now;
-      return CLSP_STATUS_OK;
+      return ledger_accepted ? CLSP_STATUS_OK : CLSP_STATUS_RESOURCE_EXHAUSTED;
     }
 
     /** @brief Retry one immutable protected microphone datagram and commit source state once. */
@@ -5472,6 +5813,25 @@ namespace umbra::lsp {
       if (!pending_microphone_.occupied) return CLSP_STATUS_OK;
       const auto sent = ::send(socket_, pending_microphone_.bytes.data(), pending_microphone_.length, 0);
       if (sent == static_cast<ssize_t>(pending_microphone_.length)) {
+        const auto sent_microseconds = monotonic_microseconds();
+        auto &record = microphone_sent_packets_[
+          pending_microphone_.extended_sequence % microphone_sent_packets_.size()
+        ];
+        const auto ledger_exhausted = record.occupied && record.state == MicrophoneFeedbackState::unreported;
+        if (!ledger_exhausted) {
+          record = {
+            .extended_sequence = pending_microphone_.extended_sequence,
+            .sent_microseconds = sent_microseconds,
+            .complete_ip_bytes = static_cast<std::uint32_t>(pending_microphone_.length) + ip_udp_overhead_bytes(),
+            .microphone_generation = pending_microphone_.microphone_generation,
+            .state = MicrophoneFeedbackState::unreported,
+            .occupied = true,
+          };
+          microphone_bytes_in_flight_ = saturating_rate_add(
+            microphone_bytes_in_flight_,
+            record.complete_ip_bytes
+          );
+        }
         microphone_tokens_bits_ -= std::min(microphone_tokens_bits_, pending_microphone_.charged_bits);
         reverse_tokens_bits_ -= std::min(reverse_tokens_bits_, pending_microphone_.charged_bits);
         microphone_marker_.store(false, std::memory_order_release);
@@ -5485,7 +5845,7 @@ namespace umbra::lsp {
         );
         pending_microphone_ = {};
         increment(RuntimeCounter::transmitted);
-        return CLSP_STATUS_OK;
+        return ledger_exhausted ? CLSP_STATUS_RESOURCE_EXHAUSTED : CLSP_STATUS_OK;
       }
       if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
         return CLSP_STATUS_OK;
@@ -5518,9 +5878,10 @@ namespace umbra::lsp {
       const auto read = microphone_read_.load(std::memory_order_relaxed);
       if (read != microphone_write_.load(std::memory_order_acquire)) {
         const auto opus = microphone_queue_[read].bytes();
-        const auto charged = static_cast<std::uint64_t>(12U + opus.size() + 16U + 28U) * 8U;
+        const auto charged =
+          static_cast<std::uint64_t>(12U + opus.size() + 16U + ip_udp_overhead_bytes()) * 8U;
         const auto input_reserve = input_configured_ ?
-          input_configuration_.reserved_input_wire_bits_per_second / 1'000U : 0U;
+          input_configuration_.reserved_input_wire_bits_per_second / 500U : 0U;
         if (charged <= microphone_tokens_bits_ && reverse_tokens_bits_ > input_reserve &&
             charged <= reverse_tokens_bits_ - input_reserve) {
           auto &packet = pending_microphone_.bytes;
@@ -5540,6 +5901,8 @@ namespace umbra::lsp {
           auto length = written.bytes_written + opus.size();
           const auto protected_status = srtp_.protect(packet, length, false);
           if (protected_status != CLSP_STATUS_OK) return protected_status;
+          pending_microphone_.extended_sequence = microphone_next_extended_sequence_++;
+          pending_microphone_.microphone_generation = microphone_configuration_.microphone_generation;
           ++microphone_sequence_;
           pending_microphone_.length = length;
           pending_microphone_.queue_index = read;
@@ -5568,15 +5931,17 @@ namespace umbra::lsp {
       }
       const auto input_rate = input_configured_ ? input_configuration_.reserved_input_wire_bits_per_second : 0U;
       const auto microphone_rate = microphone_active_.load(std::memory_order_acquire) ?
-                                     microphone_pacing_rate(microphone_configuration_) : 0U;
-      const auto rate = input_rate + microphone_rate;
+                                     current_microphone_pacing_rate() : 0U;
+      const auto fallback_rate = saturating_rate_add(input_rate, microphone_rate);
+      const auto rate = reverse_congestion_rate_bits_per_second_ != 0 ?
+                          reverse_congestion_rate_bits_per_second_ : fallback_rate;
       const auto elapsed = now - reverse_last_credit_us_;
       const auto earned = rate == 0U ? 0U :
         (elapsed > std::numeric_limits<std::uint64_t>::max() / rate ?
            std::numeric_limits<std::uint64_t>::max() : elapsed * rate / 1'000'000U);
       const auto capacity = std::max<std::uint64_t>(
         input_rate / 500U + microphone_rate / 25U,
-        2U * static_cast<std::uint64_t>(maximum_udp_payload + 28U) * 8U
+        2U * static_cast<std::uint64_t>(maximum_udp_payload + ip_udp_overhead_bytes()) * 8U
       );
       reverse_tokens_bits_ = earned >= capacity || reverse_tokens_bits_ >= capacity - earned ?
                                capacity : reverse_tokens_bits_ + earned;
@@ -5586,17 +5951,17 @@ namespace umbra::lsp {
     /** @brief Refill the reverse-microphone pacer below the dedicated input lane. */
     void replenish_microphone_credit(const std::uint64_t now) noexcept {
       if (now < microphone_last_credit_us_) { microphone_last_credit_us_ = now; return; }
-      const auto rate = microphone_pacing_rate(microphone_configuration_);
+      const auto rate = current_microphone_pacing_rate();
       const auto elapsed = now - microphone_last_credit_us_;
       const auto earned = elapsed > std::numeric_limits<std::uint64_t>::max() / rate ?
                             std::numeric_limits<std::uint64_t>::max() : elapsed * rate / 1'000'000U;
-      const auto capacity = microphone_credit_capacity(microphone_configuration_);
+      const auto capacity = microphone_credit_capacity(microphone_configuration_, rate);
       microphone_tokens_bits_ = earned >= capacity || microphone_tokens_bits_ >= capacity - earned ?
                                   capacity : microphone_tokens_bits_ + earned;
       microphone_last_credit_us_ = now;
     }
 
-    /** @brief Emit one protected RTCP sender report for the microphone timeline. */
+    /** @brief Emit a regular microphone SR/SDES compound with the association's established CNAME. */
     [[nodiscard]] clsp_status_t send_microphone_report(const std::uint64_t now) noexcept {
       if (pending_rtcp_) {
         return CLSP_STATUS_OK;
@@ -5614,17 +5979,28 @@ namespace umbra::lsp {
       constexpr std::uint64_t ntp_epoch_offset = 2'208'988'800ULL;
       const auto ntp_seconds = static_cast<std::uint64_t>(realtime.tv_sec) + ntp_epoch_offset;
       const auto ntp_fraction = static_cast<std::uint64_t>(realtime.tv_nsec) * (std::uint64_t {1} << 32U) / 1'000'000'000ULL;
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(8, 4), static_cast<std::uint32_t>(ntp_seconds));
-      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(12, 4), static_cast<std::uint32_t>(ntp_fraction));
+      const auto ntp_seconds_field = static_cast<std::uint32_t>(ntp_seconds);
+      const auto ntp_fraction_field = static_cast<std::uint32_t>(ntp_fraction);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(8, 4), ntp_seconds_field);
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(12, 4), ntp_fraction_field);
       lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(16, 4), microphone_timestamp_ - 960U);
       lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(20, 4), microphone_packet_count_);
       lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan(24, 4), microphone_octet_count_);
-      auto length = std::size_t {28};
+      // This SSRC has its own sender timeline, but shares the association CNAME
+      // with input/video feedback. A bare SR cannot establish RTCP authority.
+      const auto sdes_length = lumen::lsp::transport::write_sdes_cname(
+        microphone_configuration_.microphone_ssrc,
+        std::span<const std::uint8_t> {compound_cname_}.first(compound_cname_length_),
+        std::span<std::uint8_t> {packet}.subspan(28)
+      );
+      if (sdes_length == 0) return CLSP_STATUS_INTERNAL_FAILURE;
+      auto length = std::size_t {28} + sdes_length;
       const auto status = srtp_.protect(packet, length, true);
       if (status != CLSP_STATUS_OK) return status;
       pending_rtcp_.kind = PendingProtectedRtcp::Kind::microphone_report;
       pending_rtcp_.length = length;
       pending_rtcp_.created_microseconds = now;
+      pending_rtcp_.microphone_lsr = (ntp_seconds_field << 16U) | (ntp_fraction_field >> 16U);
       return transmit_pending_rtcp(now);
     }
 
@@ -6215,6 +6591,14 @@ namespace umbra::lsp {
         if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::compound) {
           compound_rtcp_sent_ = true;
           last_compound_rtcp_microseconds_ = now;
+          if (pending_rtcp_.input_lsr != 0) {
+            input_sender_report_timings_[input_sender_report_timing_index_] = {
+              .sent_microseconds = now,
+              .lsr = pending_rtcp_.input_lsr,
+            };
+            input_sender_report_timing_index_ =
+              (input_sender_report_timing_index_ + 1U) % input_sender_report_timings_.size();
+          }
         } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::congestion_feedback) {
           if (pending_rtcp_.video_feedback) {
             (void) video_feedback_.commit(pending_rtcp_.video_feedback, now);
@@ -6238,6 +6622,14 @@ namespace umbra::lsp {
           increment(RuntimeCounter::congestion_feedback_packets);
         } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::microphone_report) {
           microphone_last_report_us_ = now;
+          if (pending_rtcp_.microphone_lsr != 0) {
+            microphone_sender_report_timings_[microphone_sender_report_timing_index_] = {
+              .sent_microseconds = now,
+              .lsr = pending_rtcp_.microphone_lsr,
+            };
+            microphone_sender_report_timing_index_ =
+              (microphone_sender_report_timing_index_ + 1U) % microphone_sender_report_timings_.size();
+          }
         } else if (pending_rtcp_.kind == PendingProtectedRtcp::Kind::lspv) {
           pthread_mutex_lock(&mutex_);
           if (video_recovery_feedback_pending_) {
@@ -6452,12 +6844,46 @@ namespace umbra::lsp {
       if (audio_configured_.load(std::memory_order_acquire) && audio_reception_.initialized()) {
         reports[report_count++] = audio_reception_.report(audio_configuration_.audio_ssrc, now);
       }
-      const auto plaintext = write_compound_rr_sdes(
-        input_configuration_.input_ssrc,
-        std::span<const std::uint8_t> {compound_cname_}.first(compound_cname_length_),
-        std::span<const native_receiver_report_block> {reports}.first(report_count),
-        pending_rtcp_.bytes
-      );
+      const auto cname = std::span<const std::uint8_t> {compound_cname_}.first(compound_cname_length_);
+      const auto live_reports = std::span<const native_receiver_report_block> {reports}.first(report_count);
+      auto plaintext = std::size_t {0};
+      pending_rtcp_.input_lsr = 0;
+      if (input_packet_count_ != 0 && input_last_rtp_send_microseconds_ != 0 &&
+          now >= input_last_rtp_send_microseconds_) {
+        timespec realtime {};
+        if (clock_gettime(CLOCK_REALTIME, &realtime) != 0 || realtime.tv_sec < 0 || realtime.tv_nsec < 0) {
+          return CLSP_STATUS_INTERNAL_FAILURE;
+        }
+        constexpr std::uint64_t ntp_epoch_offset = 2'208'988'800ULL;
+        const auto ntp_seconds = static_cast<std::uint32_t>(
+          static_cast<std::uint64_t>(realtime.tv_sec) + ntp_epoch_offset
+        );
+        const auto ntp_fraction = static_cast<std::uint32_t>(
+          static_cast<std::uint64_t>(realtime.tv_nsec) * (std::uint64_t {1} << 32U) / 1'000'000'000ULL
+        );
+        const auto projected_timestamp = input_last_rtp_timestamp_ + static_cast<std::uint32_t>(
+          now - input_last_rtp_send_microseconds_
+        );
+        plaintext = write_compound_input_sr_sdes(
+          input_configuration_.input_ssrc,
+          cname,
+          ntp_seconds,
+          ntp_fraction,
+          projected_timestamp,
+          input_packet_count_,
+          input_octet_count_,
+          live_reports,
+          pending_rtcp_.bytes
+        );
+        pending_rtcp_.input_lsr = (ntp_seconds << 16U) | (ntp_fraction >> 16U);
+      } else {
+        plaintext = write_compound_rr_sdes(
+          input_configuration_.input_ssrc,
+          cname,
+          live_reports,
+          pending_rtcp_.bytes
+        );
+      }
       if (plaintext == 0) {
         return CLSP_STATUS_INTERNAL_FAILURE;
       }
@@ -8025,6 +8451,451 @@ namespace umbra::lsp {
       input_last_credit_us_ = now;
     }
 
+    /** @brief Return whether authenticated feedback names the active input authority. */
+    [[nodiscard]] bool active_reverse_feedback_mapping() const noexcept {
+      return input_configured_ && input_configuration_.stream_generation != 0 &&
+             input_configuration_.input_generation != 0 && input_configuration_.input_ssrc != 0 &&
+             input_configuration_.acknowledgement_ssrc != 0;
+    }
+
+    /** @brief Return whether the active reverse authority also owns microphone media. */
+    [[nodiscard]] bool active_microphone_feedback_mapping() const noexcept {
+      return active_reverse_feedback_mapping() && microphone_active_.load(std::memory_order_acquire) &&
+             microphone_prepared_.load(std::memory_order_acquire) &&
+             microphone_configuration_.stream_generation != 0 &&
+             microphone_configuration_.stream_generation == input_configuration_.stream_generation &&
+             microphone_configuration_.microphone_generation != 0 &&
+             microphone_configuration_.microphone_ssrc != 0 &&
+             input_configuration_.acknowledgement_ssrc != 0;
+    }
+
+    /** @brief Validate host compound RR/CNAME and derive reverse RTT from real LSR/DLSR. */
+    [[nodiscard]] bool handle_reverse_receiver_report(
+      const std::span<const std::uint8_t> packet,
+      const std::uint64_t now
+    ) noexcept {
+      if (!active_reverse_feedback_mapping()) {
+        return false;
+      }
+      const auto authority = lumen::lsp::transport::validate_compound_rtcp_authority(
+        packet,
+        input_configuration_.acknowledgement_ssrc
+      );
+      if (!authority ||
+          authority.first_report.packet_type != lumen::lsp::transport::rtcp_receiver_report_type ||
+          now < microphone_last_compound_microseconds_ ||
+          (microphone_feedback_cname_length_ != 0 &&
+           (microphone_feedback_cname_length_ != authority.cname.size() ||
+            !std::equal(
+              authority.cname.begin(),
+              authority.cname.end(),
+              microphone_feedback_cname_.begin()
+            )))) {
+        return false;
+      }
+
+      const auto &report_packet = authority.first_report;
+      const auto report_offset = report_packet.packet_type == lumen::lsp::transport::rtcp_sender_report_type ?
+                                   24U : 4U;
+      std::uint32_t candidate_rtt = 0;
+      const auto microphone_active = active_microphone_feedback_mapping();
+      bool input_report_seen = false;
+      bool microphone_report_seen = false;
+      for (std::size_t index = 0; index < report_packet.count; ++index) {
+        const auto report = report_packet.payload.subspan(report_offset + index * 24U, 24U);
+        const auto media_ssrc = lumen::lsp::wire::read_be<std::uint32_t>(report.first<4>());
+        const std::array<MicrophoneSenderReportTiming, 8> *timings = nullptr;
+        if (media_ssrc == input_configuration_.input_ssrc) {
+          if (input_report_seen) {
+            return false;
+          }
+          input_report_seen = true;
+          timings = &input_sender_report_timings_;
+        } else if (microphone_active && media_ssrc == microphone_configuration_.microphone_ssrc) {
+          if (microphone_report_seen) {
+            return false;
+          }
+          microphone_report_seen = true;
+          timings = &microphone_sender_report_timings_;
+        } else {
+          return false;
+        }
+        const auto lsr = lumen::lsp::wire::read_be<std::uint32_t>(report.subspan<16, 4>());
+        const auto dlsr = lumen::lsp::wire::read_be<std::uint32_t>(report.subspan<20, 4>());
+        std::uint64_t sender_report_time = 0;
+        for (const auto &timing : *timings) {
+          if (timing.lsr == lsr) {
+            sender_report_time = timing.sent_microseconds;
+            break;
+          }
+        }
+        if (lsr == 0 || sender_report_time == 0 || sender_report_time > now) {
+          continue;
+        }
+        const auto receiver_delay = static_cast<std::uint64_t>(dlsr) * 1'000'000ULL / 65'536ULL;
+        const auto elapsed = now - sender_report_time;
+        if (receiver_delay < elapsed && elapsed - receiver_delay <= 10'000'000U) {
+          candidate_rtt = static_cast<std::uint32_t>(elapsed - receiver_delay);
+        }
+      }
+
+      if (microphone_feedback_cname_length_ == 0) {
+        std::copy(authority.cname.begin(), authority.cname.end(), microphone_feedback_cname_.begin());
+        microphone_feedback_cname_length_ = authority.cname.size();
+      }
+      if (candidate_rtt != 0) {
+        if (microphone_smoothed_rtt_microseconds_ == 0) {
+          microphone_smoothed_rtt_microseconds_ = candidate_rtt;
+          microphone_rtt_variation_microseconds_ = candidate_rtt / 2U;
+        } else {
+          const auto difference = microphone_smoothed_rtt_microseconds_ > candidate_rtt ?
+                                    microphone_smoothed_rtt_microseconds_ - candidate_rtt :
+                                    candidate_rtt - microphone_smoothed_rtt_microseconds_;
+          microphone_rtt_variation_microseconds_ =
+            (microphone_rtt_variation_microseconds_ * 3U + difference) / 4U;
+          microphone_smoothed_rtt_microseconds_ =
+            (microphone_smoothed_rtt_microseconds_ * 7U + candidate_rtt) / 8U;
+        }
+      }
+      microphone_last_compound_microseconds_ = now;
+      return true;
+    }
+
+    /** @brief Atomically apply authenticated input/microphone CCFB to the aggregate reverse controller. */
+    [[nodiscard]] bool handle_reverse_congestion_feedback(
+      const std::span<const std::uint8_t> packet,
+      const std::uint64_t now
+    ) noexcept {
+      if (!active_reverse_feedback_mapping() || microphone_feedback_cname_length_ == 0 ||
+          now < microphone_last_compound_microseconds_ ||
+          now - microphone_last_compound_microseconds_ > microphone_compound_freshness_microseconds) {
+        return false;
+      }
+      const auto feedback = lumen::lsp::transport::validate_congestion_feedback_packet(
+        packet,
+        input_configuration_.acknowledgement_ssrc
+      );
+      if (!feedback) {
+        return false;
+      }
+      const lumen::lsp::transport::congestion_feedback_block_view *input_block = nullptr;
+      const lumen::lsp::transport::congestion_feedback_block_view *microphone_block = nullptr;
+      const auto microphone_active = active_microphone_feedback_mapping();
+      for (std::size_t index = 0; index < feedback.block_count; ++index) {
+        const auto &block = feedback.blocks[index];
+        if (block.media_ssrc == input_configuration_.input_ssrc) {
+          if (input_block != nullptr) {
+            return false;
+          }
+          input_block = &block;
+        } else if (microphone_active && block.media_ssrc == microphone_configuration_.microphone_ssrc) {
+          if (microphone_block != nullptr) {
+            return false;
+          }
+          microphone_block = &block;
+        } else {
+          return false;
+        }
+      }
+      if (input_block == nullptr && microphone_block == nullptr) {
+        return false;
+      }
+      const auto input_report_count = input_block == nullptr ? 0U : input_block->report_count;
+      const auto microphone_report_count = microphone_block == nullptr ? 0U : microphone_block->report_count;
+      if (input_report_count == 0 && microphone_report_count == 0) {
+        return true;
+      }
+      if (input_report_count > input_sent_packets_.size() ||
+          microphone_report_count > microphone_sent_packets_.size() ||
+          (microphone_last_feedback_microseconds_ != 0 &&
+           (now < microphone_last_feedback_microseconds_ ||
+            now - microphone_last_feedback_microseconds_ <
+              lumen::lsp::transport::congestion_feedback_floor_microseconds)) ||
+          (microphone_has_feedback_timestamp_ &&
+           static_cast<std::int32_t>(feedback.report_timestamp - microphone_last_feedback_timestamp_) <= 0)) {
+        return false;
+      }
+
+      if (input_block != nullptr) {
+        std::uint64_t first_extended_sequence = 0;
+        for (std::size_t index = 0; index < input_block->report_count; ++index) {
+          const auto sequence = static_cast<std::uint16_t>(input_block->begin_sequence + index);
+          const auto &record = input_sent_packets_[sequence];
+          const auto metric = lumen::lsp::wire::read_be<std::uint16_t>(
+            input_block->metrics.subspan(index * 2U, 2U)
+          );
+          const auto received = (metric & 0x8000U) != 0;
+          if (!record.occupied || record.input_generation != input_configuration_.input_generation ||
+              static_cast<std::uint16_t>(record.extended_sequence) != sequence ||
+              record.terminal_microseconds > now ||
+              now - record.terminal_microseconds > input_feedback_freshness_microseconds ||
+              (record.state == InputFeedbackState::local_unsent && received) ||
+              (record.state != InputFeedbackState::local_unsent && record.complete_ip_bytes == 0) ||
+              (!received && record.state == InputFeedbackState::received)) {
+            return false;
+          }
+          if (index == 0) {
+            first_extended_sequence = record.extended_sequence;
+          } else if (record.extended_sequence != first_extended_sequence + index) {
+            return false;
+          }
+          if (received) {
+            const auto ato = static_cast<std::uint16_t>(metric & 0x1fffU);
+            if (ato <= 0x1ffdU && record.arrival_timestamp_valid) {
+              const auto arrival = feedback.report_timestamp - static_cast<std::uint32_t>(ato) * 64U;
+              const auto difference = static_cast<std::int32_t>(arrival - record.arrival_timestamp);
+              if (difference < -64 || difference > 64) {
+                return false;
+              }
+            }
+          }
+        }
+      }
+      if (microphone_block != nullptr) {
+        std::uint64_t first_extended_sequence = 0;
+        for (std::size_t index = 0; index < microphone_block->report_count; ++index) {
+          const auto sequence = static_cast<std::uint16_t>(microphone_block->begin_sequence + index);
+          const auto &record = microphone_sent_packets_[sequence % microphone_sent_packets_.size()];
+          const auto metric = lumen::lsp::wire::read_be<std::uint16_t>(
+            microphone_block->metrics.subspan(index * 2U, 2U)
+          );
+          const auto received = (metric & 0x8000U) != 0;
+          if (!record.occupied || record.microphone_generation != microphone_configuration_.microphone_generation ||
+              static_cast<std::uint16_t>(record.extended_sequence) != sequence || record.complete_ip_bytes == 0 ||
+              record.sent_microseconds > now ||
+              now - record.sent_microseconds > microphone_feedback_freshness_microseconds ||
+              (!received && record.state == MicrophoneFeedbackState::received)) {
+            return false;
+          }
+          if (index == 0) {
+            first_extended_sequence = record.extended_sequence;
+          } else if (record.extended_sequence != first_extended_sequence + index) {
+            return false;
+          }
+          if (received) {
+            const auto ato = static_cast<std::uint16_t>(metric & 0x1fffU);
+            if (ato <= 0x1ffdU && record.arrival_timestamp_valid) {
+              const auto arrival = feedback.report_timestamp - static_cast<std::uint32_t>(ato) * 64U;
+              const auto difference = static_cast<std::int32_t>(arrival - record.arrival_timestamp);
+              if (difference < -64 || difference > 64) {
+                return false;
+              }
+            }
+          }
+        }
+      }
+
+      std::uint64_t delivered_bytes = 0;
+      std::uint64_t lost_bytes = 0;
+      std::uint64_t ecn_ce_bytes = 0;
+      std::int32_t queue_delay_trend = 0;
+      bool input_delay_observed = false;
+      if (input_block != nullptr) {
+        for (std::size_t index = 0; index < input_block->report_count; ++index) {
+          const auto sequence = static_cast<std::uint16_t>(input_block->begin_sequence + index);
+          auto &record = input_sent_packets_[sequence];
+          const auto metric = lumen::lsp::wire::read_be<std::uint16_t>(
+            input_block->metrics.subspan(index * 2U, 2U)
+          );
+          const auto received = (metric & 0x8000U) != 0;
+          const auto ecn = static_cast<std::uint8_t>((metric >> 13U) & 0x03U);
+          if (record.state == InputFeedbackState::local_unsent) {
+            continue;
+          }
+          if (received) {
+            const auto newly_received = record.state != InputFeedbackState::received;
+            if (record.state == InputFeedbackState::unreported) {
+              input_bytes_in_flight_ = input_bytes_in_flight_ > record.complete_ip_bytes ?
+                                         input_bytes_in_flight_ - record.complete_ip_bytes : 0;
+            } else if (record.state == InputFeedbackState::lost) {
+              input_lost_bytes_ = input_lost_bytes_ > record.complete_ip_bytes ?
+                                    input_lost_bytes_ - record.complete_ip_bytes : 0;
+            }
+            if (newly_received) {
+              record.state = InputFeedbackState::received;
+              delivered_bytes = saturating_rate_add(delivered_bytes, record.complete_ip_bytes);
+              input_delivered_bytes_ = saturating_rate_add(input_delivered_bytes_, record.complete_ip_bytes);
+            }
+            if (ecn == 3U && record.ecn != 3U) {
+              record.ecn = 3U;
+              ecn_ce_bytes = saturating_rate_add(ecn_ce_bytes, record.complete_ip_bytes);
+              input_ecn_ce_bytes_ = saturating_rate_add(input_ecn_ce_bytes_, record.complete_ip_bytes);
+            }
+            const auto ato = static_cast<std::uint16_t>(metric & 0x1fffU);
+            if (ato <= 0x1ffdU) {
+              const auto arrival = feedback.report_timestamp - static_cast<std::uint32_t>(ato) * 64U;
+              record.arrival_timestamp = arrival;
+              record.arrival_timestamp_valid = true;
+              if (newly_received &&
+                  (!input_has_delay_sample_ ||
+                   record.terminal_microseconds > input_last_delay_send_microseconds_)) {
+                if (input_has_delay_sample_) {
+                  const auto arrival_ticks = static_cast<std::int32_t>(
+                    arrival - input_last_delay_arrival_timestamp_
+                  );
+                  if (arrival_ticks >= 0) {
+                    const auto arrival_delta =
+                      static_cast<std::int64_t>(arrival_ticks) * 1'000'000LL / 65'536LL;
+                    const auto send_delta = static_cast<std::int64_t>(
+                      record.terminal_microseconds - input_last_delay_send_microseconds_
+                    );
+                    queue_delay_trend = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                      arrival_delta - send_delta,
+                      std::numeric_limits<std::int32_t>::min(),
+                      std::numeric_limits<std::int32_t>::max()
+                    ));
+                  }
+                }
+                input_last_delay_arrival_timestamp_ = arrival;
+                input_last_delay_send_microseconds_ = record.terminal_microseconds;
+                input_has_delay_sample_ = true;
+                input_delay_observed = true;
+              }
+            }
+          } else if (record.state == InputFeedbackState::unreported) {
+            record.state = InputFeedbackState::lost;
+            lost_bytes = saturating_rate_add(lost_bytes, record.complete_ip_bytes);
+            input_lost_bytes_ = saturating_rate_add(input_lost_bytes_, record.complete_ip_bytes);
+            input_bytes_in_flight_ = input_bytes_in_flight_ > record.complete_ip_bytes ?
+                                       input_bytes_in_flight_ - record.complete_ip_bytes : 0;
+          }
+        }
+      }
+      if (microphone_block != nullptr) {
+      for (std::size_t index = 0; index < microphone_block->report_count; ++index) {
+        const auto sequence = static_cast<std::uint16_t>(microphone_block->begin_sequence + index);
+        auto &record = microphone_sent_packets_[sequence % microphone_sent_packets_.size()];
+        const auto metric = lumen::lsp::wire::read_be<std::uint16_t>(
+          microphone_block->metrics.subspan(index * 2U, 2U)
+        );
+        const auto received = (metric & 0x8000U) != 0;
+        const auto ecn = static_cast<std::uint8_t>((metric >> 13U) & 0x03U);
+        if (received) {
+          const auto newly_received = record.state != MicrophoneFeedbackState::received;
+          if (record.state == MicrophoneFeedbackState::unreported) {
+            microphone_bytes_in_flight_ = microphone_bytes_in_flight_ > record.complete_ip_bytes ?
+                                            microphone_bytes_in_flight_ - record.complete_ip_bytes : 0;
+          } else if (record.state == MicrophoneFeedbackState::lost) {
+            microphone_lost_bytes_ = microphone_lost_bytes_ > record.complete_ip_bytes ?
+                                       microphone_lost_bytes_ - record.complete_ip_bytes : 0;
+          }
+          if (newly_received) {
+            record.state = MicrophoneFeedbackState::received;
+            delivered_bytes = saturating_rate_add(delivered_bytes, record.complete_ip_bytes);
+            microphone_delivered_bytes_ = saturating_rate_add(
+              microphone_delivered_bytes_,
+              record.complete_ip_bytes
+            );
+          }
+          if (ecn == 3U && record.ecn != 3U) {
+            record.ecn = 3U;
+            ecn_ce_bytes = saturating_rate_add(ecn_ce_bytes, record.complete_ip_bytes);
+            microphone_ecn_ce_bytes_ = saturating_rate_add(
+              microphone_ecn_ce_bytes_,
+              record.complete_ip_bytes
+            );
+          }
+          const auto ato = static_cast<std::uint16_t>(metric & 0x1fffU);
+          if (ato <= 0x1ffdU) {
+            const auto arrival = feedback.report_timestamp - static_cast<std::uint32_t>(ato) * 64U;
+            record.arrival_timestamp = arrival;
+            record.arrival_timestamp_valid = true;
+            if (newly_received &&
+                (!microphone_has_delay_sample_ ||
+                 record.sent_microseconds > microphone_last_delay_send_microseconds_)) {
+              if (microphone_has_delay_sample_) {
+                const auto arrival_ticks = static_cast<std::int32_t>(
+                  arrival - microphone_last_delay_arrival_timestamp_
+                );
+                if (arrival_ticks >= 0) {
+                  const auto arrival_delta = static_cast<std::int64_t>(arrival_ticks) * 1'000'000LL / 65'536LL;
+                  const auto send_delta = static_cast<std::int64_t>(
+                    record.sent_microseconds - microphone_last_delay_send_microseconds_
+                  );
+                  if (!input_delay_observed) {
+                    queue_delay_trend = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                      arrival_delta - send_delta,
+                      std::numeric_limits<std::int32_t>::min(),
+                      std::numeric_limits<std::int32_t>::max()
+                    ));
+                  }
+                }
+              }
+              microphone_last_delay_arrival_timestamp_ = arrival;
+              microphone_last_delay_send_microseconds_ = record.sent_microseconds;
+              microphone_has_delay_sample_ = true;
+            }
+          }
+        } else if (record.state == MicrophoneFeedbackState::unreported) {
+          record.state = MicrophoneFeedbackState::lost;
+          lost_bytes = saturating_rate_add(lost_bytes, record.complete_ip_bytes);
+          microphone_lost_bytes_ = saturating_rate_add(microphone_lost_bytes_, record.complete_ip_bytes);
+          microphone_bytes_in_flight_ = microphone_bytes_in_flight_ > record.complete_ip_bytes ?
+                                          microphone_bytes_in_flight_ - record.complete_ip_bytes : 0;
+        }
+      }
+      }
+      microphone_last_feedback_timestamp_ = feedback.report_timestamp;
+      microphone_last_feedback_microseconds_ = now;
+      microphone_has_feedback_timestamp_ = true;
+
+      if (delivered_bytes == 0 && lost_bytes == 0 && ecn_ce_bytes == 0) {
+        return true;
+      }
+      if ((!microphone_congestion_ || reverse_controller_includes_microphone_ != microphone_active) &&
+          !reset_reverse_congestion_controller()) {
+        realtime_failure_status_ = CLSP_STATUS_INVALID_CONFIGURATION;
+        return false;
+      }
+      microphone_congestion_->apply_feedback({
+        .delivered_bytes = delivered_bytes,
+        .lost_bytes = lost_bytes,
+        .ecn_ce_bytes = ecn_ce_bytes,
+        .bytes_in_flight = saturating_rate_add(input_bytes_in_flight_, microphone_bytes_in_flight_),
+        .smoothed_rtt_microseconds = microphone_smoothed_rtt_microseconds_,
+        .rtt_variation_microseconds = microphone_rtt_variation_microseconds_,
+        .queue_delay_trend_microseconds = queue_delay_trend,
+      });
+      const auto snapshot = microphone_congestion_->snapshot();
+      const auto input_rate = input_configuration_.reserved_input_wire_bits_per_second;
+      if (snapshot.pacing_bits_per_second < input_rate) {
+        realtime_failure_status_ = CLSP_STATUS_RESOURCE_EXHAUSTED;
+        return false;
+      }
+      reverse_congestion_rate_bits_per_second_ = snapshot.pacing_bits_per_second;
+      microphone_congestion_rate_bits_per_second_ = microphone_active ?
+        snapshot.pacing_bits_per_second - input_rate : 0U;
+      if (microphone_active) {
+        if (microphone_congestion_rate_bits_per_second_ <
+            microphone_minimum_wire_rate(microphone_configuration_)) {
+          realtime_failure_status_ = CLSP_STATUS_RESOURCE_EXHAUSTED;
+          return false;
+        }
+        microphone_tokens_bits_ = std::min(
+          microphone_tokens_bits_,
+          microphone_credit_capacity(microphone_configuration_, microphone_congestion_rate_bits_per_second_)
+        );
+      }
+      const auto reverse_capacity = std::max<std::uint64_t>(
+        input_rate / 500U + microphone_congestion_rate_bits_per_second_ / 25U,
+        2U * static_cast<std::uint64_t>(maximum_udp_payload + ip_udp_overhead_bytes()) * 8U
+      );
+      reverse_tokens_bits_ = std::min(reverse_tokens_bits_, reverse_capacity);
+      if (snapshot.minimum_unsustainable) {
+        microphone_minimum_failure_count_ = static_cast<std::uint8_t>(std::min<unsigned>(
+          microphone_minimum_failure_intervals,
+          static_cast<unsigned>(microphone_minimum_failure_count_) + 1U
+        ));
+        if (microphone_minimum_failure_count_ == microphone_minimum_failure_intervals) {
+          realtime_failure_status_ = CLSP_STATUS_RESOURCE_EXHAUSTED;
+          return false;
+        }
+      } else {
+        microphone_minimum_failure_count_ = 0;
+      }
+      return true;
+    }
+
     /** @brief Parse authenticated SRTCP LSPI and retire baseline/edge state. */
     [[nodiscard]] bool handle_authenticated_realtime(
       const std::span<const std::uint8_t> packet,
@@ -8086,23 +8957,38 @@ namespace umbra::lsp {
         callbacks_.audio_packet(callbacks_.context, event);
         return true;
       }
+      if (packet[1] == lumen::lsp::transport::rtcp_receiver_report_type) {
+        return handle_reverse_receiver_report(packet, authenticated_microseconds);
+      }
+      if (packet[1] == lumen::lsp::transport::rtcp_transport_feedback_type &&
+          (packet[0] & 0x1fU) == lumen::lsp::transport::rtcp_congestion_feedback_format) {
+        return handle_reverse_congestion_feedback(packet, authenticated_microseconds);
+      }
       if (packet[1] == 200U) {
-        if (packet.size() < 28U) {
+        const auto first_sender_ssrc = packet.size() >= 8U ?
+                                         lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4)) : 0U;
+        const auto authority = lumen::lsp::transport::validate_compound_rtcp_authority(
+          packet,
+          first_sender_ssrc
+        );
+        if (!authority || authority.first_report.packet_type != lumen::lsp::transport::rtcp_sender_report_type ||
+            authority.first_report.payload.size() < 24U) {
           return false;
         }
-        const auto words = lumen::lsp::wire::read_be<std::uint16_t>(packet.subspan(2, 2));
-        if ((static_cast<std::size_t>(words) + 1U) * 4U != packet.size()) {
-          return false;
-        }
-        const auto sender_ssrc =
-          lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(4, 4));
-          const auto video_lane = video_lane_for_ssrc(sender_ssrc);
-          if (video_lane != VideoRtpLane::none) {
-          const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4));
-          const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4));
-            auto *reception = video_lane == VideoRtpLane::primary ? &video_reception_ :
-                              (video_lane == VideoRtpLane::flexfec ? &flexfec_reception_ : &rtx_reception_);
-            reception->note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
+        const auto sender_ssrc = lumen::lsp::wire::read_be<std::uint32_t>(
+          authority.first_report.payload.first<4>()
+        );
+        const auto video_lane = video_lane_for_ssrc(sender_ssrc);
+        if (video_lane != VideoRtpLane::none) {
+          const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(
+            authority.first_report.payload.subspan<4, 4>()
+          );
+          const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(
+            authority.first_report.payload.subspan<8, 4>()
+          );
+          auto *reception = video_lane == VideoRtpLane::primary ? &video_reception_ :
+                            (video_lane == VideoRtpLane::flexfec ? &flexfec_reception_ : &rtx_reception_);
+          reception->note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
           return true;
         }
         if (!audio_configured_.load(std::memory_order_acquire) ||
@@ -8113,17 +8999,27 @@ namespace umbra::lsp {
         if (sender_ssrc != audio.audio_ssrc) {
           return false;
         }
-        const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4));
-        const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4));
+        const auto seconds = lumen::lsp::wire::read_be<std::uint32_t>(
+          authority.first_report.payload.subspan<4, 4>()
+        );
+        const auto fraction = lumen::lsp::wire::read_be<std::uint32_t>(
+          authority.first_report.payload.subspan<8, 4>()
+        );
         audio_reception_.note_sender_report((seconds << 16U) | (fraction >> 16U), arrival_microseconds);
         const clsp_audio_timing_event_t timing {
           .abi_version = CLSP_CORE_ABI_VERSION,
           .structure_size = sizeof(clsp_audio_timing_event_t),
           .audio_generation = audio.audio_generation,
           .ssrc = audio.audio_ssrc,
-          .ntp_seconds = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(8, 4)),
-          .ntp_fraction = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(12, 4)),
-          .rtp_timestamp = lumen::lsp::wire::read_be<std::uint32_t>(packet.subspan(16, 4)),
+          .ntp_seconds = lumen::lsp::wire::read_be<std::uint32_t>(
+            authority.first_report.payload.subspan<4, 4>()
+          ),
+          .ntp_fraction = lumen::lsp::wire::read_be<std::uint32_t>(
+            authority.first_report.payload.subspan<8, 4>()
+          ),
+          .rtp_timestamp = lumen::lsp::wire::read_be<std::uint32_t>(
+            authority.first_report.payload.subspan<12, 4>()
+          ),
         };
         callbacks_.audio_timing(callbacks_.context, timing);
         return true;
@@ -8327,6 +9223,9 @@ namespace umbra::lsp {
         increment(RuntimeCounter::dropped);
         return false;
       }
+      if (observed == lumen::lsp::receive_id_result::accepted) {
+        note_authenticated_inbound(control_now);
+      }
       increment(RuntimeCounter::received);
       const auto ack_required = lumen::lsp::has_flag(
         parsed.header.flags,
@@ -8499,6 +9398,14 @@ namespace umbra::lsp {
         }
         if (command.activate_microphone) {
           if (!microphone_prepared_.load(std::memory_order_acquire)) return CLSP_STATUS_INVALID_STATE;
+          if (!reset_reverse_congestion_controller(true)) return CLSP_STATUS_INVALID_CONFIGURATION;
+          const auto now = monotonic_microseconds();
+          microphone_last_credit_us_ = now;
+          microphone_tokens_bits_ = microphone_credit_capacity(
+            microphone_configuration_,
+            microphone_congestion_rate_bits_per_second_
+          );
+          reverse_last_credit_us_ = now;
           microphone_active_.store(true, std::memory_order_release);
         }
         if (command.response) {
@@ -8572,14 +9479,36 @@ namespace umbra::lsp {
     }
 
     /** @brief Fail the worker without exposing parser/security details to the peer. */
-    void fail_worker(const clsp_status_t status) noexcept {
+    void fail_worker(const clsp_status_t status, const char *stage = nullptr) noexcept {
+      if (stage != nullptr) {
+        std::fprintf(stderr, "LSP transport failed during %s (status=%u).\n", stage, static_cast<unsigned int>(status));
+      }
       clear_deferred_video_batch();
+      capture_accepting_.store(false, std::memory_order_release);
+      capture_read_.store(capture_write_.load(std::memory_order_acquire), std::memory_order_release);
+      last_authenticated_inbound_microseconds_.store(0U, std::memory_order_release);
       flush_telemetry(monotonic_microseconds(), true);
       signal_startup(status);
       terminal_failed_.store(true, std::memory_order_release);
       authenticated_.store(false, std::memory_order_release);
       stop_requested_.store(true, std::memory_order_release);
       publish_lifecycle(CLSP_LIFECYCLE_FAILED, latch_terminal_status(status));
+    }
+
+    /** @brief Record one newly admitted authenticated peer packet for active-stream liveness. */
+    void note_authenticated_inbound(const std::uint64_t now) noexcept {
+      if (now != 0U && video_delivery_active_.load(std::memory_order_acquire)) {
+        last_authenticated_inbound_microseconds_.store(now, std::memory_order_release);
+      }
+    }
+
+    /** @brief Return whether an active stream missed three authenticated report intervals. */
+    [[nodiscard]] bool active_stream_peer_timed_out(const std::uint64_t now) const noexcept {
+      if (!video_delivery_active_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      const auto last = last_authenticated_inbound_microseconds_.load(std::memory_order_acquire);
+      return last != 0U && now >= last && now - last >= active_stream_peer_silence_timeout_microseconds;
     }
 
     /** @brief Attribute one bounded ring failure to its exact native device generation. */
@@ -8741,6 +9670,7 @@ namespace umbra::lsp {
     std::atomic<bool> audio_configured_ {false};  ///< Exact host-audio mapping admission gate.
     std::atomic<bool> video_configured_ {false};  ///< Exact primary-video mapping admission gate.
     std::atomic<bool> video_delivery_active_ {false};  ///< ACK-gated complete-frame publication.
+    std::atomic<std::uint64_t> last_authenticated_inbound_microseconds_ {0};  ///< Active-stream peer watchdog evidence.
     std::atomic<bool> path_discovery_enabled_ {false};  ///< Native PMTU search activation.
     std::atomic<std::uint32_t> published_stream_generation_ {0};  ///< Coarse current stream generation.
     std::atomic<std::uint32_t> published_input_generation_ {0};  ///< Coarse current input generation.
@@ -8792,6 +9722,16 @@ namespace umbra::lsp {
     std::array<DeferredVideoDatagram, receive_batch_size> deferred_video_ {};  ///< Current bounded priority batch.
     std::size_t deferred_video_count_ {};  ///< Protected video packets collected this worker turn.
     std::array<lumen::lsp::packet_slab<maximum_microphone_opus_bytes>, microphone_queue_capacity> microphone_queue_ {};  ///< Complete Opus SPSC queue.
+    std::array<InputSentPacket, input_feedback_ledger_capacity>
+      input_sent_packets_ {};  ///< O(1) successful-send and local-unsent input correlation.
+    std::array<MicrophoneSentPacket, microphone_feedback_ledger_capacity>
+      microphone_sent_packets_ {};  ///< Successful microphone sends retained for CCFB.
+    std::array<MicrophoneSenderReportTiming, 8>
+      input_sender_report_timings_ {};  ///< Recent input SR LSR/send-time correlations.
+    std::array<MicrophoneSenderReportTiming, 8>
+      microphone_sender_report_timings_ {};  ///< Recent SR LSR/send-time correlations.
+    std::optional<lumen::lsp::transport::congestion_controller>
+      microphone_congestion_ {};  ///< Independent reverse-path capacity state.
     std::atomic<std::size_t> microphone_read_ {0};  ///< Native sender queue read cursor.
     std::atomic<std::size_t> microphone_write_ {0};  ///< Swift encoder queue write cursor.
     std::atomic<bool> microphone_active_ {false};  ///< Capture-to-network admission state.
@@ -8896,8 +9836,22 @@ namespace umbra::lsp {
     std::uint64_t input_last_credit_us_ {};  ///< Last token refill time.
     std::uint64_t reverse_tokens_bits_ {};  ///< Aggregate input-plus-microphone pacing credit.
     std::uint64_t reverse_last_credit_us_ {};  ///< Aggregate reverse-controller refill time.
+    std::uint64_t reverse_congestion_rate_bits_per_second_ {};  ///< Feedback-selected aggregate reverse rate.
     std::uint64_t last_pointer_sent_us_ {};  ///< Last cumulative pointer submission time.
     std::uint16_t rtp_sequence_ {};  ///< Input RTP sequence with libSRTP rollover tracking.
+    std::uint64_t input_next_extended_sequence_ {};  ///< Next protect-consumed input RTP sequence incarnation.
+    std::uint64_t input_bytes_in_flight_ {};  ///< Successful input sends without terminal feedback.
+    std::uint64_t input_delivered_bytes_ {};  ///< Overlap-corrected delivered complete input IP bytes.
+    std::uint64_t input_lost_bytes_ {};  ///< Overlap-corrected lost complete input IP bytes.
+    std::uint64_t input_ecn_ce_bytes_ {};  ///< Authenticated delivered input CE bytes.
+    std::uint64_t input_last_delay_send_microseconds_ {};  ///< Latest input CCFB delay-trend send sample.
+    std::uint64_t input_last_rtp_send_microseconds_ {};  ///< Successful send time for input SR projection.
+    std::uint32_t input_last_delay_arrival_timestamp_ {};  ///< Latest input CCFB arrival middle-NTP sample.
+    std::uint32_t input_last_rtp_timestamp_ {};  ///< Latest successful 1-MHz RTP timestamp.
+    std::uint32_t input_packet_count_ {};  ///< Successful input RTP packet count for SR.
+    std::uint32_t input_octet_count_ {};  ///< Successful input RTP payload octets for SR.
+    std::size_t input_sender_report_timing_index_ {};  ///< Next bounded input SR timing slot.
+    bool input_has_delay_sample_ {};  ///< Whether input queue-delay trend has a prior delivery.
     std::uint16_t microphone_sequence_ {};  ///< Microphone RTP sequence.
     std::uint32_t microphone_timestamp_ {};  ///< 48-kHz microphone RTP timestamp.
     std::uint32_t microphone_packet_count_ {};  ///< Sender-report packet count.
@@ -8905,6 +9859,26 @@ namespace umbra::lsp {
     std::uint64_t microphone_tokens_bits_ {};  ///< Reverse microphone pacing credit.
     std::uint64_t microphone_last_credit_us_ {};  ///< Last microphone token refill.
     std::uint64_t microphone_last_report_us_ {};  ///< Last microphone RTCP SR submission.
+    std::uint64_t microphone_next_extended_sequence_ {};  ///< Next microphone RTP sequence incarnation.
+    std::uint64_t microphone_congestion_rate_bits_per_second_ {};  ///< Feedback-selected microphone sub-pacer rate.
+    std::uint64_t microphone_last_compound_microseconds_ {};  ///< Fresh host RR/CNAME authority time.
+    std::uint64_t microphone_last_feedback_microseconds_ {};  ///< Accepted nonempty CCFB cadence origin.
+    std::uint64_t microphone_bytes_in_flight_ {};  ///< Successful sends without terminal feedback.
+    std::uint64_t microphone_delivered_bytes_ {};  ///< Overlap-corrected delivered complete IP bytes.
+    std::uint64_t microphone_lost_bytes_ {};  ///< Overlap-corrected lost complete IP bytes.
+    std::uint64_t microphone_ecn_ce_bytes_ {};  ///< Authenticated delivered CE bytes.
+    std::uint64_t microphone_last_delay_send_microseconds_ {};  ///< Latest CCFB delay-trend send sample.
+    std::uint32_t microphone_last_feedback_timestamp_ {};  ///< Latest nonempty CCFB middle-NTP time.
+    std::uint32_t microphone_smoothed_rtt_microseconds_ {};  ///< SR/RR-derived reverse media SRTT.
+    std::uint32_t microphone_rtt_variation_microseconds_ {};  ///< SR/RR-derived reverse media RTTVAR.
+    std::uint32_t microphone_last_delay_arrival_timestamp_ {};  ///< Latest CCFB arrival middle-NTP sample.
+    std::array<std::uint8_t, 255> microphone_feedback_cname_ {};  ///< Stable host feedback CNAME.
+    std::size_t microphone_feedback_cname_length_ {};  ///< Populated host feedback CNAME length.
+    std::size_t microphone_sender_report_timing_index_ {};  ///< Next bounded SR timing replacement slot.
+    std::uint8_t microphone_minimum_failure_count_ {};  ///< Consecutive impaired intervals at minimum capacity.
+    bool microphone_has_feedback_timestamp_ {};  ///< Whether CCFB timestamp monotonicity has an origin.
+    bool microphone_has_delay_sample_ {};  ///< Whether queue-delay trend has a prior delivery.
+    bool reverse_controller_includes_microphone_ {};  ///< Whether aggregate bounds include microphone minima.
     bool input_configuration_pending_ {};  ///< Producer installed a new START mapping.
     bool pending_input_rate_update_ {};  ///< Producer queued one worker-owned rate update.
     bool video_sequence_initialized_ {};  ///< Whether extended sequence state has an origin.

@@ -58,6 +58,37 @@ public enum LSPControlStatus: UInt8, Error, Sendable {
     case internalFailure = 10
 }
 
+extension LSPControlStatus: LocalizedError {
+    /// A concise user-facing description of the stable control status.
+    public var errorDescription: String? {
+        switch self {
+        case .success:
+            "The request completed successfully."
+        case .malformed:
+            "Lumen rejected the request because it was malformed."
+        case .unsupported:
+            "Lumen does not support this request."
+        case .authenticationFailed:
+            "Lumen could not authenticate this client. Pair Umbra with Lumen again and retry."
+        case .permissionDenied:
+            "Lumen denied this request. Enable the required access for Umbra in "
+                + "Lumen's client permissions, then retry."
+        case .busy:
+            "Lumen is already handling a conflicting operation."
+        case .unsupportedMediaTuple:
+            "Lumen and Umbra could not negotiate a supported media configuration."
+        case .staleGeneration:
+            "The Lumen session changed before this request completed. Reconnect and retry."
+        case .timeout:
+            "The request to Lumen timed out."
+        case .pathCapacityInsufficient:
+            "The network path cannot support the requested stream settings."
+        case .internalFailure:
+            "The request failed because of an unexpected streaming error."
+        }
+    }
+}
+
 /// A validated SERVER_HELLO response.
 public struct LSPServerHello: Equatable, Sendable {
     public var connectionGeneration: UInt32

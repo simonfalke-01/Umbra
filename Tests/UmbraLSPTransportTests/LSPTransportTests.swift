@@ -110,6 +110,12 @@ final class LSPTransportTests: XCTestCase {
         }
         XCTAssertGreaterThanOrEqual(clientHelloCount, 2, "Exercise a real ClientHello retransmission.")
         XCTAssertEqual(try transport.telemetrySnapshot().authenticationFailures, 0)
+        let timestamp = try transport.nativeTimingSnapshot().snapshotTimeMicroseconds
+        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1_000
+        XCTAssertGreaterThan(timestamp, 0)
+        XCTAssertLessThanOrEqual(timestamp, now)
+        XCTAssertLessThan(now - min(now, timestamp), 1_000_000,
+                          "Native and media/input timestamps must share the awake-only uptime domain.")
     }
 
     func testTelemetryIntervalRejectsSub250MillisecondPublication() {

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import UmbraCLIExecution
+import UmbraLSP
 
 enum LSPCLIOwnerCommand: String, Codable, Sendable {
     case attach
@@ -28,6 +29,110 @@ struct LSPCLIOwnerTelemetry: Codable, Sendable {
     var authenticationFailures: UInt64
     var currentUDPPayloadSize: UInt16
     var reconnectPhase: String?
+    var completeFrameReceiveToVideoToolboxSubmit: LSPCLIOwnerTimingDistribution? = nil
+    var videoToolboxSubmitToDecodeCompletion: LSPCLIOwnerTimingDistribution? = nil
+    var completeFrameReceiveToMetalEnqueue: LSPCLIOwnerTimingDistribution? = nil
+    var metalEnqueueToCommit: LSPCLIOwnerTimingDistribution? = nil
+    var audioReceiveToDecode: LSPCLIOwnerTimingDistribution? = nil
+    var audioDecodeAndRenderEnqueue: LSPCLIOwnerTimingDistribution? = nil
+    var audioUnderruns: UInt64? = nil
+    var audioRebuffers: UInt64? = nil
+}
+
+struct LSPCLIOwnerTimingDistribution: Codable, Sendable {
+    var boundedWindowSampleCount: Int
+    var p50Microseconds: UInt64
+    var p95Microseconds: UInt64
+    var p99Microseconds: UInt64
+    var maximumMicroseconds: UInt64
+    var measurementDrops: UInt64
+    var clockDomain: String
+}
+
+extension LSPCLIOwnerTelemetry {
+    init(_ value: CLILSPTelemetry) {
+        lifecycle = value.lifecycle
+        receivedDatagrams = value.receivedDatagrams
+        transmittedDatagrams = value.transmittedDatagrams
+        droppedDatagrams = value.droppedDatagrams
+        authenticationFailures = value.authenticationFailures
+        currentUDPPayloadSize = value.currentUDPPayloadSize
+        reconnectPhase = value.reconnectPhase
+        completeFrameReceiveToVideoToolboxSubmit = value.completeFrameReceiveToVideoToolboxSubmit.map(
+            LSPCLIOwnerTimingDistribution.init
+        )
+        videoToolboxSubmitToDecodeCompletion = value.videoToolboxSubmitToDecodeCompletion.map(
+            LSPCLIOwnerTimingDistribution.init
+        )
+        completeFrameReceiveToMetalEnqueue = value.completeFrameReceiveToMetalEnqueue.map(
+            LSPCLIOwnerTimingDistribution.init
+        )
+        metalEnqueueToCommit = value.metalEnqueueToCommit.map(LSPCLIOwnerTimingDistribution.init)
+        audioReceiveToDecode = value.audioReceiveToDecode.map(LSPCLIOwnerTimingDistribution.init)
+        audioDecodeAndRenderEnqueue = value.audioDecodeAndRenderEnqueue.map(
+            LSPCLIOwnerTimingDistribution.init
+        )
+        audioUnderruns = value.audioUnderruns
+        audioRebuffers = value.audioRebuffers
+    }
+
+    var cliValue: CLILSPTelemetry {
+        .init(
+            lifecycle: lifecycle,
+            receivedDatagrams: receivedDatagrams,
+            transmittedDatagrams: transmittedDatagrams,
+            droppedDatagrams: droppedDatagrams,
+            authenticationFailures: authenticationFailures,
+            currentUDPPayloadSize: currentUDPPayloadSize,
+            reconnectPhase: reconnectPhase,
+            completeFrameReceiveToVideoToolboxSubmit: completeFrameReceiveToVideoToolboxSubmit?.cliValue,
+            videoToolboxSubmitToDecodeCompletion: videoToolboxSubmitToDecodeCompletion?.cliValue,
+            completeFrameReceiveToMetalEnqueue: completeFrameReceiveToMetalEnqueue?.cliValue,
+            metalEnqueueToCommit: metalEnqueueToCommit?.cliValue,
+            audioReceiveToDecode: audioReceiveToDecode?.cliValue,
+            audioDecodeAndRenderEnqueue: audioDecodeAndRenderEnqueue?.cliValue,
+            audioUnderruns: audioUnderruns,
+            audioRebuffers: audioRebuffers
+        )
+    }
+}
+
+extension LSPCLIOwnerTimingDistribution {
+    init(_ value: CLILSPTimingDistribution) {
+        boundedWindowSampleCount = value.boundedWindowSampleCount
+        p50Microseconds = value.p50Microseconds
+        p95Microseconds = value.p95Microseconds
+        p99Microseconds = value.p99Microseconds
+        maximumMicroseconds = value.maximumMicroseconds
+        measurementDrops = value.measurementDrops
+        clockDomain = value.clockDomain
+    }
+
+    var cliValue: CLILSPTimingDistribution {
+        .init(
+            boundedWindowSampleCount: boundedWindowSampleCount,
+            p50Microseconds: p50Microseconds,
+            p95Microseconds: p95Microseconds,
+            p99Microseconds: p99Microseconds,
+            maximumMicroseconds: maximumMicroseconds,
+            measurementDrops: measurementDrops,
+            clockDomain: clockDomain
+        )
+    }
+}
+
+extension CLILSPTimingDistribution {
+    init(_ value: LSPDistributionSnapshot) {
+        self.init(
+            boundedWindowSampleCount: value.count,
+            p50Microseconds: value.p50Microseconds,
+            p95Microseconds: value.p95Microseconds,
+            p99Microseconds: value.p99Microseconds,
+            maximumMicroseconds: value.maximumMicroseconds,
+            measurementDrops: value.drops,
+            clockDomain: value.clockDomain
+        )
+    }
 }
 
 enum LSPCLIOwnerIPCError: Error, LocalizedError {

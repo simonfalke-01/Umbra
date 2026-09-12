@@ -17,7 +17,7 @@ extern "C" {
 #define CLSP_CORE_ABI_VERSION UINT32_C(2)
 
 /** @brief Source digest of the mirrored portable LSP core. */
-#define CLSP_CORE_SOURCE_DIGEST "72b3a260e9b083d15af34403517965b36f67f008e6624b08bc965c9057f679db"
+#define CLSP_CORE_SOURCE_DIGEST "d565644e8c3a00d6c474d6c118b8b8eccd3140d35eda54dbb0bba7c42f1ca7f0"
 
 /** @brief Default LSP UDP application port. */
 #define CLSP_DEFAULT_PORT UINT16_C(48030)
@@ -1453,6 +1453,17 @@ extern "C" {
    * become the sole fallback owner.
    */
   clsp_status_t clsp_core_start_apple_input_capture(
+    clsp_core_t *core,
+    clsp_apple_input_capture_t **output
+  );
+
+  /**
+   * @brief Start focused-window AppKit fallback capture on the calling main thread.
+   *
+   * Physical samples remain inside the native adapter and enter the same
+   * allocation-free input queues as preferred IOHID capture.
+   */
+  clsp_status_t clsp_core_start_apple_appkit_input_capture(
     clsp_core_t *core,
     clsp_apple_input_capture_t **output
   );

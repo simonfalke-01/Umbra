@@ -220,7 +220,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let maximumConcurrentArtworkRequests: Int
     private let lspProduct: LSPProductClient?
     private let lspDiscovery = LSPDiscovery.makeBonjourBrowser()
-    private let lspInputCapture = LSPAppKitInputCapture()
+    private let lspInputCapture: LSPAppKitInputCapture
     private weak var streamWindow: StreamWindowController?
     private let lspMediaCapabilities: AppleStreamingCapabilities
     private var activeLSPHostID: UUID?
@@ -274,6 +274,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.maximumConcurrentArtworkRequests = max(1, maximumConcurrentArtworkRequests)
         self.lspProduct = lspProduct
         self.streamWindow = streamWindow
+        self.lspInputCapture = LSPAppKitInputCapture(targetWindow: streamWindow?.inputCaptureWindow)
         self.lspMediaCapabilities = lspMediaCapabilities
         let (events, continuation) = AsyncStream<HostServiceEvent>.makeStream()
         handlerInstallationTask = Task { [service, continuation] in
@@ -878,15 +879,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 return .init(
                     error: nil,
                     stopKind: nil,
-                    telemetry: .init(
-                        lifecycle: value.lifecycle,
-                        receivedDatagrams: value.receivedDatagrams,
-                        transmittedDatagrams: value.transmittedDatagrams,
-                        droppedDatagrams: value.droppedDatagrams,
-                        authenticationFailures: value.authenticationFailures,
-                        currentUDPPayloadSize: value.currentUDPPayloadSize,
-                        reconnectPhase: value.reconnectPhase
-                    )
+                    telemetry: .init(value)
                 )
             }
         } catch {
@@ -900,6 +893,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
         let telemetry = try await session.telemetrySnapshot()
         let reconnect = await lspProduct?.reconnectTelemetry(hostID: hostID)
+        let media = await lspProduct?.productTelemetry(hostID: hostID)
         return .init(
             lifecycle: String(describing: telemetry.lifecycle),
             receivedDatagrams: telemetry.receivedDatagrams,
@@ -907,7 +901,27 @@ final class LiveUmbraClientService: UmbraClientServicing {
             droppedDatagrams: telemetry.droppedDatagrams,
             authenticationFailures: telemetry.authenticationFailures,
             currentUDPPayloadSize: telemetry.currentUDPPayloadSize,
-            reconnectPhase: reconnect.map { String(describing: $0.phase) }
+            reconnectPhase: reconnect.map { String(describing: $0.phase) },
+            completeFrameReceiveToVideoToolboxSubmit: media
+                .flatMap(\.completeFrameReceiveToVideoToolboxSubmit)
+                .map(CLILSPTimingDistribution.init),
+            videoToolboxSubmitToDecodeCompletion: media
+                .flatMap(\.videoToolboxSubmitToDecodeCompletion)
+                .map(CLILSPTimingDistribution.init),
+            completeFrameReceiveToMetalEnqueue: media
+                .flatMap(\.completeFrameReceiveToMetalEnqueue)
+                .map(CLILSPTimingDistribution.init),
+            metalEnqueueToCommit: media
+                .flatMap(\.metalEnqueueToCommit)
+                .map(CLILSPTimingDistribution.init),
+            audioReceiveToDecode: media
+                .flatMap(\.audioReceiveToDecode)
+                .map(CLILSPTimingDistribution.init),
+            audioDecodeAndRenderEnqueue: media
+                .flatMap(\.audioDecodeAndRenderEnqueue)
+                .map(CLILSPTimingDistribution.init),
+            audioUnderruns: media?.audioUnderruns,
+            audioRebuffers: media?.audioRebuffers
         )
     }
 
@@ -930,9 +944,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
         notifyLSPSessionTerminated(succeeded: succeeded)
     }
 
-    private func notifyLSPSessionTerminated(succeeded: Bool) {
+    private func notifyLSPSessionTerminated(succeeded: Bool, reason: String? = nil) {
         guard !didNotifyLSPSessionTermination else { return }
         didNotifyLSPSessionTermination = true
+        if onSessionTerminated != nil, let reason {
+            FileHandle.standardError.write(Data((reason + "\n").utf8))
+        }
         onSessionTerminated?(succeeded)
     }
 
@@ -1039,7 +1056,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 case .failed(let error):
                     self.eventHandler?(.sessionWarning("Native LSP stream failed: \(error.localizedDescription)"))
                     if !self.cliStopReplyPending {
-                        self.notifyLSPSessionTerminated(succeeded: false)
+                        self.notifyLSPSessionTerminated(
+                            succeeded: false,
+                            reason: "Native LSP stream failed: \(error.localizedDescription)"
+                        )
                     }
                 }
             }
@@ -1069,7 +1089,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     await self.streamWindow?.finish()
                     self.eventHandler?(.sessionWarning("Native LSP reconnect failed: \(error.localizedDescription)"))
                     if !self.cliStopReplyPending {
-                        self.notifyLSPSessionTerminated(succeeded: false)
+                        self.notifyLSPSessionTerminated(
+                            succeeded: false,
+                            reason: "Native LSP reconnect failed: \(error.localizedDescription)"
+                        )
                     }
                 }
             }

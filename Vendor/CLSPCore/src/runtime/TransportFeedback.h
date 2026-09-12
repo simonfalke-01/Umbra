@@ -478,4 +478,98 @@ namespace umbra::lsp {
     std::copy(cname.begin(), cname.end(), packet.begin() + static_cast<std::ptrdiff_t>(rr_size + 10U));
     return total;
   }
+
+  /**
+   * @brief Write one input sender report with receiver blocks and stable SDES CNAME.
+   *
+   * @param sender_ssrc Active input RTP sender SSRC.
+   * @param cname Stable association CNAME.
+   * @param ntp_seconds Current NTP seconds field.
+   * @param ntp_fraction Current NTP fractional field.
+   * @param rtp_timestamp Projected 1-MHz input RTP timestamp.
+   * @param packet_count Successfully submitted input RTP packet count.
+   * @param octet_count Successfully submitted input RTP payload octets.
+   * @param reports Authenticated forward-media receiver report blocks.
+   * @param destination Bounded plaintext RTCP storage.
+   * @return Complete compound byte count, or zero when validation fails.
+   */
+  [[nodiscard]] inline std::size_t write_compound_input_sr_sdes(
+    const std::uint32_t sender_ssrc,
+    const std::span<const std::uint8_t> cname,
+    const std::uint32_t ntp_seconds,
+    const std::uint32_t ntp_fraction,
+    const std::uint32_t rtp_timestamp,
+    const std::uint32_t packet_count,
+    const std::uint32_t octet_count,
+    const std::span<const native_receiver_report_block> reports,
+    const std::span<std::uint8_t> destination
+  ) noexcept {
+    if (sender_ssrc == 0 || cname.empty() || cname.size() > UINT8_MAX || reports.size() > 31U) {
+      return 0;
+    }
+    for (const auto &report : reports) {
+      if (report.media_ssrc == 0) {
+        return 0;
+      }
+    }
+    const auto sr_size = 28U + reports.size() * 24U;
+    const auto sdes_unpadded = 4U + 4U + 2U + cname.size() + 1U;
+    const auto sdes_size = (sdes_unpadded + 3U) & ~std::size_t {3U};
+    const auto total = sr_size + sdes_size;
+    if (destination.size() < total || sr_size / 4U - 1U > UINT16_MAX ||
+        sdes_size / 4U - 1U > UINT16_MAX) {
+      return 0;
+    }
+    const auto packet = destination.first(total);
+    std::fill(packet.begin(), packet.end(), 0);
+    packet[0] = static_cast<std::uint8_t>(0x80U | reports.size());
+    packet[1] = 200U;
+    lumen::lsp::wire::write_be<std::uint16_t>(
+      packet.subspan(2, 2),
+      static_cast<std::uint16_t>(sr_size / 4U - 1U)
+    );
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(4, 4), sender_ssrc);
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(8, 4), ntp_seconds);
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(12, 4), ntp_fraction);
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(16, 4), rtp_timestamp);
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(20, 4), packet_count);
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(24, 4), octet_count);
+    for (std::size_t index = 0; index < reports.size(); ++index) {
+      const auto offset = 28U + index * 24U;
+      const auto &report = reports[index];
+      lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(offset, 4), report.media_ssrc);
+      packet[offset + 4U] = report.fraction_lost;
+      const auto lost = static_cast<std::uint32_t>(report.cumulative_lost) & 0x00ff'ffffU;
+      packet[offset + 5U] = static_cast<std::uint8_t>(lost >> 16U);
+      packet[offset + 6U] = static_cast<std::uint8_t>(lost >> 8U);
+      packet[offset + 7U] = static_cast<std::uint8_t>(lost);
+      lumen::lsp::wire::write_be<std::uint32_t>(
+        packet.subspan(offset + 8U, 4),
+        report.extended_highest_sequence
+      );
+      lumen::lsp::wire::write_be<std::uint32_t>(
+        packet.subspan(offset + 12U, 4),
+        report.interarrival_jitter
+      );
+      lumen::lsp::wire::write_be<std::uint32_t>(
+        packet.subspan(offset + 16U, 4),
+        report.last_sender_report
+      );
+      lumen::lsp::wire::write_be<std::uint32_t>(
+        packet.subspan(offset + 20U, 4),
+        report.delay_since_last_sender_report
+      );
+    }
+    packet[sr_size] = 0x81U;
+    packet[sr_size + 1U] = 202U;
+    lumen::lsp::wire::write_be<std::uint16_t>(
+      packet.subspan(sr_size + 2U, 2),
+      static_cast<std::uint16_t>(sdes_size / 4U - 1U)
+    );
+    lumen::lsp::wire::write_be<std::uint32_t>(packet.subspan(sr_size + 4U, 4), sender_ssrc);
+    packet[sr_size + 8U] = 1U;
+    packet[sr_size + 9U] = static_cast<std::uint8_t>(cname.size());
+    std::copy(cname.begin(), cname.end(), packet.begin() + static_cast<std::ptrdiff_t>(sr_size + 10U));
+    return total;
+  }
 }  // namespace umbra::lsp

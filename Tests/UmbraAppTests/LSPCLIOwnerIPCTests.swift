@@ -1,11 +1,41 @@
 import Darwin
 import Foundation
+import UmbraCLIExecution
 import XCTest
 @testable import UmbraApp
 
 final class LSPCLIOwnerIPCTests: XCTestCase {
     func testSameUserBoundedOwnerEndpointRoutesOnlyMatchingHost() async throws {
         let hostID = UUID()
+        let timing: (UInt64) -> CLILSPTimingDistribution = { value in
+            .init(
+                boundedWindowSampleCount: Int(value),
+                p50Microseconds: value * 10,
+                p95Microseconds: value * 20,
+                p99Microseconds: value * 30,
+                maximumMicroseconds: value * 40,
+                measurementDrops: value * 2,
+                clockDomain: value.isMultiple(of: 2)
+                    ? "client-monotonic/kernel-timestamped" : "client-monotonic"
+            )
+        }
+        let expected = CLILSPTelemetry(
+            lifecycle: "authenticated",
+            receivedDatagrams: 10,
+            transmittedDatagrams: 20,
+            droppedDatagrams: 1,
+            authenticationFailures: 0,
+            currentUDPPayloadSize: 1_400,
+            reconnectPhase: nil,
+            completeFrameReceiveToVideoToolboxSubmit: timing(1),
+            videoToolboxSubmitToDecodeCompletion: timing(2),
+            completeFrameReceiveToMetalEnqueue: timing(3),
+            metalEnqueueToCommit: timing(4),
+            audioReceiveToDecode: timing(5),
+            audioDecodeAndRenderEnqueue: timing(6),
+            audioUnderruns: 0,
+            audioRebuffers: nil
+        )
         let endpoint = try LSPCLIOwnerEndpoint(hostID: hostID) { request in
             guard request.hostID == hostID, request.command == .telemetry else {
                 return .init(error: "mismatch", stopKind: nil, telemetry: nil)
@@ -13,15 +43,7 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
             return .init(
                 error: nil,
                 stopKind: nil,
-                telemetry: .init(
-                    lifecycle: "authenticated",
-                    receivedDatagrams: 10,
-                    transmittedDatagrams: 20,
-                    droppedDatagrams: 1,
-                    authenticationFailures: 0,
-                    currentUDPPayloadSize: 1_400,
-                    reconnectPhase: nil
-                )
+                telemetry: .init(expected)
             )
         }
         defer { endpoint.stop() }
@@ -30,7 +52,17 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
             hostID: hostID,
             command: .telemetry
         )
-        XCTAssertEqual(response.telemetry?.receivedDatagrams, 10)
+        let telemetry = try XCTUnwrap(response.telemetry?.cliValue)
+        XCTAssertEqual(telemetry, expected)
+        XCTAssertTrue(telemetry.commandLineOutput.contains(
+            "lsp.media.complete_frame_receive_to_videotoolbox_submit.bounded_window_samples=1\n"
+        ))
+        XCTAssertTrue(telemetry.commandLineOutput.contains(
+            "lsp.media.videotoolbox_submit_to_decode_completion.clock_domain="
+                + "client-monotonic/kernel-timestamped\n"
+        ))
+        XCTAssertTrue(telemetry.commandLineOutput.contains("lsp.media.audio_underruns=0\n"))
+        XCTAssertTrue(telemetry.commandLineOutput.contains("lsp.media.audio_rebuffers=unavailable\n"))
         var parentStatus = stat()
         let parent = "/tmp/umbra-lsp-owner-\(geteuid())"
         XCTAssertEqual(lstat(parent, &parentStatus), 0)
