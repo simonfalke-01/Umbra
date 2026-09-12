@@ -1440,11 +1440,17 @@ extern "C" clsp_status_t clsp_core_start_apple_appkit_input_capture(
     return CLSP_STATUS_INPUT_UNAVAILABLE;
   }
   capture->queue = dispatch_queue_create("app.umbra.lsp-appkit", DISPATCH_QUEUE_SERIAL);
-  if (capture->queue == nullptr || !install_appkit_monitor(*capture)) {
+  if (capture->queue == nullptr) {
     quiesce(*capture);
     clsp_core_release(core);
     delete capture;
     return CLSP_STATUS_RESOURCE_EXHAUSTED;
+  }
+  if (!install_appkit_monitor(*capture)) {
+    quiesce(*capture);
+    clsp_core_release(core);
+    delete capture;
+    return CLSP_STATUS_INPUT_UNAVAILABLE;
   }
   publish_pointer_arrival(*capture);
   const auto neutralize_status = clsp_core_neutralize_input(core);

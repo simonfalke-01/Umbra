@@ -12,6 +12,8 @@ final class LSPAppKitInputCapture {
     private var session: LSPClientSession?
     private var nativeCapture: LSPAppleInputCapture?
     private var focusObservers: [NSObjectProtocol] = []
+    private var scheduledSourceStart: Task<Void, Never>?
+    private var isStartingSources = false
 
     init(targetWindow: NSWindow?) {
         self.targetWindow = targetWindow
@@ -45,7 +47,7 @@ final class LSPAppKitInputCapture {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.startSources() }
+                MainActor.assumeIsolated { self?.scheduleSourceStart() }
             },
             center.addObserver(
                 forName: NSWindow.didResignKeyNotification,
@@ -59,7 +61,7 @@ final class LSPAppKitInputCapture {
                 object: targetWindow,
                 queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.startSources() }
+                MainActor.assumeIsolated { self?.scheduleSourceStart() }
             },
             center.addObserver(
                 forName: NSWindow.willCloseNotification,
@@ -95,13 +97,41 @@ final class LSPAppKitInputCapture {
         }
     }
 
+    /// Coalesces activation and key-window notifications after the current AppKit transition unwinds.
+    private func scheduleSourceStart() {
+        guard scheduledSourceStart == nil else { return }
+        scheduledSourceStart = Task { @MainActor [weak self] in
+            guard !Task.isCancelled, let self else { return }
+            self.scheduledSourceStart = nil
+            self.startSources()
+        }
+    }
+
+    /// Returns whether the exact stream window currently owns application input focus.
+    private var ownsInputFocus: Bool {
+        guard NSApp.isActive,
+              let targetWindow,
+              let keyWindow = NSApp.keyWindow else { return false }
+        return targetWindow.isKeyWindow && keyWindow === targetWindow
+    }
+
     private func startSourcesThrowing() throws {
         guard nativeCapture == nil,
               let session,
-              NSApp.isActive,
-              targetWindow?.isKeyWindow == true else { return }
+              ownsInputFocus else { return }
+        guard !isStartingSources else {
+            scheduleSourceStart()
+            return
+        }
+        isStartingSources = true
+        defer { isStartingSources = false }
         do {
-            nativeCapture = try session.startAppleInputCapture()
+            let capture = try session.startAppleInputCapture()
+            guard self.session === session, ownsInputFocus else {
+                capture.stop()
+                return
+            }
+            nativeCapture = capture
             return
         } catch LSPTransportError.inputPermissionDenied, LSPTransportError.inputUnavailable {
             // Native start quiesces completely before returning, so AppKit now
@@ -109,7 +139,13 @@ final class LSPAppKitInputCapture {
         } catch {
             throw error
         }
-        nativeCapture = try session.startAppleAppKitInputCapture()
+        guard self.session === session, ownsInputFocus else { return }
+        let capture = try session.startAppleAppKitInputCapture()
+        guard self.session === session, ownsInputFocus else {
+            capture.stop()
+            return
+        }
+        nativeCapture = capture
     }
 
     /// Emits releases, neutralizes native authority, restores coalescing, and removes callbacks.
@@ -124,6 +160,8 @@ final class LSPAppKitInputCapture {
     }
 
     private func stopSources() {
+        scheduledSourceStart?.cancel()
+        scheduledSourceStart = nil
         if let nativeCapture {
             nativeCapture.stop()
             self.nativeCapture = nil

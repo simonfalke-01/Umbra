@@ -1,4 +1,5 @@
 import CLSPCore
+import Dispatch
 import Foundation
 
 /// Congestion profile selected for an LSP connection.
@@ -2220,10 +2221,12 @@ public final class LSPAppleInputCapture: @unchecked Sendable {
     }
 }
 
-private final class LSPNativeCallbackState: @unchecked Sendable {
+final class LSPNativeCallbackState: @unchecked Sendable {
     typealias Completion = @Sendable (Result<LSPControlEvent, LSPTransportError>) -> Void
 
     private let lock = NSLock()
+    private let videoDeliveryQueue = DispatchQueue(label: "app.umbra.lsp-video-delivery", qos: .userInteractive)
+    private var videoHandlerGeneration: UInt64 = 0
     private var completions: [UInt64: Completion] = [:]
     private var eventHandler: (@Sendable (LSPControlEvent) -> Void)?
     private var lifecycleHandler: (@Sendable (LSPTransportLifecycle) -> Void)?
@@ -2322,12 +2325,25 @@ private final class LSPNativeCallbackState: @unchecked Sendable {
     }
 
     func receiveVideoAccessUnit(_ accessUnit: LSPEncodedVideoAccessUnit) {
-        let handler = lock.withLock { videoAccessUnitHandler }
-        handler?(accessUnit)
+        guard let generation = lock.withLock({ videoAccessUnitHandler == nil ? nil : videoHandlerGeneration }) else {
+            return
+        }
+        // Retained native frame buffers bound this queue to decoder surfaces + 2.
+        // VideoToolbox can synchronously reject/complete a submission; consumer
+        // feedback must therefore run outside the native callback's thread scope.
+        videoDeliveryQueue.async { [self, accessUnit] in
+            let handler = lock.withLock {
+                videoHandlerGeneration == generation ? videoAccessUnitHandler : nil
+            }
+            handler?(accessUnit)
+        }
     }
 
     func setVideoAccessUnitHandler(_ handler: (@Sendable (LSPEncodedVideoAccessUnit) -> Void)?) {
-        lock.withLock { videoAccessUnitHandler = handler }
+        lock.withLock {
+            videoHandlerGeneration &+= 1
+            videoAccessUnitHandler = handler
+        }
     }
 
     func receivePathProbe(_ event: LSPPathProbeEvent) {

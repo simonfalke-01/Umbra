@@ -1,9 +1,39 @@
+import AppKit
 import CLSPCore
 import Darwin
 import XCTest
 @testable import UmbraLSPTransport
 
 final class LSPTransportTests: XCTestCase {
+    func testVideoConsumerRunsOutsideNativeCallbackThread() {
+        let callbackState = LSPNativeCallbackState()
+        let nativeThreadID = pthread_mach_thread_np(pthread_self())
+        let delivered = expectation(description: "frame delivered outside native callback")
+        callbackState.setVideoAccessUnitHandler { frame in
+            XCTAssertNotEqual(pthread_mach_thread_np(pthread_self()), nativeThreadID)
+            XCTAssertEqual(frame.frameID, 1)
+            delivered.fulfill()
+        }
+        callbackState.receiveVideoAccessUnit(.init(
+            videoGeneration: 1, rtpTimestamp: 1, frameID: 1,
+            receiveTimeMicroseconds: 1, captureTimeMicroseconds: 1,
+            inputStateSequence: 0, inputEdgeID: 0, recoveryEpoch: 0,
+            independent: true, codec: 2, payloadFormat: .annexB,
+            encodedAccessUnit: Data([0, 0, 0, 1])
+        ))
+        wait(for: [delivered], timeout: 1)
+    }
+
+    @MainActor
+    func testAppKitCaptureWithoutKeyWindowIsUnavailableNotExhausted() throws {
+        guard NSApp?.keyWindow == nil else { throw XCTSkip("Requires no test-owned key window.") }
+        let core = try makeInactiveNativeCore()
+        defer { clsp_core_release(core) }
+        var capture: OpaquePointer?
+        XCTAssertEqual(clsp_core_start_apple_appkit_input_capture(core, &capture), CLSP_STATUS_INPUT_UNAVAILABLE)
+        XCTAssertNil(capture)
+    }
+
     func testNativeAppleInputCaptureFailedStartupCanBeRetriedWithoutAbort() throws {
         let core = try makeInactiveNativeCore()
         defer { clsp_core_release(core) }
