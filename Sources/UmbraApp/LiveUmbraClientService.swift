@@ -223,6 +223,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let lspInputCapture: LSPAppKitInputCapture
     private weak var streamWindow: StreamWindowController?
     private let lspMediaCapabilities: AppleStreamingCapabilities
+    private let lspFailureHandler: @Sendable (String) -> Void
     private var activeLSPHostID: UUID?
     private var activeLSPApplicationID: String?
     private var lspOwnerEndpoint: LSPCLIOwnerEndpoint?
@@ -263,7 +264,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
         maximumConcurrentArtworkRequests: Int = 4,
         lspProduct: LSPProductClient? = nil,
         streamWindow: StreamWindowController? = nil,
-        lspMediaCapabilities: AppleStreamingCapabilities = .probe()
+        lspMediaCapabilities: AppleStreamingCapabilities = .probe(),
+        lspFailureHandler: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.service = service
         self.preferences = preferences
@@ -276,6 +278,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.streamWindow = streamWindow
         self.lspInputCapture = LSPAppKitInputCapture(targetWindow: streamWindow?.inputCaptureWindow)
         self.lspMediaCapabilities = lspMediaCapabilities
+        self.lspFailureHandler = lspFailureHandler
         let (events, continuation) = AsyncStream<HostServiceEvent>.makeStream()
         handlerInstallationTask = Task { [service, continuation] in
             await service.setEventHandler { event in
@@ -586,8 +589,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 displayApplicationID: id,
                 resume: resume,
                 preferences: resolved,
-                microphoneOffer: microphoneOffer,
-                installCLIOwner: false
+                microphoneOffer: microphoneOffer
             )
             return
         }
@@ -653,7 +655,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         guard request.intent.hostID == "lsp:\(target.hostID.uuidString.lowercased())" else {
             throw UmbraClientServiceError.invalidInput("The resolved LSP host does not match the stream intent.")
         }
-        try await requireAvailableCLIOwner(hostID: target.hostID)
         guard let lspProduct else {
             throw UmbraClientServiceError.unavailable("Native LSP is unavailable in this build.")
         }
@@ -666,8 +667,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             displayApplicationID: ApplicationID(request.intent.applicationID),
             resume: request.intent.kind == .resume,
             preferences: request.intent.preferences,
-            microphoneOffer: microphoneOffer,
-            installCLIOwner: true
+            microphoneOffer: microphoneOffer
         )
         guard target.emitTelemetry else { return nil }
         return try await lspTelemetry(hostID: target.hostID)
@@ -681,60 +681,61 @@ final class LiveUmbraClientService: UmbraClientServicing {
         displayApplicationID: ApplicationID,
         resume: Bool,
         preferences: StreamingPreferences,
-        microphoneOffer: LSPMicrophoneOffer?,
-        installCLIOwner: Bool
+        microphoneOffer: LSPMicrophoneOffer?
     ) async throws {
-        guard activeLSPHostID == nil else { throw LSPControlStatus.busy }
+        guard activeLSPHostID == nil, lspOwnerEndpoint == nil else { throw LSPControlStatus.busy }
         guard lspMediaCapabilities.hasMetalDevice,
               let frameRate = preferences.normalizedFrameRate
         else { throw UmbraClientServiceError.unavailable("Native LSP requires Metal and a valid refresh rate.") }
-        try await configureLSPTransport(product, preferences: preferences)
         guard let streamWindow else {
             throw UmbraClientServiceError.unavailable("Native LSP hardware video is unavailable.")
         }
-        try await streamWindow.prepareLSPVideo(
-            applicationName: applicationName,
-            preferences: preferences
-        )
-        var started = false
-        defer { if !started { Task { @MainActor in await streamWindow.finish() } } }
-        let session = try await product.startInput(
-            hostID: hostID,
-            applicationID: applicationID,
-            resume: resume,
-            pointerRate: UInt32(preferences.lspPointerRate),
-            controllerRate: UInt32(preferences.lspControllerRate),
-            sensorRate: UInt32(preferences.lspSensorRate),
-            reconciliationRate: UInt32(preferences.lspReconciliationRate),
-            microphoneOffer: microphoneOffer,
-            capabilities: lspMediaCapabilities,
-            preferences: preferences,
-            refreshNumerator: frameRate.numerator,
-            refreshDenominator: frameRate.denominator,
-            decoderSurfaces: 3,
-            maximumCaptureToPresentMicroseconds: UInt32(max(
-                10_000,
-                Int(2_000_000 * Double(frameRate.denominator) / Double(frameRate.numerator))
-            ))
-        )
+        // Reserve ownership before the first suspension in GUI and CLI startup.
+        // A second instance must not send START or prepare another stream window
+        // while this host is already owned locally.
+        try installCLIOwnerEndpoint(hostID: hostID)
+        let session: LSPClientSession
+        var remoteStarted = false
         do {
+            try await configureLSPTransport(product, preferences: preferences)
+            try await streamWindow.prepareLSPVideo(
+                applicationName: applicationName,
+                preferences: preferences
+            )
+            session = try await product.startInput(
+                hostID: hostID,
+                applicationID: applicationID,
+                resume: resume,
+                pointerRate: UInt32(preferences.lspPointerRate),
+                controllerRate: UInt32(preferences.lspControllerRate),
+                sensorRate: UInt32(preferences.lspSensorRate),
+                reconciliationRate: UInt32(preferences.lspReconciliationRate),
+                microphoneOffer: microphoneOffer,
+                capabilities: lspMediaCapabilities,
+                preferences: preferences,
+                refreshNumerator: frameRate.numerator,
+                refreshDenominator: frameRate.denominator,
+                decoderSurfaces: 3,
+                maximumCaptureToPresentMicroseconds: UInt32(max(
+                    10_000,
+                    Int(2_000_000 * Double(frameRate.denominator) / Double(frameRate.numerator))
+                ))
+            )
+            remoteStarted = true
             try lspInputCapture.transfer(to: session)
             activeLSPHostID = hostID
             activeLSPApplicationID = applicationID
             didNotifyLSPSessionTermination = false
-            if installCLIOwner {
-                try installCLIOwnerEndpoint(hostID: hostID)
-            }
         } catch {
             lspInputCapture.stop()
+            if remoteStarted { _ = await product.stop(hostID: hostID) }
+            await streamWindow.finish()
             lspOwnerEndpoint?.stop()
             lspOwnerEndpoint = nil
             activeLSPHostID = nil
             activeLSPApplicationID = nil
-            _ = await product.stop(hostID: hostID)
             throw error
         }
-        started = true
         markLSPHostSession(hostID: hostID, runningApplicationID: displayApplicationID)
         streamWindow.onTextCommit = { [weak self] text in
             Task { @MainActor [weak self] in
@@ -811,18 +812,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
     }
 
-    private func requireAvailableCLIOwner(hostID: UUID) async throws {
-        guard LSPCLIOwnerEndpoint.endpointExists(hostID: hostID) else { return }
-        do {
-            _ = try await LSPCLIOwnerEndpoint.request(hostID: hostID, command: .telemetry)
-            throw LSPControlStatus.busy
-        } catch LSPCLIOwnerIPCError.unavailable {
-            // The endpoint constructor safely replaces a same-user stale socket.
-        }
-    }
-
     private func installCLIOwnerEndpoint(hostID: UUID) throws {
-        lspOwnerEndpoint?.stop()
         lspOwnerEndpoint = try LSPCLIOwnerEndpoint(
             hostID: hostID,
             handler: { [weak self] request in
@@ -947,8 +937,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private func notifyLSPSessionTerminated(succeeded: Bool, reason: String? = nil) {
         guard !didNotifyLSPSessionTermination else { return }
         didNotifyLSPSessionTermination = true
-        if onSessionTerminated != nil, let reason {
-            FileHandle.standardError.write(Data((reason + "\n").utf8))
+        if let reason {
+            lspFailureHandler(reason)
+            if onSessionTerminated != nil {
+                FileHandle.standardError.write(Data((reason + "\n").utf8))
+            }
         }
         onSessionTerminated?(succeeded)
     }
@@ -1940,7 +1933,10 @@ final class LiveApplicationComposition {
             ),
             lspProduct: lspProduct,
             streamWindow: streamWindow,
-            lspMediaCapabilities: mediaCapabilities
+            lspMediaCapabilities: mediaCapabilities,
+            lspFailureHandler: { [supportLogger] message in
+                supportLogger?.record(source: "LSP", level: .error, message: message)
+            }
         )
         streamWindow.onStopRequested = { [weak clientService] quitHostApplication in
             await clientService?.stopFromStreamWindow(quitHostApplication: quitHostApplication)

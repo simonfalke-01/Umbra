@@ -71,6 +71,58 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
         let socket = "\(parent)/\(hostID.uuidString.lowercased()).sock"
         XCTAssertEqual(lstat(socket, &socketStatus), 0)
         XCTAssertEqual(socketStatus.st_mode & 0o077, 0)
+        var ownershipStatus = stat()
+        let ownership = "\(parent)/\(hostID.uuidString.lowercased()).lock"
+        XCTAssertEqual(lstat(ownership, &ownershipStatus), 0)
+        XCTAssertEqual(ownershipStatus.st_uid, geteuid())
+        XCTAssertEqual(ownershipStatus.st_mode & S_IFMT, S_IFREG)
+        XCTAssertEqual(ownershipStatus.st_mode & 0o077, 0)
+    }
+
+    func testSecondOwnerIsRejectedWithoutReplacingOriginalEndpoint() async throws {
+        let hostID = UUID()
+        let endpoint = try LSPCLIOwnerEndpoint(hostID: hostID) { _ in
+            .init(
+                error: nil,
+                stopKind: nil,
+                telemetry: Self.telemetry(lifecycle: "original")
+            )
+        }
+        defer { endpoint.stop() }
+
+        XCTAssertThrowsError(
+            try LSPCLIOwnerEndpoint(hostID: hostID) { _ in
+                .init(
+                    error: nil,
+                    stopKind: nil,
+                    telemetry: Self.telemetry(lifecycle: "replacement")
+                )
+            }
+        ) { error in
+            guard case LSPCLIOwnerIPCError.ownerAlreadyRunning = error else {
+                return XCTFail("Unexpected second-owner error: \(error)")
+            }
+        }
+
+        let response = try await LSPCLIOwnerEndpoint.request(hostID: hostID, command: .telemetry)
+        XCTAssertEqual(response.telemetry?.lifecycle, "original")
+    }
+
+    func testStoppedOwnerCannotRemoveSuccessorEndpoint() async throws {
+        let hostID = UUID()
+        let original = try LSPCLIOwnerEndpoint(hostID: hostID) { _ in
+            .init(error: nil, stopKind: nil, telemetry: Self.telemetry(lifecycle: "original"))
+        }
+        original.stop()
+
+        let successor = try LSPCLIOwnerEndpoint(hostID: hostID) { _ in
+            .init(error: nil, stopKind: nil, telemetry: Self.telemetry(lifecycle: "successor"))
+        }
+        defer { successor.stop() }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        let response = try await LSPCLIOwnerEndpoint.request(hostID: hostID, command: .telemetry)
+        XCTAssertEqual(response.telemetry?.lifecycle, "successor")
     }
 
     func testResponseSentHandlerRunsOnlyAfterReplyIsWritableToClient() async throws {
@@ -95,6 +147,18 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
         let response = try await request.value
         XCTAssertEqual(response.stopKind, "stopped")
         await gate.open()
+    }
+
+    private static func telemetry(lifecycle: String) -> LSPCLIOwnerTelemetry {
+        .init(
+            lifecycle: lifecycle,
+            receivedDatagrams: 0,
+            transmittedDatagrams: 0,
+            droppedDatagrams: 0,
+            authenticationFailures: 0,
+            currentUDPPayloadSize: 1_400,
+            reconnectPhase: nil
+        )
     }
 }
 

@@ -137,6 +137,7 @@ extension CLILSPTimingDistribution {
 
 enum LSPCLIOwnerIPCError: Error, LocalizedError {
     case unavailable
+    case ownerAlreadyRunning
     case insecureEndpoint
     case invalidMessage
     case remote(String)
@@ -145,6 +146,7 @@ enum LSPCLIOwnerIPCError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unavailable: "The long-lived LSP owner is not running."
+        case .ownerAlreadyRunning: "Umbra is already starting or streaming from this host."
         case .insecureEndpoint: "The LSP owner endpoint failed same-user permission validation."
         case .invalidMessage: "The LSP owner returned an invalid bounded response."
         case .remote(let message): message
@@ -162,6 +164,7 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
 
     private let path: String
     private let descriptor: Int32
+    private let ownershipDescriptor: Int32
     private let handler: Handler
     private let task: Task<Void, Never>
     private let lock = NSLock()
@@ -174,11 +177,30 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
     ) throws {
         path = try Self.endpointPath(hostID: hostID, createParent: true)
         self.handler = handler
-        descriptor = try Self.makeListener(path: path)
+        let acquiredOwnershipDescriptor = try Self.acquireOwnership(path: path)
+        let listenerDescriptor: Int32
+        do {
+            listenerDescriptor = try Self.makeListener(path: path)
+        } catch {
+            Self.releaseOwnership(descriptor: acquiredOwnershipDescriptor)
+            throw error
+        }
+        let acceptDescriptor = Darwin.dup(listenerDescriptor)
+        guard acceptDescriptor >= 0 else {
+            let duplicationError = errno
+            _ = Darwin.shutdown(listenerDescriptor, SHUT_RDWR)
+            _ = Darwin.close(listenerDescriptor)
+            _ = unlink(path)
+            Self.releaseOwnership(descriptor: acquiredOwnershipDescriptor)
+            throw LSPCLIOwnerIPCError.system(duplicationError)
+        }
+        descriptor = listenerDescriptor
+        ownershipDescriptor = acquiredOwnershipDescriptor
         task = Task.detached(priority: .utility) {
-            [path, descriptor, handler, responseSentHandler] in
+            [acceptDescriptor, handler, responseSentHandler] in
+            defer { _ = Darwin.close(acceptDescriptor) }
             while !Task.isCancelled {
-                let client = Darwin.accept(descriptor, nil, nil)
+                let client = Darwin.accept(acceptDescriptor, nil, nil)
                 if client < 0 {
                     if errno == EINTR { continue }
                     return
@@ -190,7 +212,6 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
                     responseSentHandler: responseSentHandler
                 )
             }
-            _ = unlink(path)
         }
     }
 
@@ -207,6 +228,7 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
         _ = Darwin.shutdown(descriptor, SHUT_RDWR)
         _ = Darwin.close(descriptor)
         _ = unlink(path)
+        Self.releaseOwnership(descriptor: ownershipDescriptor)
     }
 
     static func request(hostID: UUID, command: LSPCLIOwnerCommand) async throws -> LSPCLIOwnerResponse {
@@ -288,6 +310,73 @@ final class LSPCLIOwnerEndpoint: @unchecked Sendable {
             _ = unlink(path)
             throw error
         }
+    }
+
+    private static func acquireOwnership(path: String) throws -> Int32 {
+        let ownershipPath = URL(fileURLWithPath: path)
+            .deletingPathExtension()
+            .appendingPathExtension("lock")
+            .path
+        let descriptor: Int32
+        while true {
+            let existingDescriptor = ownershipPath.withCString {
+                Darwin.open($0, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_EXLOCK | O_NONBLOCK)
+            }
+            if existingDescriptor >= 0 {
+                descriptor = existingDescriptor
+                break
+            }
+            let openError = errno
+            if openError == EWOULDBLOCK {
+                throw LSPCLIOwnerIPCError.ownerAlreadyRunning
+            }
+            guard openError == ENOENT else {
+                if openError == EINTR { continue }
+                throw openError == ELOOP
+                    ? LSPCLIOwnerIPCError.insecureEndpoint
+                    : LSPCLIOwnerIPCError.system(openError)
+            }
+
+            let createdDescriptor = ownershipPath.withCString {
+                Darwin.open(
+                    $0,
+                    O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_EXLOCK | O_NONBLOCK,
+                    mode_t(S_IRUSR | S_IWUSR)
+                )
+            }
+            if createdDescriptor >= 0 {
+                descriptor = createdDescriptor
+                break
+            }
+            let createError = errno
+            if createError == EEXIST || createError == EINTR { continue }
+            throw createError == ELOOP
+                ? LSPCLIOwnerIPCError.insecureEndpoint
+                : LSPCLIOwnerIPCError.system(createError)
+        }
+
+        do {
+            var status = stat()
+            guard Darwin.fstat(descriptor, &status) == 0 else {
+                throw LSPCLIOwnerIPCError.system(errno)
+            }
+            guard status.st_uid == geteuid(),
+                  status.st_mode & S_IFMT == S_IFREG,
+                  status.st_mode & 0o077 == 0 else {
+                throw LSPCLIOwnerIPCError.insecureEndpoint
+            }
+            guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+                throw LSPCLIOwnerIPCError.system(errno)
+            }
+            return descriptor
+        } catch {
+            _ = Darwin.close(descriptor)
+            throw error
+        }
+    }
+
+    private static func releaseOwnership(descriptor: Int32) {
+        _ = Darwin.close(descriptor)
     }
 
     private static func endpointPath(hostID: UUID, createParent: Bool) throws -> String {
