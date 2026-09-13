@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #if defined(__APPLE__)
 #include <os/log.h>
+#include <time.h>
 #endif
 #endif
 
@@ -355,9 +356,30 @@ private:
         size <= 0) {
       return WOLFSSL_CBIO_ERR_GENERAL;
     }
-    const auto sent =
+    auto sent =
         ::send(self->socket_, buffer, static_cast<std::size_t>(size), 0);
+#if defined(__APPLE__)
+    // The first send can precede completion of macOS's asynchronous Local
+    // Network decision. Keep this socket alive for that decision, rather than
+    // immediately cancelling it and creating another unvalidated socket.
+    // Only the first datagram gets this bounded grace; explicit permission
+    // errors and every established-association error retain their old policy.
+    while (sent < 0 && !self->sent_datagram_ && self->startup_route_retries_ < 3U &&
+           (errno == EHOSTUNREACH || errno == ENETUNREACH || errno == EPIPE)) {
+      ++self->startup_route_retries_;
+      const timespec delay {.tv_sec = 0, .tv_nsec = 20'000'000L};
+      (void)nanosleep(&delay, nullptr);
+      sent = ::send(self->socket_, buffer, static_cast<std::size_t>(size), 0);
+    }
+#endif
     if (sent == size) {
+#if defined(__APPLE__)
+      if (!self->sent_datagram_ && self->startup_route_retries_ != 0) {
+        os_log_info(OS_LOG_DEFAULT, "LSP initial datagram accepted after %{public}u startup retries",
+                    self->startup_route_retries_);
+      }
+#endif
+      self->sent_datagram_ = true;
       return size;
     }
     if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == EINTR)) {
@@ -515,6 +537,8 @@ private:
   int socket_{-1};         ///< Connected nonblocking UDP socket.
   bool socket_failed_{};   ///< Terminal UDP send error, distinct from DTLS policy.
   int send_error_{};       ///< Saved kernel errno before logging or wolfSSL can overwrite it.
+  bool sent_datagram_{};   ///< Whether this association has submitted its first datagram.
+  unsigned int startup_route_retries_{}; ///< At most three first-datagram policy/route retries.
   std::span<const std::uint8_t>
       pending_input_{}; ///< One complete incoming DTLS datagram.
   DtlsApplicationDataCallback

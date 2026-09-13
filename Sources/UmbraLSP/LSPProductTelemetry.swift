@@ -15,6 +15,8 @@ public struct LSPDistributionSnapshot: Equatable, Sendable {
 public struct LSPProductTelemetrySnapshot: Equatable, Sendable {
     /// Coarse VideoToolbox pipeline counters captured on the low-rate telemetry tick.
     public var videoDecoderStatistics: MediaPipelineStatistics? = nil
+    /// Host encoder-submit to encoded-access-unit-complete duration from authenticated LSP frame metadata.
+    public var hostEncoderDuration: LSPDistributionSnapshot? = nil
     public var completeFrameReceiveToVideoToolboxSubmit: LSPDistributionSnapshot?
     public var videoToolboxSubmitToDecodeCompletion: LSPDistributionSnapshot?
     public var completeFrameReceiveToMetalEnqueue: LSPDistributionSnapshot?

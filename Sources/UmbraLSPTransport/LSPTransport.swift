@@ -537,6 +537,8 @@ public struct LSPEncodedVideoAccessUnit: @unchecked Sendable {
     public var frameID: UInt64
     public var receiveTimeMicroseconds: UInt64
     public var captureTimeMicroseconds: UInt64
+    /// Authenticated host encoder-completion minus encoder-submit duration.
+    public var hostEncoderDurationMicroseconds: UInt32?
     public var inputStateSequence: UInt64
     public var inputEdgeID: UInt64
     public var recoveryEpoch: UInt32
@@ -746,7 +748,7 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
 /// configuration, start/stop, and low-rate telemetry snapshots.
 public final class LSPTransport: @unchecked Sendable {
     /// ABI version compiled into the Swift façade.
-    public static let abiVersion: UInt32 = 2
+    public static let abiVersion: UInt32 = 3
 
     /// Expected source digest for the pinned Photon portable protocol core.
     public static let sourceDigest = "d565644e8c3a00d6c474d6c118b8b8eccd3140d35eda54dbb0bba7c42f1ca7f0"
@@ -2479,7 +2481,7 @@ private let lspVideoAccessUnitCallback: @convention(c) (
           native.structure_size == MemoryLayout<clsp_video_access_unit_event_t>.size,
           native.video_generation != 0,
           native.frame_id != 0,
-          native.reserved_zero == 0,
+          native.has_encoder_timing <= 1,
           (1...3).contains(native.codec),
           let payloadFormat = LSPVideoPayloadFormat(rawValue: native.payload_format)
     else {
@@ -2499,12 +2501,21 @@ private let lspVideoAccessUnitCallback: @convention(c) (
         length: span.length,
         deallocator: { _, _ in clsp_buffer_release(handle) }
     )
+    let hostEncoderDurationMicroseconds: UInt32?
+    if native.has_encoder_timing == 1,
+       native.capture_to_encoder_complete_microseconds >= native.capture_to_encoder_submit_microseconds {
+        hostEncoderDurationMicroseconds =
+            native.capture_to_encoder_complete_microseconds - native.capture_to_encoder_submit_microseconds
+    } else {
+        hostEncoderDurationMicroseconds = nil
+    }
     let accessUnit = LSPEncodedVideoAccessUnit(
         videoGeneration: native.video_generation,
         rtpTimestamp: native.rtp_timestamp,
         frameID: native.frame_id,
         receiveTimeMicroseconds: native.receive_time_microseconds,
         captureTimeMicroseconds: native.capture_time_microseconds,
+        hostEncoderDurationMicroseconds: hostEncoderDurationMicroseconds,
         inputStateSequence: native.input_state_sequence,
         inputEdgeID: native.input_edge_id,
         recoveryEpoch: native.recovery_epoch,

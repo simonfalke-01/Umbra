@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 /** @brief C ABI version implemented by CLSPCore. */
-#define CLSP_CORE_ABI_VERSION UINT32_C(2)
+#define CLSP_CORE_ABI_VERSION UINT32_C(3)
 
 /** @brief Source digest of the mirrored portable LSP core. */
 #define CLSP_CORE_SOURCE_DIGEST "d565644e8c3a00d6c474d6c118b8b8eccd3140d35eda54dbb0bba7c42f1ca7f0"
@@ -464,17 +464,19 @@ extern "C" {
     uint64_t input_state_sequence;  ///< Applied input watermark state.
     uint64_t input_edge_id;  ///< Applied input watermark edge.
     uint32_t recovery_epoch;  ///< Authenticated per-frame recovery epoch.
+    uint32_t capture_to_encoder_submit_microseconds;  ///< Host capture-to-encoder-submit interval when present.
+    uint32_t capture_to_encoder_complete_microseconds;  ///< Host capture-to-encoded-access-unit-complete interval when present.
+    uint8_t has_encoder_timing;  ///< Whether both host encoder timing intervals are authenticated.
     uint8_t independent;  ///< Codec-independent frame marking.
     uint8_t codec;  ///< One `clsp_video_codec_t`.
     uint8_t payload_format;  ///< One `clsp_video_payload_format_t`.
-    uint8_t reserved_zero;  ///< Reserved and zero.
     union {
       clsp_buffer_t *encoded_access_unit;  ///< Owning retained complete encoded-AU handle.
-      clsp_buffer_t *frame;  ///< ABI-v2 source-compatibility name for native runtime integration.
+      clsp_buffer_t *frame;  ///< Source-compatibility name retained from ABI v2.
     };
   } clsp_video_access_unit_event_t;
 
-  /** @brief Source-compatible native runtime alias for the ABI-v2 encoded-AU event. */
+  /** @brief Source-compatible native runtime alias for the encoded-AU event. */
   typedef clsp_video_access_unit_event_t clsp_video_frame_event_t;
 
   /** @brief Decoder outcome values carried unchanged in protected LSPV. */
@@ -989,7 +991,7 @@ extern "C" {
     clsp_audio_timing_callback_t audio_timing;  ///< Optional authenticated sender-report callback.
     union {
       clsp_video_access_unit_callback_t video_access_unit;  ///< Optional retained complete encoded-AU callback.
-      clsp_video_frame_callback_t video_frame;  ///< ABI-v2 native source-compatibility name.
+      clsp_video_frame_callback_t video_frame;  ///< Native source-compatibility name retained from ABI v2.
     };
     clsp_path_probe_callback_t path_probe;  ///< Optional coarse DPLPMTUD control callback.
   } clsp_callbacks_t;

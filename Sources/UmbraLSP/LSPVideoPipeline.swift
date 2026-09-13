@@ -22,6 +22,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         var enqueueTimes: [UInt64: UInt64] = [:]
         var active = false
         var terminal = false
+        var hostEncoderDuration = LSPFixedDurationWindow()
         var receiveToSubmit = LSPFixedDurationWindow()
         var submitToDecode = LSPFixedDurationWindow()
         var receiveToMetalEnqueue = LSPFixedDurationWindow()
@@ -191,6 +192,11 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                   request.nativeConfiguration.payloadFormat == frame.payloadFormat.rawValue,
                   let decoder = state.decoder else { return nil }
             let native = request.nativeConfiguration
+            if let duration = frame.hostEncoderDurationMicroseconds {
+                state.hostEncoderDuration.record(UInt64(duration))
+            } else {
+                state.hostEncoderDuration.drop()
+            }
             guard state.outstanding.count < Int(native.decoderSurfaces) else {
                 state.receiveToSubmit.drop()
                 state.submitToDecode.drop()
@@ -445,6 +451,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         return lock.withLock {
             .init(
                 videoDecoderStatistics: decoderStatistics,
+                hostEncoderDuration: state.hostEncoderDuration.snapshot(clockDomain: "host-monotonic-duration"),
                 completeFrameReceiveToVideoToolboxSubmit: state.receiveToSubmit.snapshot(),
                 videoToolboxSubmitToDecodeCompletion: state.submitToDecode.snapshot(),
                 completeFrameReceiveToMetalEnqueue: state.receiveToMetalEnqueue.snapshot(),

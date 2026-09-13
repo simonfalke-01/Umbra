@@ -1308,7 +1308,7 @@ namespace {
     return CLSP_STATUS_OK;
   }
 
-  /** @brief Validate the complete ABI-v2 video tuple before runtime admission. */
+  /** @brief Validate the complete ABI-v3 video tuple before runtime admission. */
   [[nodiscard]] constexpr bool validate_video_configuration(
     const clsp_video_configuration_t &value
   ) noexcept {

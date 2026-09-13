@@ -16,4 +16,17 @@ final class LSPProductTelemetryTests: XCTestCase {
         XCTAssertEqual(snapshot.drops, 1)
         XCTAssertEqual(snapshot.clockDomain, "client-monotonic")
     }
+
+    func testHostEncoderDistributionRetainsHostDurationClockDomain() throws {
+        var window = LSPFixedDurationWindow()
+        window.record(2_400)
+        window.record(3_600)
+
+        let snapshot = try XCTUnwrap(window.snapshot(clockDomain: "host-monotonic-duration"))
+
+        XCTAssertEqual(snapshot.count, 2)
+        XCTAssertEqual(snapshot.p50Microseconds, 2_400)
+        XCTAssertEqual(snapshot.p99Microseconds, 3_600)
+        XCTAssertEqual(snapshot.clockDomain, "host-monotonic-duration")
+    }
 }

@@ -259,6 +259,8 @@ namespace umbra::lsp {
                                                   ///< capture value in microseconds.
       std::uint64_t input_state_sequence{};       ///< Applied input state sequence.
       std::uint64_t input_edge_id{};              ///< Applied input edge identifier.
+      std::uint32_t capture_to_encoder_submit_microseconds{};  ///< Host capture-to-submit duration.
+      std::uint32_t capture_to_encoder_complete_microseconds{};  ///< Host capture-to-completion duration.
     };
 
     /** @brief Authenticated recovery-epoch disposition for one video packet. */
@@ -918,6 +920,10 @@ namespace umbra::lsp {
               return std::nullopt;
             }
             extensions.has_encoder_timing = true;
+            extensions.capture_to_encoder_submit_microseconds =
+              lumen::lsp::wire::read_be<std::uint32_t>(value.first(4));
+            extensions.capture_to_encoder_complete_microseconds =
+              lumen::lsp::wire::read_be<std::uint32_t>(value.subspan(4, 4));
             break;
           default:
             return std::nullopt;
@@ -2791,9 +2797,12 @@ namespace umbra::lsp {
       std::uint64_t capture_time_microseconds {};  ///< Repeated absolute capture time when observed.
       std::uint64_t input_state_sequence {};  ///< Repeated applied state watermark.
       std::uint64_t input_edge_id {};  ///< Repeated applied edge watermark.
+      std::uint32_t capture_to_encoder_submit_microseconds {};  ///< Repeated host capture-to-submit interval.
+      std::uint32_t capture_to_encoder_complete_microseconds {};  ///< Repeated host capture-to-completion interval.
       std::uint16_t start_sequence_number {};  ///< RTP sequence carrying authenticated frame start.
       bool has_capture_time {};  ///< Whether capture time has been bound.
       bool has_input_watermark {};  ///< Whether the input watermark has been bound.
+      bool has_encoder_timing {};  ///< Whether encoder timing has been bound.
       bool has_independent_marking {};  ///< Whether independence metadata has been bound.
       bool has_start_sequence {};  ///< Whether the authenticated start sequence is bound.
       bool independent {};  ///< Whether any repeated frame marking says independent.
@@ -3869,6 +3878,10 @@ namespace umbra::lsp {
           ::close(descriptor);
           continue;
         }
+        // Let the asynchronous per-socket policy lookup triggered by connect
+        // complete before the first write can permanently reject this socket.
+        const timespec policy_grace {.tv_sec = 0, .tv_nsec = 20'000'000L};
+        (void)nanosleep(&policy_grace, nullptr);
         socket_ = descriptor;
         socket_family_ = candidate->ai_family;
         std::memcpy(&peer_address_, candidate->ai_addr, candidate->ai_addrlen);
@@ -7414,6 +7427,20 @@ namespace umbra::lsp {
         metadata.input_state_sequence = extensions.input_state_sequence;
         metadata.input_edge_id = extensions.input_edge_id;
       }
+      if (extensions.has_encoder_timing) {
+        if (metadata.has_encoder_timing &&
+            (metadata.capture_to_encoder_submit_microseconds !=
+               extensions.capture_to_encoder_submit_microseconds ||
+             metadata.capture_to_encoder_complete_microseconds !=
+               extensions.capture_to_encoder_complete_microseconds)) {
+          return false;
+        }
+        metadata.has_encoder_timing = true;
+        metadata.capture_to_encoder_submit_microseconds =
+          extensions.capture_to_encoder_submit_microseconds;
+        metadata.capture_to_encoder_complete_microseconds =
+          extensions.capture_to_encoder_complete_microseconds;
+      }
       if (extensions.has_frame_marking) {
         if (metadata.has_independent_marking &&
             metadata.independent != extensions.independent) {
@@ -8093,10 +8120,12 @@ namespace umbra::lsp {
         .input_state_sequence = metadata->input_state_sequence,
         .input_edge_id = metadata->input_edge_id,
         .recovery_epoch = metadata->recovery_epoch,
+        .capture_to_encoder_submit_microseconds = metadata->capture_to_encoder_submit_microseconds,
+        .capture_to_encoder_complete_microseconds = metadata->capture_to_encoder_complete_microseconds,
+        .has_encoder_timing = static_cast<std::uint8_t>(metadata->has_encoder_timing),
         .independent = static_cast<std::uint8_t>(metadata->independent),
         .codec = video_configuration_.codec,
         .payload_format = video_configuration_.payload_format,
-        .reserved_zero = 0,
         .encoded_access_unit = buffer,
       };
       const auto first_authenticated_microseconds = metadata->first_authenticated_microseconds;

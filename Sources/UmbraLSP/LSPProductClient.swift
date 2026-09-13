@@ -38,6 +38,8 @@ public actor LSPProductClient {
     static let startRecoveryPollInterval = Duration.seconds(1)
     static let maximumCatalogFailureRetries = 2
     static let maximumStartSubmissions = 2
+    static let reachabilityHandshakeTimeout = Duration.seconds(1)
+    static let reachabilityRequestTimeout = Duration.seconds(1)
 
     private struct ReconnectAttempt {
         var id: UUID
@@ -536,6 +538,86 @@ public actor LSPProductClient {
         }
     }
 
+    /// Performs one short authenticated read without START, ATTACH, or browsing recovery retries.
+    public func probeReachability(hostID: UUID) async throws {
+        try Task.checkCancellation()
+        let hosts = try await hostStore.load().records
+        let trusts = try await trustStore.load().records
+        guard let host = hosts.first(where: { $0.hostID == hostID }),
+              let trust = trusts.first(where: { $0.hostID == hostID }) else {
+            throw LSPControlStatus.authenticationFailed
+        }
+
+        let priorSession = sessions[hostID]
+        let session: LSPClientSession
+        if let priorSession,
+           [.authenticated, .inputActive].contains(await priorSession.state),
+           sessions[hostID] === priorSession {
+            session = priorSession
+        } else {
+            let configuration = Self.reachabilityConfiguration(from: transportConfiguration)
+            let (candidate, updatedTrust) = try await authenticatedSession(
+                host: host,
+                trust: trust,
+                configuration: configuration,
+                failFast: true
+            )
+            try Task.checkCancellation()
+            guard sessions[hostID] === priorSession else {
+                _ = await candidate.retireFailedBrowseAssociation(.invalidState)
+                guard let current = sessions[hostID] else { throw LSPTransportError.invalidState }
+                _ = try await current.listApplications(timeout: Self.reachabilityRequestTimeout)
+                return
+            }
+            _ = try await trustStore.update { snapshot in
+                guard let current = snapshot.records.first(where: { $0.hostID == hostID }),
+                      current == trust || current == updatedTrust else {
+                    throw LSPControlStatus.staleGeneration
+                }
+                var snapshot = snapshot
+                snapshot.records.removeAll { $0.hostID == hostID }
+                snapshot.records.append(updatedTrust)
+                return snapshot
+            }
+            await configureSessionHandlers(candidate, hostID: hostID)
+            let cacheUnchanged: Bool
+            if let priorSession {
+                cacheUnchanged = sessions[hostID] === priorSession
+            } else {
+                cacheUnchanged = sessions[hostID] == nil
+            }
+            if cacheUnchanged {
+                sessions[hostID] = candidate
+                session = candidate
+            } else if let current = sessions[hostID] {
+                _ = await candidate.retireFailedBrowseAssociation(.invalidState)
+                session = current
+            } else {
+                _ = await candidate.retireFailedBrowseAssociation(.invalidState)
+                throw LSPTransportError.invalidState
+            }
+        }
+
+        do {
+            _ = try await session.listApplications(timeout: Self.reachabilityRequestTimeout)
+        } catch let error as LSPTransportError {
+            guard sessions[hostID] === session else { throw error }
+            let retired = await session.retireFailedBrowseAssociation(error)
+            if retired, sessions[hostID] === session {
+                sessions.removeValue(forKey: hostID)
+            }
+            throw error
+        }
+    }
+
+    static func reachabilityConfiguration(
+        from configuration: LSPTransportConfiguration
+    ) -> LSPTransportConfiguration {
+        var configuration = configuration
+        configuration.handshakeTimeout = reachabilityHandshakeTimeout
+        return configuration
+    }
+
     private func applications(
         hostID: UUID,
         recoverCachedFailure: Bool
@@ -956,7 +1038,9 @@ public actor LSPProductClient {
     private func authenticatedSession(
         host: LSPHostRecord,
         trust: LSPTrustRecord,
-        attemptID: UUID? = nil
+        attemptID: UUID? = nil,
+        configuration: LSPTransportConfiguration? = nil,
+        failFast: Bool = false
     ) async throws -> (LSPClientSession, LSPTrustRecord) {
         var pins: [Data] = []
         if let pending = trust.pendingDTLSSPKISHA256 { pins.append(pending) }
@@ -969,7 +1053,7 @@ public actor LSPProductClient {
                 try Task.checkCancellation()
             }
             let candidate = try await LSPClientSession.persistent(
-                configuration: transportConfiguration,
+                configuration: configuration ?? transportConfiguration,
                 identityStore: identityStore,
                 videoRenderer: videoRenderer
             )
@@ -985,6 +1069,12 @@ public actor LSPProductClient {
                 return (candidate, updated)
             } catch {
                 finalError = error
+                // Only a staged, already trusted certificate pin may justify
+                // another probe handshake. Route/time-out failures wait for
+                // the next scheduled status check instead of cascading here.
+                if failFast, (error as? LSPTransportError) != .spkiMismatch {
+                    throw error
+                }
             }
         }
         throw finalError

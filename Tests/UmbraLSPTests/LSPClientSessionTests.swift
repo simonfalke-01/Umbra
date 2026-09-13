@@ -563,6 +563,22 @@ final class LSPClientSessionTests: XCTestCase {
         XCTAssertFalse(LSPProductClient.isRetryableCatalogFailure(LSPTransportError.inputPermissionDenied))
     }
 
+    func testReachabilityProbeUsesOneSecondHandshakeWithoutChangingTransportPolicy() {
+        let source = LSPTransportConfiguration(
+            port: 49_999,
+            profile: .competitionLAN(capacityMbps: 800),
+            telemetryInterval: .milliseconds(750),
+            handshakeTimeout: .seconds(12)
+        )
+        let probe = LSPProductClient.reachabilityConfiguration(from: source)
+
+        XCTAssertEqual(probe.port, source.port)
+        XCTAssertEqual(probe.profile, source.profile)
+        XCTAssertEqual(probe.telemetryInterval, source.telemetryInterval)
+        XCTAssertEqual(probe.handshakeTimeout, .seconds(1))
+        XCTAssertEqual(LSPProductClient.reachabilityRequestTimeout, .seconds(1))
+    }
+
     func testStartEncodesOrderedAdaptiveAudioOffersAndMaximumPayload() throws {
         let request = LSPInputStartRequest(
             applicationID: "desktop",

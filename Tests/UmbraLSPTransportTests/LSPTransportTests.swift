@@ -12,11 +12,13 @@ final class LSPTransportTests: XCTestCase {
         callbackState.setVideoAccessUnitHandler { frame in
             XCTAssertNotEqual(pthread_mach_thread_np(pthread_self()), nativeThreadID)
             XCTAssertEqual(frame.frameID, 1)
+            XCTAssertEqual(frame.hostEncoderDurationMicroseconds, 2_500)
             delivered.fulfill()
         }
         callbackState.receiveVideoAccessUnit(.init(
             videoGeneration: 1, rtpTimestamp: 1, frameID: 1,
             receiveTimeMicroseconds: 1, captureTimeMicroseconds: 1,
+            hostEncoderDurationMicroseconds: 2_500,
             inputStateSequence: 0, inputEdgeID: 0, recoveryEpoch: 0,
             independent: true, codec: 2, payloadFormat: .annexB,
             encodedAccessUnit: Data([0, 0, 0, 1])
@@ -54,7 +56,7 @@ final class LSPTransportTests: XCTestCase {
     }
 
     func testABIVersionDigestAndInitialTelemetryMatchNativeCore() throws {
-        XCTAssertEqual(clsp_core_abi_version(), 2)
+        XCTAssertEqual(clsp_core_abi_version(), 3)
         XCTAssertEqual(String(cString: clsp_core_source_digest()), LSPTransport.sourceDigest)
 
         let transport = try LSPTransport()

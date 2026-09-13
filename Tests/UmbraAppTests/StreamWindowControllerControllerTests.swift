@@ -233,6 +233,11 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             native: nil
         )
         let product = LSPProductTelemetrySnapshot(
+            hostEncoderDuration: .init(
+                count: 10, p50Microseconds: 2_400, p95Microseconds: 3_000,
+                p99Microseconds: 3_600, maximumMicroseconds: 4_000,
+                drops: 0, clockDomain: "host-monotonic-duration"
+            ),
             completeFrameReceiveToVideoToolboxSubmit: .init(
                 count: 10,
                 p50Microseconds: 100,
@@ -282,8 +287,10 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             presentation[.lspFrameToDecoder],
             "n=10 p50=100µs p95=200µs p99=250µs max=300µs drops=1 [client-monotonic]"
         )
-        XCTAssertTrue(presentation.overlayText.contains("RX→decoder p50/p99"))
-        XCTAssertTrue(presentation.overlayText.contains("0.10 / 0.25 ms"))
+        XCTAssertTrue(presentation.overlayText.contains("Client decode"))
+        XCTAssertTrue(presentation.overlayText.contains("Host encode"))
+        XCTAssertTrue(presentation.overlayText.contains("2.40 ms (p99 3.60)"))
+        XCTAssertFalse(presentation.overlayText.contains("RX→decoder"))
         XCTAssertTrue(presentation.overlayText.contains("RX 900 / TX 700"))
         XCTAssertFalse(presentation.overlayText.contains("Unavailable"))
         XCTAssertFalse(presentation.overlayText.contains("Network RTT"))
@@ -486,12 +493,17 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         XCTAssertTrue(fields.allSatisfy { !$0.isAccessibilityElement() })
         for field in fields {
             let font = try XCTUnwrap(field.font)
-            XCTAssertEqual(font.pointSize, 10)
+            XCTAssertEqual(font.pointSize, 12)
             XCTAssertTrue(NSFontManager.shared.traits(of: font).contains(.fixedPitchFontMask))
             XCTAssertFalse(NSFontManager.shared.traits(of: font).contains(.boldFontMask))
             XCTAssertFalse(field.drawsBackground)
             XCTAssertFalse(field.isBordered)
         }
+        overlay.setPresentation(StreamStatisticsPresentation(values: [.videoRate: "120 FPS"]))
+        let attributes = try XCTUnwrap(fields.first).attributedStringValue.attributes(at: 0, effectiveRange: nil)
+        XCTAssertNil(attributes[.strokeWidth])
+        XCTAssertNil(attributes[.strokeColor])
+        XCTAssertNotNil(attributes[.shadow])
     }
 
     func testStatisticsOverlayRendersInsideTheStreamInDarkAndIncreasedContrast() throws {
@@ -558,7 +570,7 @@ final class StreamWindowControllerControllerTests: XCTestCase {
                 (overlay.accessibilityValue() as? String)?.contains("59.9 FPS") == true
             )
             XCTAssertEqual(overlay.layer?.borderWidth ?? 0, 0)
-            XCTAssertLessThan(overlay.frame.height, 120)
+            XCTAssertLessThan(overlay.frame.height, 140)
 
             guard let outputDirectory = ProcessInfo.processInfo.environment["UMBRA_UI_SNAPSHOT_DIR"] else {
                 continue

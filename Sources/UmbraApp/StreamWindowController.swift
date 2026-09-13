@@ -238,16 +238,15 @@ enum StreamStatisticsPresenter {
         if lsp != nil || product != nil {
             var rows: [(String, String)] = [
                 ("Frame rate", videoRate),
-                ("Decode p50/p99", compactDistribution(product?.videoToolboxSubmitToDecodeCompletion)),
-                ("RX→decoder p50/p99", compactDistribution(product?.completeFrameReceiveToVideoToolboxSubmit)),
-                ("RX→Metal p50/p99", compactDistribution(product?.completeFrameReceiveToMetalEnqueue)),
-                ("Metal wait p50/p99", compactDistribution(product?.metalEnqueueToCommit)),
+                ("Host encode", compactDistribution(product?.hostEncoderDuration)),
+                ("Client decode", compactDistribution(product?.videoToolboxSubmitToDecodeCompletion)),
+                ("Render queue", compactDistribution(product?.metalEnqueueToCommit)),
                 ("Frame drops", presentation[.droppedFrames]),
                 ("Packets", presentation[.lspDatagrams]),
                 ("Packet drops", presentation[.lspDrops]),
             ]
             if product?.audioReceiveToDecode != nil {
-                rows.insert(("Audio wait p50/p99", compactDistribution(product?.audioReceiveToDecode)), at: 5)
+                rows.insert(("Audio buffer", compactDistribution(product?.audioReceiveToDecode)), at: 4)
             }
             if let failures = lsp?.authenticationFailures, failures > 0 {
                 rows.append(("Auth failures", String(failures)))
@@ -261,7 +260,7 @@ enum StreamStatisticsPresenter {
     /// Keeps the on-video readout short; the full distribution remains in telemetry.
     private static func compactDistribution(_ value: LSPDistributionSnapshot?) -> String {
         guard let value, value.count > 0 else { return "Unavailable" }
-        return String(format: "%.2f / %.2f ms",
+        return String(format: "%.2f ms (p99 %.2f)",
                       Double(value.p50Microseconds) / 1_000,
                       Double(value.p99Microseconds) / 1_000)
     }
@@ -1487,8 +1486,7 @@ final class StreamStatisticsOverlayView: NSView {
         readout.attributedStringValue = NSAttributedString(string: presentation.overlayText, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: UmbraLayout.streamOverlayFontSize, weight: .regular),
             .foregroundColor: StreamOverlayStyle.text,
-            .strokeColor: StreamOverlayStyle.outline,
-            .strokeWidth: StreamOverlayStyle.outlineWidth,
+            .shadow: StreamOverlayStyle.textShadow,
         ])
         setAccessibilityValue(presentation.accessibilityValue)
         isHidden = false

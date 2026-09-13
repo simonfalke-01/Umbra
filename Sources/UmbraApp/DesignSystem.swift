@@ -28,7 +28,7 @@ enum UmbraLayout {
     static let settingsMaximumHeight: CGFloat = 620
     static let streamOverlayMaximumWidth: CGFloat = 360
     /// Compact, noninteractive telemetry drawn directly over streamed video.
-    static let streamOverlayFontSize: CGFloat = 10
+    static let streamOverlayFontSize: CGFloat = 12
 
     static func settingsWindowHeight(contentHeight: CGFloat?) -> CGFloat {
         guard let contentHeight, contentHeight.isFinite, contentHeight > 0 else {
@@ -42,11 +42,16 @@ enum UmbraLayout {
     }
 }
 
-/// High-contrast glyphs remain readable over light and dark video without a panel.
+/// Solid antialiased glyphs remain readable over video without an outline or panel.
 enum StreamOverlayStyle {
     static let text = NSColor.white
-    static let outline = NSColor.black
-    static let outlineWidth: CGFloat = -3
+    static var textShadow: NSShadow {
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.shadowBlurRadius = 2
+        return shadow
+    }
 }
 
 enum UmbraSymbol {

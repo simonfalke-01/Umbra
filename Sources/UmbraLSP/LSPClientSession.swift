@@ -480,13 +480,16 @@ public actor LSPClientSession {
     }
 
     /// Lists applications after pairing or reconnect authentication grants browse permission.
-    public func listApplications() async throws -> [LSPApplication] {
+    ///
+    /// - Parameter timeout: Bounded wait for the authenticated APPLICATIONS response.
+    public func listApplications(timeout: Duration = .seconds(2)) async throws -> [LSPApplication] {
         guard state == .authenticated || state == .inputActive else { throw LSPTransportError.notAuthenticated }
         guard !startInProgress else { throw LSPControlStatus.busy }
         guard effectivePermissions.contains(.browseApplications) else { throw LSPControlStatus.permissionDenied }
         let event = try await transport.request(
             messageType: LSPControlMessageType.listApplications.rawValue,
-            payload: try LSPControlWire.listApplications()
+            payload: try LSPControlWire.listApplications(),
+            timeout: timeout
         )
         return try LSPControlWire.applications(from: event)
     }
@@ -780,6 +783,7 @@ public actor LSPClientSession {
         let audio = audioPlayout.telemetrySnapshot()
         return .init(
             videoDecoderStatistics: video?.videoDecoderStatistics,
+            hostEncoderDuration: video?.hostEncoderDuration,
             completeFrameReceiveToVideoToolboxSubmit: video?.completeFrameReceiveToVideoToolboxSubmit,
             videoToolboxSubmitToDecodeCompletion: video?.videoToolboxSubmitToDecodeCompletion,
             completeFrameReceiveToMetalEnqueue: video?.completeFrameReceiveToMetalEnqueue,

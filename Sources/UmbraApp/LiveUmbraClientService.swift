@@ -289,7 +289,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.lspFailureHandler = lspFailureHandler
         self.lspHostProbe = lspHostProbe ?? { hostID in
             guard let lspProduct else { throw LSPTransportError.invalidState }
-            _ = try await lspProduct.applications(hostID: hostID)
+            try await lspProduct.probeReachability(hostID: hostID)
         }
         let (events, continuation) = AsyncStream<HostServiceEvent>.makeStream()
         handlerInstallationTask = Task { [service, continuation] in
