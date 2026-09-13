@@ -29,6 +29,16 @@ public enum LSPPairedDiscoveryRefresh: Sendable {
 
 /// Coarse product owner for LSP persistence, pairing, auth, and application browsing.
 public actor LSPProductClient {
+    enum StartReadiness: Equatable {
+        case ready(resume: Bool)
+        case waitingForRunningApplication
+    }
+
+    static let startRecoveryTimeout = Duration.seconds(15)
+    static let startRecoveryPollInterval = Duration.seconds(1)
+    static let maximumCatalogFailureRetries = 2
+    static let maximumStartSubmissions = 2
+
     private struct ReconnectAttempt {
         var id: UUID
         var task: Task<LSPClientSession, Error>
@@ -58,6 +68,7 @@ public actor LSPProductClient {
     private let identityStore: JSONFileStore<LSPClientIdentitySnapshot>
     private var sessions: [UUID: LSPClientSession] = [:]
     private var reconnectAttempts: [UUID: ReconnectAttempt] = [:]
+    private var startAttempts: [UUID: UUID] = [:]
     private var discoveredPairingHosts: [UUID: LSPDiscoveredPairingHost] = [:]
     private var pairingAttempts: [UUID: PairingAttempt] = [:]
     private var quarantinedPairingDiscovery: [UUID: QuarantinedPairingDiscovery] = [:]
@@ -513,6 +524,23 @@ public actor LSPProductClient {
 
     /// Authenticates stored trust and returns the exact host application snapshot.
     public func applications(hostID: UUID) async throws -> [LSPApplication] {
+        do {
+            return try await applications(hostID: hostID, recoverCachedFailure: true)
+        } catch let error as LSPTransportError {
+            // Cold interface/route setup can reject the first socket attempt.
+            // Retry only when no association or input owner was installed.
+            guard sessions[hostID] == nil,
+                  LSPClientSession.isRecoverableBrowseFailure(error) else { throw error }
+            try await Task.sleep(for: Self.startRecoveryPollInterval)
+            return try await applications(hostID: hostID, recoverCachedFailure: false)
+        }
+    }
+
+    private func applications(
+        hostID: UUID,
+        recoverCachedFailure: Bool
+    ) async throws -> [LSPApplication] {
+        try Task.checkCancellation()
         let hosts = try await hostStore.load().records
         let trusts = try await trustStore.load().records
         guard let host = hosts.first(where: { $0.hostID == hostID }),
@@ -521,8 +549,10 @@ public actor LSPProductClient {
             throw LSPControlStatus.authenticationFailed
         }
         let session: LSPClientSession
+        let reusedCachedSession: Bool
         if let existing = sessions[hostID], [.authenticated, .inputActive].contains(await existing.state) {
             session = existing
+            reusedCachedSession = true
         } else {
             let (created, updatedTrust) = try await authenticatedSession(host: host, trust: trust)
             _ = try await trustStore.update { snapshot in
@@ -534,8 +564,22 @@ public actor LSPProductClient {
             await configureSessionHandlers(created, hostID: hostID)
             sessions[hostID] = created
             session = created
+            reusedCachedSession = false
         }
-        return try await session.listApplications()
+        do {
+            return try await session.listApplications()
+        } catch let error as LSPTransportError {
+            guard sessions[hostID] === session else {
+                guard reusedCachedSession, recoverCachedFailure else { throw error }
+                return try await applications(hostID: hostID, recoverCachedFailure: false)
+            }
+            let retired = await session.retireFailedBrowseAssociation(error)
+            if retired, sessions[hostID] === session {
+                sessions.removeValue(forKey: hostID)
+            }
+            guard retired, reusedCachedSession, recoverCachedFailure else { throw error }
+            return try await applications(hostID: hostID, recoverCachedFailure: false)
+        }
     }
 
     /// Waits for one bounded authenticated artwork object referenced by APPLICATIONS.
@@ -558,6 +602,9 @@ public actor LSPProductClient {
     }
 
     /// Starts the negotiated input-only session for one authenticated native application.
+    ///
+    /// The requested resume intent is a UI hint; a fresh authenticated catalog decides whether
+    /// START launches a stopped application or resumes its current process generation.
     public func startInput(
         hostID: UUID,
         applicationID: String,
@@ -613,7 +660,7 @@ public actor LSPProductClient {
     func startInput(
         hostID: UUID,
         applicationID: String,
-        resume: Bool = false,
+        resume _: Bool = false,
         pointerRate: UInt32 = 1_000,
         controllerRate: UInt32 = 250,
         sensorRate: UInt32 = 250,
@@ -624,24 +671,112 @@ public actor LSPProductClient {
         decoderSurfaces: UInt8 = 3,
         maximumCaptureToPresentMicroseconds: UInt32 = 50_000
     ) async throws -> LSPClientSession {
-        _ = try await applications(hostID: hostID)
-        guard let session = sessions[hostID], await session.state == .authenticated else {
-            throw LSPTransportError.notAuthenticated
+        guard startAttempts[hostID] == nil else { throw LSPControlStatus.busy }
+        let attemptID = UUID()
+        startAttempts[hostID] = attemptID
+        defer {
+            if startAttempts[hostID] == attemptID {
+                startAttempts.removeValue(forKey: hostID)
+            }
         }
-        _ = try await session.startInput(LSPInputStartRequest(
-            applicationID: applicationID,
-            resume: resume,
-            pointerRate: pointerRate,
-            controllerRate: controllerRate,
-            sensorRate: sensorRate,
-            reconciliationRate: reconciliationRate,
-            microphoneOffer: microphoneOffer,
-            videoOffers: videoOffers,
-            receiveBatchCapacity: receiveBatchCapacity,
-            decoderSurfaces: decoderSurfaces,
-            maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds
-        ))
-        return session
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.startRecoveryTimeout)
+        var catalogFailureRetries = 0
+        var startSubmissions = 0
+        while true {
+            try Task.checkCancellation()
+            let applications: [LSPApplication]
+            do {
+                applications = try await self.applications(hostID: hostID)
+                catalogFailureRetries = 0
+            } catch {
+                guard catalogFailureRetries < Self.maximumCatalogFailureRetries,
+                      Self.isRetryableCatalogFailure(error),
+                      clock.now < deadline else {
+                    throw error
+                }
+                catalogFailureRetries += 1
+                try await Self.sleepForStartRecovery(clock: clock, deadline: deadline)
+                continue
+            }
+            switch try Self.startReadiness(applicationID: applicationID, applications: applications) {
+            case .waitingForRunningApplication:
+                guard clock.now < deadline else { throw LSPControlStatus.busy }
+                try await Self.sleepForStartRecovery(clock: clock, deadline: deadline)
+                continue
+            case .ready(let resolvedResume):
+                guard let session = sessions[hostID] else { throw LSPTransportError.notAuthenticated }
+                let sessionState = await session.state
+                if sessionState == .inputActive { throw LSPControlStatus.busy }
+                guard sessionState == .authenticated else { throw LSPTransportError.notAuthenticated }
+                try Task.checkCancellation()
+                startSubmissions += 1
+                do {
+                    _ = try await session.startInput(LSPInputStartRequest(
+                        applicationID: applicationID,
+                        resume: resolvedResume,
+                        pointerRate: pointerRate,
+                        controllerRate: controllerRate,
+                        sensorRate: sensorRate,
+                        reconciliationRate: reconciliationRate,
+                        microphoneOffer: microphoneOffer,
+                        videoOffers: videoOffers,
+                        receiveBatchCapacity: receiveBatchCapacity,
+                        decoderSurfaces: decoderSurfaces,
+                        maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds
+                    ))
+                    return session
+                } catch {
+                    guard Self.isDefiniteRetryableStartFailure(error),
+                          let status = error as? LSPControlStatus else {
+                        throw error
+                    }
+                    guard startSubmissions < Self.maximumStartSubmissions,
+                          clock.now < deadline else {
+                        throw status
+                    }
+                    try await Self.sleepForStartRecovery(clock: clock, deadline: deadline)
+                }
+            }
+        }
+    }
+
+    static func startReadiness(
+        applicationID: String,
+        applications: [LSPApplication]
+    ) throws -> StartReadiness {
+        guard applications.contains(where: { $0.id == applicationID }) else {
+            throw LSPControlStatus.staleGeneration
+        }
+        guard let running = applications.first(where: \.isRunning) else {
+            return .ready(resume: false)
+        }
+        guard running.id == applicationID, running.resumeAvailable else {
+            return .waitingForRunningApplication
+        }
+        return .ready(resume: true)
+    }
+
+    static func isRetryableCatalogFailure(_ error: Error) -> Bool {
+        if let status = error as? LSPControlStatus {
+            return status == .busy || status == .timeout || status == .staleGeneration
+        }
+        if let transportError = error as? LSPTransportError {
+            return LSPClientSession.isRecoverableBrowseFailure(transportError) || transportError == .controlWindowFull
+        }
+        return false
+    }
+
+    static func isDefiniteRetryableStartFailure(_ error: Error) -> Bool {
+        (error as? LSPControlStatus) == .busy
+    }
+
+    private static func sleepForStartRecovery(
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async throws {
+        let wake = min(clock.now.advanced(by: startRecoveryPollInterval), deadline)
+        try await clock.sleep(until: wake)
     }
 
     /// Reconnects or rekeys through a fresh DTLS association and authenticated ATTACH.

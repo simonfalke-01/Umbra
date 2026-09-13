@@ -606,6 +606,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
             guard let lspProduct, let applicationID = lspApplicationIDs[hostID]?[id.rawValue] else {
                 throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
             }
+            if activeLSPHostID == nativeHostID, activeLSPApplicationID == applicationID,
+               await streamWindow?.focusExistingSession() == true {
+                return
+            }
+            try Task.checkCancellation()
             let microphoneOffer = try await lspMicrophoneOffer()
             let resolved = preferenceResolver(preferences.settings).preferences
             try await startLSPStream(
@@ -1145,6 +1150,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     let devices = await self.lspProduct?.deviceRateTelemetry(hostID: hostID) ?? []
                     let productTelemetry = await self.lspProduct?.productTelemetry(hostID: hostID)
                     let nativeTiming = try? await self.lspProduct?.nativeTimingTelemetry(hostID: hostID)
+                    if let decoder = productTelemetry?.videoDecoderStatistics {
+                        self.streamWindow?.updateVideoPipelineStatistics(decoder)
+                    }
                     self.streamWindow?.updateLSPStatistics(
                         telemetry,
                         reconnect: self.latestLSPReconnectTelemetry,
@@ -1676,12 +1684,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
         switch event {
         case .added(let service), .updated(_, let service):
             latestLSPDiscoveryTokens[service.id] = service.changeToken
-            guard let serviceWithTXT = await LSPBonjourTXTResolver().resolve(service),
-                  let resolved = try? await lspDiscovery.resolveEndpoint(for: serviceWithTXT),
+            guard let resolved = await LSPBonjourTXTResolver().resolve(service),
                   latestLSPDiscoveryTokens[service.id] == service.changeToken,
                   let candidate = LSPDiscovery.pairingHost(
-                    from: serviceWithTXT,
-                    resolvedEndpoint: resolved
+                    from: resolved.service,
+                    resolvedEndpoint: resolved.endpoint
                   ) else { return }
             lspDiscoveryHostIDsByServiceID[service.id] = candidate.hostID
             if let lspProduct {

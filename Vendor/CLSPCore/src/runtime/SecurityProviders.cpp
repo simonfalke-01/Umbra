@@ -26,6 +26,9 @@
 
 #include <cerrno>
 #include <sys/socket.h>
+#if defined(__APPLE__)
+#include <os/log.h>
+#endif
 #endif
 
 #if CLSP_CORE_HAS_LIBSRTP
@@ -166,6 +169,9 @@ public:
 #if CLSP_CORE_HAS_WOLFSSL
   /** @brief Release all wolfSSL and exporter state. */
   ~Impl() {
+    // The socket belongs to Runtime and may already have been closed/reused.
+    // Teardown must never submit through a stale descriptor.
+    socket_ = -1;
     if (session_ != nullptr) {
       wolfSSL_free(session_);
     }
@@ -244,6 +250,12 @@ public:
   /** @brief Advance a handshake without an incoming datagram. */
   [[nodiscard]] clsp_status_t advance_handshake() noexcept {
     return complete_or_wait(wolfSSL_connect(session_));
+  }
+
+  /** @brief Permit address fallback only for an explicit kernel route failure. */
+  [[nodiscard]] bool route_failed() const noexcept {
+    return socket_failed_ && (send_error_ == EHOSTUNREACH || send_error_ == ENETUNREACH ||
+                              send_error_ == ENETDOWN || send_error_ == EADDRNOTAVAIL);
   }
 
   /** @brief Process one complete DTLS datagram. */
@@ -348,9 +360,16 @@ private:
     if (sent == size) {
       return size;
     }
-    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == EINTR)) {
       return WOLFSSL_CBIO_ERR_WANT_WRITE;
     }
+    self->send_error_ = sent < 0 ? errno : 0;
+#if defined(__APPLE__)
+    if (!self->socket_failed_) {
+      os_log_error(OS_LOG_DEFAULT, "LSP DTLS datagram send failed: errno=%{public}d bytes=%{public}d",
+                   self->send_error_, size);
+    }
+#endif
     self->socket_failed_ = true;
     return WOLFSSL_CBIO_ERR_GENERAL;
   }
@@ -495,6 +514,7 @@ private:
   WOLFSSL *session_{};     ///< One peer-bound DTLS association.
   int socket_{-1};         ///< Connected nonblocking UDP socket.
   bool socket_failed_{};   ///< Terminal UDP send error, distinct from DTLS policy.
+  int send_error_{};       ///< Saved kernel errno before logging or wolfSSL can overwrite it.
   std::span<const std::uint8_t>
       pending_input_{}; ///< One complete incoming DTLS datagram.
   DtlsApplicationDataCallback
@@ -522,6 +542,8 @@ private:
   [[nodiscard]] clsp_status_t advance_handshake() noexcept {
     return CLSP_STATUS_MISSING_WOLFSSL;
   }
+  /** @brief Dependency-free providers never report a network-route failure. */
+  [[nodiscard]] bool route_failed() const noexcept { return false; }
   [[nodiscard]] clsp_status_t receive(std::span<const std::uint8_t>) noexcept {
     return CLSP_STATUS_MISSING_WOLFSSL;
   }
@@ -559,6 +581,10 @@ clsp_status_t WolfSSLDtlsClient::initialize(
     const std::span<const std::uint8_t, 32> expected_spki_sha256,
     const DtlsApplicationDataCallback callback,
     void *callback_context) noexcept {
+  // Reinitialization is confined to startup: discard the previous candidate's
+  // failed handshake and secrets before assigning another resolved endpoint.
+  delete impl_;
+  impl_ = new (std::nothrow) Impl;
   return impl_ == nullptr
              ? CLSP_STATUS_RESOURCE_EXHAUSTED
              : impl_->initialize(socket, peer_address, peer_address_size,
@@ -569,6 +595,10 @@ clsp_status_t WolfSSLDtlsClient::initialize(
 clsp_status_t WolfSSLDtlsClient::advance_handshake() noexcept {
   return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED
                           : impl_->advance_handshake();
+}
+
+bool WolfSSLDtlsClient::route_failed() const noexcept {
+  return impl_ != nullptr && impl_->route_failed();
 }
 
 clsp_status_t WolfSSLDtlsClient::receive(

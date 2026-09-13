@@ -463,6 +463,106 @@ final class LSPClientSessionTests: XCTestCase {
         XCTAssertEqual(try identity.publicKeyRawRepresentation.count, 32)
     }
 
+    func testBrowseRetirementRequiresRecoverableFailureWithoutInputOwnership() {
+        for error in [
+            LSPTransportError.socketFailure,
+            .dtlsFailure,
+            .notAuthenticated,
+            .timeout,
+            .invalidState,
+        ] {
+            XCTAssertTrue(LSPClientSession.canRetireFailedBrowseAssociation(
+                state: .authenticated,
+                hasInputAuthority: false,
+                startInProgress: false,
+                error: error
+            ))
+        }
+        XCTAssertFalse(LSPClientSession.canRetireFailedBrowseAssociation(
+            state: .inputActive,
+            hasInputAuthority: true,
+            startInProgress: false,
+            error: .notAuthenticated
+        ))
+        XCTAssertFalse(LSPClientSession.canRetireFailedBrowseAssociation(
+            state: .authenticated,
+            hasInputAuthority: true,
+            startInProgress: false,
+            error: .notAuthenticated
+        ))
+        XCTAssertFalse(LSPClientSession.canRetireFailedBrowseAssociation(
+            state: .authenticated,
+            hasInputAuthority: false,
+            startInProgress: true,
+            error: .notAuthenticated
+        ))
+        XCTAssertFalse(LSPClientSession.canRetireFailedBrowseAssociation(
+            state: .authenticated,
+            hasInputAuthority: false,
+            startInProgress: false,
+            error: .inputPermissionDenied
+        ))
+    }
+
+    func testStartReadinessUsesFreshCatalogProcessState() throws {
+        let stopped = LSPApplication(
+            id: "desktop",
+            name: "Desktop",
+            imagePath: "",
+            isRunning: false,
+            resumeAvailable: false,
+            processGeneration: 0
+        )
+        var running = stopped
+        running.isRunning = true
+        running.processGeneration = 7
+        XCTAssertEqual(
+            try LSPProductClient.startReadiness(applicationID: "desktop", applications: [stopped]),
+            .ready(resume: false)
+        )
+        XCTAssertEqual(
+            try LSPProductClient.startReadiness(applicationID: "desktop", applications: [running]),
+            .waitingForRunningApplication
+        )
+        running.resumeAvailable = true
+        XCTAssertEqual(
+            try LSPProductClient.startReadiness(applicationID: "desktop", applications: [running]),
+            .ready(resume: true)
+        )
+        XCTAssertThrowsError(try LSPProductClient.startReadiness(
+            applicationID: "missing",
+            applications: [stopped]
+        )) { error in
+            XCTAssertEqual(error as? LSPControlStatus, .staleGeneration)
+        }
+    }
+
+    func testStartRecoveryRetriesOnlyDefiniteBusyAndHasBoundedPolicy() {
+        XCTAssertTrue(LSPProductClient.isDefiniteRetryableStartFailure(LSPControlStatus.busy))
+        XCTAssertFalse(LSPProductClient.isDefiniteRetryableStartFailure(LSPControlStatus.timeout))
+        XCTAssertFalse(LSPProductClient.isDefiniteRetryableStartFailure(LSPTransportError.timeout))
+        XCTAssertFalse(LSPProductClient.isDefiniteRetryableStartFailure(LSPControlStatus.permissionDenied))
+        XCTAssertEqual(LSPProductClient.startRecoveryTimeout, .seconds(15))
+        XCTAssertEqual(LSPProductClient.startRecoveryPollInterval, .seconds(1))
+        XCTAssertEqual(LSPProductClient.maximumStartSubmissions, 2)
+        XCTAssertEqual(LSPProductClient.maximumCatalogFailureRetries, 2)
+    }
+
+    func testCatalogRecoveryRetriesOnlyTransientStateAndTransportFailures() {
+        for error in [
+            LSPControlStatus.busy,
+            .timeout,
+            .staleGeneration,
+        ] {
+            XCTAssertTrue(LSPProductClient.isRetryableCatalogFailure(error))
+        }
+        XCTAssertTrue(LSPProductClient.isRetryableCatalogFailure(LSPTransportError.notAuthenticated))
+        XCTAssertTrue(LSPProductClient.isRetryableCatalogFailure(LSPTransportError.controlWindowFull))
+        XCTAssertFalse(LSPProductClient.isRetryableCatalogFailure(LSPControlStatus.authenticationFailed))
+        XCTAssertFalse(LSPProductClient.isRetryableCatalogFailure(LSPControlStatus.permissionDenied))
+        XCTAssertFalse(LSPProductClient.isRetryableCatalogFailure(LSPTransportError.inputPermissionDenied))
+    }
+
     func testStartEncodesOrderedAdaptiveAudioOffersAndMaximumPayload() throws {
         let request = LSPInputStartRequest(
             applicationID: "desktop",

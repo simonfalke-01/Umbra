@@ -6,6 +6,29 @@ import UmbraCore
 
 @MainActor
 final class UmbraAppLifecycleTests: XCTestCase {
+    func testOnlyStreamCommandsDeferResolutionUntilAfterApplicationInitialization() throws {
+        let processArguments = [
+            "/Applications/Umbra.app/Contents/MacOS/Umbra",
+            "stream",
+            "simon.local",
+            "Desktop",
+        ]
+        let parseResult = UmbraCLIParser().parseProcessArguments(processArguments)
+        let launchRequest = try XCTUnwrap(UmbraBootstrap.deferredStreamLaunchRequest(
+            for: parseResult,
+            processArguments: processArguments
+        ))
+
+        guard case let .deferredStream(deferredArguments) = launchRequest else {
+            return XCTFail("Expected stream resolution to be deferred")
+        }
+        XCTAssertEqual(deferredArguments, processArguments)
+        XCTAssertNil(UmbraBootstrap.deferredStreamLaunchRequest(
+            for: .ready(command: .launchApplication, warnings: []),
+            processArguments: [processArguments[0]]
+        ))
+    }
+
     func testRawBuildLaunchIsRejectedBeforeNetworkServicesAreCreated() {
         let failure = UmbraBootstrap.unpackagedLaunchFailure(
             bundleURL: URL(fileURLWithPath: "/repo/.build/debug", isDirectory: true),

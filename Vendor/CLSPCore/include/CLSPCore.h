@@ -1364,7 +1364,18 @@ extern "C" {
     uint16_t received_payload_size
   );
 
-  /** @brief Report one terminal decoder result for an exact delivered frame/epoch and current hardware credit. */
+  /**
+   * @brief Report one terminal decoder result, releasing its exact native reservation once.
+   * @param core Owning native transport.
+   * @param video_generation Active video generation.
+   * @param frame_id Exact delivered frame identifier.
+   * @param recovery_epoch Recovery epoch retained with the delivered frame.
+   * @param decoder_status Terminal hardware decode result.
+   * @param decoder_credit Observed hardware capacity hint, bounded by negotiated surfaces.
+   * It excludes frames still queued for delivery; native reservations remain authoritative.
+   * @param render_mailbox_occupancy Observed zero-or-one render mailbox occupancy.
+   * @return Typed status; unknown/duplicate frames never release native credit.
+   */
   clsp_status_t clsp_core_report_video_decode(
     clsp_core_t *core,
     uint32_t video_generation,

@@ -1,17 +1,17 @@
 import Foundation
 import UmbraNetworking
 
-/// Resolves Bonjour TXT when Network.framework publishes a service result without metadata.
+/// Resolves Bonjour metadata and the SRV target name without opening a throwaway UDP connection.
 final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Sendable {
+    typealias Resolution = (service: DiscoveredHostService, endpoint: ResolvedBonjourServiceEndpoint)
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<DiscoveredHostService?, Never>?
+    private var continuation: CheckedContinuation<Resolution?, Never>?
     private var discovered: DiscoveredHostService?
     private var service: NetService?
     private var serviceRunLoop: CFRunLoop?
     private var finished = false
 
-    func resolve(_ discovered: DiscoveredHostService) async -> DiscoveredHostService? {
-        if !discovered.txtRecord.isEmpty { return discovered }
+    func resolve(_ discovered: DiscoveredHostService) async -> Resolution? {
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 let shouldStart = lock.withLock { () -> Bool in
@@ -27,7 +27,7 @@ final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Send
                 let thread = Thread { [self] in
                     run(discovered)
                 }
-                thread.name = "Umbra LSP Bonjour TXT resolver"
+                thread.name = "Umbra LSP Bonjour resolver"
                 thread.qualityOfService = .userInitiated
                 thread.start()
             }
@@ -93,23 +93,39 @@ final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Send
     }
 
     private func resolveTXT(_ data: Data?) {
-        guard let data else { return }
-        let values = NetService.dictionary(fromTXTRecord: data)
-        var text: [String: String] = [:]
-        for (key, value) in values {
-            guard let decoded = String(data: value, encoding: .utf8) else {
-                finish(nil)
-                return
+        guard var discovered = lock.withLock({ self.discovered }) else { return }
+        if let data {
+            let values = NetService.dictionary(fromTXTRecord: data)
+            var text: [String: String] = [:]
+            for (key, value) in values {
+                guard let decoded = String(data: value, encoding: .utf8) else {
+                    finish(nil)
+                    return
+                }
+                text[key] = decoded
             }
-            text[key] = decoded
+            if !text.isEmpty {
+                discovered.txtRecord = text
+                lock.withLock { self.discovered = discovered }
+            }
         }
-        guard !text.isEmpty, var discovered = lock.withLock({ self.discovered }) else { return }
-        discovered.txtRecord = text
-        finish(discovered)
+        guard !discovered.txtRecord.isEmpty,
+              let service = lock.withLock({ self.service }),
+              let targetHost = service.hostName, !targetHost.isEmpty,
+              let port = UInt16(exactly: service.port), port != 0 else { return }
+        finish((discovered, .init(
+            targetHost: targetHost,
+            port: port,
+            serviceName: discovered.name,
+            serviceType: discovered.type,
+            domain: discovered.domain,
+            interfaceName: discovered.interfaceName,
+            changeToken: discovered.changeToken
+        )))
     }
 
-    private func finish(_ result: DiscoveredHostService?) {
-        let completion = lock.withLock { () -> CheckedContinuation<DiscoveredHostService?, Never>? in
+    private func finish(_ result: Resolution?) {
+        let completion = lock.withLock { () -> CheckedContinuation<Resolution?, Never>? in
             guard !finished else { return nil }
             finished = true
             defer { continuation = nil }

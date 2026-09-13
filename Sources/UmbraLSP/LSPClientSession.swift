@@ -184,6 +184,7 @@ public actor LSPClientSession {
     private var pendingDeviceOffers: [LSPNativeDeviceOffer] = []
     private var reconnectDuration = LSPFixedDurationWindow()
     private var reconnectStartedAtMicroseconds: UInt64?
+    private var startInProgress = false
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -481,6 +482,7 @@ public actor LSPClientSession {
     /// Lists applications after pairing or reconnect authentication grants browse permission.
     public func listApplications() async throws -> [LSPApplication] {
         guard state == .authenticated || state == .inputActive else { throw LSPTransportError.notAuthenticated }
+        guard !startInProgress else { throw LSPControlStatus.busy }
         guard effectivePermissions.contains(.browseApplications) else { throw LSPControlStatus.permissionDenied }
         let event = try await transport.request(
             messageType: LSPControlMessageType.listApplications.rawValue,
@@ -492,12 +494,15 @@ public actor LSPClientSession {
     /// Starts the exact input-only vertical slice and installs its native SRTP mapping.
     public func startInput(_ request: LSPInputStartRequest) async throws -> LSPInputStartResponse {
         guard state == .authenticated else { throw LSPTransportError.notAuthenticated }
+        guard !startInProgress else { throw LSPControlStatus.busy }
         guard effectivePermissions.contains([.startOrAttach, .input]) else {
             throw LSPControlStatus.permissionDenied
         }
         if request.microphoneOffer != nil, !effectivePermissions.contains(.microphone) {
             throw LSPControlStatus.permissionDenied
         }
+        startInProgress = true
+        defer { startInProgress = false }
         installControlHandlerIfNeeded()
         var resolvedRequest = request
         resolvedRequest.networkProfile = switch transportProfile {
@@ -565,6 +570,55 @@ public actor LSPClientSession {
         }
         state = .inputActive
         return response
+    }
+
+    /// Retires a browse-only association after the native transport becomes unusable.
+    ///
+    /// A session that owns or is acquiring input authority is never touched by browse recovery.
+    ///
+    /// - Parameter error: The native transport failure returned by the browse request.
+    /// - Returns: `true` when this browse-only association was retired.
+    func retireFailedBrowseAssociation(_ error: LSPTransportError) -> Bool {
+        guard Self.canRetireFailedBrowseAssociation(
+            state: state,
+            hasInputAuthority: inputAuthority != nil,
+            startInProgress: startInProgress,
+            error: error
+        ) else {
+            return false
+        }
+        videoPipeline?.disablePublication()
+        try? transport.stop()
+        videoPipeline?.retireAfterHandoff()
+        resetBulkObjects()
+        hello = nil
+        clientNonce = nil
+        authenticatedTrust = nil
+        effectivePermissions = []
+        state = .failed(error)
+        terminationObserver.emit(.failed(error))
+        return true
+    }
+
+    static func canRetireFailedBrowseAssociation(
+        state: LSPClientSessionState,
+        hasInputAuthority: Bool,
+        startInProgress: Bool,
+        error: LSPTransportError
+    ) -> Bool {
+        state == .authenticated &&
+            !hasInputAuthority &&
+            !startInProgress &&
+            isRecoverableBrowseFailure(error)
+    }
+
+    static func isRecoverableBrowseFailure(_ error: LSPTransportError) -> Bool {
+        switch error {
+        case .socketFailure, .dtlsFailure, .notAuthenticated, .timeout, .invalidState:
+            true
+        default:
+            false
+        }
     }
 
     /// Sends one reliable UTF-8/IME commit behind the exact applied-edge barrier.
@@ -725,6 +779,7 @@ public actor LSPClientSession {
         let video = videoPipeline?.telemetrySnapshot()
         let audio = audioPlayout.telemetrySnapshot()
         return .init(
+            videoDecoderStatistics: video?.videoDecoderStatistics,
             completeFrameReceiveToVideoToolboxSubmit: video?.completeFrameReceiveToVideoToolboxSubmit,
             videoToolboxSubmitToDecodeCompletion: video?.videoToolboxSubmitToDecodeCompletion,
             completeFrameReceiveToMetalEnqueue: video?.completeFrameReceiveToMetalEnqueue,

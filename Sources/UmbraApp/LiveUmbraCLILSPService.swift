@@ -415,13 +415,13 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
     private func receiveDiscovery(_ event: DiscoveryEvent) async {
         switch event {
         case .added(let service), .updated(_, let service):
-            guard let serviceWithTXT = await LSPBonjourTXTResolver().resolve(service),
-                  let endpoint = try? await discovery.resolveEndpoint(for: serviceWithTXT),
+            guard let resolved = await LSPBonjourTXTResolver().resolve(service),
                   let candidate = LSPDiscovery.pairingHost(
-                    from: serviceWithTXT,
-                    resolvedEndpoint: endpoint
+                    from: resolved.service,
+                    resolvedEndpoint: resolved.endpoint
                   ) else { return }
             candidates[candidate.hostID] = candidate
+            _ = try? await product.refreshPairedDiscovery(candidate)
             _ = await product.registerDiscoveredPairingHost(candidate)
         case .removed(let service):
             guard let candidate = candidates.values.first(where: { $0.discoveryServiceID == service.id }) else { return }

@@ -11,6 +11,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         var receiveTimeMicroseconds: UInt64
         var submitTimeMicroseconds: UInt64
         var enqueueTimeMicroseconds: UInt64?
+        var reporting: Bool
     }
 
     private struct State {
@@ -92,7 +93,9 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             metadata: Self.hdrMetadata(request.hdrMetadata, transfer: native.transferCharacteristics)
         )
         try decoder.prepareCodecInitializationThrowing(initialization, payloadFormat: payloadFormat)
-        decoder.installDecodeOutcomeHandler { [weak self] outcome in self?.decoded(outcome) }
+        decoder.installDecodeOutcomeHandler { [weak self] outcome in
+            self?.decoded(outcome, videoGeneration: native.videoGeneration)
+        }
         decoder.start()
         do {
             try transport.configureVideo(native)
@@ -116,18 +119,22 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     /// Transfers renderer reporting only after VIDEO_CONFIG_ACK was submitted.
     public func activate() throws {
+        guard let generation = lock.withLock({ state.configuration?.nativeConfiguration.videoGeneration }) else {
+            throw LSPTransportError.invalidState
+        }
         renderer.setMailboxDropNewest(false)
         renderer.installCommandCommitHandler { [weak self] frameNumber in
-            self?.reportCommit(frameNumber: frameNumber)
+            self?.reportCommit(frameNumber: frameNumber, videoGeneration: generation)
         }
         renderer.installFrameDropHandler { [weak self] frameNumber, reason in
-            self?.rendererDropped(frameNumber: frameNumber, reason: reason)
+            self?.rendererDropped(
+                frameNumber: frameNumber,
+                reason: reason,
+                videoGeneration: generation
+            )
         }
         lock.withLock { state.active = true }
         do {
-            guard let generation = lock.withLock({ state.configuration?.nativeConfiguration.videoGeneration }) else {
-                throw LSPTransportError.invalidState
-            }
             try transport.activateVideo(videoGeneration: generation)
         } catch {
             lock.withLock { state.active = false }
@@ -201,7 +208,8 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                 independent: frame.independent,
                 receiveTimeMicroseconds: frame.receiveTimeMicroseconds,
                 submitTimeMicroseconds: submitTime,
-                enqueueTimeMicroseconds: nil
+                enqueueTimeMicroseconds: nil,
+                reporting: false
             )
             return (decoder, native, Self.mediaFrameToken(for: frame.frameID))
         }
@@ -228,30 +236,48 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             videoConfigurationGeneration: frame.videoGeneration
         ))
         if disposition == .capacityDropped {
-            recordDecodeDrop(frameID: frame.frameID)
-            finish(frameID: frame.frameID, status: .surfaceExhausted)
+            recordDecodeDrop(frameID: frame.frameID, videoGeneration: frame.videoGeneration)
+            finish(
+                frameID: frame.frameID,
+                status: .surfaceExhausted,
+                videoGeneration: frame.videoGeneration
+            )
         } else if disposition == .requestKeyFrame {
-            recordDecodeDrop(frameID: frame.frameID)
-            finish(frameID: frame.frameID, status: frame.independent ? .unrecoverableError : .recoverableError)
+            recordDecodeDrop(frameID: frame.frameID, videoGeneration: frame.videoGeneration)
+            finish(
+                frameID: frame.frameID,
+                status: frame.independent ? .unrecoverableError : .recoverableError,
+                videoGeneration: frame.videoGeneration
+            )
         }
     }
 
-    private func decoded(_ outcome: VideoDecodeOutcome) {
+    private func decoded(_ outcome: VideoDecodeOutcome, videoGeneration: UInt32) {
         switch outcome {
         case .decoded(let frameNumber):
             let frameID = Self.lspFrameID(from: frameNumber)
-            recordDecodeAndEnqueue(frameID: frameID)
-            finish(frameID: frameID, status: .ready)
+            recordDecodeAndEnqueue(frameID: frameID, videoGeneration: videoGeneration)
+            finish(frameID: frameID, status: .ready, videoGeneration: videoGeneration)
         case .failed(let frameNumber):
             let frameID = Self.lspFrameID(from: frameNumber)
-            recordDecodeDrop(frameID: frameID)
-            let independent = lock.withLock { state.outstanding[frameID]?.independent ?? false }
-            finish(frameID: frameID, status: independent ? .unrecoverableError : .recoverableError)
+            recordDecodeDrop(frameID: frameID, videoGeneration: videoGeneration)
+            let independent = lock.withLock {
+                guard state.active,
+                      state.configuration?.nativeConfiguration.videoGeneration == videoGeneration else { return false }
+                return state.outstanding[frameID]?.independent ?? false
+            }
+            finish(
+                frameID: frameID,
+                status: independent ? .unrecoverableError : .recoverableError,
+                videoGeneration: videoGeneration
+            )
         }
     }
 
-    private func recordDecodeDrop(frameID: UInt64) {
+    private func recordDecodeDrop(frameID: UInt64, videoGeneration: UInt32) {
         lock.withLock {
+            guard state.active,
+                  state.configuration?.nativeConfiguration.videoGeneration == videoGeneration else { return }
             state.submitToDecode.drop()
             state.receiveToMetalEnqueue.drop()
             state.metalEnqueueToCommit.drop()
@@ -259,10 +285,12 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         }
     }
 
-    private func recordDecodeAndEnqueue(frameID: UInt64) {
+    private func recordDecodeAndEnqueue(frameID: UInt64, videoGeneration: UInt32) {
         let now = Self.monotonicMicroseconds()
         lock.withLock {
-            guard var frame = state.outstanding[frameID] else { return }
+            guard state.active,
+                  state.configuration?.nativeConfiguration.videoGeneration == videoGeneration,
+                  var frame = state.outstanding[frameID] else { return }
             if now >= frame.submitTimeMicroseconds {
                 state.submitToDecode.record(now - frame.submitTimeMicroseconds)
             } else {
@@ -283,11 +311,21 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         }
     }
 
-    private func finish(frameID: UInt64, status: LSPVideoDecodeStatus) {
+    private func finish(
+        frameID: UInt64,
+        status: LSPVideoDecodeStatus,
+        videoGeneration: UInt32
+    ) {
         let report = lock.withLock { () -> (UInt32, FrameState, UInt8)? in
             guard let configuration = state.configuration?.nativeConfiguration,
-                  let frame = state.outstanding.removeValue(forKey: frameID) else { return nil }
-            let credit = UInt8(max(0, Int(configuration.decoderSurfaces) - state.outstanding.count))
+                  state.active,
+                  configuration.videoGeneration == videoGeneration,
+                  var frame = state.outstanding[frameID],
+                  !frame.reporting else { return nil }
+            frame.reporting = true
+            state.outstanding[frameID] = frame
+            let completedOutstandingCount = state.outstanding.count - 1
+            let credit = UInt8(max(0, Int(configuration.decoderSurfaces) - completedOutstandingCount))
             return (configuration.videoGeneration, frame, credit)
         }
         guard let report else { return }
@@ -300,8 +338,14 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                 availableCredit: report.2,
                 mailboxOccupancy: status == .ready ? 1 : 0
             )
-            let commitWasPending = lock.withLock { state.pendingCommits.remove(frameID) != nil }
-            if commitWasPending {
+            let commitWasPending = lock.withLock { () -> Bool? in
+                guard state.active,
+                      state.configuration?.nativeConfiguration.videoGeneration == report.0,
+                      state.outstanding[frameID]?.reporting == true else { return nil }
+                state.outstanding.removeValue(forKey: frameID)
+                return state.pendingCommits.remove(frameID) != nil
+            }
+            if commitWasPending == true {
                 do {
                     try transport.reportVideoCommit(
                         videoGeneration: report.0,
@@ -309,20 +353,32 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                         mailboxOccupancy: 0
                     )
                 } catch {
-                    fail((error as? LSPTransportError) ?? .internalFailure)
+                    fail(
+                        (error as? LSPTransportError) ?? .internalFailure,
+                        videoGeneration: report.0
+                    )
                 }
             }
         } catch {
-            _ = lock.withLock { state.pendingCommits.remove(frameID) }
-            fail((error as? LSPTransportError) ?? .internalFailure)
+            _ = lock.withLock {
+                guard state.configuration?.nativeConfiguration.videoGeneration == report.0 else { return false }
+                return state.pendingCommits.remove(frameID) != nil
+            }
+            fail(
+                (error as? LSPTransportError) ?? .internalFailure,
+                videoGeneration: report.0
+            )
         }
     }
 
     private func reportDrop(_ frame: LSPEncodedVideoAccessUnit, status: LSPVideoDecodeStatus) {
-        let credit = lock.withLock { () -> UInt8 in
-            guard let configuration = state.configuration?.nativeConfiguration else { return 0 }
+        let credit = lock.withLock { () -> UInt8? in
+            guard state.active,
+                  let configuration = state.configuration?.nativeConfiguration,
+                  configuration.videoGeneration == frame.videoGeneration else { return nil }
             return UInt8(max(0, Int(configuration.decoderSurfaces) - state.outstanding.count))
         }
+        guard let credit else { return }
         do {
             try transport.reportVideoDecode(
                 videoGeneration: frame.videoGeneration,
@@ -333,28 +389,39 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                 mailboxOccupancy: 1
             )
         } catch {
-            fail((error as? LSPTransportError) ?? .internalFailure)
+            fail(
+                (error as? LSPTransportError) ?? .internalFailure,
+                videoGeneration: frame.videoGeneration
+            )
         }
     }
 
-    private func reportCommit(frameNumber: Int) {
+    private func reportCommit(frameNumber: Int, videoGeneration: UInt32) {
         let commitTime = Self.monotonicMicroseconds()
         let frameID = Self.lspFrameID(from: frameNumber)
         guard let result = lock.withLock({ () -> (UInt32, Bool)? in
-            guard let generation = state.configuration?.nativeConfiguration.videoGeneration else { return nil }
-            if let enqueueTime = state.enqueueTimes.removeValue(forKey: frameID) {
+            guard state.active,
+                  state.configuration?.nativeConfiguration.videoGeneration == videoGeneration else { return nil }
+            if state.outstanding[frameID] != nil {
+                if let enqueueTime = state.enqueueTimes.removeValue(forKey: frameID) {
+                    if commitTime >= enqueueTime {
+                        state.metalEnqueueToCommit.record(commitTime - enqueueTime)
+                    } else {
+                        state.metalEnqueueToCommit.drop()
+                    }
+                }
+                state.pendingCommits.insert(frameID)
+                return (videoGeneration, false)
+            } else if let enqueueTime = state.enqueueTimes.removeValue(forKey: frameID) {
                 if commitTime >= enqueueTime {
                     state.metalEnqueueToCommit.record(commitTime - enqueueTime)
                 } else {
                     state.metalEnqueueToCommit.drop()
                 }
-            } else if state.outstanding[frameID] != nil {
-                state.pendingCommits.insert(frameID)
-                return (generation, false)
             } else {
                 state.metalEnqueueToCommit.drop()
             }
-            return (generation, true)
+            return (videoGeneration, true)
         })
         else { return }
         guard result.1 else { return }
@@ -365,13 +432,19 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                 mailboxOccupancy: 0
             )
         } catch {
-            fail((error as? LSPTransportError) ?? .internalFailure)
+            fail(
+                (error as? LSPTransportError) ?? .internalFailure,
+                videoGeneration: result.0
+            )
         }
     }
 
     public func telemetrySnapshot() -> LSPProductTelemetrySnapshot {
-        lock.withLock {
+        let decoder = lock.withLock { state.decoder }
+        let decoderStatistics = decoder?.statistics()
+        return lock.withLock {
             .init(
+                videoDecoderStatistics: decoderStatistics,
                 completeFrameReceiveToVideoToolboxSubmit: state.receiveToSubmit.snapshot(),
                 videoToolboxSubmitToDecodeCompletion: state.submitToDecode.snapshot(),
                 completeFrameReceiveToMetalEnqueue: state.receiveToMetalEnqueue.snapshot(),
@@ -390,21 +463,29 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         max(1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1_000)
     }
 
-    private func rendererDropped(frameNumber: Int, reason: MetalFrameDropReason) {
+    private func rendererDropped(
+        frameNumber: Int,
+        reason: MetalFrameDropReason,
+        videoGeneration: UInt32
+    ) {
         let frameID = Self.lspFrameID(from: frameNumber)
         lock.withLock {
+            guard state.active,
+                  state.configuration?.nativeConfiguration.videoGeneration == videoGeneration else { return }
             state.pendingCommits.remove(frameID)
             state.enqueueTimes.removeValue(forKey: frameID)
             state.metalEnqueueToCommit.drop()
         }
         if reason == .rendererUnavailable {
-            fail(.invalidState)
+            fail(.invalidState, videoGeneration: videoGeneration)
         }
     }
 
-    private func fail(_ error: LSPTransportError) {
+    private func fail(_ error: LSPTransportError, videoGeneration: UInt32) {
         let handler = lock.withLock { () -> (@Sendable (LSPTransportError) -> Void)? in
-            guard !state.terminal else { return nil }
+            guard state.active,
+                  state.configuration?.nativeConfiguration.videoGeneration == videoGeneration,
+                  !state.terminal else { return nil }
             state.terminal = true
             state.active = false
             return failureHandler

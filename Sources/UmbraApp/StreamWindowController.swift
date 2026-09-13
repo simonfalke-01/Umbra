@@ -89,15 +89,31 @@ enum StreamPerformanceMetric: CaseIterable, Sendable {
 
 struct StreamStatisticsPresentation: Equatable, Sendable {
     let values: [StreamPerformanceMetric: String]
+    var compactText: String? = nil
 
     subscript(_ metric: StreamPerformanceMetric) -> String {
         values[metric] ?? "Unavailable"
     }
 
     var accessibilityValue: String {
-        StreamPerformanceMetric.allCases
-            .map { "\($0.title) \(self[$0])" }
-            .joined(separator: "\n")
+        overlayText
+    }
+
+    /// Only shows measurements relevant to this transport, not an internal telemetry dump.
+    var overlayText: String {
+        if let compactText { return compactText }
+        let metrics: [StreamPerformanceMetric] = [
+            .videoRate, .networkRTT, .decodeTime, .hostProcessingLatency,
+            .receiveToDecodeLatency, .droppedFrames, .renderQueue,
+        ]
+        return metrics.map { metric in
+            Self.line(metric.title, self[metric])
+        }.joined(separator: "\n")
+    }
+
+    static func line(_ label: String, _ value: String) -> String {
+        let display = value == "Unavailable" ? "—" : value
+        return label.padding(toLength: 20, withPad: " ", startingAt: 0) + " " + display
     }
 }
 
@@ -135,7 +151,7 @@ enum StreamStatisticsPresenter {
             rtt = "Unavailable"
         }
 
-        return StreamStatisticsPresentation(values: [
+        var presentation = StreamStatisticsPresentation(values: [
             .videoRate: videoRate,
             .decodeTime: decoder?.averageDecodeLatencyMilliseconds.map {
                 String(format: "%.1f ms", $0)
@@ -219,6 +235,35 @@ enum StreamStatisticsPresenter {
             .lspFrameToMetal: distribution(product?.completeFrameReceiveToMetalEnqueue),
             .lspAudioReceive: distribution(product?.audioReceiveToDecode),
         ])
+        if lsp != nil || product != nil {
+            var rows: [(String, String)] = [
+                ("Frame rate", videoRate),
+                ("Decode p50/p99", compactDistribution(product?.videoToolboxSubmitToDecodeCompletion)),
+                ("RX→decoder p50/p99", compactDistribution(product?.completeFrameReceiveToVideoToolboxSubmit)),
+                ("RX→Metal p50/p99", compactDistribution(product?.completeFrameReceiveToMetalEnqueue)),
+                ("Metal wait p50/p99", compactDistribution(product?.metalEnqueueToCommit)),
+                ("Frame drops", presentation[.droppedFrames]),
+                ("Packets", presentation[.lspDatagrams]),
+                ("Packet drops", presentation[.lspDrops]),
+            ]
+            if product?.audioReceiveToDecode != nil {
+                rows.insert(("Audio wait p50/p99", compactDistribution(product?.audioReceiveToDecode)), at: 5)
+            }
+            if let failures = lsp?.authenticationFailures, failures > 0 {
+                rows.append(("Auth failures", String(failures)))
+            }
+            presentation.compactText = rows.map { StreamStatisticsPresentation.line($0.0, $0.1) }
+                .joined(separator: "\n")
+        }
+        return presentation
+    }
+
+    /// Keeps the on-video readout short; the full distribution remains in telemetry.
+    private static func compactDistribution(_ value: LSPDistributionSnapshot?) -> String {
+        guard let value, value.count > 0 else { return "Unavailable" }
+        return String(format: "%.2f / %.2f ms",
+                      Double(value.p50Microseconds) / 1_000,
+                      Double(value.p99Microseconds) / 1_000)
     }
 
     private static func frameCount(_ count: Int) -> String {
@@ -794,6 +839,27 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         await presentationFinishTask?.value
     }
 
+    /// Reuses an already active stream, or waits for its existing close operation to finish.
+    /// A pending first frame is left hidden until normal renderer publication reveals it.
+    func focusExistingSession() async -> Bool {
+        if let stopRequestTask {
+            await stopRequestTask.value
+            return false
+        }
+        if let presentationFinishTask {
+            await presentationFinishTask.value
+            return false
+        }
+        guard isSessionActive, !isStopRequested else { return false }
+        if presentationRevealed {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+            NSRunningApplication.current.activate(options: [])
+            focusStreamContent()
+        }
+        return true
+    }
+
     private func performPresentationFinish() async {
         guard isSessionActive else { return }
         controllers.releaseAllInputs()
@@ -1129,18 +1195,11 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     private func setStatisticsVisible(_ visible: Bool) {
         showsStatistics = visible
-        contentView.setStatisticsPresentation(
-            visible ? StreamStatisticsPresenter.make(
-                renderer: nil,
-                decoder: nil,
-                transport: nil,
-                lsp: nil,
-                reconnect: nil,
-                devices: [],
-                product: nil,
-                nativeTiming: nil
-            ) : nil
-        )
+        if visible {
+            refreshStatistics()
+        } else {
+            contentView.setStatisticsPresentation(nil)
+        }
         statisticsTimer?.invalidate()
         statisticsTimer = nil
         guard visible else { return }
@@ -1154,7 +1213,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private func refreshStatistics() {
         guard showsStatistics else { return }
         contentView.setStatisticsPresentation(StreamStatisticsPresenter.make(
-            renderer: nil,
+            renderer: renderer?.statistics(),
             decoder: videoPipelineStatistics,
             transport: streamStatistics,
             lsp: lspTelemetry,
@@ -1385,147 +1444,38 @@ final class StreamContainerView: NSView {
     }
 }
 
-final class StreamStatisticsOverlayView: NSVisualEffectView {
-    private static let rows: [[StreamPerformanceMetric?]] = [
-        [.videoRate, .networkRTT],
-        [.decodeTime, .droppedFrames],
-        [.renderQueue, .videoQueue],
-        [.audioQueue, .videoPackets],
-        [.audioPackets, nil],
-        [.inputToDecodeProxyLatency, nil],
-        [.hostProcessingLatency, .receiveToDecodeLatency],
-        [.receiveToSubmitLatency, .reassemblyToSubmitLatency],
-        [.videoToolboxLatency, .decodeToMetalCommitLatency],
-        [.presentationProxyLatency, nil],
-    ]
-
-    private var valueLabels: [StreamPerformanceMetric: NSTextField] = [:]
-    private var increasedContrastOverride: Bool?
+/// Small click-through text over video, with no material, background, or container border.
+final class StreamStatisticsOverlayView: NSView {
+    private let readout = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        material = .hudWindow
-        blendingMode = .withinWindow
-        state = .active
-        wantsLayer = true
-        layer?.cornerRadius = UmbraLayout.cornerMedium
-        layer?.masksToBounds = true
-        updateContrastBoundary()
-
-        let title = NSTextField(labelWithString: "Stream Performance")
-        title.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        title.textColor = .labelColor
-        title.setAccessibilityElement(false)
-
-        let latencyNote = NSTextField(labelWithString: "Latency: p50 / p95 / p99")
-        latencyNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
-        latencyNote.textColor = .secondaryLabelColor
-        latencyNote.setAccessibilityElement(false)
-
-        let grid = NSGridView(views: Self.rows.map { row in
-            row.flatMap { metric -> [NSView] in
-                guard let metric else { return [NSView(), NSView()] }
-                let label = NSTextField(labelWithString: metric.title)
-                label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
-                label.textColor = .secondaryLabelColor
-                label.alignment = .right
-                label.lineBreakMode = .byTruncatingTail
-                label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-                label.setAccessibilityElement(false)
-                let value = NSTextField(labelWithString: "Unavailable")
-                value.font = .monospacedDigitSystemFont(
-                    ofSize: NSFont.smallSystemFontSize,
-                    weight: .regular
-                )
-                value.textColor = .labelColor
-                value.lineBreakMode = .byTruncatingMiddle
-                value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-                value.setAccessibilityElement(false)
-                valueLabels[metric] = value
-                return [label, value]
-            }
-        })
-        grid.rowSpacing = UmbraLayout.space1
-        grid.columnSpacing = UmbraLayout.space2
-        grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 2).xPlacement = .trailing
-        grid.column(at: 1).trailingPadding = UmbraLayout.space4
-
-        let header = NSStackView(views: [title, latencyNote])
-        header.orientation = .horizontal
-        header.alignment = .firstBaseline
-        header.distribution = .fill
-        header.spacing = UmbraLayout.space4
-
-        let content = NSStackView(views: [header, grid])
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.distribution = .gravityAreas
-        content.spacing = UmbraLayout.space2
-        content.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(content)
+        readout.font = .monospacedSystemFont(ofSize: UmbraLayout.streamOverlayFontSize, weight: .regular)
+        readout.textColor = StreamOverlayStyle.text
+        readout.drawsBackground = false
+        readout.isBordered = false
+        readout.maximumNumberOfLines = 0
+        readout.lineBreakMode = .byClipping
+        readout.setAccessibilityElement(false)
+        readout.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(readout)
         NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: UmbraLayout.space3),
-            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -UmbraLayout.space3),
-            content.topAnchor.constraint(equalTo: topAnchor, constant: UmbraLayout.space3),
-            content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -UmbraLayout.space3),
-            grid.widthAnchor.constraint(equalTo: content.widthAnchor),
+            readout.leadingAnchor.constraint(equalTo: leadingAnchor),
+            readout.trailingAnchor.constraint(equalTo: trailingAnchor),
+            readout.topAnchor.constraint(equalTo: topAnchor),
+            readout.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Stream performance")
-        setAccessibilityHelp("Latency values are the 50th, 95th, and 99th percentiles.")
+        setAccessibilityHelp("LSP latency values show the median and 99th percentile in milliseconds. A dash means no measurement yet.")
         isHidden = true
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(accessibilityDisplayOptionsDidChange(_:)),
-            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
-            object: nil
-        )
     }
 
     required init?(coder: NSCoder) { nil }
 
-    deinit {
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        updateContrastBoundary()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        updateContrastBoundary()
-    }
-
-    override func layout() {
-        super.layout()
-        updateContrastBoundary()
-    }
-
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
-    }
-
-    func setIncreasedContrastOverride(_ increasedContrast: Bool?) {
-        increasedContrastOverride = increasedContrast
-        updateContrastBoundary()
-    }
-
-    @objc
-    private func accessibilityDisplayOptionsDidChange(_ notification: Notification) {
-        updateContrastBoundary()
-    }
-
-    private func updateContrastBoundary() {
-        let increasedContrast = increasedContrastOverride
-            ?? NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
-        layer?.borderWidth = increasedContrast ? UmbraLayout.accessibilityBorderWidth : 0
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.borderColor = NSColor.separatorColor.cgColor
-        }
     }
 
     func setPresentation(_ presentation: StreamStatisticsPresentation?) {
@@ -1534,11 +1484,12 @@ final class StreamStatisticsOverlayView: NSVisualEffectView {
             setAccessibilityValue(nil)
             return
         }
-        for metric in StreamPerformanceMetric.allCases {
-            let value = presentation[metric]
-            valueLabels[metric]?.stringValue = value
-            valueLabels[metric]?.toolTip = value
-        }
+        readout.attributedStringValue = NSAttributedString(string: presentation.overlayText, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: UmbraLayout.streamOverlayFontSize, weight: .regular),
+            .foregroundColor: StreamOverlayStyle.text,
+            .strokeColor: StreamOverlayStyle.outline,
+            .strokeWidth: StreamOverlayStyle.outlineWidth,
+        ])
         setAccessibilityValue(presentation.accessibilityValue)
         isHidden = false
     }

@@ -1194,19 +1194,6 @@ namespace umbra::lsp {
         cleanup_platform();
         return status;
       }
-      if (const auto status = dtls_.initialize(
-            socket_,
-            &peer_address_,
-            peer_address_size_,
-            std::span<const std::uint8_t, 32> {endpoint.server_spki_sha256},
-            receive_application_data,
-            this
-          );
-          status != CLSP_STATUS_OK) {
-        cleanup_platform();
-        return status;
-      }
-
       stop_requested_.store(false, std::memory_order_release);
       terminal_failed_.store(false, std::memory_order_release);
       terminal_status_.store(CLSP_STATUS_OK, std::memory_order_release);
@@ -2103,11 +2090,17 @@ namespace umbra::lsp {
                            ) ||
           render_mailbox_occupancy > 1U ||
           video_decoder_credit_.in_flight() == 0 ||
-          decoder_credit !=
-            static_cast<std::uint8_t>(video_decoder_credit_.capacity() - video_decoder_credit_.in_flight() + 1U)) {
+          decoder_credit > video_decoder_credit_.capacity()) {
+        os_log_error(OS_LOG_DEFAULT,
+          "LSP decode feedback rejected: generation=%{public}u expected=%{public}u retained=%{public}d in_flight=%{public}u credit=%{public}u",
+          video_generation, video_configuration_.video_generation, delivered != nullptr,
+          static_cast<unsigned int>(video_decoder_credit_.in_flight()), static_cast<unsigned int>(decoder_credit));
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
+      // Native reservations include frames queued for Swift delivery as well as
+      // hardware submissions. The asynchronous Swift capacity hint cannot equal
+      // that count reliably; release only this exact retained native frame.
       *delivered = {};
       (void)video_decoder_credit_.release();
       video_render_mailbox_occupancy_ = render_mailbox_occupancy;
@@ -2175,6 +2168,10 @@ namespace umbra::lsp {
       if (video_generation != video_configuration_.video_generation ||
           frame_id == 0 || frame_id > video_largest_decoded_frame_id_ ||
           render_mailbox_occupancy > 1U) {
+        os_log_error(OS_LOG_DEFAULT,
+          "LSP commit feedback rejected: generation=%{public}u expected=%{public}u frame=%{public}llu decoded=%{public}llu",
+          video_generation, video_configuration_.video_generation,
+          static_cast<unsigned long long>(frame_id), static_cast<unsigned long long>(video_largest_decoded_frame_id_));
         pthread_mutex_unlock(&mutex_);
         return CLSP_STATUS_INVALID_ARGUMENT;
       }
@@ -3822,7 +3819,7 @@ namespace umbra::lsp {
     }
 
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
-    /** @brief Resolve and connect one nonblocking UDP socket, then register kqueue readiness. */
+    /** @brief Select a resolved UDP route by sending its real ClientHello, then register readiness. */
     [[nodiscard]] clsp_status_t open_socket(const clsp_endpoint_t &endpoint) noexcept {
       std::array<char, 256> host {};
       if (endpoint.host.length == 0 || endpoint.host.length >= host.size() || endpoint.host.data == nullptr || endpoint.port == 0) {
@@ -3853,6 +3850,14 @@ namespace umbra::lsp {
           os_log_error(OS_LOG_DEFAULT, "LSP UDP socket creation failed: errno=%{public}d", errno);
           continue;
         }
+        // A rejected datagram must become a recoverable transport error, never
+        // SIGPIPE terminating the GUI before it can report or retry startup.
+        const int no_sigpipe = 1;
+        if (setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP signal suppression setup failed: errno=%{public}d", errno);
+          ::close(descriptor);
+          continue;
+        }
         const auto flags = fcntl(descriptor, F_GETFL, 0);
         if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
           os_log_error(OS_LOG_DEFAULT, "LSP UDP nonblocking setup failed: errno=%{public}d", errno);
@@ -3868,6 +3873,25 @@ namespace umbra::lsp {
         socket_family_ = candidate->ai_family;
         std::memcpy(&peer_address_, candidate->ai_addr, candidate->ai_addrlen);
         peer_address_size_ = static_cast<unsigned int>(candidate->ai_addrlen);
+        auto status = dtls_.initialize(
+          socket_, &peer_address_, peer_address_size_,
+          std::span<const std::uint8_t, 32> {endpoint.server_spki_sha256},
+          receive_application_data, this
+        );
+        if (status == CLSP_STATUS_OK) {
+          status = dtls_.advance_handshake();
+        }
+        if (status != CLSP_STATUS_OK) {
+          const bool retry_address = status == CLSP_STATUS_SOCKET_FAILURE && dtls_.route_failed();
+          ::close(socket_);
+          socket_ = -1;
+          if (retry_address) {
+            os_log_info(OS_LOG_DEFAULT, "LSP UDP initial route unavailable: family=%{public}d; trying next resolved address", candidate->ai_family);
+            continue;
+          }
+          freeaddrinfo(addresses);
+          return status;
+        }
         break;
       }
       freeaddrinfo(addresses);
@@ -3942,11 +3966,7 @@ namespace umbra::lsp {
 
     /** @brief Own the complete socket/security/control runtime until stop or failure. */
     void run_worker() noexcept {
-      auto status = dtls_.advance_handshake();
-      if (status != CLSP_STATUS_OK) {
-        fail_worker(status);
-        return;
-      }
+      auto status = CLSP_STATUS_OK;
       auto last_dtls_progress = monotonic_microseconds();
       while (!stop_requested_.load(std::memory_order_acquire)) {
         std::array<struct kevent, 8> events {};

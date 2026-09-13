@@ -48,7 +48,7 @@ namespace umbra::lsp {
     ~WolfSSLDtlsClient();
 
     /**
-     * @brief Configure the exact LSP/1 policy for one connected socket.
+     * @brief Create a fresh exact-policy association for one connected socket before worker startup.
      *
      * @param socket Connected nonblocking UDP socket.
      * @param peer_address Complete connected peer address.
@@ -69,6 +69,9 @@ namespace umbra::lsp {
 
     /** @brief Emit the initial ClientHello or advance a waiting handshake. */
     [[nodiscard]] clsp_status_t advance_handshake() noexcept;
+
+    /** @brief Identify kernel route errors for address fallback; explicit permission and authentication errors remain terminal. */
+    [[nodiscard]] bool route_failed() const noexcept;
 
     /**
      * @brief Process exactly one RFC 7983-classified DTLS datagram.

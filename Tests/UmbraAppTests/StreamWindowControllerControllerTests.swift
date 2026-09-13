@@ -282,6 +282,12 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             presentation[.lspFrameToDecoder],
             "n=10 p50=100µs p95=200µs p99=250µs max=300µs drops=1 [client-monotonic]"
         )
+        XCTAssertTrue(presentation.overlayText.contains("RX→decoder p50/p99"))
+        XCTAssertTrue(presentation.overlayText.contains("0.10 / 0.25 ms"))
+        XCTAssertTrue(presentation.overlayText.contains("RX 900 / TX 700"))
+        XCTAssertFalse(presentation.overlayText.contains("Unavailable"))
+        XCTAssertFalse(presentation.overlayText.contains("Network RTT"))
+        XCTAssertFalse(presentation.overlayText.contains("client-monotonic"))
     }
 
     func testStatisticsPresenterDistinguishesUnavailableMetricsFromValidZero() {
@@ -470,26 +476,21 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         )
     }
 
-    func testStatisticsOverlayUsesNativeHUDMaterialHierarchyAndDoesNotCaptureInput() throws {
+    func testStatisticsOverlayUsesSmallMonospaceTextWithoutBackgroundOrInputCapture() throws {
         let overlay = StreamStatisticsOverlayView()
-        let grid = try XCTUnwrap(
-            descendants(of: overlay, type: NSGridView.self).first
-        )
         let fields = descendants(of: overlay, type: NSTextField.self)
 
-        XCTAssertFalse(fields.isEmpty)
-        XCTAssertEqual(grid.numberOfRows, 10)
-        XCTAssertEqual(overlay.material, .hudWindow)
-        XCTAssertEqual(overlay.blendingMode, .withinWindow)
-        XCTAssertEqual(overlay.state, .active)
+        XCTAssertEqual(fields.count, 1)
+        XCTAssertTrue(descendants(of: overlay, type: NSVisualEffectView.self).isEmpty)
         XCTAssertNil(overlay.hitTest(NSPoint(x: 1, y: 1)))
-        XCTAssertTrue(fields.contains { $0.stringValue == "Stream Performance" })
-        XCTAssertTrue(fields.contains { $0.stringValue == "Latency: p50 / p95 / p99" })
         XCTAssertTrue(fields.allSatisfy { !$0.isAccessibilityElement() })
-        for field in fields where field.stringValue != "Stream Performance" {
+        for field in fields {
             let font = try XCTUnwrap(field.font)
-            XCTAssertEqual(font.pointSize, NSFont.smallSystemFontSize)
+            XCTAssertEqual(font.pointSize, 10)
+            XCTAssertTrue(NSFontManager.shared.traits(of: font).contains(.fixedPitchFontMask))
             XCTAssertFalse(NSFontManager.shared.traits(of: font).contains(.boldFontMask))
+            XCTAssertFalse(field.drawsBackground)
+            XCTAssertFalse(field.isBordered)
         }
     }
 
@@ -524,9 +525,6 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             canvas.layer?.backgroundColor = NSColor.darkGray.cgColor
             let overlay = StreamStatisticsOverlayView()
             overlay.appearance = NSAppearance(named: appearance.value)
-            overlay.setIncreasedContrastOverride(
-                appearance.value == .accessibilityHighContrastDarkAqua
-            )
             overlay.setPresentation(presentation)
             canvas.addSubview(overlay)
             overlay.frame = NSRect(
@@ -557,16 +555,10 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             XCTAssertFalse(overlay.isHidden)
             XCTAssertEqual(overlay.accessibilityLabel(), "Stream performance")
             XCTAssertTrue(
-                (overlay.accessibilityValue() as? String)?.contains("Frame rate 59.9 FPS") == true
+                (overlay.accessibilityValue() as? String)?.contains("59.9 FPS") == true
             )
-            if appearance.value == .accessibilityHighContrastDarkAqua {
-                XCTAssertEqual(
-                    overlay.layer?.borderWidth,
-                    UmbraLayout.accessibilityBorderWidth
-                )
-            } else {
-                XCTAssertEqual(overlay.layer?.borderWidth, 0)
-            }
+            XCTAssertEqual(overlay.layer?.borderWidth ?? 0, 0)
+            XCTAssertLessThan(overlay.frame.height, 120)
 
             guard let outputDirectory = ProcessInfo.processInfo.environment["UMBRA_UI_SNAPSHOT_DIR"] else {
                 continue
@@ -584,7 +576,7 @@ final class StreamWindowControllerControllerTests: XCTestCase {
             ))
         }
 
-        let streamView = StreamMetalView(frame: NSRect(x: 0, y: 0, width: 720, height: 520))
+        let streamView = StreamMetalView(frame: NSRect(x: 0, y: 0, width: 360, height: 520))
         streamView.setStatisticsPresentation(presentation)
         streamView.layoutSubtreeIfNeeded()
         let hostedOverlay = try XCTUnwrap(
@@ -947,20 +939,31 @@ final class StreamWindowControllerControllerTests: XCTestCase {
         defer { selector.orderOut(nil) }
 
         let controller = try StreamWindowController(device: nil)
+        let initiallyFocused = await controller.focusExistingSession()
+        XCTAssertFalse(initiallyFocused)
         try await controller.prepare(for: makeBootstrap(windowMode: .windowed))
 
         XCTAssertTrue(selector.isVisible)
         XCTAssertFalse(controller.isStreamWindowVisible)
+        let pendingFrameFocused = await controller.focusExistingSession()
+        XCTAssertTrue(pendingFrameFocused)
+        XCTAssertFalse(controller.isStreamWindowVisible, "An existing pending stream must still wait for a frame.")
 
         controller.handleFirstRendererCommitForTesting()
 
         XCTAssertFalse(selector.isVisible)
         XCTAssertTrue(controller.isStreamWindowVisible)
+        let originalWindow = controller.inputCaptureWindow
+        let existingFocused = await controller.focusExistingSession()
+        XCTAssertTrue(existingFocused)
+        XCTAssertTrue(controller.inputCaptureWindow === originalWindow)
 
         await controller.finish()
 
         XCTAssertTrue(selector.isVisible)
         XCTAssertFalse(controller.isStreamWindowVisible)
+        let finishedFocused = await controller.focusExistingSession()
+        XCTAssertFalse(finishedFocused)
     }
 
     func testHiddenMetalSurfaceRevealsOnItsFirstRealCommandCommit() async throws {

@@ -26,7 +26,9 @@ enum UmbraLayout {
     static let macOSControlHeight: CGFloat = 24
     static let settingsMinimumHeight: CGFloat = 180
     static let settingsMaximumHeight: CGFloat = 620
-    static let streamOverlayMaximumWidth: CGFloat = 720
+    static let streamOverlayMaximumWidth: CGFloat = 360
+    /// Compact, noninteractive telemetry drawn directly over streamed video.
+    static let streamOverlayFontSize: CGFloat = 10
 
     static func settingsWindowHeight(contentHeight: CGFloat?) -> CGFloat {
         guard let contentHeight, contentHeight.isFinite, contentHeight > 0 else {
@@ -38,6 +40,13 @@ enum UmbraLayout {
         let measured = ceil(contentHeight)
         return min(max(measured, settingsMinimumHeight), settingsMaximumHeight)
     }
+}
+
+/// High-contrast glyphs remain readable over light and dark video without a panel.
+enum StreamOverlayStyle {
+    static let text = NSColor.white
+    static let outline = NSColor.black
+    static let outlineWidth: CGFloat = -3
 }
 
 enum UmbraSymbol {

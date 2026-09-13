@@ -57,13 +57,20 @@ struct UmbraApp: App {
         let launchRequest = UmbraBootstrap.resolveLaunchRequest()
         let terminateAfterStream: Bool
         let requestedStream: CLIStreamLaunchRequest?
+        let deferredStreamArguments: [String]?
         switch launchRequest {
         case .launchApplication:
             terminateAfterStream = false
             requestedStream = nil
+            deferredStreamArguments = nil
         case let .stream(request):
             terminateAfterStream = true
             requestedStream = request
+            deferredStreamArguments = nil
+        case let .deferredStream(processArguments):
+            terminateAfterStream = true
+            requestedStream = nil
+            deferredStreamArguments = processArguments
         }
         do {
             let composition = try LiveApplicationComposition()
@@ -76,26 +83,7 @@ struct UmbraApp: App {
             applicationDelegate.stopBarrier = { [weak composition] in
                 await composition?.stopForApplicationTermination()
             }
-            if terminateAfterStream {
-                let isLSP = requestedStream?.lsp != nil
-                composition.clientService.onSessionTerminated = { succeeded in
-                    if isLSP, succeeded {
-                        writeCLIStandardOutput("LSP stream ended.\n")
-                    }
-                    exit(succeeded ? CLIExitCode.success.rawValue : CLIExitCode.failure.rawValue)
-                }
-            }
-            if var request = requestedStream {
-                let runtimeResolution = composition.runtimePreferenceResolver.resolveForStreaming(
-                    request.intent.preferences,
-                    uiScreen: NSApp.keyWindow?.screen
-                )
-                request.intent = runtimeResolution.applying(to: request.intent)
-                composition.supportLog?.record(
-                    source: "Application",
-                    level: .info,
-                    message: "Starting requested \(request.intent.kind.rawValue) stream for host \(request.intent.hostID), application \(request.intent.applicationID)."
-                )
+            if requestedStream != nil || deferredStreamArguments != nil {
                 Task { @MainActor [weak store] in
                     composition.supportLog?.record(
                         source: "Application",
@@ -104,6 +92,45 @@ struct UmbraApp: App {
                     )
                     do {
                         await composition.clientService.waitUntilReady()
+                        var request: CLIStreamLaunchRequest
+                        if let requestedStream {
+                            request = requestedStream
+                        } else if let deferredStreamArguments {
+                            let outcome = await UmbraBootstrap.resolveDeferredStream(
+                                processArguments: deferredStreamArguments,
+                                defaultStreamingPreferences: composition.preferences.settings,
+                                service: composition.applicationService
+                            )
+                            switch outcome {
+                            case let .stream(resolvedRequest):
+                                request = resolvedRequest
+                            case .launchApplication:
+                                return
+                            case let .terminate(result):
+                                exit(result.exitCode)
+                            }
+                        } else {
+                            return
+                        }
+
+                        let isLSP = request.lsp != nil
+                        composition.clientService.onSessionTerminated = { succeeded in
+                            if isLSP, succeeded {
+                                writeCLIStandardOutput("LSP stream ended.\n")
+                            }
+                            exit(succeeded ? CLIExitCode.success.rawValue : CLIExitCode.failure.rawValue)
+                        }
+                        let runtimeResolution = composition.runtimePreferenceResolver
+                            .resolveForStreaming(
+                                request.intent.preferences,
+                                uiScreen: NSApp.keyWindow?.screen
+                            )
+                        request.intent = runtimeResolution.applying(to: request.intent)
+                        composition.supportLog?.record(
+                            source: "Application",
+                            level: .info,
+                            message: "Starting requested \(request.intent.kind.rawValue) stream for host \(request.intent.hostID), application \(request.intent.applicationID)."
+                        )
                         let telemetry = try await composition.clientService.beginCLIStream(request)
                         if let target = request.lsp {
                             writeCLIStandardOutput(
