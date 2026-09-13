@@ -15,8 +15,9 @@ PACKAGE_SCRIPT = REPOSITORY_ROOT / "Scripts" / "package-app.sh"
 IDENTITY = "Developer ID Application: Umbra Test (ABCDE12345)"
 CERTIFICATE = b"gate6-test-leaf-certificate"
 CERTIFICATE_SHA256 = hashlib.sha256(CERTIFICATE).hexdigest()
-EMPTY_ENTITLEMENTS_SHA256 = hashlib.sha256(
-    plistlib.dumps({}, fmt=plistlib.FMT_BINARY, sort_keys=True)
+ENTITLEMENTS = {"com.apple.security.device.audio-input": True}
+ENTITLEMENTS_SHA256 = hashlib.sha256(
+    plistlib.dumps(ENTITLEMENTS, fmt=plistlib.FMT_BINARY, sort_keys=True)
 ).hexdigest()
 REQUIRED_LEGAL_RESOURCES = {
     "LICENSE": REPOSITORY_ROOT / "LICENSE",
@@ -58,7 +59,8 @@ class PackageAppQualifyingTests(unittest.TestCase):
             "UMBRA_QUALIFYING_BUILD": "1",
             "CODE_SIGN_IDENTITY": IDENTITY,
             "UMBRA_APPROVED_SIGNING_CERTIFICATE_SHA256": CERTIFICATE_SHA256,
-            "UMBRA_APPROVED_ENTITLEMENTS_SHA256": EMPTY_ENTITLEMENTS_SHA256,
+            "UMBRA_APPROVED_ENTITLEMENTS_SHA256": ENTITLEMENTS_SHA256,
+            "STUB_ENTITLEMENTS_HEX": plistlib.dumps(ENTITLEMENTS).hex(),
             "STUB_CERTIFICATE_HEX": CERTIFICATE.hex(),
             "STUB_CERTIFICATE_SHA256": CERTIFICATE_SHA256,
             "STUB_CODE_SIGN_IDENTITY": IDENTITY,
@@ -93,10 +95,18 @@ class PackageAppQualifyingTests(unittest.TestCase):
             self.tools / "plutil",
             r"""
             #!/usr/bin/env python3
+            import plistlib
             import sys
             if "-lint" in sys.argv:
                 raise SystemExit(0)
             key = sys.argv[sys.argv.index("-extract") + 1]
+            if key == r"com\.apple\.security\.device\.audio-input":
+                try:
+                    value = plistlib.loads(sys.stdin.buffer.read())
+                except Exception:
+                    raise SystemExit(1)
+                print("true" if value.get("com.apple.security.device.audio-input") is True else "false")
+                raise SystemExit(0)
             values = {
                 "CFBundleIdentifier": "app.umbra.Umbra",
                 "NSBonjourServices.0": "_nvstream._tcp",
@@ -185,7 +195,7 @@ class PackageAppQualifyingTests(unittest.TestCase):
             completed.stdout,
         )
         self.assertIn(
-            f"QUALIFYING_ENTITLEMENTS_SHA256={EMPTY_ENTITLEMENTS_SHA256}",
+            f"QUALIFYING_ENTITLEMENTS_SHA256={ENTITLEMENTS_SHA256}",
             completed.stdout,
         )
 
@@ -195,6 +205,17 @@ class PackageAppQualifyingTests(unittest.TestCase):
                 completed = self.run_validation(CODE_SIGN_IDENTITY=identity)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn("explicit non-ad-hoc", completed.stderr)
+
+    def test_microphone_entitlement_is_required_for_every_package(self) -> None:
+        for qualifying in ("0", "1"):
+            for entitlements in ({}, {"com.apple.security.device.audio-input": False}):
+                with self.subTest(qualifying=qualifying, entitlements=entitlements):
+                    completed = self.run_validation(
+                        UMBRA_QUALIFYING_BUILD=qualifying,
+                        STUB_ENTITLEMENTS_HEX=plistlib.dumps(entitlements).hex(),
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn("microphone audio-input entitlement", completed.stderr)
 
     def test_missing_legal_resource_is_rejected(self) -> None:
         resources = self.app / "Contents" / "Resources"

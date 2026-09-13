@@ -10,7 +10,7 @@ expected_app_identifier="app.umbra.Umbra"
 qualifying_build="${UMBRA_QUALIFYING_BUILD:-0}"
 approved_certificate_sha256="${UMBRA_APPROVED_SIGNING_CERTIFICATE_SHA256:-}"
 approved_entitlements_sha256="${UMBRA_APPROVED_ENTITLEMENTS_SHA256:-}"
-signing_entitlements_path="${UMBRA_SIGNING_ENTITLEMENTS_PATH:-}"
+signing_entitlements_path="${UMBRA_SIGNING_ENTITLEMENTS_PATH:-$repository_root/Resources/Umbra/Umbra.entitlements}"
 validate_only_path=""
 typeset -a cleanup_paths=()
 typeset -a required_legal_resources=(
@@ -210,6 +210,11 @@ validate_packaged_app() {
     }
 
     codesign --verify --deep --strict --verbose=2 "$candidate"
+    local required_entitlements
+    required_entitlements="$(codesign --display --entitlements :- "$candidate" 2>/dev/null)"
+    [[ "$(echo "$required_entitlements" | plutil -extract 'com\.apple\.security\.device\.audio-input' raw - 2>/dev/null)" == "true" ]] || {
+        fail "Umbra's signature is missing the microphone audio-input entitlement."
+    }
     if [[ "$qualifying_build" == "1" ]]; then
         require_qualifying_identity
         local signature_details
@@ -369,12 +374,13 @@ if [[ "$qualifying_build" == "1" ]]; then
     fi
     codesign "${codesign_arguments[@]}" "$app_root"
 elif [[ -n "${CODE_SIGN_IDENTITY:-}" ]]; then
-    codesign --force --options runtime --timestamp --sign "$CODE_SIGN_IDENTITY" "$app_root"
+    codesign --force --options runtime --timestamp --entitlements "$signing_entitlements_path" --sign "$CODE_SIGN_IDENTITY" "$app_root"
 else
     codesign \
         --force \
         --sign - \
         --identifier "$app_identifier" \
+        --entitlements "$signing_entitlements_path" \
         "$app_root"
 fi
 
