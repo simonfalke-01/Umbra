@@ -731,6 +731,7 @@ public actor LSPProductClient {
             sensorRate: sensorRate,
             reconciliationRate: reconciliationRate,
             microphoneOffer: microphoneOffer,
+            microphoneDeviceUID: preferences.clientMicrophoneDeviceUID,
             videoOffers: offers,
             receiveBatchCapacity: receiveBatchCapacity,
             decoderSurfaces: decoderSurfaces,
@@ -748,6 +749,7 @@ public actor LSPProductClient {
         sensorRate: UInt32 = 250,
         reconciliationRate: UInt32 = 250,
         microphoneOffer: LSPMicrophoneOffer? = nil,
+        microphoneDeviceUID: String? = nil,
         videoOffers: [LSPVideoOffer],
         receiveBatchCapacity: UInt8 = 64,
         decoderSurfaces: UInt8 = 3,
@@ -792,6 +794,7 @@ public actor LSPProductClient {
                 if sessionState == .inputActive { throw LSPControlStatus.busy }
                 guard sessionState == .authenticated else { throw LSPTransportError.notAuthenticated }
                 try Task.checkCancellation()
+                try await session.selectMicrophoneDevice(uid: microphoneDeviceUID)
                 startSubmissions += 1
                 do {
                     _ = try await session.startInput(LSPInputStartRequest(

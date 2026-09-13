@@ -1028,8 +1028,10 @@ final class AppStore: ObservableObject {
                     progress: operation?.progress,
                     isCancellable: true
                 )
-            } else if preferences.settings.connectionWarnings, failure == nil {
-                failure = PresentedFailure(title: "Streaming Warning", message: message)
+            } else if preferences.settings.connectionWarnings {
+                // Recoverable streaming notices must not present a modal or take input focus.
+                // Terminal failures have their own sessionFailed event and recovery action.
+                sessionDegradation = message
             }
         case let .sessionDegraded(message):
             sessionDegradation = message

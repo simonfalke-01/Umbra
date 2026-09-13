@@ -301,6 +301,18 @@
       "extractionState" : "manual",
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "System Default" } } }
     },
+    "Microphone" : {
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Microphone" } } }
+    },
+    "Unavailable Microphone" : {
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Unavailable Microphone" } } }
+    },
+    "The selected microphone is disconnected. Reconnect it or choose another input." : {
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "The selected microphone is disconnected. Reconnect it or choose another input." } } }
+    },
     "Troubleshooting" : {
       "comment" : "Menu item opening Moonlight troubleshooting documentation.",
       "extractionState" : "manual",

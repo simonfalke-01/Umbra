@@ -139,6 +139,7 @@ public struct LSPActiveInputAuthority: Equatable, Sendable {
     public var audioConfiguration: LSPNativeAudioConfiguration
     public var microphoneConfiguration: LSPNativeMicrophoneConfiguration?
     public var microphoneRequired: Bool
+    public var microphoneDeviceUID: String?
     public var videoSelection: LSPVideoSelection
 }
 
@@ -185,6 +186,7 @@ public actor LSPClientSession {
     private var reconnectDuration = LSPFixedDurationWindow()
     private var reconnectStartedAtMicroseconds: UInt64?
     private var startInProgress = false
+    private var selectedMicrophoneDeviceUID: String?
 
     public init(
         configuration: LSPTransportConfiguration = .init(),
@@ -221,6 +223,14 @@ public actor LSPClientSession {
     ) async throws -> LSPClientSession {
         let identity = try await LSPPersistence.loadOrCreateClientIdentity(from: identityStore)
         return try LSPClientSession(configuration: configuration, identity: identity, videoRenderer: videoRenderer)
+    }
+
+    /// Selects the stable CoreAudio input UID used if this association negotiates microphone uplink.
+    public func selectMicrophoneDevice(uid: String?) throws {
+        guard state == .idle || state == .authenticated else {
+            throw LSPTransportError.invalidState
+        }
+        selectedMicrophoneDeviceUID = uid
     }
 
     /// Starts discovered-host PIN pairing and returns the six digits for local display only.
@@ -555,6 +565,7 @@ public actor LSPClientSession {
             audioConfiguration: response.audioConfiguration,
             microphoneConfiguration: response.microphoneConfiguration,
             microphoneRequired: resolvedRequest.microphoneOffer?.required ?? false,
+            microphoneDeviceUID: selectedMicrophoneDeviceUID,
             videoSelection: response.videoSelection
         )
         installedAudioGeneration = nil
@@ -985,6 +996,7 @@ public actor LSPClientSession {
                 audioConfiguration: response.audioConfiguration,
                 microphoneConfiguration: response.microphoneConfiguration,
                 microphoneRequired: prior.microphoneRequired,
+                microphoneDeviceUID: prior.microphoneDeviceUID,
                 videoSelection: response.videoSelection
             )
             installedAudioGeneration = nil
@@ -1725,6 +1737,7 @@ public actor LSPClientSession {
             do {
                 try microphoneUplink.configure(
                     request.nativeConfiguration,
+                    deviceUID: authority.microphoneDeviceUID,
                     transport: transport,
                     failureHandler: { [weak self] error in
                         Task { await self?.microphoneCaptureFailed(error) }

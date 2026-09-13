@@ -395,6 +395,32 @@ final class AppStoreApplicationTests: XCTestCase {
         XCTAssertNil(store.failure)
     }
 
+    func testStreamingWarningsNeverPresentAModalOrInterruptTheSession() async {
+        let host = makeHost(id: "host")
+        let application = makeApplication(id: 1, hostID: host.id, name: "Desktop")
+        let service = AppStoreClientServiceSpy(hosts: [host], applications: [host.id: [application]])
+        let store = AppStore(service: service)
+        store.openApplications(for: host)
+        await waitUntil { store.applications == [application] }
+        store.launch(application)
+        await waitUntil { service.applicationOperations.count == 1 }
+        service.send(.sessionStreaming)
+
+        for message in [
+            "Native LSP input reconnected with fresh security keys.",
+            "LSP device rate negotiation failed and will retry.",
+            "A recoverable streaming warning.",
+        ] {
+            service.send(.sessionWarning(message))
+            XCTAssertNil(store.failure)
+            XCTAssertNil(store.operation)
+            XCTAssertEqual(store.sessionDegradation, message)
+        }
+
+        service.send(.sessionFailed(.init(kind: .connectionFailed, message: "Connection recovery failed.")))
+        XCTAssertEqual(store.failure?.message, "Connection recovery failed.")
+    }
+
     func testSessionDegradationPersistsAcrossConnectionStagesUntilSessionEnds() async {
         let host = makeHost(id: "host")
         let application = makeApplication(id: 1, hostID: host.id, name: "Desktop")

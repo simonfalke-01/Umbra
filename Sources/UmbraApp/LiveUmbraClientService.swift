@@ -338,6 +338,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lspInputCapture.failureHandler = { [weak self] error in
             self?.eventHandler?(.sessionWarning("Native LSP input stopped: \(error.localizedDescription)"))
         }
+        streamWindow?.onStreamingWarning = { [weak self] message in
+            self?.eventHandler?(.sessionWarning(message))
+        }
     }
 
     deinit {
@@ -1115,7 +1118,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
                         self.notifyLSPSessionTerminated(succeeded: true)
                     }
                 case .failed(let error):
-                    self.eventHandler?(.sessionWarning("Native LSP stream failed: \(error.localizedDescription)"))
+                    self.eventHandler?(.sessionFailed(.init(
+                        kind: .streamTerminated,
+                        message: "Native LSP stream failed: \(error.localizedDescription)"
+                    )))
                     if !self.cliStopReplyPending {
                         self.notifyLSPSessionTerminated(
                             succeeded: false,
@@ -1135,7 +1141,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 do {
                     try await self.reconnectLSPInput(hostID: hostID, reason: .transportLoss)
                     guard self.isActiveLSPStream(streamID, hostID: hostID) else { return }
-                    self.eventHandler?(.sessionWarning("Native LSP input reconnected with fresh security keys."))
                 } catch is CancellationError {
                     return
                 } catch {
@@ -1152,7 +1157,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
                         self.lspOwnerEndpoint?.stop()
                         self.lspOwnerEndpoint = nil
                     }
-                    self.eventHandler?(.sessionWarning("Native LSP reconnect failed: \(error.localizedDescription)"))
+                    self.eventHandler?(.sessionFailed(.init(
+                        kind: .connectionFailed,
+                        message: "Native LSP reconnect failed: \(error.localizedDescription)"
+                    )))
                     if !self.cliStopReplyPending {
                         self.notifyLSPSessionTerminated(
                             succeeded: false,
@@ -1218,6 +1226,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
         }
         lspDeviceOfferTask = Task { @MainActor [weak self, session] in
+            var lastFailure: String?
             while !Task.isCancelled {
                 guard let self,
                       await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
@@ -1226,9 +1235,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 } catch is CancellationError {
                     return
                 } catch {
-                    self.eventHandler?(.sessionWarning(
-                        "LSP device rate negotiation failed and will retry: \(error.localizedDescription)"
-                    ))
+                    guard !Task.isCancelled else { return }
+                    let message = "LSP device rate negotiation will retry: \(error.localizedDescription)"
+                    if message != lastFailure {
+                        self.lspFailureHandler(message)
+                        lastFailure = message
+                    }
                 }
                 try? await Task.sleep(for: .milliseconds(50))
             }
@@ -1289,7 +1301,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
             return nil
         }
-        guard AudioQueueMicrophoneCapture.isAvailable() else {
+        guard AudioQueueMicrophoneCapture.isAvailable(deviceUID: preferences.settings.clientMicrophoneDeviceUID) else {
             if required {
                 throw UmbraClientServiceError.unavailable(
                     "Microphone forwarding is required, but no usable AudioQueue input is available."

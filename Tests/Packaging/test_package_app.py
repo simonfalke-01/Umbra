@@ -78,6 +78,18 @@ class PackageAppQualifyingTests(unittest.TestCase):
         executable.parent.mkdir(parents=True)
         executable.write_bytes(b"Mach-O fixture")
         executable.chmod(0o755)
+        helper = self.app / "Contents" / "MacOS" / "UmbraAWDLHelper"
+        helper.write_bytes(b"Mach-O helper fixture")
+        helper.chmod(0o755)
+        helper_plist = (
+            self.app
+            / "Contents"
+            / "Library"
+            / "LaunchDaemons"
+            / "com.umbra.awdl-helper.plist"
+        )
+        helper_plist.parent.mkdir(parents=True)
+        helper_plist.write_text("fixture", encoding="utf-8")
         (self.app / "Contents" / "Info.plist").write_text("fixture", encoding="utf-8")
         resources.mkdir(parents=True)
         for name, source in REQUIRED_LEGAL_RESOURCES.items():
@@ -115,6 +127,9 @@ class PackageAppQualifyingTests(unittest.TestCase):
                 "NSLocalNetworkUsageDescription": "network",
                 "NSInputMonitoringUsageDescription": "input",
                 "NSMicrophoneUsageDescription": "microphone",
+                "Label": "app.umbra.Umbra.awdl-helper",
+                "BundleProgram": "Contents/MacOS/UmbraAWDLHelper",
+                r"MachServices.app\.umbra\.Umbra\.awdl-helper": "true",
             }
             print(values[key])
             """,
@@ -169,6 +184,8 @@ class PackageAppQualifyingTests(unittest.TestCase):
             elif "--verbose=4" in arguments:
                 identity = os.environ["STUB_CODE_SIGN_IDENTITY"]
                 flags = os.environ["STUB_RUNTIME_FLAGS"]
+                if arguments[-1].endswith("UmbraAWDLHelper"):
+                    print("Identifier=app.umbra.Umbra.awdl-helper", file=sys.stderr)
                 print(f"Authority={identity}", file=sys.stderr)
                 print("TeamIdentifier=ABCDE12345", file=sys.stderr)
                 print(flags, file=sys.stderr)

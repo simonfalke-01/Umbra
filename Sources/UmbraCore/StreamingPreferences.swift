@@ -420,6 +420,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var playAudioOnHost: Bool
     public var clientMicrophoneEnabled: Bool
     public var clientMicrophoneRequired: Bool
+    public var clientMicrophoneDeviceUID: String?
+    public var disableAWDLWhileStreaming: Bool
     public var lspNetworkProfile: LSPNetworkProfilePreference
     public var lspCompetitionCapacityMbps: Int
     public var lspPointerRate: Int
@@ -478,6 +480,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         playAudioOnHost: Bool = false,
         clientMicrophoneEnabled: Bool = false,
         clientMicrophoneRequired: Bool = false,
+        clientMicrophoneDeviceUID: String? = nil,
+        disableAWDLWhileStreaming: Bool = false,
         lspNetworkProfile: LSPNetworkProfilePreference = .adaptiveLowLatency,
         lspCompetitionCapacityMbps: Int = 0,
         lspPointerRate: Int = 1_000,
@@ -547,6 +551,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.playAudioOnHost = playAudioOnHost
         self.clientMicrophoneEnabled = clientMicrophoneEnabled
         self.clientMicrophoneRequired = clientMicrophoneRequired
+        self.clientMicrophoneDeviceUID = clientMicrophoneDeviceUID
+        self.disableAWDLWhileStreaming = disableAWDLWhileStreaming
         self.lspNetworkProfile = lspNetworkProfile
         self.lspCompetitionCapacityMbps = lspCompetitionCapacityMbps
         self.lspPointerRate = lspPointerRate
@@ -605,6 +611,8 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case playAudioOnHost
         case clientMicrophoneEnabled
         case clientMicrophoneRequired
+        case clientMicrophoneDeviceUID
+        case disableAWDLWhileStreaming
         case lspNetworkProfile
         case lspCompetitionCapacityMbps
         case lspPointerRate
@@ -705,6 +713,11 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             playAudioOnHost: try container.decodeIfPresent(Bool.self, forKey: .playAudioOnHost) ?? defaults.playAudioOnHost,
             clientMicrophoneEnabled: try container.decodeIfPresent(Bool.self, forKey: .clientMicrophoneEnabled) ?? defaults.clientMicrophoneEnabled,
             clientMicrophoneRequired: try container.decodeIfPresent(Bool.self, forKey: .clientMicrophoneRequired) ?? defaults.clientMicrophoneRequired,
+            clientMicrophoneDeviceUID: try container.decodeIfPresent(String.self, forKey: .clientMicrophoneDeviceUID),
+            disableAWDLWhileStreaming: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .disableAWDLWhileStreaming
+            ) ?? defaults.disableAWDLWhileStreaming,
             lspNetworkProfile: try container.decodeIfPresent(
                 LSPNetworkProfilePreference.self,
                 forKey: .lspNetworkProfile

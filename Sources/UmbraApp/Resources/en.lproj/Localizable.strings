@@ -55,6 +55,9 @@
 /* Application language preference. */
 "Language" = "Language";
 "System Default" = "System Default";
+"Microphone" = "Microphone";
+"Unavailable Microphone" = "Unavailable Microphone";
+"The selected microphone is disconnected. Reconnect it or choose another input." = "The selected microphone is disconnected. Reconnect it or choose another input.";
 "Changes take effect after you relaunch Umbra." = "Changes take effect after you relaunch Umbra.";
 
 /* Application menu commands. */

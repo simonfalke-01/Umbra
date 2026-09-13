@@ -39,11 +39,15 @@ struct MicrophonePermissionEnvironment {
     let permissionModel: MicrophonePermissionSettingsModel
     let applicationNotifications: NotificationCenter
     let openMicrophoneSettings: () -> Void
+    let availableInputDevices: () -> [ClientMicrophoneDevice]
 
     init(
         authorizer: any ClientMicrophoneAuthorizing,
         initialState: MicrophonePermissionPresentationState? = nil,
         applicationNotifications: NotificationCenter = .default,
+        availableInputDevices: @escaping () -> [ClientMicrophoneDevice] = {
+            SystemClientMicrophoneDevices.availableDevices()
+        },
         openMicrophoneSettings: @escaping () -> Void
     ) {
         permissionModel = MicrophonePermissionSettingsModel(
@@ -51,16 +55,21 @@ struct MicrophonePermissionEnvironment {
             initialState: initialState
         )
         self.applicationNotifications = applicationNotifications
+        self.availableInputDevices = availableInputDevices
         self.openMicrophoneSettings = openMicrophoneSettings
     }
 
     init(
         permissionModel: MicrophonePermissionSettingsModel,
         applicationNotifications: NotificationCenter = .default,
+        availableInputDevices: @escaping () -> [ClientMicrophoneDevice] = {
+            SystemClientMicrophoneDevices.availableDevices()
+        },
         openMicrophoneSettings: @escaping () -> Void
     ) {
         self.permissionModel = permissionModel
         self.applicationNotifications = applicationNotifications
+        self.availableInputDevices = availableInputDevices
         self.openMicrophoneSettings = openMicrophoneSettings
     }
 

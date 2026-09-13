@@ -62,6 +62,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "Umbra", targets: ["UmbraApp"]),
+        .executable(name: "UmbraAWDLHelper", targets: ["UmbraAWDLHelper"]),
         .library(name: "CLSPCore", targets: ["CLSPCore"]),
         .library(name: "UmbraLSPTransport", targets: ["UmbraLSPTransport"]),
         .library(name: "UmbraLSP", targets: ["UmbraLSP"]),
@@ -132,7 +133,17 @@ let package = Package(
         ),
         .target(
             name: "UmbraPlatform",
-            path: "Sources/UmbraPlatform"
+            path: "Sources/UmbraPlatform",
+            linkerSettings: [
+                .linkedFramework("ServiceManagement"),
+            ]
+        ),
+        .executableTarget(
+            name: "UmbraAWDLHelper",
+            path: "Sources/UmbraAWDLHelper",
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
         ),
         .target(
             name: "UmbraDiagnostics",

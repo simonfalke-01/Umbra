@@ -1,6 +1,111 @@
 import AudioToolbox
 import COpus
+import CoreAudio
 import Foundation
+
+/// One input-capable CoreAudio device identified by its stable device UID.
+public struct ClientMicrophoneDevice: Hashable, Sendable {
+    public let uid: String
+    public let name: String
+
+    public init(uid: String, name: String) {
+        self.uid = uid
+        self.name = name
+    }
+}
+
+/// Enumerates the currently attached CoreAudio devices that expose input streams.
+public enum SystemClientMicrophoneDevices {
+    public static func availableDevices() -> [ClientMicrophoneDevice] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var byteCount: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &byteCount
+        ) == noErr else { return [] }
+
+        let deviceCount = Int(byteCount) / MemoryLayout<AudioDeviceID>.size
+        guard deviceCount > 0 else { return [] }
+        var deviceIDs = [AudioDeviceID](repeating: kAudioObjectUnknown, count: deviceCount)
+        let queryStatus = deviceIDs.withUnsafeMutableBytes { bytes in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                0,
+                nil,
+                &byteCount,
+                bytes.baseAddress!
+            )
+        }
+        guard queryStatus == noErr else { return [] }
+
+        return deviceIDs.compactMap { deviceID in
+            guard hasInputStreams(deviceID),
+                  let uid = stringProperty(
+                      kAudioDevicePropertyDeviceUID,
+                      scope: kAudioDevicePropertyScopeInput,
+                      deviceID: deviceID
+                  ),
+                  !uid.isEmpty else { return nil }
+            let name = stringProperty(
+                kAudioObjectPropertyName,
+                scope: kAudioObjectPropertyScopeGlobal,
+                deviceID: deviceID
+            ) ?? uid
+            return ClientMicrophoneDevice(uid: uid, name: name)
+        }
+        .sorted {
+            let comparison = $0.name.localizedStandardCompare($1.name)
+            return comparison == .orderedSame ? $0.uid < $1.uid : comparison == .orderedAscending
+        }
+    }
+
+    private static func hasInputStreams(_ deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var byteCount: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &byteCount
+        ) == noErr && byteCount >= UInt32(MemoryLayout<AudioStreamID>.size)
+    }
+
+    private static func stringProperty(
+        _ selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope,
+        deviceID: AudioDeviceID
+    ) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: Unmanaged<CFString>?
+        var byteCount = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &byteCount,
+            &value
+        ) == noErr, let value else { return nil }
+        return value.takeRetainedValue() as String
+    }
+}
 
 public struct ClientMicrophonePCMFrame: Equatable, Sendable {
     public static let sampleRate = 48_000
@@ -24,12 +129,28 @@ public protocol ClientMicrophoneCapturing: AnyObject, Sendable {
 
 public protocol ClientMicrophoneCaptureCreating: Sendable {
     func makeCapture() -> any ClientMicrophoneCapturing
+    func makeCapture(deviceUID: String?) -> any ClientMicrophoneCapturing
+}
+
+public extension ClientMicrophoneCaptureCreating {
+    func makeCapture(deviceUID _: String?) -> any ClientMicrophoneCapturing {
+        makeCapture()
+    }
 }
 
 public struct AudioQueueMicrophoneCaptureFactory: ClientMicrophoneCaptureCreating, Sendable {
-    public init() {}
+    private let deviceUID: String?
+
+    public init(deviceUID: String? = nil) {
+        self.deviceUID = deviceUID
+    }
+
     public func makeCapture() -> any ClientMicrophoneCapturing {
-        AudioQueueMicrophoneCapture()
+        AudioQueueMicrophoneCapture(deviceUID: deviceUID)
+    }
+
+    public func makeCapture(deviceUID: String?) -> any ClientMicrophoneCapturing {
+        AudioQueueMicrophoneCapture(deviceUID: deviceUID)
     }
 }
 
@@ -39,6 +160,7 @@ public enum AudioQueueMicrophoneCaptureError: Error, Equatable, Sendable, Custom
     case bufferAllocationFailed(OSStatus)
     case bufferEnqueueFailed(OSStatus)
     case propertyListenerFailed(OSStatus)
+    case deviceSelectionFailed(OSStatus)
     case queueStartFailed(OSStatus)
     case startCancelled
     case inputStopped
@@ -50,6 +172,7 @@ public enum AudioQueueMicrophoneCaptureError: Error, Equatable, Sendable, Custom
         case let .bufferAllocationFailed(status): "AudioQueue input buffer allocation failed (\(status))"
         case let .bufferEnqueueFailed(status): "AudioQueue input buffer enqueue failed (\(status))"
         case let .propertyListenerFailed(status): "AudioQueue input listener installation failed (\(status))"
+        case let .deviceSelectionFailed(status): "AudioQueue input device selection failed (\(status))"
         case let .queueStartFailed(status): "AudioQueue input start failed (\(status))"
         case .startCancelled: "Microphone capture was stopped while starting"
         case .inputStopped: "AudioQueue microphone input stopped unexpectedly"
@@ -78,6 +201,7 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
     )
     private let workerQueueKey = DispatchSpecificKey<Void>()
     private let resourceFactory: any AudioQueueInputResourceCreating
+    private let deviceUID: String?
     private var lifecycleState: LifecycleState = .idle
     private var stopRequestedWhileStarting = false
     private var resource: (any AudioQueueInputResource)?
@@ -85,11 +209,15 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
     private var discontinuityHandler: (@Sendable () -> Void)?
     private var failureHandler: (@Sendable (Error) -> Void)?
 
-    public convenience init() {
-        self.init(resourceFactory: SystemAudioQueueInputResourceFactory())
+    public convenience init(deviceUID: String? = nil) {
+        self.init(deviceUID: deviceUID, resourceFactory: SystemAudioQueueInputResourceFactory())
     }
 
-    init(resourceFactory: any AudioQueueInputResourceCreating) {
+    init(
+        deviceUID: String? = nil,
+        resourceFactory: any AudioQueueInputResourceCreating
+    ) {
+        self.deviceUID = deviceUID
         self.resourceFactory = resourceFactory
         workerQueue.setSpecific(key: workerQueueKey, value: ())
     }
@@ -99,7 +227,7 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
     }
 
     /// Probes creation of the real mono 48-kHz AudioQueue input without starting capture.
-    public static func isAvailable() -> Bool {
+    public static func isAvailable(deviceUID: String? = nil) -> Bool {
         var format = AudioStreamBasicDescription(
             mSampleRate: Double(ClientMicrophonePCMFrame.sampleRate),
             mFormatID: kAudioFormatLinearPCM,
@@ -122,6 +250,14 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
             &queue
         )
         if let queue {
+            if result == noErr, let deviceUID {
+                do {
+                    try SystemAudioQueueInputResource.assign(deviceUID: deviceUID, to: queue)
+                } catch {
+                    AudioQueueDispose(queue, true)
+                    return false
+                }
+            }
             AudioQueueDispose(queue, true)
         }
         return result == noErr && queue != nil
@@ -148,7 +284,7 @@ public final class AudioQueueMicrophoneCapture: ClientMicrophoneCapturing, @unch
         workerQueue.async { [self] in consumeSamples() }
         var createdResource: (any AudioQueueInputResource)?
         do {
-            let newResource = try resourceFactory.makeResource(owner: self)
+            let newResource = try resourceFactory.makeResource(owner: self, deviceUID: deviceUID)
             createdResource = newResource
             try throwIfStartWasStopped()
             try newResource.start()
@@ -317,11 +453,31 @@ protocol AudioQueueInputResource: AnyObject, Sendable {
 
 protocol AudioQueueInputResourceCreating: Sendable {
     func makeResource(owner: AudioQueueMicrophoneCapture) throws -> any AudioQueueInputResource
+    func makeResource(
+        owner: AudioQueueMicrophoneCapture,
+        deviceUID: String?
+    ) throws -> any AudioQueueInputResource
+}
+
+extension AudioQueueInputResourceCreating {
+    func makeResource(
+        owner: AudioQueueMicrophoneCapture,
+        deviceUID _: String?
+    ) throws -> any AudioQueueInputResource {
+        try makeResource(owner: owner)
+    }
 }
 
 private struct SystemAudioQueueInputResourceFactory: AudioQueueInputResourceCreating, Sendable {
     func makeResource(owner: AudioQueueMicrophoneCapture) throws -> any AudioQueueInputResource {
-        try SystemAudioQueueInputResource(owner: owner)
+        try makeResource(owner: owner, deviceUID: nil)
+    }
+
+    func makeResource(
+        owner: AudioQueueMicrophoneCapture,
+        deviceUID: String?
+    ) throws -> any AudioQueueInputResource {
+        try SystemAudioQueueInputResource(owner: owner, deviceUID: deviceUID)
     }
 }
 
@@ -333,7 +489,7 @@ private final class SystemAudioQueueInputResource: AudioQueueInputResource, @unc
     private var queue: AudioQueueRef?
     private var listenerInstalled = false
 
-    init(owner: AudioQueueMicrophoneCapture) throws {
+    init(owner: AudioQueueMicrophoneCapture, deviceUID: String?) throws {
         ownerContext = Unmanaged.passUnretained(owner).toOpaque()
         var format = AudioStreamBasicDescription(
             mSampleRate: Double(ClientMicrophonePCMFrame.sampleRate),
@@ -361,6 +517,9 @@ private final class SystemAudioQueueInputResource: AudioQueueInputResource, @unc
         }
         self.queue = queue
         do {
+            if let deviceUID {
+                try Self.assign(deviceUID: deviceUID, to: queue)
+            }
             for _ in 0..<Self.inputBufferCount {
                 var buffer: AudioQueueBufferRef?
                 let allocationResult = AudioQueueAllocateBuffer(
@@ -393,6 +552,22 @@ private final class SystemAudioQueueInputResource: AudioQueueInputResource, @unc
     }
 
     deinit { stopAndDispose() }
+
+    fileprivate static func assign(deviceUID: String, to queue: AudioQueueRef) throws {
+        let coreAudioUID = deviceUID as CFString
+        var value = Unmanaged.passUnretained(coreAudioUID)
+        let status = withUnsafePointer(to: &value) { pointer in
+            AudioQueueSetProperty(
+                queue,
+                kAudioQueueProperty_CurrentDevice,
+                pointer,
+                UInt32(MemoryLayout<Unmanaged<CFString>>.size)
+            )
+        }
+        guard status == noErr else {
+            throw AudioQueueMicrophoneCaptureError.deviceSelectionFailed(status)
+        }
+    }
 
     func start() throws {
         let queue = try lock.withLock { () throws -> AudioQueueRef in

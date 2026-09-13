@@ -364,6 +364,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     var onStatisticsToggle: (() -> Void)?
     var onControllerMouseModeChanged: ((Bool) -> Void)?
     var onTextCommit: ((String) -> Void)?
+    var onStreamingWarning: ((String) -> Void)?
     var isStreamWindowVisible: Bool { window.isVisible }
     /// Exact stream window used for coarse native input-capture focus ownership.
     var inputCaptureWindow: NSWindow { window }
@@ -374,6 +375,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private let contentView: StreamMetalView
     private let diagnosticHandler: @Sendable (String) -> Void
     private let startupTelemetry: SessionStartupTelemetryRecorder
+    private let awdlStreamingController: AWDLStreamingController
     private let keyboard = AppKitKeyboardInputAdapter()
     private let pointer: AppKitPointerInputAdapter
     private let pointerCapture = PointerCaptureCoordinator()
@@ -421,6 +423,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             AppKitWindowModeDriver(window: $0)
         },
         startupTelemetry: SessionStartupTelemetryRecorder = SessionStartupTelemetryRecorder(),
+        awdlStreamingController: AWDLStreamingController = AWDLStreamingController(),
         diagnosticHandler: @escaping @Sendable (String) -> Void = { _ in }
     ) throws {
         let frame = NSRect(x: 0, y: 0, width: 1_280, height: 720)
@@ -489,6 +492,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         self.pointer = pointer
         self.diagnosticHandler = diagnosticHandler
         self.startupTelemetry = startupTelemetry
+        self.awdlStreamingController = awdlStreamingController
         windowModeCoordinator = WindowModeCoordinator(driver: windowModeDriverFactory(window))
         super.init()
 
@@ -633,6 +637,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             await stopRequestTask.value
             self.stopRequestTask = nil
         }
+        await applyAWDLPreference(bootstrap.preferences.disableAWDLWhileStreaming)
         presentationFinishTask = nil
         windowModeCoordinator.setWindowActivationSuppressed(true)
         fullscreenTeardown = StreamWindowTeardownStateMachine()
@@ -718,6 +723,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     /// Prepares the existing Metal window/router for native LSP without manufacturing legacy state.
     func prepareLSPVideo(applicationName: String, preferences: StreamingPreferences) async throws {
         if let stopRequestTask { await stopRequestTask.value; self.stopRequestTask = nil }
+        await applyAWDLPreference(preferences.disableAWDLWhileStreaming)
         presentationFinishTask = nil
         windowModeCoordinator.setWindowActivationSuppressed(true)
         fullscreenTeardown = StreamWindowTeardownStateMachine()
@@ -860,6 +866,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     }
 
     private func performPresentationFinish() async {
+        await restoreAWDLIfNeeded()
         guard isSessionActive else { return }
         controllers.releaseAllInputs()
         isSessionActive = false
@@ -888,6 +895,38 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         if nativeLSPControllerOwnership {
             nativeLSPControllerOwnership = false
             controllers.start()
+        }
+    }
+
+    private func applyAWDLPreference(_ disableWhileStreaming: Bool) async {
+        switch await awdlStreamingController.begin(disableWhileStreaming: disableWhileStreaming) {
+        case .notRequested:
+            break
+        case .disabled:
+            diagnosticHandler("AWDL is disabled and verified for this stream.")
+        case .alreadyDisabled:
+            diagnosticHandler("AWDL was already disabled; Umbra will preserve that state.")
+        case .unavailable:
+            diagnosticHandler("This Mac has no available AWDL interface; no network interface was changed.")
+        case .failed(let message):
+            let warning = "AWDL could not be disabled; streaming continues without this optimization: \(message)"
+            diagnosticHandler(warning)
+            onStreamingWarning?(warning)
+        case .restored, .unchanged:
+            break
+        }
+    }
+
+    private func restoreAWDLIfNeeded() async {
+        switch await awdlStreamingController.finish() {
+        case .restored:
+            diagnosticHandler("AWDL was restored to its pre-stream state.")
+        case .failed(let message):
+            let warning = "AWDL restoration could not be verified: \(message)"
+            diagnosticHandler(warning)
+            onStreamingWarning?(warning)
+        case .notRequested, .disabled, .alreadyDisabled, .unavailable, .unchanged:
+            break
         }
     }
 

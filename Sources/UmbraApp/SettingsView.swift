@@ -916,8 +916,14 @@ private struct CustomFrameRateEditor: View {
 }
 
 struct AudioSettingsView: View {
+    private struct MicrophoneChoice: Hashable {
+        let uid: String?
+        let title: String
+    }
+
     @ObservedObject var preferences: PreferencesStore
     @StateObject private var microphonePermission: MicrophonePermissionSettingsModel
+    @State private var microphoneDevices: [ClientMicrophoneDevice] = []
     private let microphonePermissionEnvironment: MicrophonePermissionEnvironment
 
     init(
@@ -952,6 +958,42 @@ struct AudioSettingsView: View {
         )
     }
 
+    private var microphoneChoices: [MicrophoneChoice] {
+        var choices = [MicrophoneChoice(
+            uid: nil,
+            title: UmbraLocalization.string("System Default")
+        )]
+        choices.append(contentsOf: microphoneDevices.map {
+            MicrophoneChoice(uid: $0.uid, title: $0.name)
+        })
+        if let selectedUID = preferences.settings.clientMicrophoneDeviceUID,
+           !microphoneDevices.contains(where: { $0.uid == selectedUID }) {
+            choices.append(MicrophoneChoice(
+                uid: selectedUID,
+                title: UmbraLocalization.string("Unavailable Microphone")
+            ))
+        }
+        return choices
+    }
+
+    private var microphoneChoiceBinding: Binding<MicrophoneChoice> {
+        Binding(
+            get: {
+                microphoneChoices.first {
+                    $0.uid == preferences.settings.clientMicrophoneDeviceUID
+                } ?? microphoneChoices[0]
+            },
+            set: { choice in
+                preferences.update(\.clientMicrophoneDeviceUID, to: choice.uid)
+            }
+        )
+    }
+
+    private var selectedMicrophoneIsUnavailable: Bool {
+        guard let selectedUID = preferences.settings.clientMicrophoneDeviceUID else { return false }
+        return !microphoneDevices.contains { $0.uid == selectedUID }
+    }
+
     var body: some View {
         SettingsPane(tab: .audio) {
             SettingsSection("Audio") {
@@ -983,6 +1025,21 @@ struct AudioSettingsView: View {
                     ),
                     binding: clientMicrophoneBinding
                 )
+                SettingsRow(
+                    UmbraLocalization.string("Microphone"),
+                    message: selectedMicrophoneIsUnavailable
+                        ? UmbraLocalization.string(
+                            "The selected microphone is disconnected. Reconnect it or choose another input."
+                        )
+                        : nil
+                ) {
+                    CompactMenuPicker(
+                        title: UmbraLocalization.string("Microphone"),
+                        options: microphoneChoices,
+                        selection: microphoneChoiceBinding,
+                        optionLabel: \.title
+                    )
+                }
                 PreferenceToggle(
                     UmbraLocalization.string("Require microphone for streaming"),
                     message: UmbraLocalization.string(
@@ -1000,7 +1057,9 @@ struct AudioSettingsView: View {
             )
         ) { _ in
             _ = microphonePermission.refreshAuthorization()
+            refreshMicrophoneDevices()
         }
+        .onAppear { refreshMicrophoneDevices() }
     }
 
     @ViewBuilder
@@ -1053,6 +1112,10 @@ struct AudioSettingsView: View {
                 )
             }
         }
+    }
+
+    private func refreshMicrophoneDevices() {
+        microphoneDevices = microphonePermissionEnvironment.availableInputDevices()
     }
 }
 
@@ -1186,8 +1249,29 @@ private struct ControllerSettingsView: View {
 }
 
 private struct AdvancedSettingsView: View {
+    private enum AWDLStatus {
+        case checking
+        case enabled
+        case disabled
+        case unavailable
+        case failed
+
+        var label: String {
+            switch self {
+            case .checking: "Checking…"
+            case .enabled: "Enabled"
+            case .disabled: "Disabled"
+            case .unavailable: "Unavailable"
+            case .failed: "Couldn’t Check"
+            }
+        }
+    }
+
     @ObservedObject var preferences: PreferencesStore
     @State private var showsResetConfirmation = false
+    @State private var awdlStatus: AWDLStatus = .checking
+    @State private var awdlHelperStatus: AWDLHelperRegistrationStatus = .notRegistered
+    @State private var awdlHelperError: String?
 
     var body: some View {
         SettingsPane(tab: .advanced) {
@@ -1255,6 +1339,32 @@ private struct AdvancedSettingsView: View {
                     "Check for blocked connections",
                     message: "Runs connection checks when a host cannot be reached.",
                     binding: preferences.binding(for: \.detectNetworkBlocking)
+                )
+                SettingsRow(
+                    "AWDL interface",
+                    message: "Current Apple Wireless Direct Link state on this Mac."
+                ) {
+                    Text(awdlStatus.label)
+                        .foregroundStyle(.secondary)
+                }
+                SettingsRow(
+                    "AWDL network helper",
+                    message: awdlHelperError ?? awdlHelperMessage
+                ) {
+                    HStack(spacing: UmbraLayout.space2) {
+                        Text(awdlHelperLabel)
+                            .foregroundStyle(.secondary)
+                        if awdlHelperStatus != .enabled {
+                            Button(awdlHelperActionLabel, action: setupAWDLHelper)
+                        }
+                    }
+                }
+                PreferenceToggle(
+                    "Disable AWDL while streaming",
+                    message: "Uses the approved helper without prompting, then restores AWDL when streaming ends. While active, AirDrop, Sidecar, and peer-to-peer AirPlay are unavailable.",
+                    binding: preferences.binding(for: \.disableAWDLWhileStreaming),
+                    enabled: awdlHelperStatus == .enabled || preferences.settings.disableAWDLWhileStreaming,
+                    disabledReason: "Set up and approve Umbra's restricted network helper first."
                 )
                 PreferenceToggle(
                     "Show performance overlay",
@@ -1329,8 +1439,76 @@ private struct AdvancedSettingsView: View {
         } message: {
             Text("This cannot be undone.")
         }
+        .task {
+            refreshAWDLHelperStatus()
+            await refreshAWDLStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshAWDLHelperStatus()
+            Task { await refreshAWDLStatus() }
+        }
     }
 
+    private func refreshAWDLStatus() async {
+        do {
+            switch try await SystemAWDLInterfaceCommandExecutor().currentState() {
+            case .up: awdlStatus = .enabled
+            case .down: awdlStatus = .disabled
+            case .unavailable: awdlStatus = .unavailable
+            }
+        } catch {
+            awdlStatus = .failed
+        }
+    }
+
+    private var awdlHelperLabel: String {
+        switch awdlHelperStatus {
+        case .notRegistered: "Not Set Up"
+        case .enabled: "Ready"
+        case .requiresApproval: "Needs Approval"
+        case .notFound: "Not Available"
+        }
+    }
+
+    private var awdlHelperActionLabel: String {
+        awdlHelperStatus == .requiresApproval ? "Open Login Items" : "Set Up…"
+    }
+
+    private var awdlHelperMessage: String {
+        switch awdlHelperStatus {
+        case .notRegistered:
+            "One-time setup installs a signed helper restricted to enabling and disabling awdl0."
+        case .enabled:
+            "Approved. Stream startup, reconnects, and later Umbra launches require no administrator prompt."
+        case .requiresApproval:
+            "Allow Umbra's helper once in Login Items, then return here."
+        case .notFound:
+            "This Umbra package does not contain its signed network helper."
+        }
+    }
+
+    private func refreshAWDLHelperStatus() {
+        awdlHelperStatus = AWDLHelperRegistration().status()
+        if awdlHelperStatus == .enabled { awdlHelperError = nil }
+    }
+
+    private func setupAWDLHelper() {
+        let registration = AWDLHelperRegistration()
+        do {
+            if awdlHelperStatus == .requiresApproval {
+                registration.openApprovalSettings()
+            } else {
+                awdlHelperStatus = try registration.register()
+                if awdlHelperStatus == .requiresApproval {
+                    registration.openApprovalSettings()
+                }
+            }
+            awdlHelperError = nil
+        } catch {
+            awdlHelperStatus = registration.status()
+            awdlHelperError = error.localizedDescription
+        }
+    }
 }
 
 private struct LSPRateSettingsRows: View {

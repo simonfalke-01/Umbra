@@ -20,6 +20,7 @@ public final class LSPMicrophoneUplink: @unchecked Sendable {
     /// Prepares native mapping, encoder, and live capture before MICROPHONE_CONFIG_ACK.
     public func configure(
         _ configuration: LSPNativeMicrophoneConfiguration,
+        deviceUID: String? = nil,
         transport: LSPTransport,
         failureHandler: @escaping @Sendable (Error) -> Void
     ) throws {
@@ -28,7 +29,7 @@ public final class LSPMicrophoneUplink: @unchecked Sendable {
             inbandFECEnabled: configuration.inbandFEC,
             dtxEnabled: configuration.dtx
         )
-        let capture = AudioQueueMicrophoneCapture()
+        let capture = AudioQueueMicrophoneCapture(deviceUID: deviceUID)
         try transport.configureMicrophone(configuration)
         do {
             try capture.start(

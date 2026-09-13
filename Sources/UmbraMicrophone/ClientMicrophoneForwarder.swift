@@ -38,6 +38,19 @@ public protocol ClientMicrophoneForwarding: AnyObject, Sendable {
 
 public protocol ClientMicrophonePreparing: Sendable {
     func prepare(host: String) async throws -> any ClientMicrophoneForwarding
+    func prepare(
+        host: String,
+        deviceUID: String?
+    ) async throws -> any ClientMicrophoneForwarding
+}
+
+public extension ClientMicrophonePreparing {
+    func prepare(
+        host: String,
+        deviceUID _: String?
+    ) async throws -> any ClientMicrophoneForwarding {
+        try await prepare(host: host)
+    }
 }
 
 public struct SystemClientMicrophonePreparer: ClientMicrophonePreparing, Sendable {
@@ -52,14 +65,21 @@ public struct SystemClientMicrophonePreparer: ClientMicrophonePreparing, Sendabl
         self.captureFactory = captureFactory
     }
 
-    public func prepare(host _: String) async throws -> any ClientMicrophoneForwarding {
+    public func prepare(host: String) async throws -> any ClientMicrophoneForwarding {
+        try await prepare(host: host, deviceUID: nil)
+    }
+
+    public func prepare(
+        host _: String,
+        deviceUID: String?
+    ) async throws -> any ClientMicrophoneForwarding {
         let status = await authorization.requestAuthorization()
         guard status.permitsCapture else {
             throw ClientMicrophonePreparationError.permissionDenied(status)
         }
         return try ClientMicrophoneForwarder(
             sender: ConnectedMicrophoneUDPSender(),
-            capture: captureFactory.makeCapture()
+            capture: captureFactory.makeCapture(deviceUID: deviceUID)
         )
     }
 }

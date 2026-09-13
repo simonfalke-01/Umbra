@@ -7,6 +7,8 @@ app_root="${UMBRA_APP_OUTPUT_PATH:-$repository_root/.build/Umbra.app}"
 app_root="${app_root:A}"
 build_scratch_path="${UMBRA_BUILD_SCRATCH_PATH:-}"
 expected_app_identifier="app.umbra.Umbra"
+expected_awdl_helper_identifier="app.umbra.Umbra.awdl-helper"
+awdl_helper_plist_name="com.umbra.awdl-helper.plist"
 qualifying_build="${UMBRA_QUALIFYING_BUILD:-0}"
 approved_certificate_sha256="${UMBRA_APPROVED_SIGNING_CERTIFICATE_SHA256:-}"
 approved_entitlements_sha256="${UMBRA_APPROVED_ENTITLEMENTS_SHA256:-}"
@@ -125,9 +127,25 @@ validate_packaged_app() {
 
     local info_plist="$candidate/Contents/Info.plist"
     local executable="$candidate/Contents/MacOS/Umbra"
+    local awdl_helper="$candidate/Contents/MacOS/UmbraAWDLHelper"
+    local awdl_helper_plist="$candidate/Contents/Library/LaunchDaemons/$awdl_helper_plist_name"
     local resource_directory="$candidate/Contents/Resources"
-    [[ -f "$info_plist" && -f "$executable" && -d "$resource_directory" ]] || {
-        fail "Umbra's packaged executable, Info.plist, or resources are missing."
+    [[ -f "$info_plist"
+        && -f "$executable"
+        && -f "$awdl_helper"
+        && -f "$awdl_helper_plist"
+        && -d "$resource_directory" ]] || {
+        fail "Umbra's packaged executable, restricted AWDL helper, Info.plist, or resources are missing."
+    }
+    plutil -lint "$awdl_helper_plist" >/dev/null
+    [[ "$(plutil -extract Label raw "$awdl_helper_plist")" == "$expected_awdl_helper_identifier" ]] || {
+        fail "Umbra's AWDL helper launchd label is invalid."
+    }
+    [[ "$(plutil -extract BundleProgram raw "$awdl_helper_plist")" == "Contents/MacOS/UmbraAWDLHelper" ]] || {
+        fail "Umbra's AWDL helper must use its bundle-relative executable path."
+    }
+    [[ "$(plutil -extract 'MachServices.app\.umbra\.Umbra\.awdl-helper' raw "$awdl_helper_plist")" == "true" ]] || {
+        fail "Umbra's AWDL helper Mach service is missing."
     }
     local legal_resource
     local legal_source
@@ -198,6 +216,12 @@ validate_packaged_app() {
         || "$dynamic_dependencies" == *"libsrtp2"* ]]; then
         fail "Refusing to package an executable with non-system dynamic dependencies."
     fi
+    local helper_dynamic_dependencies
+    helper_dynamic_dependencies="$(otool -L "$awdl_helper")"
+    if [[ "$helper_dynamic_dependencies" == *"/opt/homebrew"*
+        || "$helper_dynamic_dependencies" == *"/usr/local"* ]]; then
+        fail "Refusing to package an AWDL helper with non-system dynamic dependencies."
+    fi
     # wolfSSL exports this internal context finalizer under an SSL_ name;
     # it is not the dormant libssl facade this check rejects.
     if nm -gU "$executable" \
@@ -208,8 +232,12 @@ validate_packaged_app() {
     [[ "$(lipo -archs "$executable")" == "arm64" ]] || {
         fail "Umbra release executable must be arm64-only."
     }
+    [[ "$(lipo -archs "$awdl_helper")" == "arm64" ]] || {
+        fail "Umbra's AWDL helper must be arm64-only."
+    }
 
     codesign --verify --deep --strict --verbose=2 "$candidate"
+    codesign --verify --strict --verbose=2 "$awdl_helper"
     local required_entitlements
     required_entitlements="$(codesign --display --entitlements :- "$candidate" 2>/dev/null)"
     [[ "$(echo "$required_entitlements" | plutil -extract 'com\.apple\.security\.device\.audio-input' raw - 2>/dev/null)" == "true" ]] || {
@@ -226,6 +254,17 @@ validate_packaged_app() {
         }
         echo "$signature_details" | grep -Eq 'flags=.*\(.*runtime.*\)' || {
             fail "Umbra qualifying signature is missing hardened-runtime flags."
+        }
+        local helper_signature_details
+        helper_signature_details="$(codesign --display --verbose=4 "$awdl_helper" 2>&1)"
+        [[ "$helper_signature_details" != *"Signature=adhoc"*
+            && "$helper_signature_details" != *"TeamIdentifier=not set"*
+            && "$helper_signature_details" == *"Identifier=$expected_awdl_helper_identifier"*
+            && "$helper_signature_details" == *"Authority=$CODE_SIGN_IDENTITY"* ]] || {
+            fail "Umbra's AWDL helper is not signed by the approved identity."
+        }
+        echo "$helper_signature_details" | grep -Eq 'flags=.*\(.*runtime.*\)' || {
+            fail "Umbra's AWDL helper is missing hardened-runtime flags."
         }
 
         local certificate_directory certificate_prefix signed_certificate_sha256
@@ -306,10 +345,18 @@ elif [[ "$configuration" == "release" ]]; then
 fi
 build_root="$(env -u CC -u CXX swift build "${swift_build_args[@]}" --show-bin-path)"
 env -u CC -u CXX swift build "${swift_build_args[@]}" --product Umbra
+env -u CC -u CXX swift build "${swift_build_args[@]}" --product UmbraAWDLHelper
 
 rm -rf "$app_root"
-mkdir -p "$app_root/Contents/MacOS" "$app_root/Contents/Resources"
+mkdir -p \
+    "$app_root/Contents/MacOS" \
+    "$app_root/Contents/Library/LaunchDaemons" \
+    "$app_root/Contents/Resources"
 cp "$build_root/Umbra" "$app_root/Contents/MacOS/Umbra"
+cp "$build_root/UmbraAWDLHelper" "$app_root/Contents/MacOS/UmbraAWDLHelper"
+cp \
+    "$repository_root/Resources/Umbra/$awdl_helper_plist_name" \
+    "$app_root/Contents/Library/LaunchDaemons/$awdl_helper_plist_name"
 cp "$repository_root/Resources/Umbra/Info.plist" "$app_root/Contents/Info.plist"
 app_identifier="$(plutil -extract CFBundleIdentifier raw "$app_root/Contents/Info.plist")"
 [[ "$app_identifier" == "$expected_app_identifier" ]] || fail \
@@ -363,6 +410,13 @@ for localization_directory in "$compiled_localizations"/*.lproj(N); do
 done
 
 if [[ "$qualifying_build" == "1" ]]; then
+    codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --identifier "$expected_awdl_helper_identifier" \
+        --sign "$CODE_SIGN_IDENTITY" \
+        "$app_root/Contents/MacOS/UmbraAWDLHelper"
     typeset -a codesign_arguments=(
         --force
         --options runtime
@@ -374,8 +428,20 @@ if [[ "$qualifying_build" == "1" ]]; then
     fi
     codesign "${codesign_arguments[@]}" "$app_root"
 elif [[ -n "${CODE_SIGN_IDENTITY:-}" ]]; then
+    codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --identifier "$expected_awdl_helper_identifier" \
+        --sign "$CODE_SIGN_IDENTITY" \
+        "$app_root/Contents/MacOS/UmbraAWDLHelper"
     codesign --force --options runtime --timestamp --entitlements "$signing_entitlements_path" --sign "$CODE_SIGN_IDENTITY" "$app_root"
 else
+    codesign \
+        --force \
+        --sign - \
+        --identifier "$expected_awdl_helper_identifier" \
+        "$app_root/Contents/MacOS/UmbraAWDLHelper"
     codesign \
         --force \
         --sign - \

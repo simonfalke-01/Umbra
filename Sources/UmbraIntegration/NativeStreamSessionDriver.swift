@@ -1058,7 +1058,13 @@ public actor NativeStreamSessionDriver: StreamSessionDriving {
             return (nil, reason)
         }
         do {
-            return (try await microphonePreparer.prepare(host: endpoint.hostname), nil)
+            return (
+                try await microphonePreparer.prepare(
+                    host: endpoint.hostname,
+                    deviceUID: bootstrap.preferences.clientMicrophoneDeviceUID
+                ),
+                nil
+            )
         } catch {
             if bootstrap.preferences.clientMicrophoneRequired {
                 throw UmbraIntegrationError.clientMicrophoneRequiredUnavailable(
