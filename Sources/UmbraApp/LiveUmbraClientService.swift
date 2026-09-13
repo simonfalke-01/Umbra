@@ -212,6 +212,12 @@ struct SessionWarningDeliveryState {
 final class LiveUmbraClientService: UmbraClientServicing {
     typealias LSPHostProbe = @MainActor @Sendable (UUID) async throws -> Void
 
+    private struct LSPReconnectAttempt {
+        var id: UUID
+        var streamID: UUID
+        var task: Task<Void, Error>
+    }
+
     var onSessionTerminated: (@MainActor @Sendable (Bool) -> Void)?
     private let service: UmbraApplicationService
     private let preferences: PreferencesStore
@@ -227,6 +233,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private let lspMediaCapabilities: AppleStreamingCapabilities
     private let lspFailureHandler: @Sendable (String) -> Void
     private let lspHostProbe: LSPHostProbe
+    private var activeLSPStreamID: UUID?
     private var activeLSPHostID: UUID?
     private var activeLSPApplicationID: String?
     private var lspOwnerEndpoint: LSPCLIOwnerEndpoint?
@@ -240,7 +247,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lspHostCheckErrors: [UUID: String] = [:]
     private var latestLSPTelemetry: LSPTelemetrySnapshot?
     private var latestLSPReconnectTelemetry: LSPReconnectSnapshot?
-    private var lspReconnectTasks: [UUID: Task<Void, Error>] = [:]
+    private var lspReconnectTasks: [UUID: LSPReconnectAttempt] = [:]
     private var eventHandler: (@MainActor @Sendable (UmbraClientEvent) -> Void)?
     private var sessionWarningDeliveryState = SessionWarningDeliveryState()
     private var artworkLoadingTasks: [String: Task<Void, Never>] = [:]
@@ -726,6 +733,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
         // A second instance must not send START or prepare another stream window
         // while this host is already owned locally.
         try installCLIOwnerEndpoint(hostID: hostID)
+        let streamID = UUID()
+        activeLSPStreamID = streamID
         let session: LSPClientSession
         var remoteStarted = false
         do {
@@ -748,7 +757,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 refreshNumerator: frameRate.numerator,
                 refreshDenominator: frameRate.denominator,
                 decoderSurfaces: 3,
-                maximumCaptureToPresentMicroseconds: UInt32(max(
+                // Adaptive mode uses the product's 50 ms admission ceiling, not a
+                // two-refresh expiry that discards otherwise decodable frames after
+                // ordinary encoder jitter. This does not delay pacing or presentation.
+                maximumCaptureToPresentMicroseconds: preferences.lspNetworkProfile == .adaptiveLowLatency ? 50_000 : UInt32(max(
                     10_000,
                     Int(2_000_000 * Double(frameRate.denominator) / Double(frameRate.numerator))
                 ))
@@ -764,6 +776,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             await streamWindow.finish()
             lspOwnerEndpoint?.stop()
             lspOwnerEndpoint = nil
+            if activeLSPStreamID == streamID { activeLSPStreamID = nil }
             activeLSPHostID = nil
             activeLSPApplicationID = nil
             throw error
@@ -771,7 +784,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         markLSPHostSession(hostID: hostID, runningApplicationID: displayApplicationID)
         streamWindow.onTextCommit = { [weak self] text in
             Task { @MainActor [weak self] in
-                guard let self, self.activeLSPHostID == hostID else { return }
+                guard let self, self.isActiveLSPStream(streamID, hostID: hostID) else { return }
                 do {
                     try await self.lspInputCapture.performTextCommit {
                         try await product.sendText(hostID: hostID, text: text)
@@ -783,7 +796,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 }
             }
         }
-        installLSPReconnectHandler(session: session, hostID: hostID)
+        installLSPReconnectHandler(session: session, hostID: hostID, streamID: streamID)
         scheduleLSPMaintenance(session: session, hostID: hostID)
     }
 
@@ -806,7 +819,11 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private func stopActiveLSPStream(
         preserveOwnerEndpointUntilReply: Bool = false
     ) async -> CLILSPStopOutcome {
-        for task in lspReconnectTasks.values { task.cancel() }
+        guard let hostID = activeLSPHostID else { return .notRunning }
+        activeLSPStreamID = nil
+        activeLSPHostID = nil
+        activeLSPApplicationID = nil
+        for attempt in lspReconnectTasks.values { attempt.task.cancel() }
         lspReconnectTasks.removeAll(keepingCapacity: true)
         plannedLSPRekeyTask?.cancel()
         plannedLSPRekeyTask = nil
@@ -816,17 +833,14 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lspDeviceOfferTask = nil
         lspInputCapture.stop()
         streamWindow?.onTextCommit = nil
-        guard let hostID = activeLSPHostID else { return .notRunning }
         let stopResult = await lspProduct?.stop(hostID: hostID) ?? .notRunning
-        activeLSPHostID = nil
-        activeLSPApplicationID = nil
+        markLSPHostSession(hostID: hostID, runningApplicationID: nil)
+        await streamWindow?.finish()
         if !preserveOwnerEndpointUntilReply {
             cliStopReplyPending = false
             lspOwnerEndpoint?.stop()
             lspOwnerEndpoint = nil
         }
-        markLSPHostSession(hostID: hostID, runningApplicationID: nil)
-        await streamWindow?.finish()
         return switch stopResult {
         case .notRunning: .notRunning
         case .stopped: .stopped
@@ -983,27 +997,37 @@ final class LiveUmbraClientService: UmbraClientServicing {
         hostID: UUID,
         reason: LSPReconnectReason
     ) async throws {
+        guard let streamID = activeLSPStreamID,
+              activeLSPHostID == hostID else { throw CancellationError() }
         if let existing = lspReconnectTasks[hostID] {
-            return try await existing.value
+            guard existing.streamID == streamID else { throw CancellationError() }
+            return try await existing.task.value
         }
+        let attemptID = UUID()
         let task = Task { @MainActor [self] in
-            try await performLSPReconnect(hostID: hostID, reason: reason)
+            try await performLSPReconnect(hostID: hostID, reason: reason, streamID: streamID)
         }
-        lspReconnectTasks[hostID] = task
+        lspReconnectTasks[hostID] = .init(id: attemptID, streamID: streamID, task: task)
         do {
             try await task.value
-            lspReconnectTasks.removeValue(forKey: hostID)
+            if lspReconnectTasks[hostID]?.id == attemptID {
+                lspReconnectTasks.removeValue(forKey: hostID)
+            }
         } catch {
-            lspReconnectTasks.removeValue(forKey: hostID)
+            if lspReconnectTasks[hostID]?.id == attemptID {
+                lspReconnectTasks.removeValue(forKey: hostID)
+            }
             throw error
         }
     }
 
     private func performLSPReconnect(
         hostID: UUID,
-        reason: LSPReconnectReason
+        reason: LSPReconnectReason,
+        streamID: UUID
     ) async throws {
         try Task.checkCancellation()
+        guard isActiveLSPStream(streamID, hostID: hostID) else { throw CancellationError() }
         guard let lspProduct else { throw UmbraClientServiceError.unavailable("Native LSP is unavailable.") }
         var publishedReplacement: LSPClientSession?
         do {
@@ -1016,7 +1040,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
             )
             publishedReplacement = replacement
             try Task.checkCancellation()
-            guard await lspProduct.isCurrentSession(replacement, hostID: hostID) else {
+            guard isActiveLSPStream(streamID, hostID: hostID),
+                  await lspProduct.isCurrentSession(replacement, hostID: hostID),
+                  isActiveLSPStream(streamID, hostID: hostID) else {
                 throw CancellationError()
             }
             do {
@@ -1026,17 +1052,21 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 throw error
             }
             try Task.checkCancellation()
-            guard await lspProduct.isCurrentSession(replacement, hostID: hostID) else {
+            guard isActiveLSPStream(streamID, hostID: hostID),
+                  await lspProduct.isCurrentSession(replacement, hostID: hostID),
+                  isActiveLSPStream(streamID, hostID: hostID) else {
                 lspInputCapture.stop()
                 throw CancellationError()
             }
             await lspProduct.markCaptureTransferred(hostID: hostID, session: replacement)
             try Task.checkCancellation()
-            guard await lspProduct.isCurrentSession(replacement, hostID: hostID) else {
+            guard isActiveLSPStream(streamID, hostID: hostID),
+                  await lspProduct.isCurrentSession(replacement, hostID: hostID),
+                  isActiveLSPStream(streamID, hostID: hostID) else {
                 lspInputCapture.stop()
                 throw CancellationError()
             }
-            installLSPReconnectHandler(session: replacement, hostID: hostID)
+            installLSPReconnectHandler(session: replacement, hostID: hostID, streamID: streamID)
             scheduleLSPMaintenance(session: replacement, hostID: hostID)
         } catch is CancellationError {
             lspInputCapture.stop()
@@ -1045,7 +1075,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
             throw CancellationError()
         } catch {
+            guard isActiveLSPStream(streamID, hostID: hostID) else { throw CancellationError() }
             if let current = await lspProduct.currentSession(hostID: hostID),
+               isActiveLSPStream(streamID, hostID: hostID),
                await current.state == .inputActive {
                 try? lspInputCapture.transfer(to: current)
             }
@@ -1053,25 +1085,29 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
     }
 
-    private func installLSPReconnectHandler(session: LSPClientSession, hostID: UUID) {
+    private func installLSPReconnectHandler(session: LSPClientSession, hostID: UUID, streamID: UUID) {
         session.setTerminationHandler { [weak self, weak session] termination in
             guard let session else { return }
             Task { @MainActor [weak self, session] in
                 guard let self else { return }
-                guard await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
+                guard self.isActiveLSPStream(streamID, hostID: hostID),
+                      await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true,
+                      self.deactivateLSPStream(streamID, hostID: hostID) else { return }
                 self.plannedLSPRekeyTask?.cancel()
                 self.lspTelemetryTask?.cancel()
                 self.lspDeviceOfferTask?.cancel()
+                if let reconnect = self.lspReconnectTasks[hostID], reconnect.streamID == streamID {
+                    reconnect.task.cancel()
+                    self.lspReconnectTasks.removeValue(forKey: hostID)
+                }
                 self.lspInputCapture.stop()
-                self.activeLSPHostID = nil
-                self.activeLSPApplicationID = nil
+                self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
+                self.streamWindow?.onTextCommit = nil
+                await self.streamWindow?.finish()
                 if !self.cliStopReplyPending {
                     self.lspOwnerEndpoint?.stop()
                     self.lspOwnerEndpoint = nil
                 }
-                self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
-                self.streamWindow?.onTextCommit = nil
-                await self.streamWindow?.finish()
                 switch termination {
                 case .streamEnded:
                     self.eventHandler?(.sessionEnded)
@@ -1093,25 +1129,29 @@ final class LiveUmbraClientService: UmbraClientServicing {
             guard lifecycle == .failed, let session else { return }
             Task { @MainActor [weak self, session] in
                 guard let self else { return }
-                guard await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
+                guard self.isActiveLSPStream(streamID, hostID: hostID),
+                      await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true,
+                      self.isActiveLSPStream(streamID, hostID: hostID) else { return }
                 do {
                     try await self.reconnectLSPInput(hostID: hostID, reason: .transportLoss)
+                    guard self.isActiveLSPStream(streamID, hostID: hostID) else { return }
                     self.eventHandler?(.sessionWarning("Native LSP input reconnected with fresh security keys."))
+                } catch is CancellationError {
+                    return
                 } catch {
+                    guard self.deactivateLSPStream(streamID, hostID: hostID) else { return }
                     self.plannedLSPRekeyTask?.cancel()
                     self.lspTelemetryTask?.cancel()
                     self.lspDeviceOfferTask?.cancel()
                     self.lspInputCapture.stop()
-                    self.activeLSPHostID = nil
-                    self.activeLSPApplicationID = nil
-                    if !self.cliStopReplyPending {
-                        self.lspOwnerEndpoint?.stop()
-                        self.lspOwnerEndpoint = nil
-                    }
                     self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
                     self.streamWindow?.onTextCommit = nil
                     await self.lspProduct?.failSession(hostID: hostID)
                     await self.streamWindow?.finish()
+                    if !self.cliStopReplyPending {
+                        self.lspOwnerEndpoint?.stop()
+                        self.lspOwnerEndpoint = nil
+                    }
                     self.eventHandler?(.sessionWarning("Native LSP reconnect failed: \(error.localizedDescription)"))
                     if !self.cliStopReplyPending {
                         self.notifyLSPSessionTerminated(
@@ -1122,6 +1162,19 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 }
             }
         }
+    }
+
+    private func isActiveLSPStream(_ streamID: UUID, hostID: UUID) -> Bool {
+        activeLSPStreamID == streamID && activeLSPHostID == hostID
+    }
+
+    @discardableResult
+    private func deactivateLSPStream(_ streamID: UUID, hostID: UUID) -> Bool {
+        guard isActiveLSPStream(streamID, hostID: hostID) else { return false }
+        activeLSPStreamID = nil
+        activeLSPHostID = nil
+        activeLSPApplicationID = nil
+        return true
     }
 
     private func scheduleLSPMaintenance(session: LSPClientSession, hostID: UUID) {

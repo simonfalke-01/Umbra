@@ -1,7 +1,8 @@
 import Foundation
+import Darwin
 import UmbraNetworking
 
-/// Resolves Bonjour metadata and the SRV target name without opening a throwaway UDP connection.
+/// Resolves Bonjour metadata and a numeric peer without opening a throwaway UDP connection.
 final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Sendable {
     typealias Resolution = (service: DiscoveredHostService, endpoint: ResolvedBonjourServiceEndpoint)
     private let lock = NSLock()
@@ -10,6 +11,7 @@ final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Send
     private var service: NetService?
     private var serviceRunLoop: CFRunLoop?
     private var finished = false
+    private var addressesResolved = false
 
     func resolve(_ discovered: DiscoveredHostService) async -> Resolution? {
         return await withTaskCancellationHandler {
@@ -80,6 +82,7 @@ final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Send
     }
 
     func netServiceDidResolveAddress(_ sender: NetService) {
+        lock.withLock { addressesResolved = true }
         resolveTXT(sender.txtRecordData())
     }
 
@@ -110,8 +113,10 @@ final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Send
             }
         }
         guard !discovered.txtRecord.isEmpty,
+              lock.withLock({ addressesResolved }),
               let service = lock.withLock({ self.service }),
-              let targetHost = service.hostName, !targetHost.isEmpty,
+              let addresses = service.addresses,
+              let targetHost = Self.numericHost(from: addresses),
               let port = UInt16(exactly: service.port), port != 0 else { return }
         finish((discovered, .init(
             targetHost: targetHost,
@@ -122,6 +127,34 @@ final class LSPBonjourTXTResolver: NSObject, NetServiceDelegate, @unchecked Send
             interfaceName: discovered.interfaceName,
             changeToken: discovered.changeToken
         )))
+    }
+
+    /// Uses the resolved socket addresses instead of restarting DNS resolution during connection.
+    /// IPv4 avoids persisting an interface-specific scope when both families are available.
+    static func numericHost(from addresses: [Data]) -> String? {
+        var ipv6: String?
+        for data in addresses {
+            guard data.count >= MemoryLayout<sockaddr>.size,
+                  data.count <= MemoryLayout<sockaddr_storage>.size else { continue }
+            var address = sockaddr_storage()
+            _ = withUnsafeMutableBytes(of: &address) { destination in
+                data.copyBytes(to: destination)
+            }
+            let family = Int32(address.ss_family)
+            guard (family == AF_INET && data.count >= MemoryLayout<sockaddr_in>.size) ||
+                    (family == AF_INET6 && data.count >= MemoryLayout<sockaddr_in6>.size) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getnameinfo($0, socklen_t(data.count), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+                }
+            }
+            guard result == 0 else { continue }
+            let literal = String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            if family == AF_INET { return literal }
+            if ipv6 == nil { ipv6 = literal }
+        }
+        return ipv6
     }
 
     private func finish(_ result: Resolution?) {

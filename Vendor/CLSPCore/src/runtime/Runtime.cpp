@@ -2694,6 +2694,37 @@ namespace umbra::lsp {
              control_queue_capacity;
     }
 
+    /**
+     * @brief Log an exact final control retry without payload or credential
+     * data.
+     *
+     * @param retained Exact outbound reliability slot after retry accounting.
+     */
+    void log_final_outbound_control_retry(
+      const lumen::lsp::outbound_control_frame<maximum_control_frame>
+        &retained
+    ) const noexcept {
+      if (retained.transmissions < 5U) {
+        return;
+      }
+      const auto parsed = lumen::lsp::parse_lspc(retained.frame.bytes());
+      if (!parsed) {
+        std::fprintf(stderr, "LSP final control retry has invalid retained framing.\n");
+        return;
+      }
+      std::fprintf(stderr,
+                   "LSP final control retry: type=0x%04x message=%llu "
+                   "request=%llu response=%u generation=%u "
+                   "input_configured=%u video_configured=%u.\n",
+                   static_cast<unsigned int>(parsed.header.message_type),
+                   static_cast<unsigned long long>(parsed.header.message_id),
+                   static_cast<unsigned long long>(parsed.header.request_id),
+                   static_cast<unsigned int>(lumen::lsp::has_flag(parsed.header.flags, lumen::lsp::lspc_flag::response)),
+                   static_cast<unsigned int>(connection_generation_),
+                   static_cast<unsigned int>(input_configured_),
+                   static_cast<unsigned int>(video_configured_.load(std::memory_order_acquire)));
+    }
+
     /** @brief One retained authenticated host request awaiting a semantic response. */
     struct PendingInboundRequest {
       std::uint64_t request_id {};  ///< Nonzero host request ID.
@@ -3880,7 +3911,7 @@ namespace umbra::lsp {
         }
         // Let the asynchronous per-socket policy lookup triggered by connect
         // complete before the first write can permanently reject this socket.
-        const timespec policy_grace {.tv_sec = 0, .tv_nsec = 20'000'000L};
+        const timespec policy_grace {.tv_sec = 0, .tv_nsec = 200'000'000L};
         (void)nanosleep(&policy_grace, nullptr);
         socket_ = descriptor;
         socket_family_ = candidate->ai_family;
@@ -9522,6 +9553,7 @@ namespace umbra::lsp {
         }
         increment(RuntimeCounter::transmitted);
         outbound_window_.mark_retransmitted(*retained, now, rto_);
+        log_final_outbound_control_retry(*retained);
       }
       return CLSP_STATUS_OK;
     }
