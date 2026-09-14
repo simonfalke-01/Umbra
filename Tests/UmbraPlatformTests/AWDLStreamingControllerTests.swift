@@ -29,8 +29,8 @@ final class AWDLStreamingControllerTests: XCTestCase {
         XCTAssertEqual(secondBegin, .alreadyDisabled)
         XCTAssertEqual(secondFinish, .unchanged)
         XCTAssertEqual(preservedState, .down)
-        XCTAssertEqual(secondBeginCount, 1)
-        XCTAssertEqual(secondEndCount, 1)
+        XCTAssertEqual(secondBeginCount, 2)
+        XCTAssertEqual(secondEndCount, 2)
     }
 
     func testFinishCancelsInFlightActivationAndRestoresBeforeReturning() async {
@@ -89,6 +89,7 @@ private actor ControlledAWDLCommands: AWDLInterfaceCommandExecuting {
     private var suspendEnd: Bool
     private var beginStarted = false
     private var endStarted = false
+    private var restoreState: AWDLInterfaceState?
     private var beginStartedWaiters: [CheckedContinuation<Void, Never>] = []
     private var endStartedWaiters: [CheckedContinuation<Void, Never>] = []
     private var beginRelease: CheckedContinuation<Void, Never>?
@@ -108,6 +109,7 @@ private actor ControlledAWDLCommands: AWDLInterfaceCommandExecuting {
 
     func acquireDisableLease() async -> AWDLInterfaceState {
         beginCount += 1
+        if restoreState == nil { restoreState = state }
         state = .down
         beginStarted = true
         beginStartedWaiters.forEach { $0.resume() }
@@ -128,7 +130,8 @@ private actor ControlledAWDLCommands: AWDLInterfaceCommandExecuting {
             await withCheckedContinuation { endRelease = $0 }
             suspendEnd = false
         }
-        state = .up
+        state = restoreState ?? state
+        restoreState = nil
         return state
     }
 

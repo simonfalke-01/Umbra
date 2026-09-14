@@ -35,6 +35,8 @@ static SecRequirementRef gClientRequirement;
 static BOOL gOriginalStateKnown;
 static BOOL gOriginalStateWasUp;
 static BOOL gRestoreRetryScheduled;
+static BOOL gDisableReassertScheduled;
+static BOOL gDisableReassertErrorLogged;
 
 static NSString *UmbraErrnoMessage(NSString *operation) {
   return [NSString stringWithFormat:@"%@ failed: %s", operation, strerror(errno)];
@@ -137,6 +139,37 @@ static void UmbraRemoveRecoveryMarker(void) {
 
 static BOOL UmbraRestoreOriginalState(NSString **errorMessage);
 
+static void UmbraScheduleDisableReassertion(void) {
+  if (gDisableReassertScheduled || gLeaseConnections.count == 0) {
+    return;
+  }
+  gDisableReassertScheduled = YES;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC * 250), gServiceQueue, ^{
+    gDisableReassertScheduled = NO;
+    if (gLeaseConnections.count == 0) {
+      gDisableReassertErrorLogged = NO;
+      return;
+    }
+    NSString *message = nil;
+    const UmbraAWDLState state = UmbraReadAWDLState(&message);
+    if (state == UmbraAWDLStateUp) {
+      if (UmbraSetAWDLEnabled(NO, &message)) {
+        os_log_info(OS_LOG_DEFAULT, "Umbra AWDL helper reasserted the active disable lease.");
+        gDisableReassertErrorLogged = NO;
+      } else if (!gDisableReassertErrorLogged) {
+        os_log_error(OS_LOG_DEFAULT, "Umbra AWDL helper could not reassert awdl0: %{public}@", message);
+        gDisableReassertErrorLogged = YES;
+      }
+    } else if (state == UmbraAWDLStateDown) {
+      gDisableReassertErrorLogged = NO;
+    } else if (!gDisableReassertErrorLogged) {
+      os_log_error(OS_LOG_DEFAULT, "Umbra AWDL helper could not inspect awdl0: %{public}@", message);
+      gDisableReassertErrorLogged = YES;
+    }
+    UmbraScheduleDisableReassertion();
+  });
+}
+
 static void UmbraScheduleRestoreRetry(void) {
   if (gRestoreRetryScheduled || !gOriginalStateKnown || !gOriginalStateWasUp || gLeaseConnections.count != 0) {
     return;
@@ -220,7 +253,17 @@ static void UmbraHandleMessage(NSValue *connectionKey, xpc_object_t message) {
   }
   if (operation == UmbraAWDLOperationAcquire) {
     if ([gLeaseConnections containsObject:connectionKey]) {
-      UmbraReply(message, 0, UmbraReadAWDLState(&errorMessage), errorMessage);
+      UmbraAWDLState state = UmbraReadAWDLState(&errorMessage);
+      if (state == UmbraAWDLStateUnavailable) {
+        UmbraReply(message, ENODEV, state, errorMessage ?: @"awdl0 is unavailable.");
+        return;
+      }
+      if (state == UmbraAWDLStateUp && !UmbraSetAWDLEnabled(NO, &errorMessage)) {
+        UmbraReply(message, EIO, state, errorMessage);
+        return;
+      }
+      UmbraScheduleDisableReassertion();
+      UmbraReply(message, errorMessage == nil ? 0 : EIO, UmbraAWDLStateDown, errorMessage);
       return;
     }
     UmbraAWDLState state = UmbraReadAWDLState(&errorMessage);
@@ -248,6 +291,7 @@ static void UmbraHandleMessage(NSValue *connectionKey, xpc_object_t message) {
       return;
     }
     [gLeaseConnections addObject:connectionKey];
+    UmbraScheduleDisableReassertion();
     UmbraReply(message, 0, UmbraAWDLStateDown, nil);
     return;
   }

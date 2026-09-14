@@ -12,6 +12,7 @@ final class AudioQueueBufferingPolicyTests: XCTestCase {
         XCTAssertEqual(latency.bufferPoolCount, 3)
         XCTAssertEqual(latency.queueBufferFrames, 240)
         XCTAssertEqual(latency.minimumPreRollFrames, 480)
+        XCTAssertEqual(latency.rebufferPreRollFrames, 480)
 
         let nonIntegralRate = AudioQueueBufferingPolicy(configuration: PCMRendererConfiguration(
             sampleRate: 44_100,
@@ -20,31 +21,28 @@ final class AudioQueueBufferingPolicyTests: XCTestCase {
         ))
         XCTAssertEqual(nonIntegralRate.queueBufferFrames, 221)
         XCTAssertEqual(nonIntegralRate.minimumPreRollFrames, 441)
+        XCTAssertEqual(nonIntegralRate.rebufferPreRollFrames, 441)
     }
 
-    func testRebufferRequiresTwoLatencyQuantaBeforeRealPCMResumes() throws {
+    func testInitialPlayoutUsesOneQuantumAndRebufferRequiresTwo() throws {
         let ring = OutputSampleRing(
             frameCapacity: 960,
             packetCapacity: 8,
             channelCount: 2,
             metadataCount: 3,
-            minimumPreRollFrames: 480
+            minimumPreRollFrames: 240,
+            rebufferPreRollFrames: 480
         )
         ring.activateForTesting()
 
         XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 1)), 1)
-        XCTAssertEqual(ring.fillForTesting(sampleCount: 480), [Float](repeating: 0, count: 480))
-        XCTAssertEqual(ring.snapshot.queuedPackets, 1)
-
-        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 2)), 1)
         XCTAssertEqual(Set(ring.fillForTesting(sampleCount: 480)), [1])
-        XCTAssertEqual(Set(ring.fillForTesting(sampleCount: 480)), [2])
         XCTAssertEqual(ring.fillForTesting(sampleCount: 480), [Float](repeating: 0, count: 480))
         XCTAssertEqual(ring.snapshot.rebufferCount, 1)
-        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 3)), 1)
+        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 2)), 1)
         XCTAssertEqual(ring.fillForTesting(sampleCount: 480), [Float](repeating: 0, count: 480))
-        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 4)), 1)
-        XCTAssertEqual(Set(ring.fillForTesting(sampleCount: 480)), [3])
+        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 3)), 1)
+        XCTAssertEqual(Set(ring.fillForTesting(sampleCount: 480)), [2])
         XCTAssertEqual(ring.snapshot.rebufferCount, 1)
     }
 

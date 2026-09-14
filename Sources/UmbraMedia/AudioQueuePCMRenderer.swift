@@ -181,6 +181,7 @@ struct AudioQueueBufferingPolicy: Equatable, Sendable {
     let bufferPoolCount: Int
     let queueBufferFrames: Int
     let minimumPreRollFrames: Int
+    let rebufferPreRollFrames: Int
 
     init(configuration: PCMRendererConfiguration) {
         bufferPoolCount = Self.bufferPoolCount
@@ -191,6 +192,10 @@ struct AudioQueueBufferingPolicy: Equatable, Sendable {
         minimumPreRollFrames = max(
             queueBufferFrames,
             Int((configuration.minimumPreRollDuration * configuration.sampleRate).rounded(.up))
+        )
+        rebufferPreRollFrames = max(
+            queueBufferFrames,
+            Int((configuration.rebufferPreRollDuration * configuration.sampleRate).rounded(.up))
         )
     }
 }
@@ -212,7 +217,8 @@ final class OutputSampleRing: @unchecked Sendable {
         packetCapacity: Int,
         channelCount: Int,
         metadataCount: Int,
-        minimumPreRollFrames: Int = 0
+        minimumPreRollFrames: Int = 0,
+        rebufferPreRollFrames: Int? = nil
     ) {
         precondition(frameCapacity > 0)
         precondition(packetCapacity > 0)
@@ -220,6 +226,9 @@ final class OutputSampleRing: @unchecked Sendable {
         precondition(metadataCount > 0)
         precondition(minimumPreRollFrames >= 0)
         precondition(minimumPreRollFrames <= frameCapacity)
+        let rebufferPreRollFrames = rebufferPreRollFrames ?? minimumPreRollFrames
+        precondition(rebufferPreRollFrames >= minimumPreRollFrames)
+        precondition(rebufferPreRollFrames <= frameCapacity)
         self.sampleCapacity = frameCapacity * channelCount
         self.packetCapacity = packetCapacity
         self.channelCount = channelCount
@@ -241,7 +250,8 @@ final class OutputSampleRing: @unchecked Sendable {
             packetEndStorage,
             UInt32(packetCapacity),
             UInt32(channelCount),
-            UInt32(minimumPreRollFrames * channelCount)
+            UInt32(minimumPreRollFrames * channelCount),
+            UInt32(rebufferPreRollFrames * channelCount)
         )
     }
 
@@ -518,8 +528,9 @@ private final class AudioQueueCallbackRunLoop: AudioQueueOutputThread, @unchecke
 /// SDL-style pull output: three mode-sized AudioQueue buffers are refilled
 /// synchronously from a bounded SPSC ring. Playback consumes only complete
 /// physical blocks; every underrun is padded with silence and every completed
-/// buffer is immediately re-enqueued. Keeping three buffers preserves the
-/// stable AudioQueue handoff while latency mode shortens each physical block.
+/// buffer is immediately re-enqueued. Initial playout and post-underrun refill
+/// can use separate bounded thresholds, while three buffers preserve the stable
+/// AudioQueue handoff as latency mode shortens each physical block.
 public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsProviding, @unchecked Sendable {
     static let maximumStartRetryCount = 5
     static let startRetryDelay: TimeInterval = 0.020
@@ -596,7 +607,8 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
             packetCapacity: configuration.maximumQueuedBuffers,
             channelCount: Int(configuration.layout.channelCount),
             metadataCount: bufferingPolicy.bufferPoolCount,
-            minimumPreRollFrames: bufferingPolicy.minimumPreRollFrames
+            minimumPreRollFrames: bufferingPolicy.minimumPreRollFrames,
+            rebufferPreRollFrames: bufferingPolicy.rebufferPreRollFrames
         )
         mute = InactiveMuteState(muteWhileInactive: configuration.muteWhileInactive)
         backendQueue.setSpecific(key: backendQueueKey, value: 1)
@@ -632,7 +644,9 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
                 queuedDurationMilliseconds: Double(snapshot.queuedSamples)
                     / Double(configuration.layout.channelCount)
                     / configuration.sampleRate
-                    * 1_000
+                    * 1_000,
+                underrunCount: snapshot.underrunCount,
+                rebufferCount: snapshot.rebufferCount
             )
         }
     }

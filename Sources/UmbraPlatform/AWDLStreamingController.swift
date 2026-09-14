@@ -170,14 +170,12 @@ public actor AWDLStreamingController {
         commands: any AWDLInterfaceCommandExecuting
     ) async -> ActivationOutcome {
         do {
-            switch try await commands.currentState() {
+            let initialState = try await commands.currentState()
+            switch initialState {
             case .unavailable:
                 return ActivationOutcome(result: .unavailable)
             case .down:
-                return ActivationOutcome(
-                    result: .alreadyDisabled,
-                    active: ActiveActivation(result: .alreadyDisabled, ownsLease: false)
-                )
+                break
             case .up:
                 break
             }
@@ -192,8 +190,11 @@ public actor AWDLStreamingController {
                     )
                 }
                 return ActivationOutcome(
-                    result: .disabled,
-                    active: ActiveActivation(result: .disabled, ownsLease: true)
+                    result: initialState == .down ? .alreadyDisabled : .disabled,
+                    active: ActiveActivation(
+                        result: initialState == .down ? .alreadyDisabled : .disabled,
+                        ownsLease: true
+                    )
                 )
             } catch {
                 _ = try? await commands.releaseDisableLease()
@@ -208,11 +209,12 @@ public actor AWDLStreamingController {
         commands: any AWDLInterfaceCommandExecuting
     ) async -> AWDLStreamingChangeResult {
         do {
-            guard try await commands.releaseDisableLease() == .up,
-                  try await commands.currentState() == .up else {
-                return .failed("The approved helper did not report awdl0 as restored.")
+            let releasedState = try await commands.releaseDisableLease()
+            guard releasedState != .unavailable,
+                  try await commands.currentState() == releasedState else {
+                return .failed("The approved helper did not report a consistent awdl0 state after release.")
             }
-            return .restored
+            return releasedState == .up ? .restored : .unchanged
         } catch {
             return .failed(error.localizedDescription)
         }
@@ -328,34 +330,63 @@ private final class AWDLHelperConnection: @unchecked Sendable {
     private static let messageKey = "message"
 
     private let queue = DispatchQueue(label: "app.umbra.Umbra.awdl-helper-client")
-    private let connection: xpc_connection_t
-
-    init() {
-        connection = xpc_connection_create_mach_service(
-            Self.serviceName,
-            queue,
-            UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED)
-        )
-        xpc_connection_set_event_handler(connection) { _ in }
-        xpc_connection_activate(connection)
-    }
+    private var connection: xpc_connection_t?
+    private var connectionGeneration: UInt64 = 0
 
     deinit {
-        xpc_connection_cancel(connection)
+        if let connection {
+            xpc_connection_cancel(connection)
+        }
     }
 
     func request(_ operation: AWDLHelperOperation) async throws -> AWDLInterfaceState {
         try await withCheckedThrowingContinuation { continuation in
             let gate = AWDLHelperReplyGate(continuation: continuation)
-            let message = xpc_dictionary_create(nil, nil, 0)
-            xpc_dictionary_set_int64(message, Self.operationKey, operation.rawValue)
-            xpc_connection_send_message_with_reply(connection, message, queue) { reply in
-                gate.resolve(Self.decode(reply))
-            }
-            queue.asyncAfter(deadline: .now() + 2) {
-                gate.resolve(.failure(AWDLHelperClientError.timedOut))
+            queue.async { [self] in
+                let (connection, generation) = activeConnection()
+                let message = xpc_dictionary_create(nil, nil, 0)
+                xpc_dictionary_set_int64(message, Self.operationKey, operation.rawValue)
+                xpc_connection_send_message_with_reply(connection, message, queue) { [self] reply in
+                    if xpc_get_type(reply) == XPC_TYPE_ERROR {
+                        invalidateConnection(generation: generation)
+                    }
+                    gate.resolve(Self.decode(reply))
+                }
+                queue.asyncAfter(deadline: .now() + 2) { [self] in
+                    guard gate.resolve(.failure(AWDLHelperClientError.timedOut)) else { return }
+                    invalidateConnection(generation: generation)
+                }
             }
         }
+    }
+
+    private func activeConnection() -> (xpc_connection_t, UInt64) {
+        if let connection {
+            return (connection, connectionGeneration)
+        }
+        connectionGeneration &+= 1
+        if connectionGeneration == 0 { connectionGeneration = 1 }
+        let generation = connectionGeneration
+        let connection = xpc_connection_create_mach_service(
+            Self.serviceName,
+            queue,
+            UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED)
+        )
+        xpc_connection_set_event_handler(connection) { [weak self] event in
+            guard event === XPC_ERROR_CONNECTION_INVALID || event === XPC_ERROR_CONNECTION_INTERRUPTED else {
+                return
+            }
+            self?.invalidateConnection(generation: generation)
+        }
+        xpc_connection_activate(connection)
+        self.connection = connection
+        return (connection, generation)
+    }
+
+    private func invalidateConnection(generation: UInt64) {
+        guard connectionGeneration == generation, let connection else { return }
+        self.connection = nil
+        xpc_connection_cancel(connection)
     }
 
     private static func decode(_ reply: xpc_object_t) -> Result<AWDLInterfaceState, Error> {
@@ -389,11 +420,13 @@ private final class AWDLHelperReplyGate: @unchecked Sendable {
         self.continuation = continuation
     }
 
-    func resolve(_ result: Result<AWDLInterfaceState, Error>) {
+    @discardableResult
+    func resolve(_ result: Result<AWDLInterfaceState, Error>) -> Bool {
         let continuation = lock.withLock {
             defer { self.continuation = nil }
             return self.continuation
         }
         continuation?.resume(with: result)
+        return continuation != nil
     }
 }

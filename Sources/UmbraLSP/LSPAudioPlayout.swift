@@ -41,6 +41,7 @@ public final class LSPAudioPlayout: @unchecked Sendable {
             maximumQueuedDuration: max(frameDuration * 4.0, 0.020),
             outputBufferDuration: frameDuration,
             minimumPreRollDuration: frameDuration,
+            rebufferPreRollDuration: frameDuration * 2.0,
             muteWhileInactive: true
         ))
         let decoder = OpusMultistreamDecoder(renderer: renderer)
@@ -208,7 +209,8 @@ public final class LSPAudioPlayout: @unchecked Sendable {
 
     public func telemetrySnapshot() -> LSPProductTelemetrySnapshot {
         lock.withLock {
-            .init(
+            let statistics = pipeline?.renderer.statistics
+            return .init(
                 completeFrameReceiveToVideoToolboxSubmit: nil,
                 videoToolboxSubmitToDecodeCompletion: nil,
                 completeFrameReceiveToMetalEnqueue: nil,
@@ -216,8 +218,8 @@ public final class LSPAudioPlayout: @unchecked Sendable {
                 metalCommitToCompletion: nil,
                 audioReceiveToDecode: receiveToDecode.snapshot(),
                 audioDecodeAndRenderEnqueue: decodeAndRenderEnqueue.snapshot(),
-                audioUnderruns: nil,
-                audioRebuffers: nil,
+                audioUnderruns: statistics?.underrunCount,
+                audioRebuffers: statistics?.rebufferCount,
                 reconnectDuration: nil
             )
         }

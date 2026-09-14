@@ -197,6 +197,7 @@ typedef struct UmbraOutputSampleRing {
     uint32_t packet_capacity;
     uint32_t channel_count;
     uint32_t minimum_preroll_sample_count;
+    uint32_t rebuffer_preroll_sample_count;
     _Atomic uint64_t read_position;
     _Atomic uint64_t write_position;
     _Atomic uint64_t packet_read_position;
@@ -220,6 +221,7 @@ typedef struct UmbraOutputSampleRing {
     _Atomic uint64_t flush_packet_position;
     _Atomic bool flush_requested;
     _Atomic bool prerolling;
+    _Atomic bool initial_preroll;
     _Atomic bool accepting;
     _Atomic bool callback_enabled;
 } UmbraOutputSampleRing;
@@ -231,7 +233,8 @@ static inline void umbra_output_sample_ring_init(
     uint64_t *packet_end_positions,
     uint32_t packet_capacity,
     uint32_t channel_count,
-    uint32_t minimum_preroll_sample_count
+    uint32_t minimum_preroll_sample_count,
+    uint32_t rebuffer_preroll_sample_count
 ) {
     ring->storage = storage;
     ring->packet_end_positions = packet_end_positions;
@@ -239,6 +242,7 @@ static inline void umbra_output_sample_ring_init(
     ring->packet_capacity = packet_capacity;
     ring->channel_count = channel_count;
     ring->minimum_preroll_sample_count = minimum_preroll_sample_count;
+    ring->rebuffer_preroll_sample_count = rebuffer_preroll_sample_count;
     atomic_init(&ring->read_position, 0);
     atomic_init(&ring->write_position, 0);
     atomic_init(&ring->packet_read_position, 0);
@@ -262,6 +266,7 @@ static inline void umbra_output_sample_ring_init(
     atomic_init(&ring->flush_packet_position, 0);
     atomic_init(&ring->flush_requested, false);
     atomic_init(&ring->prerolling, true);
+    atomic_init(&ring->initial_preroll, true);
     atomic_init(&ring->accepting, false);
     atomic_init(&ring->callback_enabled, false);
 }
@@ -338,6 +343,7 @@ static inline void umbra_output_sample_ring_reset(
     atomic_store_explicit(&ring->flush_packet_position, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->flush_requested, false, memory_order_relaxed);
     atomic_store_explicit(&ring->prerolling, true, memory_order_relaxed);
+    atomic_store_explicit(&ring->initial_preroll, true, memory_order_relaxed);
 }
 
 // Publishes an exact discard barrier. Samples committed after these positions
@@ -359,6 +365,7 @@ static inline void umbra_output_sample_ring_request_flush(UmbraOutputSampleRing 
         packet_position,
         memory_order_relaxed
     );
+    atomic_store_explicit(&ring->initial_preroll, true, memory_order_release);
     atomic_store_explicit(&ring->prerolling, true, memory_order_release);
     atomic_store_explicit(&ring->flush_requested, true, memory_order_release);
 }
@@ -505,7 +512,10 @@ static inline void umbra_output_sample_ring_fill(
         return;
     }
 
-    uint64_t required_preroll_samples = ring->minimum_preroll_sample_count;
+    bool initial_preroll = atomic_load_explicit(&ring->initial_preroll, memory_order_acquire);
+    uint64_t required_preroll_samples = initial_preroll
+        ? ring->minimum_preroll_sample_count
+        : ring->rebuffer_preroll_sample_count;
     if (required_preroll_samples < requested_sample_count) {
         required_preroll_samples = requested_sample_count;
     }
@@ -516,9 +526,11 @@ static inline void umbra_output_sample_ring_fill(
             emit_silence = true;
         } else {
             atomic_store_explicit(&ring->prerolling, false, memory_order_release);
+            atomic_store_explicit(&ring->initial_preroll, false, memory_order_release);
         }
     } else if (available_samples < requested_sample_count) {
         atomic_store_explicit(&ring->prerolling, true, memory_order_release);
+        atomic_store_explicit(&ring->initial_preroll, false, memory_order_release);
         atomic_fetch_add_explicit(&ring->rebuffer_count, 1, memory_order_relaxed);
         emit_silence = true;
     }

@@ -7,6 +7,7 @@ public struct PCMRendererConfiguration: Sendable, Equatable {
     public var maximumQueuedDuration: TimeInterval
     public var outputBufferDuration: TimeInterval
     public var minimumPreRollDuration: TimeInterval
+    public var rebufferPreRollDuration: TimeInterval
     public var muteWhileInactive: Bool
 
     public init(
@@ -16,6 +17,7 @@ public struct PCMRendererConfiguration: Sendable, Equatable {
         maximumQueuedDuration: TimeInterval = 0.120,
         outputBufferDuration: TimeInterval = 0.015,
         minimumPreRollDuration: TimeInterval = 0.015,
+        rebufferPreRollDuration: TimeInterval? = nil,
         muteWhileInactive: Bool = true
     ) {
         self.sampleRate = sampleRate
@@ -28,6 +30,10 @@ public struct PCMRendererConfiguration: Sendable, Equatable {
         )
         self.minimumPreRollDuration = min(
             max(self.outputBufferDuration, minimumPreRollDuration),
+            self.maximumQueuedDuration
+        )
+        self.rebufferPreRollDuration = min(
+            max(self.minimumPreRollDuration, rebufferPreRollDuration ?? self.minimumPreRollDuration),
             self.maximumQueuedDuration
         )
         self.muteWhileInactive = muteWhileInactive
@@ -43,6 +49,8 @@ public struct AudioRendererStatistics: Sendable, Equatable {
     public let scheduledBuffers: Int
     public let playbackStarted: Bool
     public let queuedDurationMilliseconds: Double
+    public let underrunCount: UInt64
+    public let rebufferCount: UInt64
 
     public init(
         enqueuedBuffers: UInt64,
@@ -52,7 +60,9 @@ public struct AudioRendererStatistics: Sendable, Equatable {
         queuedBuffers: Int,
         scheduledBuffers: Int,
         playbackStarted: Bool,
-        queuedDurationMilliseconds: Double
+        queuedDurationMilliseconds: Double,
+        underrunCount: UInt64 = 0,
+        rebufferCount: UInt64 = 0
     ) {
         self.enqueuedBuffers = enqueuedBuffers
         self.playedBuffers = playedBuffers
@@ -62,6 +72,8 @@ public struct AudioRendererStatistics: Sendable, Equatable {
         self.scheduledBuffers = scheduledBuffers
         self.playbackStarted = playbackStarted
         self.queuedDurationMilliseconds = queuedDurationMilliseconds
+        self.underrunCount = underrunCount
+        self.rebufferCount = rebufferCount
     }
 }
 

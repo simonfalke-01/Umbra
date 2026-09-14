@@ -3994,7 +3994,11 @@ namespace umbra::lsp {
         return CLSP_STATUS_SOCKET_FAILURE;
       }
       std::array<struct kevent, 2> registrations {};
-      EV_SET(&registrations[0], socket_, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+      // Keep the socket filter level-triggered: each worker turn deliberately
+      // drains only a bounded batch, so unread media must immediately wake the
+      // next turn instead of waiting for a new edge. This also prevents DTLS
+      // control ACKs queued behind a video burst from starving until timeout.
+      EV_SET(&registrations[0], socket_, EVFILT_READ, EV_ADD, 0, 0, nullptr);
       EV_SET(&registrations[1], wake_identifier, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
       return kevent(kqueue_, registrations.data(), static_cast<int>(registrations.size()), nullptr, 0, nullptr) == 0 ?
                CLSP_STATUS_OK :
@@ -5891,21 +5895,27 @@ namespace umbra::lsp {
         auto &record = microphone_sent_packets_[
           pending_microphone_.extended_sequence % microphone_sent_packets_.size()
         ];
-        const auto ledger_exhausted = record.occupied && record.state == MicrophoneFeedbackState::unreported;
-        if (!ledger_exhausted) {
-          record = {
-            .extended_sequence = pending_microphone_.extended_sequence,
-            .sent_microseconds = sent_microseconds,
-            .complete_ip_bytes = static_cast<std::uint32_t>(pending_microphone_.length) + ip_udp_overhead_bytes(),
-            .microphone_generation = pending_microphone_.microphone_generation,
-            .state = MicrophoneFeedbackState::unreported,
-            .occupied = true,
-          };
-          microphone_bytes_in_flight_ = saturating_rate_add(
-            microphone_bytes_in_flight_,
-            record.complete_ip_bytes
-          );
+        if (record.occupied && record.state == MicrophoneFeedbackState::unreported) {
+          // Early CCFB can precede the compound RTCP authority barrier, leaving
+          // an old send unreported after later feedback has moved on. At this
+          // fixed-window wrap point the old packet is beyond feedback freshness;
+          // retire it as final loss instead of failing the whole association.
+          microphone_bytes_in_flight_ = microphone_bytes_in_flight_ > record.complete_ip_bytes ?
+                                          microphone_bytes_in_flight_ - record.complete_ip_bytes : 0;
+          microphone_lost_bytes_ = saturating_rate_add(microphone_lost_bytes_, record.complete_ip_bytes);
         }
+        record = {
+          .extended_sequence = pending_microphone_.extended_sequence,
+          .sent_microseconds = sent_microseconds,
+          .complete_ip_bytes = static_cast<std::uint32_t>(pending_microphone_.length) + ip_udp_overhead_bytes(),
+          .microphone_generation = pending_microphone_.microphone_generation,
+          .state = MicrophoneFeedbackState::unreported,
+          .occupied = true,
+        };
+        microphone_bytes_in_flight_ = saturating_rate_add(
+          microphone_bytes_in_flight_,
+          record.complete_ip_bytes
+        );
         microphone_tokens_bits_ -= std::min(microphone_tokens_bits_, pending_microphone_.charged_bits);
         reverse_tokens_bits_ -= std::min(reverse_tokens_bits_, pending_microphone_.charged_bits);
         microphone_marker_.store(false, std::memory_order_release);
@@ -5919,7 +5929,7 @@ namespace umbra::lsp {
         );
         pending_microphone_ = {};
         increment(RuntimeCounter::transmitted);
-        return ledger_exhausted ? CLSP_STATUS_RESOURCE_EXHAUSTED : CLSP_STATUS_OK;
+        return CLSP_STATUS_OK;
       }
       if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
         return CLSP_STATUS_OK;
