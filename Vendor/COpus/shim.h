@@ -203,6 +203,7 @@ typedef struct UmbraOutputSampleRing {
     _Atomic uint64_t packet_read_position;
     _Atomic uint64_t packet_write_position;
     _Atomic uint64_t accepted_packets;
+    _Atomic uint64_t non_silent_accepted_packets;
     _Atomic uint64_t played_packets;
     _Atomic uint64_t dropped_packets;
     _Atomic uint64_t rejected_packets;
@@ -248,6 +249,7 @@ static inline void umbra_output_sample_ring_init(
     atomic_init(&ring->packet_read_position, 0);
     atomic_init(&ring->packet_write_position, 0);
     atomic_init(&ring->accepted_packets, 0);
+    atomic_init(&ring->non_silent_accepted_packets, 0);
     atomic_init(&ring->played_packets, 0);
     atomic_init(&ring->dropped_packets, 0);
     atomic_init(&ring->rejected_packets, 0);
@@ -317,6 +319,7 @@ static inline void umbra_output_sample_ring_reset(
     uint64_t scheduled = atomic_load_explicit(&ring->scheduled_packets, memory_order_relaxed);
     if (reset_counters) {
         atomic_store_explicit(&ring->accepted_packets, 0, memory_order_relaxed);
+        atomic_store_explicit(&ring->non_silent_accepted_packets, 0, memory_order_relaxed);
         atomic_store_explicit(&ring->played_packets, 0, memory_order_relaxed);
         atomic_store_explicit(&ring->dropped_packets, 0, memory_order_relaxed);
         atomic_store_explicit(&ring->rejected_packets, 0, memory_order_relaxed);
@@ -407,10 +410,15 @@ static inline int umbra_output_sample_ring_write_planar(
         return -2;
     }
 
+    bool non_silent = false;
     uint32_t write_index = (uint32_t)(write_position % ring->sample_capacity);
     for (uint32_t frame = 0; frame < frame_count; frame++) {
         for (uint32_t channel = 0; channel < channel_count; channel++) {
-            ring->storage[write_index] = channels[channel][frame];
+            float sample = channels[channel][frame];
+            ring->storage[write_index] = sample;
+            if (sample > 0.0001f || sample < -0.0001f) {
+                non_silent = true;
+            }
             write_index++;
             if (write_index == ring->sample_capacity) {
                 write_index = 0;
@@ -422,6 +430,13 @@ static inline int umbra_output_sample_ring_write_planar(
     atomic_store_explicit(&ring->write_position, end_position, memory_order_relaxed);
     atomic_store_explicit(&ring->packet_write_position, packet_write + 1, memory_order_release);
     atomic_fetch_add_explicit(&ring->accepted_packets, 1, memory_order_relaxed);
+    if (non_silent) {
+        atomic_fetch_add_explicit(
+            &ring->non_silent_accepted_packets,
+            1,
+            memory_order_relaxed
+        );
+    }
     atomic_fetch_sub_explicit(&ring->active_writers, 1, memory_order_release);
     return 1;
 }
@@ -617,6 +632,11 @@ static inline void umbra_output_sample_ring_callback_enqueue_failed(
 
 static inline uint64_t umbra_output_sample_ring_accepted_packets(const UmbraOutputSampleRing *ring) {
     return atomic_load_explicit(&ring->accepted_packets, memory_order_acquire);
+}
+static inline uint64_t umbra_output_sample_ring_non_silent_accepted_packets(
+    const UmbraOutputSampleRing *ring
+) {
+    return atomic_load_explicit(&ring->non_silent_accepted_packets, memory_order_acquire);
 }
 static inline uint64_t umbra_output_sample_ring_played_packets(const UmbraOutputSampleRing *ring) {
     return atomic_load_explicit(&ring->played_packets, memory_order_acquire);

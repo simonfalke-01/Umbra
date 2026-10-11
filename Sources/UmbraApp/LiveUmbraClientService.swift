@@ -994,7 +994,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 .flatMap(\.audioDecodeAndRenderEnqueue)
                 .map(CLILSPTimingDistribution.init),
             audioUnderruns: media?.audioUnderruns,
-            audioRebuffers: media?.audioRebuffers
+            audioRebuffers: media?.audioRebuffers,
+            audioAcceptedPackets: media?.audioAcceptedPackets,
+            audioPlayedPackets: media?.audioPlayedPackets,
+            audioDroppedPackets: media?.audioDroppedPackets,
+            audioRejectedPackets: media?.audioRejectedPackets,
+            audioCallbackCount: media?.audioCallbackCount,
+            audioCallbackError: media?.audioCallbackError,
+            audioNonSilentPackets: media?.audioNonSilentPackets,
+            audioQueuedMilliseconds: media?.audioQueuedMilliseconds
         )
     }
 

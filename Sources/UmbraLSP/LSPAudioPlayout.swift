@@ -5,6 +5,110 @@ import UmbraMedia
 import UmbraOpus
 import UmbraLSPTransport
 
+struct LSPAudioSequenceState {
+    struct PendingToken: Equatable {
+        fileprivate let epoch: UInt64
+    }
+
+    enum Action: Equatable {
+        case reset
+        case conceal
+        case decode(LSPAudioPacket)
+        case discard(LSPAudioPacket)
+        case schedule(PendingToken)
+    }
+
+    private(set) var expectedSequence: UInt16?
+    private(set) var pendingPacket: LSPAudioPacket?
+    private var pendingEpoch: UInt64 = 0
+
+    mutating func invalidate() {
+        pendingEpoch &+= 1
+        expectedSequence = nil
+        pendingPacket = nil
+    }
+
+    mutating func submit(
+        _ packet: LSPAudioPacket,
+        maximumConcealedFrames: Int
+    ) -> [Action] {
+        let concealmentLimit = max(0, maximumConcealedFrames)
+        guard let expected = expectedSequence else {
+            expectedSequence = packet.sequenceNumber &+ 1
+            return packet.marker ? [.reset, .decode(packet)] : [.decode(packet)]
+        }
+
+        let incomingDistance = packet.sequenceNumber &- expected
+        guard incomingDistance <= 0x7FFF,
+              pendingPacket?.sequenceNumber != packet.sequenceNumber
+        else { return [.discard(packet)] }
+
+        if packet.marker {
+            var actions = pendingPacket.map { [Action.discard($0)] } ?? []
+            invalidatePending()
+            expectedSequence = packet.sequenceNumber &+ 1
+            actions.append(contentsOf: [.reset, .decode(packet)])
+            return actions
+        }
+
+        if let pending = pendingPacket {
+            if incomingDistance == 0 {
+                invalidatePending()
+                expectedSequence = pending.sequenceNumber &+ 1
+                return [.decode(packet), .decode(pending)]
+            }
+            let missingFrames = Int(incomingDistance) - 1
+            guard missingFrames <= concealmentLimit else {
+                invalidatePending()
+                expectedSequence = packet.sequenceNumber &+ 1
+                return [.discard(pending), .reset, .decode(packet)]
+            }
+            invalidatePending()
+            expectedSequence = packet.sequenceNumber &+ 1
+            return [.conceal, .decode(pending)]
+                + Array(repeating: .conceal, count: missingFrames - 1)
+                + [.decode(packet)]
+        }
+
+        if incomingDistance == 0 {
+            expectedSequence = packet.sequenceNumber &+ 1
+            return [.decode(packet)]
+        }
+        if incomingDistance == 1 {
+            return [hold(packet)]
+        }
+        guard Int(incomingDistance) <= concealmentLimit else {
+            expectedSequence = packet.sequenceNumber &+ 1
+            return [.reset, .decode(packet)]
+        }
+        expectedSequence = packet.sequenceNumber &+ 1
+        return Array(repeating: .conceal, count: Int(incomingDistance)) + [.decode(packet)]
+    }
+
+    mutating func expire(_ token: PendingToken) -> [Action] {
+        guard token.epoch == pendingEpoch,
+              let pending = pendingPacket,
+              let expected = expectedSequence
+        else { return [] }
+
+        guard pending.sequenceNumber &- expected == 1 else { return [] }
+        invalidatePending()
+        expectedSequence = pending.sequenceNumber &+ 1
+        return [.conceal, .decode(pending)]
+    }
+
+    private mutating func hold(_ packet: LSPAudioPacket) -> Action {
+        pendingEpoch &+= 1
+        pendingPacket = packet
+        return .schedule(PendingToken(epoch: pendingEpoch))
+    }
+
+    private mutating func invalidatePending() {
+        pendingEpoch &+= 1
+        pendingPacket = nil
+    }
+}
+
 /// Production Opus multistream decoder and AudioQueue playout owner for one LSP association.
 public final class LSPAudioPlayout: @unchecked Sendable {
     private struct Pipeline {
@@ -16,11 +120,11 @@ public final class LSPAudioPlayout: @unchecked Sendable {
     private let lock = NSLock()
     private let decodeQueue = DispatchQueue(label: "app.umbra.lsp-audio", qos: .userInteractive)
     private var pipeline: Pipeline?
-    private var pendingPacket: LSPAudioPacket?
-    private var expectedSequence: UInt16?
+    private var sequenceState = LSPAudioSequenceState()
     private var lastDecodedTimestamp: UInt32?
     private var latestTiming: LSPAudioTiming?
     private var frameDuration: TimeInterval = 0.010
+    private var maximumConcealedFrames = 4
     private var receiveTimes: [UInt64: UInt64] = [:]
     private var receiveToDecode = LSPFixedDurationWindow()
     private var decodeAndRenderEnqueue = LSPFixedDurationWindow()
@@ -40,7 +144,7 @@ public final class LSPAudioPlayout: @unchecked Sendable {
             maximumQueuedBuffers: 16,
             maximumQueuedDuration: max(frameDuration * 4.0, 0.020),
             outputBufferDuration: frameDuration,
-            minimumPreRollDuration: frameDuration,
+            minimumPreRollDuration: frameDuration * 2.0,
             rebufferPreRollDuration: frameDuration * 2.0,
             muteWhileInactive: true
         ))
@@ -57,16 +161,22 @@ public final class LSPAudioPlayout: @unchecked Sendable {
         try renderer.start()
         decoder.start()
 
-        let old = lock.withLock { () -> Pipeline? in
-            defer { pipeline = Pipeline(configuration: configuration, renderer: renderer, decoder: decoder) }
-            return pipeline
-        }
-        decodeQueue.sync {
-            pendingPacket = nil
-            expectedSequence = nil
+        let old = decodeQueue.sync { () -> Pipeline? in
+            sequenceState.invalidate()
             lastDecodedTimestamp = nil
             receiveTimes.removeAll(keepingCapacity: true)
             self.frameDuration = frameDuration
+            maximumConcealedFrames = max(1, 1_920 / Int(configuration.frameSamples))
+            return lock.withLock {
+                defer {
+                    pipeline = Pipeline(
+                        configuration: configuration,
+                        renderer: renderer,
+                        decoder: decoder
+                    )
+                }
+                return pipeline
+            }
         }
         old?.decoder.stop()
         _ = old?.renderer.stop()
@@ -107,84 +217,24 @@ public final class LSPAudioPlayout: @unchecked Sendable {
 
     /// Stops decoder and AudioQueue ownership for a retired association.
     public func stop() {
-        decodeQueue.sync {
-            pendingPacket = nil
-            expectedSequence = nil
+        let old = decodeQueue.sync { () -> Pipeline? in
+            sequenceState.invalidate()
             lastDecodedTimestamp = nil
             receiveTimes.removeAll(keepingCapacity: true)
-        }
-        let old = lock.withLock { () -> Pipeline? in
-            defer { pipeline = nil }
-            return pipeline
+            return lock.withLock {
+                defer { pipeline = nil }
+                return pipeline
+            }
         }
         old?.decoder.stop()
         _ = old?.renderer.stop()
     }
 
     private func process(_ packet: LSPAudioPacket, decoder: OpusMultistreamDecoder) {
-        if packet.marker {
-            try? decoder.resetForDiscontinuity()
-            expectedSequence = packet.sequenceNumber
-            lastDecodedTimestamp = nil
-            hold(packet, decoder: decoder)
-            return
-        }
-        guard let expected = expectedSequence else {
-            expectedSequence = packet.sequenceNumber
-            hold(packet, decoder: decoder)
-            return
-        }
-        guard let pending = pendingPacket else {
-            let distance = packet.sequenceNumber &- expected
-            guard distance <= 1 else {
-                try? decoder.resetForDiscontinuity()
-                expectedSequence = packet.sequenceNumber
-                lastDecodedTimestamp = nil
-                hold(packet, decoder: decoder)
-                return
-            }
-            hold(packet, decoder: decoder)
-            return
-        }
-
-        let pendingDistance = pending.sequenceNumber &- expected
-        let incomingDistance = packet.sequenceNumber &- expected
-        if incomingDistance > 0x7FFF || incomingDistance == pendingDistance {
-            return
-        }
-        if pendingDistance == 1, incomingDistance == 0 {
-            decode(packet, with: decoder)
-            expectedSequence = expected &+ 1
-            return
-        }
-        if pendingDistance == 0 {
-            decode(pending, with: decoder)
-            let next = expected &+ 1
-            expectedSequence = next
-            pendingPacket = nil
-            let distance = packet.sequenceNumber &- next
-            if distance <= 1 {
-                hold(packet, decoder: decoder)
-            } else if distance <= 0x7FFF {
-                try? decoder.resetForDiscontinuity()
-                expectedSequence = packet.sequenceNumber
-                lastDecodedTimestamp = nil
-                hold(packet, decoder: decoder)
-            }
-            return
-        }
-        if pendingDistance == 1, incomingDistance > 1, incomingDistance <= 0x7FFF {
-            decoder.submit(packet: CompressedAudioPacket(data: Data()))
-            expectedSequence = expected &+ 1
-            decode(pending, with: decoder)
-            expectedSequence = expected &+ 2
-            hold(packet, decoder: decoder)
-            return
-        }
-        try? decoder.resetForDiscontinuity()
-        expectedSequence = packet.sequenceNumber
-        lastDecodedTimestamp = nil
-        hold(packet, decoder: decoder)
+        perform(
+            sequenceState.submit(packet, maximumConcealedFrames: maximumConcealedFrames),
+            decoder: decoder
+        )
     }
 
     private func decode(_ packet: LSPAudioPacket, with decoder: OpusMultistreamDecoder) {
@@ -218,6 +268,14 @@ public final class LSPAudioPlayout: @unchecked Sendable {
                 metalCommitToCompletion: nil,
                 audioReceiveToDecode: receiveToDecode.snapshot(),
                 audioDecodeAndRenderEnqueue: decodeAndRenderEnqueue.snapshot(),
+                audioAcceptedPackets: statistics?.enqueuedBuffers,
+                audioPlayedPackets: statistics?.playedBuffers,
+                audioDroppedPackets: statistics?.droppedBuffers,
+                audioRejectedPackets: statistics?.rejectedBuffers,
+                audioCallbackCount: statistics?.callbackCount,
+                audioCallbackError: statistics?.callbackError,
+                audioNonSilentPackets: statistics?.nonSilentAcceptedPackets,
+                audioQueuedMilliseconds: statistics?.queuedDurationMilliseconds,
                 audioUnderruns: statistics?.underrunCount,
                 audioRebuffers: statistics?.rebufferCount,
                 reconnectDuration: nil
@@ -233,27 +291,29 @@ public final class LSPAudioPlayout: @unchecked Sendable {
         max(1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1_000)
     }
 
-    private func hold(_ packet: LSPAudioPacket, decoder: OpusMultistreamDecoder) {
-        pendingPacket = packet
-        let generation = packet.audioGeneration
-        let sequence = packet.sequenceNumber
-        decodeQueue.asyncAfter(deadline: .now() + frameDuration) { [weak self, decoder] in
-            guard let self,
-                  let pending = pendingPacket,
-                  pending.audioGeneration == generation,
-                  pending.sequenceNumber == sequence,
-                  let expected = expectedSequence
-            else { return }
-            let distance = pending.sequenceNumber &- expected
-            if distance == 1 {
+    private func perform(
+        _ actions: [LSPAudioSequenceState.Action],
+        decoder: OpusMultistreamDecoder
+    ) {
+        for action in actions {
+            switch action {
+            case .reset:
+                try? decoder.resetForDiscontinuity()
+                lastDecodedTimestamp = nil
+            case .conceal:
                 decoder.submit(packet: CompressedAudioPacket(data: Data()))
-                expectedSequence = expected &+ 1
-            } else if distance != 0 {
-                return
+            case let .decode(packet):
+                decode(packet, with: decoder)
+            case let .discard(packet):
+                receiveTimes.removeValue(forKey: Self.packetKey(packet))
+            case let .schedule(token):
+                decodeQueue.asyncAfter(deadline: .now() + frameDuration) { [weak self, decoder] in
+                    guard let self,
+                          lock.withLock({ pipeline?.decoder === decoder })
+                    else { return }
+                    perform(sequenceState.expire(token), decoder: decoder)
+                }
             }
-            decode(pending, with: decoder)
-            expectedSequence = pending.sequenceNumber &+ 1
-            pendingPacket = nil
         }
     }
 }

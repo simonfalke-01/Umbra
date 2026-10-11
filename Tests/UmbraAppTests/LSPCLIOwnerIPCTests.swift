@@ -34,7 +34,15 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
             audioReceiveToDecode: timing(5),
             audioDecodeAndRenderEnqueue: timing(6),
             audioUnderruns: 0,
-            audioRebuffers: nil
+            audioRebuffers: nil,
+            audioAcceptedPackets: 120,
+            audioPlayedPackets: 117,
+            audioDroppedPackets: 2,
+            audioRejectedPackets: 1,
+            audioCallbackCount: 130,
+            audioCallbackError: -66_632,
+            audioNonSilentPackets: 119,
+            audioQueuedMilliseconds: 30
         )
         let endpoint = try LSPCLIOwnerEndpoint(hostID: hostID) { request in
             guard request.hostID == hostID, request.command == .telemetry else {
@@ -63,6 +71,8 @@ final class LSPCLIOwnerIPCTests: XCTestCase {
         ))
         XCTAssertTrue(telemetry.commandLineOutput.contains("lsp.media.audio_underruns=0\n"))
         XCTAssertTrue(telemetry.commandLineOutput.contains("lsp.media.audio_rebuffers=unavailable\n"))
+        XCTAssertTrue(telemetry.commandLineOutput.contains("lsp.media.audio_non_silent_packets=119\n"))
+        XCTAssertTrue(telemetry.commandLineOutput.contains("lsp.media.audio_callback_error=-66632\n"))
         var parentStatus = stat()
         let parent = "/tmp/umbra-lsp-owner-\(geteuid())"
         XCTAssertEqual(lstat(parent, &parentStatus), 0)

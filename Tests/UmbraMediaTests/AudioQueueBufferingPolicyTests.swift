@@ -84,6 +84,34 @@ final class AudioQueueBufferingPolicyTests: XCTestCase {
         XCTAssertEqual(ring.snapshot.renderedSilenceSamples, 0)
     }
 
+    func testSignalCountersDistinguishDecodedSilenceFromStarvationAndRejectedPCM() throws {
+        let ring = OutputSampleRing(
+            frameCapacity: 480,
+            packetCapacity: 4,
+            channelCount: 2,
+            metadataCount: 3,
+            minimumPreRollFrames: 240
+        )
+        ring.activateForTesting()
+        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2)), 1)
+        XCTAssertEqual(ring.write(try makePCMBuffer(
+            frames: 240, channels: 2, channelValues: [0, -0.5]
+        )), 1)
+        XCTAssertEqual(ring.write(try makePCMBuffer(frames: 240, channels: 2, value: 1)), -2)
+        XCTAssertEqual(ring.snapshot.acceptedPackets, 2)
+        XCTAssertEqual(ring.snapshot.nonSilentAcceptedPackets, 1)
+
+        XCTAssertEqual(Set(ring.fillForTesting(sampleCount: 480)), [0])
+        XCTAssertEqual(Set(ring.fillForTesting(sampleCount: 480)), [0, -0.5])
+        ring.completeForTesting()
+        XCTAssertEqual(ring.snapshot.playedPackets, 2)
+        XCTAssertEqual(ring.snapshot.underrunCount, 0)
+        XCTAssertEqual(ring.snapshot.renderedSilenceSamples, 0)
+
+        ring.reset(resetCounters: true)
+        XCTAssertEqual(ring.snapshot.nonSilentAcceptedPackets, 0)
+    }
+
     private func makePCMBuffer(
         frames: AVAudioFrameCount,
         channels: AVAudioChannelCount,

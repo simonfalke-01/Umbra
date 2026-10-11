@@ -37,6 +37,14 @@ struct LSPCLIOwnerTelemetry: Codable, Sendable {
     var audioDecodeAndRenderEnqueue: LSPCLIOwnerTimingDistribution? = nil
     var audioUnderruns: UInt64? = nil
     var audioRebuffers: UInt64? = nil
+    var audioAcceptedPackets: UInt64? = nil
+    var audioPlayedPackets: UInt64? = nil
+    var audioDroppedPackets: UInt64? = nil
+    var audioRejectedPackets: UInt64? = nil
+    var audioCallbackCount: UInt64? = nil
+    var audioCallbackError: Int32? = nil
+    var audioNonSilentPackets: UInt64? = nil
+    var audioQueuedMilliseconds: Double? = nil
 }
 
 struct LSPCLIOwnerTimingDistribution: Codable, Sendable {
@@ -74,6 +82,14 @@ extension LSPCLIOwnerTelemetry {
         )
         audioUnderruns = value.audioUnderruns
         audioRebuffers = value.audioRebuffers
+        audioAcceptedPackets = value.audioAcceptedPackets
+        audioPlayedPackets = value.audioPlayedPackets
+        audioDroppedPackets = value.audioDroppedPackets
+        audioRejectedPackets = value.audioRejectedPackets
+        audioCallbackCount = value.audioCallbackCount
+        audioCallbackError = value.audioCallbackError
+        audioNonSilentPackets = value.audioNonSilentPackets
+        audioQueuedMilliseconds = value.audioQueuedMilliseconds
     }
 
     var cliValue: CLILSPTelemetry {
@@ -92,7 +108,15 @@ extension LSPCLIOwnerTelemetry {
             audioReceiveToDecode: audioReceiveToDecode?.cliValue,
             audioDecodeAndRenderEnqueue: audioDecodeAndRenderEnqueue?.cliValue,
             audioUnderruns: audioUnderruns,
-            audioRebuffers: audioRebuffers
+            audioRebuffers: audioRebuffers,
+            audioAcceptedPackets: audioAcceptedPackets,
+            audioPlayedPackets: audioPlayedPackets,
+            audioDroppedPackets: audioDroppedPackets,
+            audioRejectedPackets: audioRejectedPackets,
+            audioCallbackCount: audioCallbackCount,
+            audioCallbackError: audioCallbackError,
+            audioNonSilentPackets: audioNonSilentPackets,
+            audioQueuedMilliseconds: audioQueuedMilliseconds
         )
     }
 }

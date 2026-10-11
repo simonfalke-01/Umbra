@@ -24,6 +24,14 @@ public struct LSPProductTelemetrySnapshot: Equatable, Sendable {
     public var metalCommitToCompletion: LSPDistributionSnapshot?
     public var audioReceiveToDecode: LSPDistributionSnapshot?
     public var audioDecodeAndRenderEnqueue: LSPDistributionSnapshot?
+    public var audioAcceptedPackets: UInt64? = nil
+    public var audioPlayedPackets: UInt64? = nil
+    public var audioDroppedPackets: UInt64? = nil
+    public var audioRejectedPackets: UInt64? = nil
+    public var audioCallbackCount: UInt64? = nil
+    public var audioCallbackError: Int32? = nil
+    public var audioNonSilentPackets: UInt64? = nil
+    public var audioQueuedMilliseconds: Double? = nil
     public var audioUnderruns: UInt64?
     public var audioRebuffers: UInt64?
     public var reconnectDuration: LSPDistributionSnapshot?

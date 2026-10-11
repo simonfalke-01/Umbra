@@ -132,6 +132,14 @@ public struct CLILSPTelemetry: Equatable, Sendable {
     public var audioDecodeAndRenderEnqueue: CLILSPTimingDistribution?
     public var audioUnderruns: UInt64?
     public var audioRebuffers: UInt64?
+    public var audioAcceptedPackets: UInt64?
+    public var audioPlayedPackets: UInt64?
+    public var audioDroppedPackets: UInt64?
+    public var audioRejectedPackets: UInt64?
+    public var audioCallbackCount: UInt64?
+    public var audioCallbackError: Int32?
+    public var audioNonSilentPackets: UInt64?
+    public var audioQueuedMilliseconds: Double?
 
     public init(
         lifecycle: String, receivedDatagrams: UInt64, transmittedDatagrams: UInt64,
@@ -144,7 +152,15 @@ public struct CLILSPTelemetry: Equatable, Sendable {
         audioReceiveToDecode: CLILSPTimingDistribution? = nil,
         audioDecodeAndRenderEnqueue: CLILSPTimingDistribution? = nil,
         audioUnderruns: UInt64? = nil,
-        audioRebuffers: UInt64? = nil
+        audioRebuffers: UInt64? = nil,
+        audioAcceptedPackets: UInt64? = nil,
+        audioPlayedPackets: UInt64? = nil,
+        audioDroppedPackets: UInt64? = nil,
+        audioRejectedPackets: UInt64? = nil,
+        audioCallbackCount: UInt64? = nil,
+        audioCallbackError: Int32? = nil,
+        audioNonSilentPackets: UInt64? = nil,
+        audioQueuedMilliseconds: Double? = nil
     ) {
         self.lifecycle = lifecycle; self.receivedDatagrams = receivedDatagrams
         self.transmittedDatagrams = transmittedDatagrams; self.droppedDatagrams = droppedDatagrams
@@ -158,6 +174,14 @@ public struct CLILSPTelemetry: Equatable, Sendable {
         self.audioDecodeAndRenderEnqueue = audioDecodeAndRenderEnqueue
         self.audioUnderruns = audioUnderruns
         self.audioRebuffers = audioRebuffers
+        self.audioAcceptedPackets = audioAcceptedPackets
+        self.audioPlayedPackets = audioPlayedPackets
+        self.audioDroppedPackets = audioDroppedPackets
+        self.audioRejectedPackets = audioRejectedPackets
+        self.audioCallbackCount = audioCallbackCount
+        self.audioCallbackError = audioCallbackError
+        self.audioNonSilentPackets = audioNonSilentPackets
+        self.audioQueuedMilliseconds = audioQueuedMilliseconds
     }
 
     /// Stable command-line representation shared by direct commands and native-app handoffs.
@@ -186,6 +210,14 @@ public struct CLILSPTelemetry: Equatable, Sendable {
         output += Self.timingOutput("audio_decode_and_render_enqueue", audioDecodeAndRenderEnqueue)
         output += "lsp.media.audio_underruns=\(audioUnderruns.map(String.init) ?? "unavailable")\n"
         output += "lsp.media.audio_rebuffers=\(audioRebuffers.map(String.init) ?? "unavailable")\n"
+        output += "lsp.media.audio_accepted_packets=\(audioAcceptedPackets.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_played_packets=\(audioPlayedPackets.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_dropped_packets=\(audioDroppedPackets.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_rejected_packets=\(audioRejectedPackets.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_callback_count=\(audioCallbackCount.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_callback_error=\(audioCallbackError.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_non_silent_packets=\(audioNonSilentPackets.map { String($0) } ?? "unavailable")\n"
+        output += "lsp.media.audio_queued_milliseconds=\(audioQueuedMilliseconds.map { String($0) } ?? "unavailable")\n"
         return output
     }
 

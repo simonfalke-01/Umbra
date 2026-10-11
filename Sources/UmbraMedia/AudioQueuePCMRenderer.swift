@@ -161,6 +161,7 @@ struct AudioQueueThreadSchedulingPolicy: @unchecked Sendable {
 
 struct OutputSampleRingSnapshot: Equatable {
     let acceptedPackets: UInt64
+    let nonSilentAcceptedPackets: UInt64
     let playedPackets: UInt64
     let droppedPackets: UInt64
     let rejectedPackets: UInt64
@@ -344,6 +345,7 @@ final class OutputSampleRing: @unchecked Sendable {
     var snapshot: OutputSampleRingSnapshot {
         OutputSampleRingSnapshot(
             acceptedPackets: umbra_output_sample_ring_accepted_packets(ring),
+            nonSilentAcceptedPackets: umbra_output_sample_ring_non_silent_accepted_packets(ring),
             playedPackets: umbra_output_sample_ring_played_packets(ring),
             droppedPackets: umbra_output_sample_ring_dropped_packets(ring),
             rejectedPackets: umbra_output_sample_ring_rejected_packets(ring),
@@ -646,7 +648,10 @@ public final class AudioQueuePCMRenderer: PCMRendering, AudioRendererStatisticsP
                     / configuration.sampleRate
                     * 1_000,
                 underrunCount: snapshot.underrunCount,
-                rebufferCount: snapshot.rebufferCount
+                rebufferCount: snapshot.rebufferCount,
+                nonSilentAcceptedPackets: snapshot.nonSilentAcceptedPackets,
+                callbackCount: snapshot.callbackCount,
+                callbackError: snapshot.callbackError
             )
         }
     }

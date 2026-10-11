@@ -51,6 +51,9 @@ public struct AudioRendererStatistics: Sendable, Equatable {
     public let queuedDurationMilliseconds: Double
     public let underrunCount: UInt64
     public let rebufferCount: UInt64
+    public let nonSilentAcceptedPackets: UInt64
+    public let callbackCount: UInt64
+    public let callbackError: Int32
 
     public init(
         enqueuedBuffers: UInt64,
@@ -62,7 +65,10 @@ public struct AudioRendererStatistics: Sendable, Equatable {
         playbackStarted: Bool,
         queuedDurationMilliseconds: Double,
         underrunCount: UInt64 = 0,
-        rebufferCount: UInt64 = 0
+        rebufferCount: UInt64 = 0,
+        nonSilentAcceptedPackets: UInt64 = 0,
+        callbackCount: UInt64 = 0,
+        callbackError: Int32 = 0
     ) {
         self.enqueuedBuffers = enqueuedBuffers
         self.playedBuffers = playedBuffers
@@ -74,6 +80,9 @@ public struct AudioRendererStatistics: Sendable, Equatable {
         self.queuedDurationMilliseconds = queuedDurationMilliseconds
         self.underrunCount = underrunCount
         self.rebufferCount = rebufferCount
+        self.nonSilentAcceptedPackets = nonSilentAcceptedPackets
+        self.callbackCount = callbackCount
+        self.callbackError = callbackError
     }
 }
 
