@@ -284,8 +284,8 @@ index 3ebc315..f894a3b 100644
 +++ b/crypto/kernel/alloc.c
 @@ -82,4 +82,4 @@ void *srtp_crypto_alloc(size_t size)
      } else {
--        debug_print(srtp_mod_alloc, "allocation failed (asked for %zu bytes)\\n",
+-        debug_print(srtp_mod_alloc, "allocation failed (asked for %zu bytes)\n",
 -                    size);
-+        debug_print(srtp_mod_alloc, "allocation failed (asked for %llu bytes)\\n",
++        debug_print(srtp_mod_alloc, "allocation failed (asked for %llu bytes)\n",
 +                    (unsigned long long)size);
      }
