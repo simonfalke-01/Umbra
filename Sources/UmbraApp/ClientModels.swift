@@ -34,6 +34,8 @@ struct HostDisplayModel: Identifiable, Hashable, Sendable {
     var canWake: Bool
     var isServerSupported: Bool
     var details: String
+    /// Editable native endpoint, separate from presentation text and paired identity.
+    var connectionEndpoint: HostEndpointInput? = nil
 
     var canBrowseApplications: Bool {
         status == .online && isPaired && isServerSupported

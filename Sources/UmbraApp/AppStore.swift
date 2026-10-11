@@ -541,6 +541,22 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Saves an endpoint without dismissing drafts or presenting a blocking network operation.
+    func updateHostEndpoint(_ host: HostDisplayModel, address: String, portText: String) async throws {
+        let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else {
+            throw UmbraClientServiceError.invalidInput("Enter an IP address or hostname.")
+        }
+        guard let port = UInt16(portText.trimmingCharacters(in: .whitespacesAndNewlines)), port != 0 else {
+            throw UmbraClientServiceError.invalidInput("Enter a UDP port from 1 to 65535.")
+        }
+        let updated = try await service.updateHostEndpoint(
+            id: host.id,
+            endpoint: HostEndpointInput(address: address, port: Int(port))
+        )
+        upsert(updated)
+    }
+
     func wake(_ host: HostDisplayModel) {
         let operationToken = beginOperation(OperationPresentation(
             kind: .waking,

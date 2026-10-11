@@ -1,5 +1,6 @@
 import Foundation
 import UmbraCore
+import UmbraNetworking
 
 /// LSP permission bits stored for one freshly paired client/host relationship.
 public struct LSPPermission: OptionSet, Codable, Hashable, Sendable {
@@ -103,6 +104,7 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
     public var lastSeen: Date
     public var discoveryDomain: String?
     public var interfaceName: String?
+    public var hasManualEndpoint: Bool
 
     public init(
         hostID: UUID,
@@ -111,7 +113,8 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
         port: UInt16 = 48_030,
         lastSeen: Date,
         discoveryDomain: String? = nil,
-        interfaceName: String? = nil
+        interfaceName: String? = nil,
+        hasManualEndpoint: Bool = false
     ) {
         self.hostID = hostID
         self.name = name
@@ -120,6 +123,50 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
         self.lastSeen = lastSeen
         self.discoveryDomain = discoveryDomain
         self.interfaceName = interfaceName
+        self.hasManualEndpoint = hasManualEndpoint
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID
+        case name
+        case address
+        case port
+        case lastSeen
+        case discoveryDomain
+        case interfaceName
+        case hasManualEndpoint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            hostID: try container.decode(UUID.self, forKey: .hostID),
+            name: try container.decode(String.self, forKey: .name),
+            address: try container.decode(String.self, forKey: .address),
+            port: try container.decode(UInt16.self, forKey: .port),
+            lastSeen: try container.decode(Date.self, forKey: .lastSeen),
+            discoveryDomain: try container.decodeIfPresent(String.self, forKey: .discoveryDomain),
+            interfaceName: try container.decodeIfPresent(String.self, forKey: .interfaceName),
+            hasManualEndpoint: try container.decodeIfPresent(Bool.self, forKey: .hasManualEndpoint) ?? false
+        )
+    }
+
+    /// Validates and canonicalizes a manually entered IPv4, IPv6, or DNS endpoint address.
+    ///
+    /// The port remains a separate field. An address containing an explicit port is accepted only
+    /// when it matches that field, preventing an ambiguous endpoint from being persisted.
+    ///
+    /// - Parameters:
+    ///   - address: User-entered IPv4 literal, IPv6 literal, or DNS hostname.
+    ///   - port: Separate nonzero LSP UDP port.
+    /// - Returns: Canonical address text suitable for the native transport.
+    public static func normalizedManualAddress(_ address: String, port: UInt16) throws -> String {
+        guard port != 0 else { throw UmbraNetworkingError.invalidPort(String(port)) }
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.contains("://") else { throw UmbraNetworkingError.invalidAddress(address) }
+        let endpoint = try AddressNormalizer().normalize(trimmed, defaultPort: port)
+        guard endpoint.port == port else { throw UmbraNetworkingError.invalidAddress(address) }
+        return endpoint.host
     }
 
     public func validate() throws {

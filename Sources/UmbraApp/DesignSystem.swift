@@ -27,6 +27,8 @@ enum UmbraLayout {
     static let settingsMinimumHeight: CGFloat = 180
     static let settingsMaximumHeight: CGFloat = 620
     static let streamOverlayMaximumWidth: CGFloat = 360
+    static let hostDetailsWidth: CGFloat = 520
+    static let hostDetailsMetadataHeight: CGFloat = 140
     /// Compact, noninteractive telemetry drawn directly over streamed video.
     static let streamOverlayFontSize: CGFloat = 12
 

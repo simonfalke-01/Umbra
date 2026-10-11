@@ -35,6 +35,7 @@ protocol UmbraClientServicing: AnyObject {
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel
     func cancelPairing(hostID: HostID) async
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel
+    func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel
     func deleteHost(id: HostID) async throws
     func wakeHost(id: HostID) async throws -> HostDisplayModel
     func testNetwork(for id: HostID) async throws -> NetworkTestOutcome
@@ -53,6 +54,10 @@ protocol UmbraClientServicing: AnyObject {
 }
 
 extension UmbraClientServicing {
+    func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel {
+        throw UmbraClientServiceError.unavailable("Address editing is only available for paired LSP hosts.")
+    }
+
     func preparePairing(hostID: HostID) async throws -> PairingPreparation {
         .init(
             pin: String(format: "%04d", Int.random(in: 0...9_999)),

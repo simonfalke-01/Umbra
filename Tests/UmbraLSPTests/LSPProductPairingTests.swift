@@ -197,6 +197,65 @@ final class LSPProductPairingTests: XCTestCase {
         XCTAssertEqual(persistedHosts.records.first?.address, "new-target.local")
     }
 
+    func testManualEndpointPersistsAndCannotBeOverwrittenByPairedDiscovery() async throws {
+        let fixture = try PairingProductFixture()
+        defer { fixture.cleanup() }
+        let tracker = PairingOperationTracker(suspendBegin: false, suspendVerification: false)
+        let product = fixture.product(operations: operations(tracker: tracker))
+        let discovered = candidate(host: "private-target.local", port: 48_030, spkiByte: 0x33, token: 1)
+        let trust = LSPTrustRecord(
+            hostID: discovered.hostID,
+            hostIdentityKey: Data(repeating: 0x44, count: 32),
+            dtlsSPKISHA256: discovered.serverSPKISHA256,
+            permissions: [.browseApplications],
+            revocationGeneration: 1
+        )
+        let original = LSPHostRecord(
+            hostID: discovered.hostID,
+            name: "Saved Name",
+            address: discovered.host,
+            port: discovered.port,
+            lastSeen: .distantPast,
+            discoveryDomain: discovered.domain,
+            interfaceName: discovered.interfaceName
+        )
+        try await fixture.stores.trust.save(.init(records: [trust]))
+        try await fixture.stores.hosts.save(.init(records: [original]))
+
+        let manual = try await product.updateEndpoint(
+            hostID: discovered.hostID,
+            address: "[2001:db8::1234]",
+            port: 51_234
+        )
+        XCTAssertEqual(manual.hostID, original.hostID)
+        XCTAssertEqual(manual.name, original.name)
+        XCTAssertEqual(manual.address, "2001:db8::1234")
+        XCTAssertEqual(manual.port, 51_234)
+        XCTAssertNil(manual.discoveryDomain)
+        XCTAssertNil(manual.interfaceName)
+        XCTAssertTrue(manual.hasManualEndpoint)
+        let unchangedTrust = try await fixture.stores.trust.load()
+        XCTAssertEqual(unchangedTrust, LSPTrustSnapshot(records: [trust]))
+
+        var rediscovered = discovered
+        rediscovered.host = "new-private-target.local"
+        rediscovered.port = 49_999
+        rediscovered.interfaceName = "en7"
+        guard case .matched(let refreshed, _) = try await product.refreshPairedDiscovery(rediscovered) else {
+            return XCTFail("Matching paired discovery must remain authenticated")
+        }
+        XCTAssertEqual(refreshed.address, manual.address)
+        XCTAssertEqual(refreshed.port, manual.port)
+        XCTAssertNil(refreshed.interfaceName)
+        XCTAssertTrue(refreshed.hasManualEndpoint)
+        let persistedSnapshot = try await fixture.stores.hosts.load()
+        let persisted = persistedSnapshot.records.first
+        XCTAssertEqual(persisted?.address, manual.address)
+        XCTAssertEqual(persisted?.port, manual.port)
+        XCTAssertNil(persisted?.interfaceName)
+        XCTAssertTrue(persisted?.hasManualEndpoint == true)
+    }
+
     private func operations(
         tracker: PairingOperationTracker,
         expiry: UInt64 = 4_000_000_000

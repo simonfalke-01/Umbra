@@ -260,6 +260,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lastLSPHosts: [HostDisplayModel] = []
     private var discoveredLSPHosts: [UUID: HostDisplayModel] = [:]
     private var onlineLSPHostIDs: Set<UUID> = []
+    private var lspEndpointRevision: UInt64 = 0
     private var identityChangedLSPHostIDs: Set<UUID> = []
     private var latestLSPDiscoveryTokens: [String: UInt64] = [:]
     private var lspDiscoveryHostIDsByServiceID: [String: UUID] = [:]
@@ -466,6 +467,39 @@ final class LiveUmbraClientService: UmbraClientServicing {
             return display
         }
         return displayHost(try await service.renameHost(id: id.rawValue, name: name))
+    }
+
+    func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel {
+        guard let hostID = lspHostID(id), let lspProduct,
+              let rawPort = endpoint.port, let port = UInt16(exactly: rawPort), port != 0 else {
+            throw UmbraClientServiceError.invalidInput("Enter an LSP address and a UDP port from 1 to 65535.")
+        }
+        guard activeLSPHostID != hostID else {
+            throw UmbraClientServiceError.unavailable("Disconnect this stream before changing its address.")
+        }
+        lspEndpointRevision &+= 1
+        let updated: LSPHostRecord
+        do {
+            updated = try await lspProduct.updateEndpoint(hostID: hostID, address: endpoint.address, port: port)
+        } catch LSPControlStatus.busy {
+            throw UmbraClientServiceError.unavailable("Disconnect this stream before changing its address.")
+        }
+        onlineLSPHostIDs.remove(hostID)
+        lspHostCheckErrors.removeValue(forKey: hostID)
+        discoveredLSPHosts.removeValue(forKey: hostID)
+        var display = displayLSPHost(
+            updated,
+            paired: true,
+            online: false,
+            trust: try await lspProduct.trust(hostID: hostID)
+        )
+        display.status = .unknown
+        upsertLSPHost(display)
+        eventHandler?(.hosts(combinedHosts()))
+        Task { @MainActor [weak self] in
+            await self?.refreshLSPReachability()
+        }
+        return display
     }
 
     func deleteHost(id: HostID) async throws {
@@ -1405,7 +1439,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
             hasActiveSession: false,
             canWake: false,
             isServerSupported: true,
-            details: details.joined(separator: "\n")
+            details: details.joined(separator: "\n"),
+            connectionEndpoint: HostEndpointInput(address: host.address, port: Int(host.port))
         )
     }
 
@@ -1653,6 +1688,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     private func refreshPersistedLSPHosts() async throws {
+        let endpointRevision = lspEndpointRevision
         guard let lspProduct else {
             lastLSPHosts = []
             return
@@ -1661,6 +1697,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         for host in try await lspProduct.hosts() {
             persisted.append((host, try await lspProduct.trust(hostID: host.hostID)))
         }
+        guard endpointRevision == lspEndpointRevision else { return }
         // Read presence only after storage awaits finish: discovery may have
         // marked a host online while the saved records were being loaded.
         lastLSPHosts = persisted.map { host, trust in
@@ -1688,6 +1725,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         let hostIDs = lastLSPHosts.filter(\.isPaired).compactMap { lspHostID($0.id) }
         for hostID in hostIDs {
             guard !Task.isCancelled, lspOwnerEndpoint == nil else { return }
+            let endpointRevision = lspEndpointRevision
             let reachable: Bool
             do {
                 try await lspHostProbe(hostID)
@@ -1695,6 +1733,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 lspHostCheckErrors.removeValue(forKey: hostID)
             } catch {
                 guard !Task.isCancelled else { return }
+                guard endpointRevision == lspEndpointRevision else { continue }
                 reachable = false
                 let message = error.localizedDescription
                 if lspHostCheckErrors[hostID] != message {
@@ -1703,6 +1742,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 }
             }
             guard lspOwnerEndpoint == nil else { return }
+            guard endpointRevision == lspEndpointRevision else { continue }
             guard let index = lastLSPHosts.firstIndex(where: { lspHostID($0.id) == hostID }) else { continue }
             if reachable {
                 onlineLSPHostIDs.insert(hostID)
@@ -1756,6 +1796,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     resolvedEndpoint: resolved.endpoint
                   ) else { return }
             lspDiscoveryHostIDsByServiceID[service.id] = candidate.hostID
+            let endpointRevision = lspEndpointRevision
             if let lspProduct {
                 let refresh: LSPPairedDiscoveryRefresh
                 do {
@@ -1769,6 +1810,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 guard latestLSPDiscoveryTokens[service.id] == service.changeToken else { return }
                 _ = await lspProduct.registerDiscoveredPairingHost(candidate)
                 guard latestLSPDiscoveryTokens[service.id] == service.changeToken else { return }
+                guard endpointRevision == lspEndpointRevision else { return }
                 switch refresh {
                 case .matched(let host, let trust):
                     applyMatchedLSPHost(host, trust: trust)
@@ -1856,9 +1898,21 @@ final class LiveUmbraClientService: UmbraClientServicing {
     /// Publishes a discovery record whose stable host ID and SPKI matched saved trust.
     func applyMatchedLSPHost(_ host: LSPHostRecord, trust: LSPTrustRecord) {
         identityChangedLSPHostIDs.remove(host.hostID)
-        onlineLSPHostIDs.insert(host.hostID)
+        if !host.hasManualEndpoint {
+            onlineLSPHostIDs.insert(host.hostID)
+        }
         discoveredLSPHosts.removeValue(forKey: host.hostID)
-        upsertLSPHost(displayLSPHost(host, paired: true, online: true, trust: trust))
+        var display = displayLSPHost(
+            host,
+            paired: true,
+            online: onlineLSPHostIDs.contains(host.hostID),
+            trust: trust
+        )
+        if host.hasManualEndpoint,
+           let existing = lastLSPHosts.first(where: { lspHostID($0.id) == host.hostID }) {
+            display.status = existing.status
+        }
+        upsertLSPHost(display)
         eventHandler?(.hosts(combinedHosts()))
     }
 

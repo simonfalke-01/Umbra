@@ -259,6 +259,49 @@ struct HostDetailsSheet: View {
     let host: HostDisplayModel
     @ObservedObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    @State private var address: String
+    @State private var port: String
+    @State private var isSaving = false
+    @State private var saveError: String?
+    @FocusState private var addressFocused: Bool
+
+    init(host: HostDisplayModel, store: AppStore) {
+        self.host = host
+        self.store = store
+        _address = State(initialValue: host.connectionEndpoint?.address ?? "")
+        _port = State(initialValue: String(host.connectionEndpoint?.port ?? 48_030))
+    }
+
+    private var canEditEndpoint: Bool {
+        host.isPaired && host.connectionEndpoint != nil
+    }
+
+    private var endpointChanged: Bool {
+        address.trimmingCharacters(in: .whitespacesAndNewlines) != host.connectionEndpoint?.address ||
+            port.trimmingCharacters(in: .whitespacesAndNewlines) != String(host.connectionEndpoint?.port ?? 48_030)
+    }
+
+    private var canSave: Bool {
+        !isSaving && endpointChanged &&
+            !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)).map { $0 != 0 } == true
+    }
+
+    private var displayedDetails: String {
+        guard canEditEndpoint else { return host.details }
+        return host.details.split(separator: "\n").filter { !$0.hasPrefix("Address:") }.joined(separator: "\n")
+    }
+
+    private var validationMessage: String? {
+        guard canEditEndpoint else { return nil }
+        if address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Enter an IP address or hostname."
+        }
+        if UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)).map({ $0 != 0 }) != true {
+            return "Enter a UDP port from 1 to 65535."
+        }
+        return saveError
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space6) {
@@ -272,12 +315,36 @@ struct HostDetailsSheet: View {
                 )
             }
 
+            if canEditEndpoint {
+                Form {
+                    TextField("Address", text: $address, prompt: Text("stream.example.com"))
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .focused($addressFocused)
+                    TextField("UDP port", text: $port)
+                        .monospacedDigit()
+                    Text("Use a public IP or hostname when you’re away from home. Your pairing is kept.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .textFieldStyle(.roundedBorder)
+                .disabled(isSaving)
+                .onSubmit { saveEndpoint() }
+            }
+
             ScrollView {
-                Text(host.details.isEmpty ? "The host did not provide additional details." : host.details)
+                Text(displayedDetails.isEmpty ? "The host did not provide additional details." : displayedDetails)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(minHeight: 160)
+            .frame(height: UmbraLayout.hostDetailsMetadataHeight)
+
+            if let validationMessage {
+                Label(validationMessage, systemImage: "exclamationmark.circle")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack {
                 if host.id.rawValue.hasPrefix("lsp:") {
@@ -285,15 +352,46 @@ struct HostDetailsSheet: View {
                         dismiss()
                         store.beginPairing(host)
                     }
+                    .disabled(isSaving)
                 }
                 Spacer()
-                Button("Done") { dismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
+                if canEditEndpoint {
+                    if isSaving { ProgressView().controlSize(.small) }
+                    Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(isSaving)
+                    Button("Save") { saveEndpoint() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!canSave)
+                } else {
+                    Button("Done") { dismiss() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding(UmbraLayout.space6)
-        .frame(width: 520, height: 360)
+        .frame(width: UmbraLayout.hostDetailsWidth)
+        .interactiveDismissDisabled(isSaving)
+        .onAppear { addressFocused = canEditEndpoint }
+        .onChange(of: address) { _, _ in saveError = nil }
+        .onChange(of: port) { _, _ in saveError = nil }
+    }
+
+    private func saveEndpoint() {
+        guard canSave else { return }
+        isSaving = true
+        saveError = nil
+        Task { @MainActor in
+            defer { isSaving = false }
+            do {
+                try await store.updateHostEndpoint(host, address: address, portText: port)
+                dismiss()
+            } catch {
+                saveError = error.localizedDescription
+            }
+        }
     }
 }
 

@@ -44,6 +44,58 @@ final class LSPPersistenceTests: XCTestCase {
         XCTAssertEqual(loadedHosts, hosts)
     }
 
+    func testLegacyHostRecordDefaultsToAutomaticDiscoveryEndpoint() throws {
+        struct LegacyHostRecord: Encodable {
+            var hostID: UUID
+            var name: String
+            var address: String
+            var port: UInt16
+            var lastSeen: Date
+            var discoveryDomain: String?
+            var interfaceName: String?
+        }
+        struct LegacySnapshot: Encodable {
+            var schemaVersion = 1
+            var records: [LegacyHostRecord]
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let hostID = UUID()
+        let data = try encoder.encode(LegacySnapshot(records: [LegacyHostRecord(
+            hostID: hostID,
+            name: "Lumen",
+            address: "lumen.local",
+            port: 48_030,
+            lastSeen: Date(timeIntervalSince1970: 1_700_000_000),
+            discoveryDomain: "local.",
+            interfaceName: "en0"
+        )]))
+
+        let decoded = try decoder.decode(LSPHostSnapshot.self, from: data)
+
+        XCTAssertEqual(decoded.records.first?.hostID, hostID)
+        XCTAssertEqual(decoded.records.first?.hasManualEndpoint, false)
+    }
+
+    func testManualAddressNormalizationAcceptsHostAndIPv6ButRejectsConflictingPort() throws {
+        XCTAssertEqual(
+            try LSPHostRecord.normalizedManualAddress("  stream.example.com  ", port: 48_030),
+            "stream.example.com"
+        )
+        XCTAssertEqual(
+            try LSPHostRecord.normalizedManualAddress("[2001:db8::1234]", port: 48_030),
+            "2001:db8::1234"
+        )
+        XCTAssertThrowsError(
+            try LSPHostRecord.normalizedManualAddress("stream.example.com:48031", port: 48_030)
+        )
+        XCTAssertThrowsError(
+            try LSPHostRecord.normalizedManualAddress("https://stream.example.com", port: 48_030)
+        )
+    }
+
     func testTrustRejectsUnknownPermissionAndInvalidPinLength() {
         let record = LSPTrustRecord(
             hostID: UUID(),

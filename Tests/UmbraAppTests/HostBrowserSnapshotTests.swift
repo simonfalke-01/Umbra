@@ -13,6 +13,54 @@ final class HostBrowserSnapshotTests: XCTestCase {
         let name: String
     }
 
+    func testOfflineLSPDetailsRendersEditableAddressAndPort() async throws {
+        var host = makeHost(id: "lsp:00000000-0000-0000-0000-000000000001", name: "Gaming PC", status: .offline)
+        host.connectionEndpoint = HostEndpointInput(address: "192.0.2.40", port: 48_030)
+        host.details = "Protocol: Lumen Streaming Protocol\nAddress: 192.0.2.40:48030\nTrust: Paired\nEffective permissions: Browse applications, Start or attach streams, Keyboard and pointer input"
+        let store = AppStore(service: HostSnapshotService(hosts: [host]))
+        for scheme in [ColorScheme.light, .dark] {
+            let content = HostDetailsSheet(host: host, store: store)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .environment(\.colorScheme, scheme)
+            let view = NSHostingView(rootView: content)
+            view.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+            view.frame = NSRect(x: 0, y: 0, width: UmbraLayout.hostDetailsWidth, height: 460)
+            for _ in 0..<8 {
+                view.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let fields = findSubviews(of: NSTextField.self, in: view).filter(\.isEditable)
+            XCTAssertEqual(Set(fields.map(\.stringValue)), ["192.0.2.40", "48030"])
+            XCTAssertTrue(fields.allSatisfy(\.isEnabled))
+            try writeIfRequested(
+                try capturePNG(of: view),
+                name: "lsp-host-address-\(scheme == .dark ? "dark" : "light").png"
+            )
+        }
+    }
+
+    func testEndpointSaveWorksOfflineAndKeepsErrorsOutOfBlockingAlerts() async throws {
+        var host = makeHost(id: "lsp:00000000-0000-0000-0000-000000000001", name: "Gaming PC", status: .offline)
+        host.connectionEndpoint = HostEndpointInput(address: "192.0.2.40", port: 48_030)
+        let service = HostSnapshotService(hosts: [host])
+        let store = AppStore(service: service)
+        store.start()
+        await waitUntil { store.hosts.count == 1 }
+        try await store.updateHostEndpoint(host, address: " stream.example.com ", portText: "55443")
+        XCTAssertEqual(service.savedEndpoint, HostEndpointInput(address: "stream.example.com", port: 55_443))
+        XCTAssertEqual(store.hosts[0].id, host.id)
+        XCTAssertTrue(store.hosts[0].isPaired)
+        XCTAssertEqual(store.hosts[0].status, .unknown)
+        do {
+            try await store.updateHostEndpoint(host, address: "example.com", portText: "0")
+            XCTFail("Invalid ports must not be saved")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("65535"))
+        }
+        XCTAssertEqual(store.hosts[0].connectionEndpoint, service.savedEndpoint)
+        XCTAssertNil(store.failure)
+    }
+
     func testHostBrowserRendersLightDarkContrastNarrowLongAndCJKStates() async throws {
         let hosts = hostileHosts()
         let store = AppStore(service: HostSnapshotService(hosts: hosts))
@@ -467,6 +515,7 @@ private final class HostSnapshotService: UmbraClientServicing {
     let hosts: [HostDisplayModel]
     let discoveryError: Error?
     let suspendsPairing: Bool
+    private(set) var savedEndpoint: HostEndpointInput?
 
     init(
         hosts: [HostDisplayModel],
@@ -492,6 +541,13 @@ private final class HostSnapshotService: UmbraClientServicing {
     }
     func cancelPairing(hostID: HostID) async {}
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw unavailable() }
+    func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel {
+        guard var host = hosts.first(where: { $0.id == id }) else { throw unavailable() }
+        savedEndpoint = endpoint
+        host.connectionEndpoint = endpoint
+        host.status = .unknown
+        return host
+    }
     func deleteHost(id: HostID) async throws { throw unavailable() }
     func wakeHost(id: HostID) async throws -> HostDisplayModel { throw unavailable() }
     func testNetwork(for id: HostID) async throws -> NetworkTestOutcome { throw unavailable() }

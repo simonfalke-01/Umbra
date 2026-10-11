@@ -74,6 +74,8 @@ public actor LSPProductClient {
     private var discoveredPairingHosts: [UUID: LSPDiscoveredPairingHost] = [:]
     private var pairingAttempts: [UUID: PairingAttempt] = [:]
     private var quarantinedPairingDiscovery: [UUID: QuarantinedPairingDiscovery] = [:]
+    private var endpointEditHostIDs: Set<UUID> = []
+    private var endpointRevisions: [UUID: UUID] = [:]
     private let videoRenderer: (any MetalVideoRendering)?
     private let pairingOperations: LSPProductPairingOperations
     private let afterPairingTrustWrite: @Sendable () throws -> Void
@@ -148,24 +150,88 @@ public actor LSPProductClient {
                 advertisedSPKI: candidate.serverSPKISHA256
             )
         }
-        let hostSnapshot = try await hostStore.load()
-        let prior = hostSnapshot.records.first(where: { $0.hostID == candidate.hostID })
-        let refreshed = LSPHostRecord(
-            hostID: candidate.hostID,
-            name: prior?.name ?? candidate.name,
-            address: candidate.host,
-            port: candidate.port,
-            lastSeen: Date(),
-            discoveryDomain: candidate.domain,
-            interfaceName: candidate.interfaceName
-        )
-        _ = try await hostStore.update { snapshot in
+        let refreshedSnapshot = try await hostStore.update { snapshot in
             var next = snapshot
+            if let index = next.records.firstIndex(where: { $0.hostID == candidate.hostID }),
+               next.records[index].hasManualEndpoint {
+                next.records[index].lastSeen = Date()
+                return next
+            }
+            let prior = next.records.first(where: { $0.hostID == candidate.hostID })
             next.records.removeAll { $0.hostID == candidate.hostID }
-            next.records.append(refreshed)
+            next.records.append(LSPHostRecord(
+                hostID: candidate.hostID,
+                name: prior?.name ?? candidate.name,
+                address: candidate.host,
+                port: candidate.port,
+                lastSeen: Date(),
+                discoveryDomain: candidate.domain,
+                interfaceName: candidate.interfaceName
+            ))
             return next
         }
+        guard let refreshed = refreshedSnapshot.records.first(where: { $0.hostID == candidate.hostID }) else {
+            throw LSPControlStatus.authenticationFailed
+        }
         return .matched(host: refreshed, trust: trust)
+    }
+
+    /// Replaces a paired host's connection endpoint without changing its identity or trust.
+    ///
+    /// Active input sessions and in-flight START/ATTACH operations are never interrupted. A cached
+    /// browse-only association is closed locally so the next probe authenticates the new endpoint.
+    ///
+    /// - Parameters:
+    ///   - hostID: Paired LSP host identifier.
+    ///   - address: IPv4 literal, IPv6 literal, or DNS hostname.
+    ///   - port: Nonzero LSP UDP application port.
+    /// - Returns: The durably updated host record.
+    public func updateEndpoint(hostID: UUID, address: String, port: UInt16) async throws -> LSPHostRecord {
+        let normalizedAddress = try LSPHostRecord.normalizedManualAddress(address, port: port)
+        guard !endpointEditHostIDs.contains(hostID),
+              startAttempts[hostID] == nil,
+              reconnectAttempts[hostID] == nil,
+              pairingAttempts[hostID] == nil else {
+            throw LSPControlStatus.busy
+        }
+        endpointEditHostIDs.insert(hostID)
+        defer { endpointEditHostIDs.remove(hostID) }
+
+        if let session = sessions[hostID] {
+            switch await session.state {
+            case .inputActive, .connecting:
+                throw LSPControlStatus.busy
+            case .authenticated:
+                guard await session.retireFailedBrowseAssociation(.invalidState) else {
+                    throw LSPControlStatus.busy
+                }
+                if sessions[hostID] === session {
+                    sessions.removeValue(forKey: hostID)
+                }
+            case .idle, .stopped, .failed:
+                if sessions[hostID] === session {
+                    sessions.removeValue(forKey: hostID)
+                }
+            }
+        }
+
+        endpointRevisions[hostID] = UUID()
+        let updatedSnapshot = try await hostStore.update { snapshot in
+            var next = snapshot
+            guard let index = next.records.firstIndex(where: { $0.hostID == hostID }) else {
+                throw LSPControlStatus.authenticationFailed
+            }
+            next.records[index].address = normalizedAddress
+            next.records[index].port = port
+            next.records[index].discoveryDomain = nil
+            next.records[index].interfaceName = nil
+            next.records[index].hasManualEndpoint = true
+            return next
+        }
+        guard let updated = updatedSnapshot.records.first(where: { $0.hostID == hostID }) else {
+            throw LSPControlStatus.authenticationFailed
+        }
+        return updated
     }
 
     /// Selects the next association's explicit congestion profile and capacity policy.
@@ -541,6 +607,8 @@ public actor LSPProductClient {
     /// Performs one short authenticated read without START, ATTACH, or browsing recovery retries.
     public func probeReachability(hostID: UUID) async throws {
         try Task.checkCancellation()
+        guard !endpointEditHostIDs.contains(hostID) else { throw LSPControlStatus.busy }
+        let endpointRevision = endpointRevisions[hostID]
         let hosts = try await hostStore.load().records
         let trusts = try await trustStore.load().records
         guard let host = hosts.first(where: { $0.hostID == hostID }),
@@ -563,6 +631,10 @@ public actor LSPProductClient {
                 failFast: true
             )
             try Task.checkCancellation()
+            guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
+                _ = await candidate.retireFailedBrowseAssociation(.invalidState)
+                throw LSPControlStatus.busy
+            }
             guard sessions[hostID] === priorSession else {
                 _ = await candidate.retireFailedBrowseAssociation(.invalidState)
                 guard let current = sessions[hostID] else { throw LSPTransportError.invalidState }
@@ -579,7 +651,15 @@ public actor LSPProductClient {
                 snapshot.records.append(updatedTrust)
                 return snapshot
             }
+            guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
+                _ = await candidate.retireFailedBrowseAssociation(.invalidState)
+                throw LSPControlStatus.busy
+            }
             await configureSessionHandlers(candidate, hostID: hostID)
+            guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
+                _ = await candidate.retireFailedBrowseAssociation(.invalidState)
+                throw LSPControlStatus.busy
+            }
             let cacheUnchanged: Bool
             if let priorSession {
                 cacheUnchanged = sessions[hostID] === priorSession
@@ -623,6 +703,8 @@ public actor LSPProductClient {
         recoverCachedFailure: Bool
     ) async throws -> [LSPApplication] {
         try Task.checkCancellation()
+        guard !endpointEditHostIDs.contains(hostID) else { throw LSPControlStatus.busy }
+        let endpointRevision = endpointRevisions[hostID]
         let hosts = try await hostStore.load().records
         let trusts = try await trustStore.load().records
         guard let host = hosts.first(where: { $0.hostID == hostID }),
@@ -637,13 +719,25 @@ public actor LSPProductClient {
             reusedCachedSession = true
         } else {
             let (created, updatedTrust) = try await authenticatedSession(host: host, trust: trust)
+            guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
+                _ = await created.retireFailedBrowseAssociation(.invalidState)
+                throw LSPControlStatus.busy
+            }
             _ = try await trustStore.update { snapshot in
                 var snapshot = snapshot
                 snapshot.records.removeAll { $0.hostID == hostID }
                 snapshot.records.append(updatedTrust)
                 return snapshot
             }
+            guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
+                _ = await created.retireFailedBrowseAssociation(.invalidState)
+                throw LSPControlStatus.busy
+            }
             await configureSessionHandlers(created, hostID: hostID)
+            guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
+                _ = await created.retireFailedBrowseAssociation(.invalidState)
+                throw LSPControlStatus.busy
+            }
             sessions[hostID] = created
             session = created
             reusedCachedSession = false
@@ -755,7 +849,9 @@ public actor LSPProductClient {
         decoderSurfaces: UInt8 = 3,
         maximumCaptureToPresentMicroseconds: UInt32 = 50_000
     ) async throws -> LSPClientSession {
-        guard startAttempts[hostID] == nil else { throw LSPControlStatus.busy }
+        guard startAttempts[hostID] == nil, !endpointEditHostIDs.contains(hostID) else {
+            throw LSPControlStatus.busy
+        }
         let attemptID = UUID()
         startAttempts[hostID] = attemptID
         defer {
@@ -871,6 +967,7 @@ public actor LSPProductClient {
         quiesceOldCapture: (@Sendable () async throws -> Void)? = nil
     ) async throws -> LSPClientSession {
         try Task.checkCancellation()
+        guard !endpointEditHostIDs.contains(hostID) else { throw LSPControlStatus.busy }
         if let existing = reconnectAttempts[hostID] {
             let value = try await existing.task.value
             try Task.checkCancellation()
@@ -1254,6 +1351,7 @@ public actor LSPProductClient {
             snapshot.records.removeAll { $0.hostID == hostID }
             return snapshot
         }
+        endpointRevisions.removeValue(forKey: hostID)
     }
 
     /// Renames one persisted native host without touching legacy records.
