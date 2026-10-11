@@ -55,7 +55,7 @@ protocol UmbraClientServicing: AnyObject {
 
 extension UmbraClientServicing {
     func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel {
-        throw UmbraClientServiceError.unavailable("Address editing is only available for paired LSP hosts.")
+        throw UmbraClientServiceError.unavailable("Address editing is only available for paired Lumen hosts.")
     }
 
     func preparePairing(hostID: HostID) async throws -> PairingPreparation {

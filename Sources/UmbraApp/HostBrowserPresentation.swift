@@ -131,7 +131,7 @@ struct HostBrowserPresentation: Hashable, Sendable {
             ("Streaming, Pair Required", UmbraSymbol.unpaired, .warning)
         case .online where !host.isPaired:
             host.id.rawValue.hasPrefix("lsp:")
-                ? ("LSP PIN Pairing Required", UmbraSymbol.unpaired, .warning)
+                ? ("PIN Pairing Required", UmbraSymbol.unpaired, .warning)
                 : ("Pair Required", UmbraSymbol.unpaired, .warning)
         case .online where host.hasActiveSession:
             ("Streaming", UmbraSymbol.running, .neutral)

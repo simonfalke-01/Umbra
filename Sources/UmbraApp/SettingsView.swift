@@ -1411,7 +1411,7 @@ private struct AdvancedSettingsView: View {
                 )
                 PreferenceToggle(
                     "Request application quit permission when pairing",
-                    message: "Lets Umbra quit only the application owned by its authenticated LSP session.",
+                    message: "Lets Umbra quit only the application that its own stream started.",
                     binding: preferences.binding(for: \.lspPairQuitPermission)
                 )
             }

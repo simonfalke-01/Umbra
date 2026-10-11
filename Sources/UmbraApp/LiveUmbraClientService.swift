@@ -337,7 +337,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
         }
         lspInputCapture.failureHandler = { [weak self] error in
-            self?.eventHandler?(.sessionWarning("Native LSP input stopped: \(error.localizedDescription)"))
+            self?.eventHandler?(.sessionWarning("Input stopped: \(error.localizedDescription)"))
         }
         streamWindow?.onStreamingWarning = { [weak self] message in
             self?.eventHandler?(.sessionWarning(message))
@@ -372,7 +372,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         } catch {
             lastLSPHosts = []
             eventHandler?(.sessionWarning(
-                "LSP host storage is unavailable; legacy GameStream discovery remains active."
+                "Saved Lumen hosts are unavailable; Moonlight-compatible hosts can still be discovered."
             ))
         }
         eventHandler?(.hosts(combinedHosts()))
@@ -406,7 +406,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             )
         }
         guard let lspProduct else {
-            throw UmbraClientServiceError.unavailable("Native LSP pairing is unavailable in this build.")
+            throw UmbraClientServiceError.unavailable("Pairing with Lumen hosts is unavailable in this build.")
         }
         var permissions: LSPPermission = [
             .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput,
@@ -432,7 +432,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     func pairHost(_ request: PairingRequest) async throws -> HostDisplayModel {
         if let nativeHostID = lspHostID(request.hostID) {
             guard let lspProduct else {
-                throw UmbraClientServiceError.unavailable("Native LSP pairing is unavailable in this build.")
+                throw UmbraClientServiceError.unavailable("Pairing with Lumen hosts is unavailable in this build.")
             }
             let host = try await lspProduct.completePairing(hostID: nativeHostID)
             let display = displayLSPHost(
@@ -472,7 +472,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel {
         guard let hostID = lspHostID(id), let lspProduct,
               let rawPort = endpoint.port, let port = UInt16(exactly: rawPort), port != 0 else {
-            throw UmbraClientServiceError.invalidInput("Enter an LSP address and a UDP port from 1 to 65535.")
+            throw UmbraClientServiceError.invalidInput("Enter a host address and a UDP port from 1 to 65535.")
         }
         guard activeLSPHostID != hostID else {
             throw UmbraClientServiceError.unavailable("Disconnect this stream before changing its address.")
@@ -526,7 +526,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     func wakeHost(id: HostID) async throws -> HostDisplayModel {
         if lspHostID(id) != nil {
-            throw UmbraClientServiceError.unavailable("Wake-on-LAN is not part of LSP/1.")
+            throw UmbraClientServiceError.unavailable("Wake-on-LAN is not available for Lumen hosts.")
         }
         return displayHost(try await service.wakeHost(id: id.rawValue))
     }
@@ -584,7 +584,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     displayApplications: display,
                     loader: { [lspProduct] displayID in
                         guard let reference = immutableArtworkReferences[displayID] else {
-                            throw UmbraClientServiceError.invalidInput("Missing LSP artwork reference.")
+                            throw UmbraClientServiceError.invalidInput("The app artwork is missing.")
                         }
                         return try await lspProduct.applicationObject(
                             hostID: hostID,
@@ -648,7 +648,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     ) async throws {
         if let nativeHostID = lspHostID(hostID) {
             guard let lspProduct, let applicationID = lspApplicationIDs[hostID]?[id.rawValue] else {
-                throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
+                throw UmbraClientServiceError.invalidInput("The selected app is no longer available on the host.")
             }
             if activeLSPHostID == nativeHostID, activeLSPApplicationID == applicationID,
                await streamWindow?.focusExistingSession() == true {
@@ -729,10 +729,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
             return nil
         }
         guard request.intent.hostID == "lsp:\(target.hostID.uuidString.lowercased())" else {
-            throw UmbraClientServiceError.invalidInput("The resolved LSP host does not match the stream intent.")
+            throw UmbraClientServiceError.invalidInput("The host changed before the stream could start. Try again.")
         }
         guard let lspProduct else {
-            throw UmbraClientServiceError.unavailable("Native LSP is unavailable in this build.")
+            throw UmbraClientServiceError.unavailable("Streaming from Lumen hosts is unavailable in this build.")
         }
         let microphoneOffer = try await lspMicrophoneOffer(mode: target.microphone)
         try await startLSPStream(
@@ -762,9 +762,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
         guard activeLSPHostID == nil, lspOwnerEndpoint == nil else { throw LSPControlStatus.busy }
         guard lspMediaCapabilities.hasMetalDevice,
               let frameRate = preferences.normalizedFrameRate
-        else { throw UmbraClientServiceError.unavailable("Native LSP requires Metal and a valid refresh rate.") }
+        else { throw UmbraClientServiceError.unavailable("Streaming requires Metal and a display with a valid refresh rate.") }
         guard let streamWindow else {
-            throw UmbraClientServiceError.unavailable("Native LSP hardware video is unavailable.")
+            throw UmbraClientServiceError.unavailable("Hardware video decoding is unavailable on this Mac.")
         }
         // Reserve ownership before the first suspension in GUI and CLI startup.
         // A second instance must not send START or prepare another stream window
@@ -828,7 +828,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     }
                 } catch {
                     self.eventHandler?(.sessionWarning(
-                        "LSP text input failed: \(error.localizedDescription)"
+                        "Text input failed: \(error.localizedDescription)"
                     ))
                 }
             }
@@ -1073,7 +1073,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     ) async throws {
         try Task.checkCancellation()
         guard isActiveLSPStream(streamID, hostID: hostID) else { throw CancellationError() }
-        guard let lspProduct else { throw UmbraClientServiceError.unavailable("Native LSP is unavailable.") }
+        guard let lspProduct else { throw UmbraClientServiceError.unavailable("Streaming from Lumen hosts is unavailable.") }
         var publishedReplacement: LSPClientSession?
         do {
             let replacement = try await lspProduct.reconnectInput(
@@ -1162,12 +1162,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 case .failed(let error):
                     self.eventHandler?(.sessionFailed(.init(
                         kind: .streamTerminated,
-                        message: "Native LSP stream failed: \(error.localizedDescription)"
+                        message: "The stream failed: \(error.localizedDescription)"
                     )))
                     if !self.cliStopReplyPending {
                         self.notifyLSPSessionTerminated(
                             succeeded: false,
-                            reason: "Native LSP stream failed: \(error.localizedDescription)"
+                            reason: "The stream failed: \(error.localizedDescription)"
                         )
                     }
                 }
@@ -1201,12 +1201,12 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     }
                     self.eventHandler?(.sessionFailed(.init(
                         kind: .connectionFailed,
-                        message: "Native LSP reconnect failed: \(error.localizedDescription)"
+                        message: "Couldn't reconnect to the host: \(error.localizedDescription)"
                     )))
                     if !self.cliStopReplyPending {
                         self.notifyLSPSessionTerminated(
                             succeeded: false,
-                            reason: "Native LSP reconnect failed: \(error.localizedDescription)"
+                            reason: "Couldn't reconnect to the host: \(error.localizedDescription)"
                         )
                     }
                 }
@@ -1240,7 +1240,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             } catch is CancellationError {
                 return
             } catch {
-                self?.eventHandler?(.sessionWarning("Native LSP planned rekey failed: \(error.localizedDescription)"))
+                self?.eventHandler?(.sessionWarning("Couldn't refresh the stream's encryption keys: \(error.localizedDescription)"))
             }
         }
         lspTelemetryTask = Task { @MainActor [weak self, session] in
@@ -1278,7 +1278,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     return
                 } catch {
                     guard !Task.isCancelled else { return }
-                    let message = "LSP device rate negotiation will retry: \(error.localizedDescription)"
+                    let message = "Input device setup will retry: \(error.localizedDescription)"
                     if message != lastFailure {
                         self.lspFailureHandler(message)
                         lastFailure = message
@@ -1301,7 +1301,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         case .competitionLAN:
             guard let capacity = UInt32(exactly: settings.lspCompetitionCapacityMbps), capacity > 0 else {
                 throw UmbraClientServiceError.invalidInput(
-                    "Competition LSP requires an explicit positive capacity ceiling."
+                    "Competition mode requires a network capacity limit greater than zero."
                 )
             }
             profile = .competitionLAN(capacityMbps: capacity)
@@ -1362,7 +1362,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws {
         if let nativeHostID = lspHostID(hostID) {
             guard let applicationID = lspApplicationIDs[hostID]?[id.rawValue], let lspProduct else {
-                throw UmbraClientServiceError.invalidInput("The selected native LSP application is no longer available.")
+                throw UmbraClientServiceError.invalidInput("The selected app is no longer available on the host.")
             }
             try await lspProduct.quitApplication(hostID: nativeHostID, applicationID: applicationID)
             return
@@ -1375,7 +1375,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     func setApplicationHidden(id: ApplicationID, on hostID: HostID, hidden: Bool) async throws {
         if lspHostID(hostID) != nil {
-            throw UmbraClientServiceError.unavailable("Native LSP applications do not use legacy hidden-app state.")
+            throw UmbraClientServiceError.unavailable("Hiding apps is not available for Lumen hosts.")
         }
         try await service.setApplicationHidden(
             hostID: hostID.rawValue,
@@ -1386,7 +1386,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     func setDirectLaunch(id: ApplicationID, on hostID: HostID, enabled: Bool) async throws {
         if lspHostID(hostID) != nil {
-            throw UmbraClientServiceError.unavailable("Native LSP applications do not use legacy direct-launch state.")
+            throw UmbraClientServiceError.unavailable("Direct launch is not available for Lumen hosts.")
         }
         try await service.setDirectLaunch(
             hostID: hostID.rawValue,
@@ -1746,7 +1746,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 let message = error.localizedDescription
                 if lspHostCheckErrors[hostID] != message {
                     lspHostCheckErrors[hostID] = message
-                    lspFailureHandler("LSP host check failed for \(hostID): \(message)")
+                    lspFailureHandler("Host check failed for \(hostID): \(message)")
                 }
             }
             guard lspOwnerEndpoint == nil else { return }
@@ -1811,7 +1811,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     refresh = try await lspProduct.refreshPairedDiscovery(candidate)
                 } catch {
                     eventHandler?(.sessionWarning(
-                        "Couldn’t securely refresh discovered LSP host state: \(error.localizedDescription)"
+                        "Couldn’t securely refresh discovered host details: \(error.localizedDescription)"
                     ))
                     return
                 }
@@ -2156,7 +2156,7 @@ final class LiveApplicationComposition {
             streamWindow: streamWindow,
             lspMediaCapabilities: mediaCapabilities,
             lspFailureHandler: { [supportLogger] message in
-                supportLogger?.record(source: "LSP", level: .error, message: message)
+                supportLogger?.record(source: "Streaming", level: .error, message: message)
             }
         )
         streamWindow.onStopRequested = { [weak clientService] quitHostApplication in

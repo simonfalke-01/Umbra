@@ -90,7 +90,7 @@ struct AddHostSheet: View {
             .textContentType(.URL)
             TextField("Port (optional)", text: $port, prompt: Text("Default"))
                 .frame(maxWidth: 160)
-            Text("LSP hosts appear automatically when discovered on the local network.")
+            Text("Lumen hosts on your local network appear here automatically.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

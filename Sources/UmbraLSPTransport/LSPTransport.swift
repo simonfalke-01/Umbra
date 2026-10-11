@@ -687,41 +687,41 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .abiMismatch(let expected, let actual):
-            "LSP native ABI mismatch: expected \(expected), received \(actual)."
+            "Umbra's streaming component is out of date (expected \(expected), received \(actual)). Reinstall Umbra."
         case .sourceDigestMismatch:
-            "LSP portable-core source digest does not match this client build."
+            "Umbra's streaming component does not match this build. Reinstall Umbra."
         case .missingWolfSSL:
-            "LSP requires the commercial wolfSSL DTLS 1.3 provider."
+            "This build of Umbra is missing its secure streaming support."
         case .missingLibSRTP:
-            "LSP requires the libSRTP AES-GCM provider."
+            "This build of Umbra is missing its media encryption support."
         case .invalidConfiguration:
-            "The LSP transport configuration is invalid."
+            "The stream connection settings are invalid."
         case .invalidState:
-            "The LSP transport lifecycle transition is invalid."
+            "The stream connection was in an unexpected state."
         case .reentrantCallback:
-            "An LSP lifecycle operation cannot run from its native callback."
+            "The stream connection was changed at an unsupported time."
         case .resourceExhausted:
-            "A bounded LSP native resource is unavailable."
+            "Umbra ran out of stream connection resources."
         case .unsupported:
-            "The requested LSP capability is not implemented."
+            "This streaming feature is not supported yet."
         case .internalFailure:
-            "The LSP native core reported an internal failure."
+            "The stream connection failed unexpectedly."
         case .invalidEndpoint:
-            "The LSP endpoint or server SPKI pin is invalid."
+            "The saved host address or security identity is invalid. Pair the host again."
         case .socketFailure:
-            "The LSP UDP connection failed. Check the host address, network reachability, and Local Network access."
+            "Couldn't reach the host. Check the host address, your network connection, and Umbra's Local Network access."
         case .dtlsFailure:
-            "The LSP DTLS 1.3 handshake or security-policy validation failed."
+            "Couldn't establish a secure connection to the host."
         case .spkiMismatch:
-            "The server certificate does not match the paired LSP SPKI pin."
+            "The host's identity changed since pairing. Pair the host again."
         case .srtpFailure:
-            "The libSRTP AEAD AES-128-GCM contexts failed."
+            "Couldn't set up media encryption for the stream."
         case .notAuthenticated:
-            "The LSP association is not authenticated."
+            "The connection to the host is not authenticated."
         case .controlWindowFull:
-            "The bounded LSP control window is full."
+            "The host is busy handling earlier requests. Try again."
         case .timeout:
-            "The LSP operation timed out."
+            "The host didn't respond in time."
         case .inputPermissionDenied:
             "macOS denied preferred raw HID input capture."
         case .inputUnavailable:
@@ -729,15 +729,15 @@ public enum LSPTransportError: Error, Equatable, LocalizedError, Sendable {
         case .rollbackPending:
             "Native input rollback is waiting for the fresh baseline acknowledgement."
         case .pairingFailed:
-            "Native LSP PIN pairing failed."
+            "PIN pairing failed."
         case .pairingExpired:
-            "The LSP pairing PIN expired."
+            "The pairing PIN expired."
         case .pairingGenerationMismatch:
-            "The LSP pairing response does not match this approval."
+            "The pairing response does not match this request. Try pairing again."
         case .pairingConfirmationFailed:
-            "The LSP host pairing confirmation is not authentic."
+            "The host's pairing confirmation could not be verified."
         case .unknownStatus(let status):
-            "The LSP native core returned unknown status \(status)."
+            "The stream connection returned an unknown status (\(status))."
         }
     }
 }

@@ -66,23 +66,23 @@ enum StreamPerformanceMetric: CaseIterable, Sendable {
         case .audioQueue: "Audio queue"
         case .videoPackets: "Video packets"
         case .audioPackets: "Audio packets"
-        case .lspLifecycle: "LSP lifecycle"
-        case .lspDatagrams: "LSP datagrams"
-        case .lspDrops: "LSP drops"
-        case .lspAuthenticationFailures: "LSP auth failures"
-        case .lspPathMTU: "LSP UDP payload"
-        case .lspReconnect: "LSP reconnect"
-        case .lspInputDevices: "LSP input devices"
-        case .lspFrameToDecoder: "LSP frame to decoder"
-        case .lspDecodeCompletion: "LSP decode completion"
-        case .lspMetalCommit: "LSP Metal commit"
-        case .lspAudioDecode: "LSP audio decode"
-        case .lspReconnectDuration: "LSP reconnect duration"
-        case .lspNativeStages: "LSP native stages"
-        case .lspMetalCompletion: "LSP Metal completion"
-        case .lspAudioHealth: "LSP audio health"
-        case .lspFrameToMetal: "LSP frame to Metal enqueue"
-        case .lspAudioReceive: "LSP audio receive to decode"
+        case .lspLifecycle: "Connection state"
+        case .lspDatagrams: "Packets"
+        case .lspDrops: "Dropped packets"
+        case .lspAuthenticationFailures: "Auth failures"
+        case .lspPathMTU: "UDP payload size"
+        case .lspReconnect: "Reconnect"
+        case .lspInputDevices: "Input devices"
+        case .lspFrameToDecoder: "Frame to decoder"
+        case .lspDecodeCompletion: "Decode completion"
+        case .lspMetalCommit: "Metal commit"
+        case .lspAudioDecode: "Audio decode"
+        case .lspReconnectDuration: "Reconnect duration"
+        case .lspNativeStages: "Native stages"
+        case .lspMetalCompletion: "Metal completion"
+        case .lspAudioHealth: "Audio health"
+        case .lspFrameToMetal: "Frame to Metal enqueue"
+        case .lspAudioReceive: "Audio receive to decode"
         }
     }
 }
@@ -749,7 +749,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         await renderer?.awaitPresentationQuiescence()
         await videoRenderer.awaitPreparedBackendReset()
         guard videoRenderer.activatePreparedSession(generation: generation) else {
-            throw UmbraIntegrationError.mediaConfigurationFailed("LSP renderer activation was superseded.")
+            throw UmbraIntegrationError.mediaConfigurationFailed("The video renderer was replaced before it started.")
         }
         keepAwake.setActive(preferences.keepAwake, reason: "Umbra is streaming \(applicationName)")
         controllers.stop()
@@ -1506,7 +1506,7 @@ final class StreamStatisticsOverlayView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Stream performance")
-        setAccessibilityHelp("LSP latency values show the median and 99th percentile in milliseconds. A dash means no measurement yet.")
+        setAccessibilityHelp("Latency values show the median and 99th percentile in milliseconds. A dash means no measurement yet.")
         isHidden = true
     }
 

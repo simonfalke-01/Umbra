@@ -235,7 +235,7 @@ final class AppStore: ObservableObject {
                 }
                 guard preparation.pin.count == 6, preparation.pin.allSatisfy(\.isNumber),
                       preparation.provisionalSPKIFingerprint?.isEmpty == false else {
-                    throw UmbraClientServiceError.unavailable("The native LSP core returned an invalid pairing PIN.")
+                    throw UmbraClientServiceError.unavailable("Umbra generated an invalid pairing PIN. Try pairing again.")
                 }
                 pairingPreparationReservation = nil
                 pairingPreparations[host.id] = preparation
