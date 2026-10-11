@@ -31,6 +31,10 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     private let transport: LSPTransport
     private let renderer: any MetalVideoRendering
+    // Native feedback takes the transport mutex. Keep that work off both the
+    // VideoToolbox callback and the Metal presentation thread. Native frame
+    // credits bound the pending reports; release them only after reporting.
+    private let feedbackQueue = DispatchQueue(label: "app.umbra.lsp-video-feedback", qos: .userInteractive)
     private let lock = NSLock()
     private var state = State()
     private var failureHandler: (@Sendable (LSPTransportError) -> Void)?
@@ -335,6 +339,17 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             return (configuration.videoGeneration, frame, credit)
         }
         guard let report else { return }
+        feedbackQueue.async { [self] in
+            guard isActive(videoGeneration: report.0) else { return }
+            reportDecode(frameID: frameID, status: status, report: report)
+        }
+    }
+
+    private func reportDecode(
+        frameID: UInt64,
+        status: LSPVideoDecodeStatus,
+        report: (UInt32, FrameState, UInt8)
+    ) {
         do {
             try transport.reportVideoDecode(
                 videoGeneration: report.0,
@@ -385,20 +400,23 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             return UInt8(max(0, Int(configuration.decoderSurfaces) - state.outstanding.count))
         }
         guard let credit else { return }
-        do {
-            try transport.reportVideoDecode(
-                videoGeneration: frame.videoGeneration,
-                frameID: frame.frameID,
-                recoveryEpoch: frame.recoveryEpoch,
-                status: status,
-                availableCredit: credit,
-                mailboxOccupancy: 1
-            )
-        } catch {
-            fail(
-                (error as? LSPTransportError) ?? .internalFailure,
-                videoGeneration: frame.videoGeneration
-            )
+        feedbackQueue.async { [self] in
+            guard isActive(videoGeneration: frame.videoGeneration) else { return }
+            do {
+                try transport.reportVideoDecode(
+                    videoGeneration: frame.videoGeneration,
+                    frameID: frame.frameID,
+                    recoveryEpoch: frame.recoveryEpoch,
+                    status: status,
+                    availableCredit: credit,
+                    mailboxOccupancy: 1
+                )
+            } catch {
+                fail(
+                    (error as? LSPTransportError) ?? .internalFailure,
+                    videoGeneration: frame.videoGeneration
+                )
+            }
         }
     }
 
@@ -431,17 +449,26 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         })
         else { return }
         guard result.1 else { return }
-        do {
-            try transport.reportVideoCommit(
-                videoGeneration: result.0,
-                frameID: frameID,
-                mailboxOccupancy: 0
-            )
-        } catch {
-            fail(
-                (error as? LSPTransportError) ?? .internalFailure,
-                videoGeneration: result.0
-            )
+        feedbackQueue.async { [self] in
+            guard isActive(videoGeneration: result.0) else { return }
+            do {
+                try transport.reportVideoCommit(
+                    videoGeneration: result.0,
+                    frameID: frameID,
+                    mailboxOccupancy: 0
+                )
+            } catch {
+                fail(
+                    (error as? LSPTransportError) ?? .internalFailure,
+                    videoGeneration: result.0
+                )
+            }
+        }
+    }
+
+    private func isActive(videoGeneration: UInt32) -> Bool {
+        lock.withLock {
+            state.active && state.configuration?.nativeConfiguration.videoGeneration == videoGeneration
         }
     }
 
