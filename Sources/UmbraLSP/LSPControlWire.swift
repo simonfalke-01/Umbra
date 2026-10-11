@@ -511,20 +511,22 @@ public struct LSPAudioOffer: Equatable, Sendable {
     public var inbandFEC: Bool
     public var dtx: Bool
 
+    // Game audio must not use DTX: Opus classifies quiet ambience as inactive and
+    // sends silence until a loud transient, unlike continuous Moonlight audio.
     public static let adaptiveDefaults: [Self] = [
-        .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
-        .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
-        .init(channels: 6, frameSamples: 480, maximumBitrate: 768_000, inbandFEC: false, dtx: true),
-        .init(channels: 8, frameSamples: 480, maximumBitrate: 1_024_000, inbandFEC: false, dtx: true),
-        .init(channels: 2, frameSamples: 960, maximumBitrate: 256_000, inbandFEC: true, dtx: true),
+        .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
+        .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
+        .init(channels: 6, frameSamples: 480, maximumBitrate: 768_000, inbandFEC: false, dtx: false),
+        .init(channels: 8, frameSamples: 480, maximumBitrate: 1_024_000, inbandFEC: false, dtx: false),
+        .init(channels: 2, frameSamples: 960, maximumBitrate: 256_000, inbandFEC: true, dtx: false),
     ]
 
     public static let competitionDefaults: [Self] = [
-        .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
-        .init(channels: 2, frameSamples: 120, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
-        .init(channels: 6, frameSamples: 240, maximumBitrate: 768_000, inbandFEC: false, dtx: true),
-        .init(channels: 8, frameSamples: 240, maximumBitrate: 1_024_000, inbandFEC: false, dtx: true),
-        .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: true),
+        .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
+        .init(channels: 2, frameSamples: 120, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
+        .init(channels: 6, frameSamples: 240, maximumBitrate: 768_000, inbandFEC: false, dtx: false),
+        .init(channels: 8, frameSamples: 240, maximumBitrate: 1_024_000, inbandFEC: false, dtx: false),
+        .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
     ]
 }
 
