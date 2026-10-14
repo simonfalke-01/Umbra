@@ -2,12 +2,14 @@ import AppKit
 import Combine
 import Foundation
 import ImageIO
+import Network
 import UmbraCLI
 import UmbraCLIExecution
 import UmbraCore
 import UmbraDiagnostics
 import UmbraIntegration
 import UmbraLSP
+import UmbraPlatform
 import UmbraLSPTransport
 import UmbraMedia
 import UmbraMicrophone
@@ -242,7 +244,17 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var plannedLSPRekeyTask: Task<Void, Never>?
     private var lspTelemetryTask: Task<Void, Never>?
     private var lspDeviceOfferTask: Task<Void, Never>?
+    /// Addresses of each listed GameStream host, used to fold it into the same machine's LSP entry.
+    private var legacyHostAddresses: [HostID: Set<String>] = [:]
+    /// Addresses and advertised GameStream ID of each listed LSP host.
+    private var lspHostIdentities: [HostID: (addresses: Set<String>, legacyHostID: String?)] = [:]
+    private var lspClipboardSync: PasteboardSync?
+    private var lspClipboardSendTask: Task<Void, Never>?
+    private var pendingLSPClipboardContent: PasteboardContent?
+    private var lspClipboardHandlerClearTask: Task<Void, Never>?
     private var lspHostStatusTask: Task<Void, Never>?
+    private var networkPathMonitor: NWPathMonitor?
+    private var lastNetworkPathSignature: String?
     private var lspHostCheckInFlight = false
     private var lspHostCheckErrors: [UUID: String] = [:]
     private var latestLSPTelemetry: LSPTelemetrySnapshot?
@@ -350,6 +362,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         discoveryPreferenceTask?.cancel()
         lspPairingDiscoveryHandlerTask?.cancel()
         lspHostStatusTask?.cancel()
+        networkPathMonitor?.cancel()
         lspDiscovery.stop()
         lspOwnerEndpoint?.stop()
         for task in artworkLoadingTasks.values { task.cancel() }
@@ -416,6 +429,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
         if preferences.settings.lspPairQuitPermission {
             permissions.insert(.quitApplication)
+        }
+        if preferences.settings.lspClipboardSharing {
+            permissions.insert(.clipboard)
         }
         let prompt = try await lspProduct.beginPairing(
             hostID: nativeHostID,
@@ -835,6 +851,87 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
         installLSPReconnectHandler(session: session, hostID: hostID, streamID: streamID)
         scheduleLSPMaintenance(session: session, hostID: hostID)
+        await startLSPClipboardSync(product: product, hostID: hostID, streamID: streamID)
+    }
+
+    private func startLSPClipboardSync(product: LSPProductClient, hostID: UUID, streamID: UUID) async {
+        stopLSPClipboardSync()
+        guard preferences.settings.lspClipboardSharing else { return }
+        guard await product.clipboardPermitted(hostID: hostID) else {
+            lspFailureHandler(
+                "Clipboard sharing is off for this host. Enable clipboard access for Umbra in "
+                    + "Lumen's client permissions, then start a new stream."
+            )
+            return
+        }
+        guard isActiveLSPStream(streamID, hostID: hostID) else { return }
+        let sync = PasteboardSync()
+        sync.onLocalChange = { [weak self] content in
+            self?.queueLSPClipboard(content, product: product, hostID: hostID, streamID: streamID)
+        }
+        sync.onOversizedLocalChange = { [lspFailureHandler] length in
+            lspFailureHandler("Copied content larger than 16 MB (\(length) bytes) was not fully shared with the host.")
+        }
+        lspClipboardSync = sync
+        // A clear queued by an earlier stop must not land after this handler is installed.
+        await lspClipboardHandlerClearTask?.value
+        guard lspClipboardSync === sync else { return }
+        await product.setClipboardHandler { remoteHostID, content in
+            Task { @MainActor [weak self] in
+                guard let self, self.isActiveLSPStream(streamID, hostID: remoteHostID) else { return }
+                self.lspClipboardSync?.applyRemote(.init(text: content.text, html: content.html, png: content.png))
+            }
+        }
+        guard lspClipboardSync === sync else { return }
+        sync.start()
+    }
+
+    private func queueLSPClipboard(
+        _ content: PasteboardContent,
+        product: LSPProductClient,
+        hostID: UUID,
+        streamID: UUID
+    ) {
+        pendingLSPClipboardContent = content
+        guard lspClipboardSendTask == nil else { return }
+        lspClipboardSendTask = Task { @MainActor [weak self] in
+            var lastFailure: String?
+            while let self, self.isActiveLSPStream(streamID, hostID: hostID),
+                  let next = self.pendingLSPClipboardContent {
+                self.pendingLSPClipboardContent = nil
+                do {
+                    try await product.sendClipboard(
+                        hostID: hostID,
+                        content: .init(text: next.text, html: next.html, png: next.png)
+                    )
+                    lastFailure = nil
+                } catch is CancellationError {
+                    break
+                } catch {
+                    let message = "Clipboard sharing failed: \(error.localizedDescription)"
+                    if message != lastFailure {
+                        self.lspFailureHandler(message)
+                        lastFailure = message
+                    }
+                }
+            }
+            self?.lspClipboardSendTask = nil
+        }
+    }
+
+    private func stopLSPClipboardSync() {
+        lspClipboardSync?.stop()
+        lspClipboardSync = nil
+        lspClipboardSendTask?.cancel()
+        lspClipboardSendTask = nil
+        pendingLSPClipboardContent = nil
+        if let lspProduct {
+            let previous = lspClipboardHandlerClearTask
+            lspClipboardHandlerClearTask = Task {
+                await previous?.value
+                await lspProduct.setClipboardHandler(nil)
+            }
+        }
     }
 
     func disconnectSession() async {
@@ -870,6 +967,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lspDeviceOfferTask = nil
         lspInputCapture.stop()
         streamWindow?.onTextCommit = nil
+        stopLSPClipboardSync()
         let stopResult = await lspProduct?.stop(hostID: hostID) ?? .notRunning
         markLSPHostSession(hostID: hostID, runningApplicationID: nil)
         await streamWindow?.finish()
@@ -1148,6 +1246,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 self.lspInputCapture.stop()
                 self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
                 self.streamWindow?.onTextCommit = nil
+                self.stopLSPClipboardSync()
                 await self.streamWindow?.finish()
                 if !self.cliStopReplyPending {
                     self.lspOwnerEndpoint?.stop()
@@ -1193,6 +1292,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     self.lspInputCapture.stop()
                     self.markLSPHostSession(hostID: hostID, runningApplicationID: nil)
                     self.streamWindow?.onTextCommit = nil
+                    self.stopLSPClipboardSync()
                     await self.lspProduct?.failSession(hostID: hostID)
                     await self.streamWindow?.finish()
                     if !self.cliStopReplyPending {
@@ -1397,6 +1497,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
 
     private func displayHost(_ host: StreamHost) -> HostDisplayModel {
         securePorts.register(host)
+        legacyHostAddresses[HostID(host.uuid)] = Set(
+            [host.localAddress, host.remoteAddress, host.ipv6Address, host.manualAddress, host.activeAddress]
+                .compactMap { $0?.hostname.lowercased() }
+        )
         return HostDisplayModel(
             id: HostID(host.uuid),
             name: host.name,
@@ -1419,6 +1523,21 @@ final class LiveUmbraClientService: UmbraClientServicing {
         trust: LSPTrustRecord? = nil,
         identityChanged: Bool = false
     ) -> HostDisplayModel {
+        let displayID = HostID("lsp:\(host.hostID.uuidString.lowercased())")
+        lspHostIdentities[displayID] = (
+            addresses: Set(host.endpoints.map { $0.address.lowercased() } + [host.address.lowercased()]),
+            legacyHostID: host.legacyHostID
+        )
+        let otherAddresses = host.connectionCandidates()
+            .filter { $0.address.lowercased() != host.address.lowercased() || $0.port != host.port }
+            .map { endpoint in
+                let source = switch endpoint.source {
+                case .manual: "manual"
+                case .discovered: "local network"
+                case .learned: "learned"
+                }
+                return "\(endpoint.address):\(endpoint.port) (\(source))"
+            }
         var details = [
             "Protocol: Lumen Streaming Protocol",
             "Address: \(host.address):\(host.port)",
@@ -1430,6 +1549,9 @@ final class LiveUmbraClientService: UmbraClientServicing {
         if let provisionalSPKIFingerprint {
             details.append("Provisional SPKI: \(provisionalSPKIFingerprint)")
         }
+        if !otherAddresses.isEmpty {
+            details.append("Other addresses: \(otherAddresses.joined(separator: ", "))")
+        }
         if let domain = host.discoveryDomain {
             details.append("Bonjour domain: \(domain)")
         }
@@ -1440,7 +1562,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             details.append("Effective permissions: \(Self.permissionNames(trust.permissions).joined(separator: ", "))")
         }
         return HostDisplayModel(
-            id: HostID("lsp:\(host.hostID.uuidString.lowercased())"),
+            id: displayID,
             name: host.name,
             status: online && !identityChanged ? .online : .offline,
             isPaired: paired && !identityChanged,
@@ -1692,7 +1814,17 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
             nativeByID[host.id] = host
         }
-        return lastLegacyHosts + nativeByID.values
+        // A Lumen PC is listed once: its GameStream listing folds into the LSP entry.
+        let native = Array(nativeByID.values)
+        let nativeIdentities = native.compactMap { lspHostIdentities[$0.id] }
+        let legacy = lastLegacyHosts.filter { legacyHost in
+            let legacyID = legacyHost.id.rawValue.lowercased()
+            let addresses = legacyHostAddresses[legacyHost.id] ?? []
+            return !nativeIdentities.contains { identity in
+                identity.legacyHostID == legacyID || !identity.addresses.isDisjoint(with: addresses)
+            }
+        }
+        return legacy + native
     }
 
     private func refreshPersistedLSPHosts() async throws {
@@ -1765,8 +1897,32 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
     }
 
+    /// Re-checks hosts as soon as the Mac changes networks (Wi-Fi, Ethernet, VPN, or none).
+    private func startNetworkPathMonitoring() {
+        guard networkPathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let signature = "\(path.status)|" + path.availableInterfaces.map(\.name).joined(separator: ",")
+            Task { @MainActor [weak self] in
+                self?.networkPathChanged(signature: signature)
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "app.umbra.network-path"))
+        networkPathMonitor = monitor
+    }
+
+    private func networkPathChanged(signature: String) {
+        defer { lastNetworkPathSignature = signature }
+        guard let previous = lastNetworkPathSignature, previous != signature else { return }
+        Task { @MainActor [weak self] in
+            await self?.lspProduct?.retireIdleAssociations()
+            await self?.refreshLSPReachability()
+        }
+    }
+
     /// Retries idle-host checks at the existing legacy monitor's three-second cadence.
     private func startLSPHostStatusMonitoring() {
+        startNetworkPathMonitoring()
         guard lspHostStatusTask == nil else { return }
         lspHostStatusTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -1906,20 +2062,15 @@ final class LiveUmbraClientService: UmbraClientServicing {
     /// Publishes a discovery record whose stable host ID and SPKI matched saved trust.
     func applyMatchedLSPHost(_ host: LSPHostRecord, trust: LSPTrustRecord) {
         identityChangedLSPHostIDs.remove(host.hostID)
-        if !host.hasManualEndpoint {
-            onlineLSPHostIDs.insert(host.hostID)
-        }
+        // A Bonjour sighting proves the host is on this network, whatever addresses are saved.
+        onlineLSPHostIDs.insert(host.hostID)
         discoveredLSPHosts.removeValue(forKey: host.hostID)
-        var display = displayLSPHost(
+        let display = displayLSPHost(
             host,
             paired: true,
-            online: onlineLSPHostIDs.contains(host.hostID),
+            online: true,
             trust: trust
         )
-        if host.hasManualEndpoint,
-           let existing = lastLSPHosts.first(where: { lspHostID($0.id) == host.hostID }) {
-            display.status = existing.status
-        }
         upsertLSPHost(display)
         eventHandler?(.hosts(combinedHosts()))
     }
@@ -1935,7 +2086,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 port: host.port,
                 lastSeen: Date(),
                 discoveryDomain: host.domain,
-                interfaceName: host.interfaceName
+                interfaceName: host.interfaceName,
+                legacyHostID: host.legacyHostID
             )
             discoveredLSPHosts[host.hostID] = displayLSPHost(
                 record,
@@ -2001,6 +2153,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             (.stopOwnStream, "Stop own stream"),
             (.quitApplication, "Quit hosted application"),
             (.controllerOutput, "Controller rumble, lights, and haptics"),
+            (.clipboard, "Clipboard text sharing"),
         ].compactMap { permissions.contains($0.0) ? $0.1 : nil }
     }
 

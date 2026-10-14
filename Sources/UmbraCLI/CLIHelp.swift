@@ -86,7 +86,7 @@ public enum CLIHelp {
               --protocol <legacy|lsp>
                                   LSP generates and displays its own six-digit PIN
               --lsp-host-id <uuid> Select an exact discovered LSP host
-              --lsp-permissions <browse,start,input,microphone,stop,quit,controller-output>
+              --lsp-permissions <browse,start,input,microphone,stop,quit,controller-output,clipboard>
                                   Request an explicit LSP permission set
               --lsp-microphone <off|optional|required>
               -h, --help          Display this help text

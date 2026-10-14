@@ -178,6 +178,9 @@ public actor LSPClientSession {
     private var authenticatedTrust: LSPTrustRecord?
     private var effectivePermissions: LSPPermission = []
     private var certificateRotationHandler: (@Sendable (LSPTrustRecord) async -> LSPControlStatus)?
+    private var clipboardHandler: (@Sendable (LSPClipboardContent) -> Void)?
+    private var nextClipboardSequence: UInt64 = 1
+    private var lastReceivedClipboardSequence: UInt64 = 0
     private var incomingObjects: [UUID: LSPIncomingObject] = [:]
     private var completedObjects: [UUID: Data] = [:]
     private var bufferedObjectBytes = 0
@@ -243,6 +246,7 @@ public actor LSPClientSession {
             .input,
             .stopOwnStream,
             .controllerOutput,
+            .clipboard,
         ]
     ) async throws -> LSPPairingPrompt {
         try Task.checkCancellation()
@@ -1315,10 +1319,111 @@ public actor LSPClientSession {
                 Task { await self?.receiveObjectChunk(event) }
             } else if event.messageType == LSPControlMessageType.certificateRotate.rawValue {
                 Task { await self?.receiveCertificateRotation(event) }
+            } else if event.messageType == LSPControlMessageType.clipboardUpdate.rawValue {
+                Task { await self?.receiveClipboardUpdate(event) }
             }
         }
         transport.setPathProbeHandler { [weak self] event in
             Task { await self?.handlePathProbeEvent(event) }
+        }
+    }
+
+    /// Returns the permissions the host granted this authenticated association.
+    public func permissions() -> LSPPermission {
+        effectivePermissions
+    }
+
+    /// Installs the receiver for host clipboard content; nil declines host clipboard updates.
+    public func setClipboardHandler(_ handler: (@Sendable (LSPClipboardContent) -> Void)?) {
+        clipboardHandler = handler
+    }
+
+    /// Replaces the host clipboard with content copied on this Mac.
+    public func sendClipboard(_ content: LSPClipboardContent) async throws {
+        guard state == .inputActive, let authority = inputAuthority else {
+            throw LSPTransportError.invalidState
+        }
+        guard effectivePermissions.contains(.clipboard) else { throw LSPControlStatus.permissionDenied }
+        let bundle = content.bundle()
+        guard !bundle.isEmpty, bundle.count <= LSPClipboardUpdate.maximumContentLength,
+              let length = UInt32(exactly: bundle.count) else {
+            throw DeterministicCBORError.malformed
+        }
+        var update = LSPClipboardUpdate(
+            sessionID: authority.sessionID,
+            sequence: nextClipboardSequence,
+            contentLength: length,
+            inlineContent: nil,
+            objectID: nil,
+            sha256: nil
+        )
+        nextClipboardSequence += 1
+        if bundle.count <= LSPClipboardUpdate.maximumInlineContentLength {
+            update.inlineContent = bundle
+        } else {
+            let objectID = UUID()
+            let digest = Data(SHA256.hash(data: bundle))
+            try await uploadObject(objectID: objectID, bytes: bundle, sha256: digest)
+            update.objectID = objectID
+            update.sha256 = digest
+        }
+        let event = try await transport.request(
+            messageType: LSPControlMessageType.clipboardUpdate.rawValue,
+            payload: try LSPControlWire.clipboardUpdate(update)
+        )
+        try LSPControlWire.requireClipboardUpdateResponse(event, update: update)
+    }
+
+    private func receiveClipboardUpdate(_ event: LSPControlEvent) {
+        let update: LSPClipboardUpdate
+        do {
+            update = try LSPControlWire.clipboardUpdate(from: event)
+        } catch {
+            rejectControl(event, responseType: .clipboardUpdateResponse, status: .malformed)
+            return
+        }
+        guard effectivePermissions.contains(.clipboard) else {
+            rejectControl(event, responseType: .clipboardUpdateResponse, status: .permissionDenied)
+            return
+        }
+        guard let clipboardHandler else {
+            rejectControl(event, responseType: .clipboardUpdateResponse, status: .unsupported)
+            return
+        }
+        guard inputAuthority?.sessionID == update.sessionID else {
+            rejectControl(event, responseType: .clipboardUpdateResponse, status: .staleGeneration)
+            return
+        }
+        let bundle: Data
+        if let inline = update.inlineContent {
+            bundle = inline
+        } else {
+            guard let objectID = update.objectID,
+                  let bytes = completedObjects[objectID],
+                  bytes.count == Int(update.contentLength),
+                  Data(SHA256.hash(data: bytes)) == update.sha256 else {
+                rejectControl(event, responseType: .clipboardUpdateResponse, status: .staleGeneration)
+                return
+            }
+            _ = takeObject(objectID)
+            bundle = bytes
+        }
+        guard let content = LSPClipboardContent(bundle: bundle) else {
+            rejectControl(event, responseType: .clipboardUpdateResponse, status: .malformed)
+            return
+        }
+        if update.sequence > lastReceivedClipboardSequence {
+            lastReceivedClipboardSequence = update.sequence
+            clipboardHandler(content)
+        }
+        do {
+            try transport.sendControlResponse(
+                messageType: LSPControlMessageType.clipboardUpdateResponse.rawValue,
+                requestID: event.requestID,
+                payload: try LSPControlWire.clipboardUpdateResponse(update: update)
+            )
+        } catch {
+            failSession((error as? LSPTransportError) ?? .internalFailure)
         }
     }
 
@@ -1386,7 +1491,7 @@ public actor LSPClientSession {
             rejectControl(event, responseType: .objectChunk, status: .malformed)
             return
         }
-        guard effectivePermissions.contains(.browseApplications) else {
+        guard !effectivePermissions.isDisjoint(with: [.browseApplications, .clipboard]) else {
             do {
                 try sendObjectChunkResponse(
                     event: event,

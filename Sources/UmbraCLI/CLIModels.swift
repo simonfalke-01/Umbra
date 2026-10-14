@@ -30,8 +30,9 @@ public struct CLILSPPermissionSet: OptionSet, Equatable, Sendable {
     public static let stopOwnStream = Self(rawValue: 1 << 4)
     public static let quitApplication = Self(rawValue: 1 << 5)
     public static let controllerOutput = Self(rawValue: 1 << 6)
+    public static let clipboard = Self(rawValue: 1 << 7)
     public static let standard: Self = [
-        .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput,
+        .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput, .clipboard,
     ]
 }
 

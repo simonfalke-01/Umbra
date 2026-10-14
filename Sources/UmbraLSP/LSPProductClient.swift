@@ -81,6 +81,7 @@ public actor LSPProductClient {
     private let afterPairingTrustWrite: @Sendable () throws -> Void
     private var pairingDiscoveryMutationHandler: (@Sendable (LSPPairingDiscoveryMutation) -> Void)?
     private var transportConfiguration = LSPTransportConfiguration()
+    private var clipboardHandler: (@Sendable (UUID, LSPClipboardContent) -> Void)?
 
     public init(
         trustStore: JSONFileStore<LSPTrustSnapshot>,
@@ -152,21 +153,33 @@ public actor LSPProductClient {
         }
         let refreshedSnapshot = try await hostStore.update { snapshot in
             var next = snapshot
-            if let index = next.records.firstIndex(where: { $0.hostID == candidate.hostID }),
-               next.records[index].hasManualEndpoint {
-                next.records[index].lastSeen = Date()
-                return next
-            }
-            let prior = next.records.first(where: { $0.hostID == candidate.hostID })
-            next.records.removeAll { $0.hostID == candidate.hostID }
-            next.records.append(LSPHostRecord(
-                hostID: candidate.hostID,
-                name: prior?.name ?? candidate.name,
+            let now = Date()
+            let discovered = LSPHostEndpoint(
                 address: candidate.host,
                 port: candidate.port,
-                lastSeen: Date(),
+                source: .discovered,
+                lastSeen: now
+            )
+            if let index = next.records.firstIndex(where: { $0.hostID == candidate.hostID }) {
+                // Add the advertised address beside manual and learned ones; never replace them.
+                next.records[index].upsert(discovered)
+                next.records[index].lastSeen = now
+                next.records[index].discoveryDomain = candidate.domain
+                next.records[index].interfaceName = candidate.interfaceName
+                if let legacyHostID = candidate.legacyHostID {
+                    next.records[index].legacyHostID = legacyHostID
+                }
+                return next
+            }
+            next.records.append(LSPHostRecord(
+                hostID: candidate.hostID,
+                name: candidate.name,
+                address: candidate.host,
+                port: candidate.port,
+                lastSeen: now,
                 discoveryDomain: candidate.domain,
-                interfaceName: candidate.interfaceName
+                interfaceName: candidate.interfaceName,
+                legacyHostID: candidate.legacyHostID
             ))
             return next
         }
@@ -221,11 +234,7 @@ public actor LSPProductClient {
             guard let index = next.records.firstIndex(where: { $0.hostID == hostID }) else {
                 throw LSPControlStatus.authenticationFailed
             }
-            next.records[index].address = normalizedAddress
-            next.records[index].port = port
-            next.records[index].discoveryDomain = nil
-            next.records[index].interfaceName = nil
-            next.records[index].hasManualEndpoint = true
+            next.records[index].setManualEndpoint(address: normalizedAddress, port: port)
             return next
         }
         guard let updated = updatedSnapshot.records.first(where: { $0.hostID == hostID }) else {
@@ -302,7 +311,7 @@ public actor LSPProductClient {
     public func beginPairing(
         hostID: UUID,
         requestedPermissions: LSPPermission = [
-            .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput,
+            .browseApplications, .startOrAttach, .input, .stopOwnStream, .controllerOutput, .clipboard,
         ]
     ) async throws -> LSPPairingPrompt {
         if let existing = pairingAttempts[hostID] {
@@ -366,7 +375,8 @@ public actor LSPProductClient {
                             port: candidate.port,
                             lastSeen: Date(),
                             discoveryDomain: candidate.domain,
-                            interfaceName: candidate.interfaceName
+                            interfaceName: candidate.interfaceName,
+                            legacyHostID: candidate.legacyHostID
                         )
                     )
                     await self?.recordVerifiedPairing(
@@ -604,6 +614,22 @@ public actor LSPProductClient {
         }
     }
 
+    /// Closes cached browse-only associations after the Mac's network path changes.
+    ///
+    /// Their sockets are bound to the previous route; the next check reconnects through every
+    /// saved address. Streams and in-flight START, ATTACH, or pairing work are never touched.
+    public func retireIdleAssociations() async {
+        for (hostID, session) in sessions {
+            guard startAttempts[hostID] == nil,
+                  reconnectAttempts[hostID] == nil,
+                  pairingAttempts[hostID] == nil,
+                  await session.state == .authenticated,
+                  await session.retireFailedBrowseAssociation(.invalidState),
+                  sessions[hostID] === session else { continue }
+            sessions.removeValue(forKey: hostID)
+        }
+    }
+
     /// Performs one short authenticated read without START, ATTACH, or browsing recovery retries.
     public func probeReachability(hostID: UUID) async throws {
         try Task.checkCancellation()
@@ -627,8 +653,7 @@ public actor LSPProductClient {
             let (candidate, updatedTrust) = try await authenticatedSession(
                 host: host,
                 trust: trust,
-                configuration: configuration,
-                failFast: true
+                configuration: configuration
             )
             try Task.checkCancellation()
             guard !endpointEditHostIDs.contains(hostID), endpointRevisions[hostID] == endpointRevision else {
@@ -1139,45 +1164,112 @@ public actor LSPProductClient {
         host: LSPHostRecord,
         trust: LSPTrustRecord,
         attemptID: UUID? = nil,
-        configuration: LSPTransportConfiguration? = nil,
-        failFast: Bool = false
+        configuration: LSPTransportConfiguration? = nil
     ) async throws -> (LSPClientSession, LSPTrustRecord) {
         var pins: [Data] = []
         if let pending = trust.pendingDTLSSPKISHA256 { pins.append(pending) }
         if !pins.contains(trust.dtlsSPKISHA256) { pins.append(trust.dtlsSPKISHA256) }
         var finalError: Error = LSPControlStatus.authenticationFailed
-        for pin in pins {
-            if let attemptID {
-                try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
-            } else {
-                try Task.checkCancellation()
-            }
-            let candidate = try await LSPClientSession.persistent(
-                configuration: configuration ?? transportConfiguration,
-                identityStore: identityStore,
-                videoRenderer: videoRenderer
-            )
-            do {
+        // Every address is tried with the pinned host certificate, so a wrong or stale address
+        // can only fail; it can never authenticate a different machine.
+        for endpoint in host.connectionCandidates() {
+            var attemptHost = host
+            attemptHost.address = endpoint.address
+            attemptHost.port = endpoint.port
+            for pin in pins {
                 if let attemptID {
-                    await candidate.beginReconnect(attemptID: attemptID)
+                    try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+                } else {
+                    try Task.checkCancellation()
                 }
-                let updated = try await candidate.authenticate(
-                    host: host,
-                    trust: trust,
-                    serverSPKISHA256: pin
+                let candidate = try await LSPClientSession.persistent(
+                    configuration: configuration ?? transportConfiguration,
+                    identityStore: identityStore,
+                    videoRenderer: videoRenderer
                 )
-                return (candidate, updated)
-            } catch {
-                finalError = error
-                // Only a staged, already trusted certificate pin may justify
-                // another probe handshake. Route/time-out failures wait for
-                // the next scheduled status check instead of cascading here.
-                if failFast, (error as? LSPTransportError) != .spkiMismatch {
-                    throw error
+                do {
+                    if let attemptID {
+                        await candidate.beginReconnect(attemptID: attemptID)
+                    }
+                    let updated = try await candidate.authenticate(
+                        host: attemptHost,
+                        trust: trust,
+                        serverSPKISHA256: pin
+                    )
+                    await recordSuccessfulEndpoint(hostID: host.hostID, endpoint: endpoint)
+                    return (candidate, updated)
+                } catch let status as LSPControlStatus {
+                    // The host answered; another address reaches the same host and decision.
+                    throw status
+                } catch {
+                    finalError = error
+                    // Only a staged, already trusted certificate pin justifies another
+                    // handshake at this address; other failures move to the next address.
+                    if (error as? LSPTransportError) != .spkiMismatch { break }
                 }
             }
         }
         throw finalError
+    }
+
+    /// Persists the address that just authenticated and the LAN addresses behind it.
+    private func recordSuccessfulEndpoint(hostID: UUID, endpoint: LSPHostEndpoint) async {
+        let resolved = Self.resolvedAddresses(of: endpoint.address)
+        _ = try? await hostStore.update { snapshot in
+            var next = snapshot
+            guard let index = next.records.firstIndex(where: { $0.hostID == hostID }) else { return next }
+            next.records[index].markSucceeded(address: endpoint.address, port: endpoint.port)
+            for address in resolved where address.lowercased() != endpoint.address.lowercased() {
+                next.records[index].upsert(.init(address: address, port: endpoint.port, source: .learned, lastSeen: Date()))
+            }
+            return next
+        }
+    }
+
+    /// Resolves a host name to routable numeric addresses; numeric input yields nothing new.
+    ///
+    /// Link-local IPv6 addresses are skipped because they are bound to one network interface
+    /// and stop working after the Mac switches between Wi-Fi and Ethernet.
+    nonisolated static func resolvedAddresses(of host: String) -> [String] {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_DGRAM
+        hints.ai_flags = AI_NUMERICHOST
+        var numeric: UnsafeMutablePointer<addrinfo>?
+        if getaddrinfo(host, nil, &hints, &numeric) == 0 {
+            freeaddrinfo(numeric)
+            return []
+        }
+        hints.ai_flags = 0
+        var results: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &results) == 0, let first = results else { return [] }
+        defer { freeaddrinfo(results) }
+        var addresses: [String] = []
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ai_next }
+            guard let socketAddress = entry.pointee.ai_addr else { continue }
+            if entry.pointee.ai_family == AF_INET6 {
+                let isLinkLocal = socketAddress.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { pointer in
+                    pointer.pointee.sin6_addr.__u6_addr.__u6_addr8.0 == 0xFE &&
+                        (pointer.pointee.sin6_addr.__u6_addr.__u6_addr8.1 & 0xC0) == 0x80
+                }
+                if isLinkLocal { continue }
+            }
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(
+                socketAddress,
+                entry.pointee.ai_addrlen,
+                &buffer,
+                socklen_t(buffer.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            ) == 0 else { continue }
+            let address = String(cString: buffer)
+            if !addresses.contains(address) { addresses.append(address) }
+        }
+        return Array(addresses.prefix(LSPHostRecord.maximumEndpointsPerSource))
     }
 
     private func ensureAttemptCurrent(hostID: UUID, attemptID: UUID) throws {
@@ -1233,7 +1325,38 @@ public actor LSPProductClient {
         await session.invalidateAuthorityAfterAmbiguousAttach()
     }
 
+    /// Installs the receiver for host clipboard text on current and future sessions.
+    public func setClipboardHandler(_ handler: (@Sendable (UUID, LSPClipboardContent) -> Void)?) async {
+        clipboardHandler = handler
+        for (hostID, session) in sessions {
+            await session.setClipboardHandler(Self.sessionClipboardHandler(handler, hostID: hostID))
+        }
+    }
+
+    /// Sends content copied on this Mac to the host clipboard through the current input authority.
+    public func sendClipboard(hostID: UUID, content: LSPClipboardContent) async throws {
+        guard let session = sessions[hostID], await session.state == .inputActive else {
+            throw LSPTransportError.invalidState
+        }
+        try await session.sendClipboard(content)
+    }
+
+    /// Returns whether the current session for one host was granted clipboard sharing.
+    public func clipboardPermitted(hostID: UUID) async -> Bool {
+        guard let session = sessions[hostID] else { return false }
+        return await session.permissions().contains(.clipboard)
+    }
+
+    private static func sessionClipboardHandler(
+        _ handler: (@Sendable (UUID, LSPClipboardContent) -> Void)?,
+        hostID: UUID
+    ) -> (@Sendable (LSPClipboardContent) -> Void)? {
+        guard let handler else { return nil }
+        return { content in handler(hostID, content) }
+    }
+
     private func configureSessionHandlers(_ session: LSPClientSession, hostID: UUID) async {
+        await session.setClipboardHandler(Self.sessionClipboardHandler(clipboardHandler, hostID: hostID))
         let trustStore = self.trustStore
         await session.setCertificateRotationHandler { updated in
             do {

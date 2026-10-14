@@ -1414,6 +1414,12 @@ private struct AdvancedSettingsView: View {
                     message: "Lets Umbra quit only the application that its own stream started.",
                     binding: preferences.binding(for: \.lspPairQuitPermission)
                 )
+                PreferenceToggle(
+                    "Share clipboard with Lumen hosts",
+                    message: "Copies text between this Mac and the host while streaming. "
+                        + "Hosts paired before this was available need clipboard access enabled in Lumen's client permissions.",
+                    binding: preferences.binding(for: \.lspClipboardSharing)
+                )
             }
 
             SettingsSection("Defaults") {

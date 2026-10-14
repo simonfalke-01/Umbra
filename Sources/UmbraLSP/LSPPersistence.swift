@@ -17,6 +17,7 @@ public struct LSPPermission: OptionSet, Codable, Hashable, Sendable {
     public static let stopOwnStream = Self(rawValue: 1 << 4)
     public static let quitApplication = Self(rawValue: 1 << 5)
     public static let controllerOutput = Self(rawValue: 1 << 6)
+    public static let clipboard = Self(rawValue: 1 << 7)
     public static let allKnown: Self = [
         .browseApplications,
         .startOrAttach,
@@ -25,6 +26,7 @@ public struct LSPPermission: OptionSet, Codable, Hashable, Sendable {
         .stopOwnStream,
         .quitApplication,
         .controllerOutput,
+        .clipboard,
     ]
 }
 
@@ -94,7 +96,49 @@ public struct LSPTrustRecord: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
-/// Persisted LSP host address independent of legacy GameStream hosts.
+/// One address at which an LSP host has been reached or advertised.
+public struct LSPHostEndpoint: Codable, Hashable, Sendable {
+    /// How Umbra learned the address; stronger sources are kept when entries merge.
+    public enum Source: Int, Codable, Comparable, Sendable {
+        /// Resolved from a successful connection (for example, the LAN IP behind a Bonjour name).
+        case learned = 0
+        /// Advertised by Bonjour on the local network.
+        case discovered = 1
+        /// Entered by the user, such as a public address for remote access.
+        case manual = 2
+
+        public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+
+    public var address: String
+    public var port: UInt16
+    public var source: Source
+    public var lastSeen: Date?
+    public var lastSucceeded: Date?
+
+    public init(
+        address: String,
+        port: UInt16,
+        source: Source,
+        lastSeen: Date? = nil,
+        lastSucceeded: Date? = nil
+    ) {
+        self.address = address
+        self.port = port
+        self.source = source
+        self.lastSeen = lastSeen
+        self.lastSucceeded = lastSucceeded
+    }
+
+    /// Case-insensitive address and port identity.
+    var key: String { "\(address.lowercased())|\(port)" }
+}
+
+/// Persisted LSP host independent of legacy GameStream host records.
+///
+/// A host keeps every address it has been reached at, like Moonlight: Bonjour names,
+/// learned LAN addresses, and manual (for example, public) addresses. Connections try
+/// them in order of recent success, so changing networks never strands a saved host.
 public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
     public var id: UUID { hostID }
     public var hostID: UUID
@@ -105,6 +149,13 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
     public var discoveryDomain: String?
     public var interfaceName: String?
     public var hasManualEndpoint: Bool
+    /// Every known address, including the preferred `address`/`port`.
+    public var endpoints: [LSPHostEndpoint]
+    /// Lowercase GameStream unique ID advertised by the same host, when known.
+    public var legacyHostID: String?
+
+    /// Largest number of remembered addresses per source.
+    static let maximumEndpointsPerSource = 4
 
     public init(
         hostID: UUID,
@@ -114,7 +165,9 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
         lastSeen: Date,
         discoveryDomain: String? = nil,
         interfaceName: String? = nil,
-        hasManualEndpoint: Bool = false
+        hasManualEndpoint: Bool = false,
+        endpoints: [LSPHostEndpoint] = [],
+        legacyHostID: String? = nil
     ) {
         self.hostID = hostID
         self.name = name
@@ -124,6 +177,84 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
         self.discoveryDomain = discoveryDomain
         self.interfaceName = interfaceName
         self.hasManualEndpoint = hasManualEndpoint
+        self.endpoints = endpoints
+        self.legacyHostID = legacyHostID
+        if !endpoints.contains(where: { $0.address.lowercased() == address.lowercased() && $0.port == port }) {
+            self.endpoints.insert(
+                .init(address: address, port: port, source: hasManualEndpoint ? .manual : .discovered, lastSeen: lastSeen),
+                at: 0
+            )
+        }
+    }
+
+    /// Addresses to try, most recently successful first, then by source and recency.
+    public func connectionCandidates() -> [LSPHostEndpoint] {
+        let order: [LSPHostEndpoint.Source] = [.discovered, .learned, .manual]
+        return endpoints.sorted { lhs, rhs in
+            switch (lhs.lastSucceeded, rhs.lastSucceeded) {
+            case let (left?, right?) where left != right:
+                return left > right
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            default:
+                break
+            }
+            if lhs.source != rhs.source {
+                // Discovered LAN names are fastest at home; manual addresses cover remote access.
+                return order.firstIndex(of: lhs.source)! < order.firstIndex(of: rhs.source)!
+            }
+            return (lhs.lastSeen ?? .distantPast) > (rhs.lastSeen ?? .distantPast)
+        }
+    }
+
+    /// Adds or refreshes one address without discarding any other known address.
+    public mutating func upsert(_ endpoint: LSPHostEndpoint) {
+        if let index = endpoints.firstIndex(where: { $0.key == endpoint.key }) {
+            var merged = endpoints[index]
+            merged.source = max(merged.source, endpoint.source)
+            merged.lastSeen = [merged.lastSeen, endpoint.lastSeen].compactMap { $0 }.max()
+            merged.lastSucceeded = [merged.lastSucceeded, endpoint.lastSucceeded].compactMap { $0 }.max()
+            endpoints[index] = merged
+        } else {
+            endpoints.append(endpoint)
+        }
+        trimEndpoints()
+    }
+
+    /// Records a successful connection and makes that address preferred.
+    public mutating func markSucceeded(address: String, port: UInt16, at date: Date = Date()) {
+        upsert(.init(address: address, port: port, source: .learned, lastSeen: date, lastSucceeded: date))
+        self.address = address
+        self.port = port
+        lastSeen = date
+    }
+
+    /// Replaces the user's manual address while keeping discovered and learned addresses.
+    public mutating func setManualEndpoint(address: String, port: UInt16, at date: Date = Date()) {
+        endpoints.removeAll { $0.source == .manual }
+        upsert(.init(address: address, port: port, source: .manual, lastSeen: date))
+        self.address = address
+        self.port = port
+        hasManualEndpoint = true
+    }
+
+    private mutating func trimEndpoints() {
+        for source in [LSPHostEndpoint.Source.learned, .discovered, .manual] {
+            let matching = endpoints.enumerated().filter { $0.element.source == source }
+            guard matching.count > Self.maximumEndpointsPerSource else { continue }
+            let removable = matching
+                .sorted {
+                    ($0.element.lastSucceeded ?? $0.element.lastSeen ?? .distantPast) <
+                        ($1.element.lastSucceeded ?? $1.element.lastSeen ?? .distantPast)
+                }
+                .prefix(matching.count - Self.maximumEndpointsPerSource)
+                .map(\.offset)
+            for offset in removable.sorted(by: >) {
+                endpoints.remove(at: offset)
+            }
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -135,6 +266,8 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
         case discoveryDomain
         case interfaceName
         case hasManualEndpoint
+        case endpoints
+        case legacyHostID
     }
 
     public init(from decoder: Decoder) throws {
@@ -147,7 +280,9 @@ public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {
             lastSeen: try container.decode(Date.self, forKey: .lastSeen),
             discoveryDomain: try container.decodeIfPresent(String.self, forKey: .discoveryDomain),
             interfaceName: try container.decodeIfPresent(String.self, forKey: .interfaceName),
-            hasManualEndpoint: try container.decodeIfPresent(Bool.self, forKey: .hasManualEndpoint) ?? false
+            hasManualEndpoint: try container.decodeIfPresent(Bool.self, forKey: .hasManualEndpoint) ?? false,
+            endpoints: try container.decodeIfPresent([LSPHostEndpoint].self, forKey: .endpoints) ?? [],
+            legacyHostID: try container.decodeIfPresent(String.self, forKey: .legacyHostID)
         )
     }
 
@@ -363,8 +498,15 @@ enum LSPPairingPersistenceTransaction {
         updatedTrust.records.removeAll { $0.hostID == trust.hostID }
         updatedTrust.records.append(trust)
         var updatedHosts = originalHosts
+        var mergedHost = host
+        if let prior = originalHosts.records.first(where: { $0.hostID == host.hostID }) {
+            // Re-pairing keeps every address the host was already reachable at.
+            for endpoint in prior.endpoints { mergedHost.upsert(endpoint) }
+            mergedHost.legacyHostID = host.legacyHostID ?? prior.legacyHostID
+            mergedHost.hasManualEndpoint = prior.hasManualEndpoint || host.hasManualEndpoint
+        }
         updatedHosts.records.removeAll { $0.hostID == host.hostID }
-        updatedHosts.records.append(host)
+        updatedHosts.records.append(mergedHost)
 
         try await trustStore.save(updatedTrust)
         do {

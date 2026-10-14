@@ -42,7 +42,8 @@ public enum LSPDiscovery {
             domain: service.domain,
             interfaceName: resolvedEndpoint.interfaceName,
             discoveryChangeToken: service.changeToken,
-            discoveryServiceID: service.id
+            discoveryServiceID: service.id,
+            legacyHostID: service.txtRecord["gs"].flatMap { UUID(uuidString: $0) }?.uuidString.lowercased()
         )
     }
 

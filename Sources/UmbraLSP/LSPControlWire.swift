@@ -38,6 +38,8 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case inputRateRequest = 0x0218
     case inputRateResponse = 0x0219
     case streamEnded = 0x0220
+    case clipboardUpdate = 0x0222
+    case clipboardUpdateResponse = 0x0223
     case pathProbe = 0x0300
     case pathProbeAck = 0x0301
     case objectChunk = 0x0400
@@ -602,6 +604,92 @@ public struct LSPTextInputRequest: Equatable, Sendable {
     public var precedingEdgeID: UInt64
     public var utf8Length: UInt16
     public var inlineUTF8: Data?
+    public var objectID: UUID?
+    public var sha256: Data?
+}
+
+/// Clipboard representations exchanged with a Lumen host.
+///
+/// On the wire this is a bundle of entries: a 1-byte kind (1 text, 2 HTML, 3 PNG),
+/// a 4-byte big-endian length, then the bytes. Text uses LF line endings.
+public struct LSPClipboardContent: Equatable, Sendable {
+    public var text: String?
+    public var html: String?
+    public var png: Data?
+
+    public init(text: String? = nil, html: String? = nil, png: Data? = nil) {
+        self.text = text
+        self.html = html
+        self.png = png
+    }
+
+    public var isEmpty: Bool {
+        (text ?? "").isEmpty && (html ?? "").isEmpty && (png ?? Data()).isEmpty
+    }
+
+    /// Encodes the non-empty representations as one bundle.
+    public func bundle() -> Data {
+        var bundle = Data()
+        func append(_ kind: UInt8, _ bytes: Data) {
+            guard !bytes.isEmpty else { return }
+            bundle.append(kind)
+            withUnsafeBytes(of: UInt32(bytes.count).bigEndian) { bundle.append(contentsOf: $0) }
+            bundle.append(bytes)
+        }
+        append(1, Data((text ?? "").utf8))
+        append(2, Data((html ?? "").utf8))
+        append(3, png ?? Data())
+        return bundle
+    }
+
+    private static let pngSignature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+    /// Decodes and validates one bundle; nil when malformed.
+    public init?(bundle: Data) {
+        let bytes = [UInt8](bundle)
+        guard !bytes.isEmpty, bytes.count <= LSPClipboardUpdate.maximumContentLength else { return nil }
+        var index = 0
+        var seen: Set<UInt8> = []
+        var content = LSPClipboardContent()
+        while index < bytes.count {
+            guard bytes.count - index >= 5 else { return nil }
+            let kind = bytes[index]
+            let size = Int(bytes[index + 1]) << 24 | Int(bytes[index + 2]) << 16 |
+                Int(bytes[index + 3]) << 8 | Int(bytes[index + 4])
+            index += 5
+            guard (1...3).contains(kind), !seen.contains(kind), size > 0, size <= bytes.count - index else {
+                return nil
+            }
+            seen.insert(kind)
+            let entry = Data(bytes[index..<(index + size)])
+            switch kind {
+            case 1:
+                guard let text = String(data: entry, encoding: .utf8) else { return nil }
+                content.text = text
+            case 2:
+                guard let html = String(data: entry, encoding: .utf8) else { return nil }
+                content.html = html
+            default:
+                guard entry.starts(with: Self.pngSignature) else { return nil }
+                content.png = entry
+            }
+            index += size
+        }
+        self = content
+    }
+}
+
+/// One session-bound clipboard bundle replacement sent by either peer.
+public struct LSPClipboardUpdate: Equatable, Sendable {
+    /// Largest clipboard bundle either peer transfers.
+    public static let maximumContentLength = 16 * 1_024 * 1_024
+    /// Largest clipboard bundle carried inline instead of through OBJECT_CHUNK.
+    public static let maximumInlineContentLength = 768
+
+    public var sessionID: UUID
+    public var sequence: UInt64
+    public var contentLength: UInt32
+    public var inlineContent: Data?
     public var objectID: UUID?
     public var sha256: Data?
 }
@@ -1349,6 +1437,93 @@ public enum LSPControlWire {
               try uint32(values[3], nonzero: true) == request.inputGeneration,
               try uint(values[4]) == request.precedingEdgeID else {
             throw DeterministicCBORError.malformed
+        }
+    }
+
+    public static func clipboardUpdate(_ update: LSPClipboardUpdate) throws -> Data {
+        try validateClipboardUpdate(update)
+        return try encodeMap([
+            .unsigned(1),
+            .bytes(uuidBytes(update.sessionID)),
+            .unsigned(update.sequence),
+            .unsigned(UInt64(update.contentLength)),
+            update.inlineContent.map { .bytes($0) } ?? .null,
+            update.objectID.map { .bytes(uuidBytes($0)) } ?? .null,
+            update.sha256.map { .bytes($0) } ?? .null,
+        ])
+    }
+
+    public static func clipboardUpdate(from event: LSPControlEvent) throws -> LSPClipboardUpdate {
+        guard event.messageType == LSPControlMessageType.clipboardUpdate.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 7)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        let update = LSPClipboardUpdate(
+            sessionID: try uuid(try bytes(values[1], count: 16)),
+            sequence: try uint(values[2]),
+            contentLength: try uint32(values[3], nonzero: true),
+            inlineContent: try nullableBytes(values[4]),
+            objectID: try nullableBytes(values[5]).map { try uuid(try bytes(.bytes($0), count: 16)) },
+            sha256: try nullableBytes(values[6]).map { try bytes(.bytes($0), count: 32) }
+        )
+        try validateClipboardUpdate(update)
+        return update
+    }
+
+    public static func clipboardUpdateResponse(update: LSPClipboardUpdate) throws -> Data {
+        try encodeMap([
+            .unsigned(1),
+            .unsigned(UInt64(LSPControlStatus.success.rawValue)),
+            .bytes(uuidBytes(update.sessionID)),
+            .unsigned(update.sequence),
+        ])
+    }
+
+    public static func requireClipboardUpdateResponse(
+        _ event: LSPControlEvent,
+        update: LSPClipboardUpdate
+    ) throws {
+        let values = try responseValues(event, type: .clipboardUpdateResponse, count: 4)
+        try requireSuccess(values[1])
+        guard try uuid(try bytes(values[2], count: 16)) == update.sessionID,
+              try uint(values[3]) == update.sequence else {
+            throw DeterministicCBORError.malformed
+        }
+    }
+
+    private static func nullableBytes(_ value: DeterministicCBORValue) throws -> Data? {
+        switch value {
+        case .null: nil
+        case .bytes(let data): data
+        default: throw DeterministicCBORError.malformed
+        }
+    }
+
+    private static func validateClipboardUpdate(_ update: LSPClipboardUpdate) throws {
+        let length = Int(update.contentLength)
+        guard update.sequence != 0,
+              length > 0,
+              length <= LSPClipboardUpdate.maximumContentLength else {
+            throw DeterministicCBORError.malformed
+        }
+        if let inline = update.inlineContent {
+            guard inline.count == length,
+                  length <= LSPClipboardUpdate.maximumInlineContentLength,
+                  update.objectID == nil,
+                  update.sha256 == nil,
+                  LSPClipboardContent(bundle: inline) != nil else {
+                throw DeterministicCBORError.malformed
+            }
+        } else {
+            guard length > LSPClipboardUpdate.maximumInlineContentLength,
+                  update.objectID != nil,
+                  let sha256 = update.sha256,
+                  sha256.count == 32,
+                  sha256.contains(where: { $0 != 0 }) else {
+                throw DeterministicCBORError.malformed
+            }
         }
     }
 

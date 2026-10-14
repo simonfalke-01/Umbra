@@ -702,6 +702,7 @@ private extension UmbraCLIParser {
                 case "stop": permissions.insert(.stopOwnStream)
                 case "quit": permissions.insert(.quitApplication)
                 case "controller-output": permissions.insert(.controllerOutput)
+                case "clipboard": permissions.insert(.clipboard)
                 default: return nil
                 }
             }

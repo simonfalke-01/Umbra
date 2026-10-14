@@ -15,6 +15,8 @@ public struct LSPDiscoveredPairingHost: Equatable, Sendable, Identifiable {
     public var interfaceName: String?
     public var discoveryChangeToken: UInt64
     public var discoveryServiceID: String
+    /// Lowercase GameStream unique ID the same host advertises, when present.
+    public var legacyHostID: String? = nil
 
     public var id: UUID { hostID }
 

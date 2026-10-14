@@ -430,6 +430,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var lspReconciliationRate: Int
     public var lspPairMicrophonePermission: Bool
     public var lspPairQuitPermission: Bool
+    public var lspClipboardSharing: Bool
     public var multiController: Bool
     public var enableMDNS: Bool
     public var quitAppAfter: Bool
@@ -490,6 +491,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         lspReconciliationRate: Int = 250,
         lspPairMicrophonePermission: Bool = false,
         lspPairQuitPermission: Bool = false,
+        lspClipboardSharing: Bool = true,
         multiController: Bool = true,
         enableMDNS: Bool = true,
         quitAppAfter: Bool = false,
@@ -561,6 +563,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.lspReconciliationRate = lspReconciliationRate
         self.lspPairMicrophonePermission = lspPairMicrophonePermission
         self.lspPairQuitPermission = lspPairQuitPermission
+        self.lspClipboardSharing = lspClipboardSharing
         self.multiController = multiController
         self.enableMDNS = enableMDNS
         self.quitAppAfter = quitAppAfter
@@ -621,6 +624,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case lspReconciliationRate
         case lspPairMicrophonePermission
         case lspPairQuitPermission
+        case lspClipboardSharing
         case multiController
         case enableMDNS
         case quitAppAfter
@@ -738,6 +742,10 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
                 Bool.self,
                 forKey: .lspPairQuitPermission
             ) ?? defaults.lspPairQuitPermission,
+            lspClipboardSharing: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .lspClipboardSharing
+            ) ?? defaults.lspClipboardSharing,
             multiController: try container.decodeIfPresent(Bool.self, forKey: .multiController) ?? defaults.multiController,
             enableMDNS: try container.decodeIfPresent(Bool.self, forKey: .enableMDNS) ?? defaults.enableMDNS,
             quitAppAfter: try container.decodeIfPresent(Bool.self, forKey: .quitAppAfter) ?? defaults.quitAppAfter,
