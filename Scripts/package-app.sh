@@ -330,6 +330,15 @@ if [[ "$configuration" == "release" ]]; then
 fi
 
 swift_build_args=(-c "$configuration")
+if [[ "$configuration" == "release" ]]; then
+    # Explicit module builds resolve COpus from every importing target, not only
+    # targets that carry the release include settings.
+    swift_build_args+=(
+        -Xcc "-I$release_prefix/include" -Xcc "-I$release_prefix/include/opus"
+        -Xswiftc -Xcc -Xswiftc "-I$release_prefix/include"
+        -Xswiftc -Xcc -Xswiftc "-I$release_prefix/include/opus"
+    )
+fi
 if [[ "$qualifying_build" == "1" ]]; then
     require_qualifying_identity
     swift_build_args+=(

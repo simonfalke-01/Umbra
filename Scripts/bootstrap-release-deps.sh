@@ -9,6 +9,17 @@ jobs="${UMBRA_BUILD_JOBS:-$(sysctl -n hw.logicalcpu)}"
 apple_clang="$(xcrun --find clang)"
 apple_clangxx="$(xcrun --find clang++)"
 macos_sdk="$(xcrun --sdk macosx --show-sdk-path)"
+# OpenSSL and libtool makefiles cannot quote toolchain paths, so an Xcode bundle
+# name with a space (for example "Xcode 27.0.app") is reached through a stable link.
+developer_dir="$(xcode-select -p)"
+if [[ "$developer_dir" == *" "* ]]; then
+    developer_link="$repository_root/.build/xcode-developer"
+    mkdir -p "${developer_link:h}"
+    ln -sfn "$developer_dir" "$developer_link"
+    apple_clang="${apple_clang/#$developer_dir/$developer_link}"
+    apple_clangxx="${apple_clangxx/#$developer_dir/$developer_link}"
+    macos_sdk="${macos_sdk/#$developer_dir/$developer_link}"
+fi
 expected_architecture="arm64"
 source_date_epoch="0"
 zero_ar_date="1"

@@ -1,7 +1,8 @@
 import Foundation
 import UmbraServices
 
-struct NVIDIAServerCompatibilityUpdater {
+// UserDefaults and URLSession are documented as thread-safe.
+struct NVIDIAServerCompatibilityUpdater: @unchecked Sendable {
     private static let storageKey = "Umbra.maximumSupportedNVIDIAVersion"
     private static let endpoint = URL(string: "https://moonlight-stream.org/compatibility/v1")!
 
