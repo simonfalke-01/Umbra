@@ -50,6 +50,7 @@ struct clsp_apple_input_capture {
   std::uint8_t capture_source {CLSP_DEVICE_CAPTURE_IOHID};  ///< Active pointer/keyboard adapter kind.
   std::array<bool, 256> keyboard {};  ///< Current keyboard-page usage state.
   std::array<bool, 6> pointer_buttons {};  ///< Pointer buttons one through five.
+  std::array<std::uint64_t, 6> hid_button_microseconds {};  ///< Latest non-trackpad IOHID edge per button.
   double pointer_x_remainder {};  ///< AppKit sub-integer relative X carried to the next event.
   double pointer_y_remainder {};  ///< AppKit sub-integer relative Y carried to the next event.
   double vertical_scroll_remainder {};  ///< AppKit sub-integer vertical scroll carried forward.
@@ -1024,6 +1025,23 @@ namespace {
   }
 
   /** @brief Receive one public IOHID value callback on the dedicated native queue. */
+
+  /**
+   * @brief Return whether one IOHID device is a trackpad.
+   *
+   * A trackpad reports every physical click as button one; macOS turns two-finger and
+   * corner clicks into secondary clicks only in its event system. Trackpad buttons are
+   * therefore taken from AppKit instead of raw IOHID.
+   */
+  [[nodiscard]] bool is_trackpad_device(IOHIDDeviceRef device) noexcept {
+    if (device == nullptr) return false;
+    if (IOHIDDeviceConformsTo(device, kHIDPage_Digitizer, kHIDUsage_Dig_TouchPad)) return true;
+    CFTypeRef product = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductKey));
+    if (product == nullptr || CFGetTypeID(product) != CFStringGetTypeID()) return false;
+    return CFStringFind(static_cast<CFStringRef>(product), CFSTR("Trackpad"), kCFCompareCaseInsensitive).location !=
+           kCFNotFound;
+  }
+
   void input_value_callback(
     void *context,
     const IOReturn result,
@@ -1060,6 +1078,11 @@ namespace {
       return;
     }
     if (page == kHIDPage_Button && usage > 0 && usage < capture->pointer_buttons.size()) {
+      if (is_trackpad_device(IOHIDElementGetDevice(element))) {
+        // AppKit supplies trackpad buttons with secondary-click interpretation applied.
+        return;
+      }
+      capture->hid_button_microseconds[usage] = timestamp;
       const auto pressed = integer != 0;
       if (capture->pointer_buttons[usage] == pressed) {
         return;
@@ -1225,6 +1248,57 @@ namespace {
     dispatch_sync(capture.queue, ^{
       for (GCController *controller in GCController.controllers) connect_controller(capture, controller);
     });
+  }
+
+  /**
+   * @brief Install an AppKit button monitor beside IOHID capture for trackpad clicks.
+   *
+   * Events are applied on the IOHID queue so button state has one owner. A button that a
+   * non-trackpad device just reported through IOHID is ignored here, so mouse clicks are
+   * never duplicated.
+   */
+  void install_iohid_button_monitor(clsp_apple_input_capture &capture) noexcept {
+    if (!NSThread.isMainThread) return;
+    capture.appkit_window = NSApp.keyWindow;
+    if (capture.appkit_window == nil || !capture.appkit_window.isKeyWindow) return;
+    auto *capture_pointer = &capture;
+    const NSEventMask mask = NSEventMaskLeftMouseDown |
+                             NSEventMaskLeftMouseUp |
+                             NSEventMaskRightMouseDown |
+                             NSEventMaskRightMouseUp |
+                             NSEventMaskOtherMouseDown |
+                             NSEventMaskOtherMouseUp;
+    capture.appkit_monitor = [NSEvent
+      addLocalMonitorForEventsMatchingMask:mask
+      handler:^NSEvent *(NSEvent *event) {
+        auto &owner = *capture_pointer;
+        if (event == nil || owner.appkit_window == nil || event.window != owner.appkit_window ||
+            !owner.appkit_window.isKeyWindow || !owner.active.load(std::memory_order_acquire)) {
+          return event;
+        }
+        const auto native_button = event.buttonNumber;
+        if (native_button < 0 || native_button >= 5) return event;
+        const auto button = static_cast<std::size_t>(native_button + 1);
+        const auto type = event.type;
+        const bool pressed = type == NSEventTypeLeftMouseDown || type == NSEventTypeRightMouseDown ||
+                             type == NSEventTypeOtherMouseDown;
+        const auto timestamp = appkit_timestamp(owner, event);
+        dispatch_async(owner.queue, ^{
+          auto &state = *capture_pointer;
+          if (!state.active.load(std::memory_order_acquire)) return;
+          const auto hid = state.hid_button_microseconds[button];
+          if (hid != 0 && (timestamp >= hid ? timestamp - hid : hid - timestamp) < 250'000U) return;
+          if (state.pointer_buttons[button] == pressed) return;
+          state.pointer_buttons[button] = pressed;
+          submit_edge(
+            state,
+            timestamp,
+            static_cast<std::uint16_t>(button),
+            pressed ? CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN : CLSP_INPUT_EDGE_POINTER_BUTTON_UP
+          );
+        });
+        return event;
+      }];
   }
 
   /** @brief Install the focused-window local monitor and disable mouse coalescing. */
@@ -1403,6 +1477,7 @@ extern "C" clsp_status_t clsp_core_start_apple_input_capture(
   IOHIDManagerActivate(capture->manager);
   capture->activated = true;
   install_controller_sources(*capture);
+  install_iohid_button_monitor(*capture);
   if (!clsp_core_register_apple_capture(core, capture)) {
     quiesce(*capture);
     clsp_core_release(core);
