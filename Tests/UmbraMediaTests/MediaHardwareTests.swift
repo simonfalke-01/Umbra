@@ -41,7 +41,7 @@ final class MediaHardwareTests: XCTestCase {
         XCTAssertEqual(
             limiter.snapshot.outstandingCount,
             5,
-            "This limiter bounds only Swift/VideoToolbox submissions; Moonlight has a separate queue."
+            "This limiter bounds only Swift/VideoToolbox submissions; GameStream has a separate queue."
         )
         limiter.stop()
     }

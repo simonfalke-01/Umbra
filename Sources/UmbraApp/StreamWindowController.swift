@@ -365,6 +365,10 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     var onControllerMouseModeChanged: ((Bool) -> Void)?
     var onTextCommit: ((String) -> Void)?
     var onStreamingWarning: ((String) -> Void)?
+    /// Mac-cursor pointer mode changed: (absolute motion, cursor over the video).
+    var onMacCursorModeChanged: ((Bool, Bool) -> Void)?
+    /// One absolute pointer sample: (timestamp µs, Q0.32 x, Q0.32 y).
+    var onAbsolutePointer: ((UInt64, UInt32, UInt32) -> Void)?
     var isStreamWindowVisible: Bool { window.isVisible }
     /// Exact stream window used for coarse native input-capture focus ownership.
     var inputCaptureWindow: NSWindow { window }
@@ -414,6 +418,13 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private var presentationRevealed = false
     private var activeSessionID: UUID?
     private var installedInputSink: (any PlatformInputPacketSink)?
+    private var hostCursor: LSPCursorState?
+    private var macCursorActive = false
+    private var macCursorInsideVideo = false
+    private var macCursor: NSCursor?
+    private var macCursorLocalMonitor: Any?
+    private var macCursorGlobalMonitor: Any?
+    private var macCursorSettleTask: Task<Void, Never>?
     private weak var returnApplicationWindow: NSWindow?
     nonisolated(unsafe) private var screenObservers: [NSObjectProtocol] = []
 
@@ -514,6 +525,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             }
             self.pointer.geometry.contentSize = size
             self.updatePointerCaptureRegion()
+            self.rebuildMacCursor()
         }
         keyboard.onShortcut = { [weak self] action in self?.handle(action) }
         pointer.onCaptureRequested = { [weak self] active in self?.setPointerCapture(active) }
@@ -581,22 +593,19 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             ),
             pointSize: screen.frame.size,
             safeAreaInsets: DisplayEdgeInsets(screen.safeAreaInsets),
-            excludingDisplayCutouts: preferences.displayResolutionPolicy == .nativeExcludingNotch
+            excludingDisplayCutouts: preferences.displayResolutionPolicy.excludesDisplayCutouts
         )
         let physicalSize = StreamDisplayGeometryPolicy.resolvedPixelSize(
             policy: preferences.displayResolutionPolicy,
             nativeGeometry: DisplayGeometry.nativeGeometry(for: displayID),
             fallback: fallbackPhysicalSize
         )
-        let scale = max(screen.backingScaleFactor, 1)
-        let logicalSize = CGSize(
-            width: physicalSize.width / scale,
-            height: physicalSize.height / scale
-        )
-
+        // Native means the panel's real pixels (3456x2234 on a 16" MacBook Pro),
+        // not the Retina point size, which halves both dimensions.
         var resolved = preferences
-        resolved.width = Self.evenPixelDimension(logicalSize.width)
-        resolved.height = Self.evenPixelDimension(logicalSize.height)
+        let divisor = CGFloat(preferences.displayResolutionPolicy.nativeDivisor)
+        resolved.width = Self.evenPixelDimension(physicalSize.width / divisor)
+        resolved.height = Self.evenPixelDimension(physicalSize.height / divisor)
         if resolved.autoAdjustBitrate {
             resolved.bitrateKbps = StreamingPreferences.defaultBitrateKbps(
                 width: resolved.width,
@@ -885,6 +894,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         lspProductTelemetry = nil
         lspNativeTimingTelemetry = nil
         setStatisticsVisible(false)
+        resetHostCursor()
         setPointerCapture(false)
         pointerCapture.handle(.focusChanged(false))
         systemShortcutCapture.update(windowFocused: false)
@@ -985,6 +995,18 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     func windowDidChangeBackingProperties(_ notification: Notification) {
         handleScreenEnvironmentChange()
+    }
+
+    /// With the Mac cursor the top edge belongs to the host (title bars, caption buttons); a
+    /// revealed menu bar would cover it and stop positions from reaching the host.
+    func window(
+        _ window: NSWindow,
+        willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions = []
+    ) -> NSApplication.PresentationOptions {
+        guard activePreferences?.useMacCursor == true else { return proposedOptions }
+        return proposedOptions
+            .subtracting([.autoHideMenuBar, .autoHideDock])
+            .union([.hideMenuBar, .hideDock])
     }
 
     func windowWillEnterFullScreen(_ notification: Notification) {
@@ -1288,6 +1310,220 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         pointerCapture.handle(.requestCapture(active))
         pointer.isCaptureActive = pointerCapture.machine.state.isCaptured
         updatePointerCaptureRegion()
+        updateMacCursorInsideVideo()
+    }
+
+    // MARK: Mac cursor
+
+    /// Applies the host cursor state of a stream that requested a client-drawn cursor. While the
+    /// host shows its cursor, the Mac cursor is drawn with the host's shape and sends absolute
+    /// positions; while a game hides it, input returns to relative raw capture.
+    func applyHostCursor(_ state: LSPCursorState) {
+        guard isSessionActive, activePreferences?.useMacCursor == true else { return }
+        if state.shape != hostCursor?.shape || state.systemCursor != hostCursor?.systemCursor {
+            hostCursor = state
+            rebuildMacCursor()
+        } else {
+            hostCursor = state
+        }
+        setMacCursorActive(state.visible)
+    }
+
+    private func resetHostCursor() {
+        hostCursor = nil
+        macCursor = nil
+        setMacCursorActive(false)
+    }
+
+    private func setMacCursorActive(_ active: Bool) {
+        guard active != macCursorActive else { return }
+        macCursorActive = active
+        let mode: PointerMode = active
+            ? .absolute
+            : StreamPresentationInputPolicy.pointerMode(absoluteMouseMode: activePreferences?.absoluteMouseMode ?? false)
+        pointer.preferences.mode = mode
+        pointerCapture.handle(.cursorVisibilityChanged(active))
+        pointerCapture.handle(.clientDrawnCursorChanged(active))
+        pointerCapture.handle(.pointerModeChanged(mode))
+        if active {
+            installMacCursorMonitors()
+        } else {
+            removeMacCursorMonitors()
+            macCursorInsideVideo = false
+        }
+        updateMacCursorInsideVideo()
+        onMacCursorModeChanged?(active, macCursorInsideVideo)
+        if active { sendCurrentMacCursorPosition() }
+    }
+
+    private func installMacCursorMonitors() {
+        let movement: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        macCursorLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: movement) { [weak self] event in
+            if let self, self.isStreamSurfaceWindow(event.window) { self.handleMacCursorMovement(event) }
+            return event
+        }
+        macCursorGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: movement) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateMacCursorInsideVideo() }
+        }
+    }
+
+    private func removeMacCursorMonitors() {
+        if let macCursorLocalMonitor { NSEvent.removeMonitor(macCursorLocalMonitor) }
+        if let macCursorGlobalMonitor { NSEvent.removeMonitor(macCursorGlobalMonitor) }
+        macCursorLocalMonitor = nil
+        macCursorGlobalMonitor = nil
+    }
+
+    private func handleMacCursorMovement(_ event: NSEvent) {
+        updateMacCursorInsideVideo()
+        guard macCursorInsideVideo else { return }
+        (macCursor ?? .arrow).set()
+        let seconds = event.timestamp > 0 ? event.timestamp : ProcessInfo.processInfo.systemUptime
+        submitAbsolutePointer(at: macCursorContentPoint(), seconds: seconds)
+        scheduleMacCursorSettle()
+    }
+
+    /// The host walks its pointer toward each position with relative input; repeat the final
+    /// position after the Mac cursor stops so the host pointer finishes exactly under it.
+    private func scheduleMacCursorSettle() {
+        macCursorSettleTask?.cancel()
+        macCursorSettleTask = Task { @MainActor [weak self] in
+            for delay in [20, 40, 60] {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled, let self, self.macCursorActive, self.macCursorInsideVideo else { return }
+                self.submitAbsolutePointer(at: self.macCursorContentPoint(), seconds: ProcessInfo.processInfo.systemUptime)
+            }
+        }
+    }
+
+    private func sendCurrentMacCursorPosition() {
+        guard macCursorInsideVideo else { return }
+        (macCursor ?? .arrow).set()
+        let point = macCursorContentPoint()
+        submitAbsolutePointer(at: point, seconds: ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// Maps a content-view point into the letterboxed video and sends it in Q0.32 coordinates.
+    private func submitAbsolutePointer(at point: CGPoint, seconds: TimeInterval) {
+        let rect = pointer.geometry.videoRect
+        guard rect.width > 0, rect.height > 0 else { return }
+        let x = (point.x - rect.minX) / rect.width
+        let y = contentView.isFlipped ? (point.y - rect.minY) / rect.height : (rect.maxY - point.y) / rect.height
+        func q32(_ value: CGFloat) -> UInt32 {
+            UInt32((min(max(Double(value), 0), 1) * Double(UInt32.max)).rounded())
+        }
+        onAbsolutePointer?(max(1, UInt64(seconds * 1_000_000)), q32(x), q32(y))
+    }
+
+
+    private func updateMacCursorInsideVideo() {
+        var inside = false
+        // Pointer capture belongs to relative mode; with the Mac cursor the stream owns the cursor
+        // whenever Umbra is active and the cursor is over the video.
+        if macCursorActive, NSApp.isActive, window.isKeyWindow {
+            // Edges count as inside: the screen edge is the video edge in fullscreen.
+            inside = pointer.geometry.videoRect.insetBy(dx: -1, dy: -1).contains(macCursorContentPoint())
+                && isStreamSurfaceWindow(NSApp.window(
+                    withWindowNumber: NSWindow.windowNumber(at: NSEvent.mouseLocation, belowWindowWithWindowNumber: 0)
+                ))
+        }
+        guard inside != macCursorInsideVideo else { return }
+        macCursorInsideVideo = inside
+        if !inside, macCursorActive { NSCursor.arrow.set() }
+        onMacCursorModeChanged?(macCursorActive, inside)
+    }
+
+    /// The Mac cursor in content-view coordinates, taken from the screen so events delivered to
+    /// the fullscreen titlebar window map the same way as events in the stream window.
+    private func macCursorContentPoint() -> CGPoint {
+        contentView.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+    }
+
+    /// Native fullscreen keeps an invisible titlebar window over the top of the stream; the
+    /// cursor there is still over the video.
+    private func isStreamSurfaceWindow(_ candidate: NSWindow?) -> Bool {
+        guard let candidate else { return false }
+        if candidate === window { return true }
+        return window.styleMask.contains(.fullScreen)
+            && candidate.screen === window.screen
+            && NSStringFromClass(type(of: candidate)).contains("FullScreen")
+    }
+
+    /// The macOS cursor matching a standard host cursor.
+    private static func nativeCursor(for cursor: LSPSystemCursor) -> NSCursor {
+        switch cursor {
+        case .arrow, .pin, .person: .arrow
+        case .iBeam: .iBeam
+        case .hand: .pointingHand
+        case .crosshair: .crosshair
+        case .resizeWestEast: .resizeLeftRight
+        case .resizeNorthSouth: .resizeUpDown
+        case .resizeNorthwestSoutheast: diagonalResizeCursor(topLeft: true, fallback: "_windowResizeNorthWestSouthEastCursor")
+        case .resizeNortheastSouthwest: diagonalResizeCursor(topLeft: false, fallback: "_windowResizeNorthEastSouthWestCursor")
+        case .move: privateCursor("_moveCursor") ?? .openHand
+        case .notAllowed: .operationNotAllowed
+        case .help: privateCursor("_helpCursor") ?? .arrow
+        case .upArrow: .resizeUp
+        case .wait: privateCursor("_waitCursor") ?? .arrow
+        case .appStarting: privateCursor("busyButClickableCursor") ?? .arrow
+        }
+    }
+
+    private static func diagonalResizeCursor(topLeft: Bool, fallback: String) -> NSCursor {
+        if #available(macOS 15, *) {
+            return .frameResize(position: topLeft ? .topLeft : .topRight, directions: .all)
+        }
+        return privateCursor(fallback) ?? .crosshair
+    }
+
+    /// AppKit's own cursors that have no public accessor (busy, move, help).
+    private static func privateCursor(_ selector: String) -> NSCursor? {
+        let selector = NSSelectorFromString(selector)
+        guard NSCursor.responds(to: selector) else { return nil }
+        return NSCursor.perform(selector)?.takeUnretainedValue() as? NSCursor
+    }
+
+    /// Builds the Mac cursor from the host shape at the size it has in the displayed video.
+    private func rebuildMacCursor() {
+        if let systemCursor = hostCursor?.systemCursor {
+            macCursor = Self.nativeCursor(for: systemCursor)
+            if macCursorInsideVideo { macCursor?.set() }
+            return
+        }
+        guard let shape = hostCursor?.shape else {
+            macCursor = nil
+            return
+        }
+        let videoRect = pointer.geometry.videoRect
+        let scale = videoRect.width > 0 && contentView.videoSize.width > 0
+            ? videoRect.width / contentView.videoSize.width
+            : 1
+        let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: shape.width,
+            pixelsHigh: shape.height,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: shape.width * 4,
+            bitsPerPixel: 32
+        )
+        guard let bitmap, let pixels = bitmap.bitmapData else {
+            macCursor = nil
+            return
+        }
+        shape.rgba.copyBytes(to: pixels, count: shape.width * shape.height * 4)
+        let size = NSSize(width: CGFloat(shape.width) * scale, height: CGFloat(shape.height) * scale)
+        bitmap.size = size
+        let image = NSImage(size: size)
+        image.addRepresentation(bitmap)
+        macCursor = NSCursor(
+            image: image,
+            hotSpot: NSPoint(x: CGFloat(shape.hotspotX) * scale, y: CGFloat(shape.hotspotY) * scale)
+        )
+        if macCursorInsideVideo { macCursor?.set() }
     }
 
     private func applyInputPresentation(_ presentation: WindowPresentation) {
@@ -1992,7 +2228,7 @@ enum StreamDisplayGeometryPolicy {
         fallback: CGSize
     ) -> CGSize {
         guard let nativeGeometry else { return fallback }
-        return policy == .nativeExcludingNotch
+        return policy.excludesDisplayCutouts
             ? nativeGeometry.safePixelSize
             : nativeGeometry.fullPixelSize
     }
@@ -2003,11 +2239,11 @@ enum StreamDisplayGeometryPolicy {
         nativeGeometry: NativeDisplayGeometry?
     ) -> BorderlessFullscreenGeometry {
         guard let nativeGeometry, nativeGeometry.hasDisplayCutout else {
-            return policy == .nativeExcludingNotch ? .safeArea : .fullDisplay
+            return policy.excludesDisplayCutouts ? .safeArea : .fullDisplay
         }
-        if requestedSize == nativeGeometry.safePixelSize { return .safeArea }
-        if requestedSize == nativeGeometry.fullPixelSize { return .fullDisplay }
-        return policy == .nativeExcludingNotch ? .safeArea : .fullDisplay
+        if matchesShape(requestedSize, nativeGeometry.safePixelSize) { return .safeArea }
+        if matchesShape(requestedSize, nativeGeometry.fullPixelSize) { return .fullDisplay }
+        return policy.excludesDisplayCutouts ? .safeArea : .fullDisplay
     }
 
     static func usesNativeFullscreenSafeArea(
@@ -2015,7 +2251,14 @@ enum StreamDisplayGeometryPolicy {
         nativeGeometry: NativeDisplayGeometry?
     ) -> Bool {
         guard let nativeGeometry, nativeGeometry.hasDisplayCutout else { return false }
-        return requestedSize == nativeGeometry.safePixelSize
+        return matchesShape(requestedSize, nativeGeometry.safePixelSize)
+            && !matchesShape(requestedSize, nativeGeometry.fullPixelSize)
+    }
+
+    /// Whether a stream size has a display area's shape, so scaled native sizes (½) map the same way.
+    private static func matchesShape(_ size: CGSize, _ area: CGSize) -> Bool {
+        guard size.height > 0, area.height > 0 else { return false }
+        return abs(size.width / size.height - area.width / area.height) < 0.002
     }
 }
 

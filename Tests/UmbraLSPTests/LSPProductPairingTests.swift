@@ -172,8 +172,10 @@ final class LSPProductPairingTests: XCTestCase {
             return XCTFail("Matching host ID and SPKI must refresh the endpoint")
         }
         XCTAssertEqual(saved.name, "Saved Name")
-        XCTAssertEqual(saved.address, "new-target.local")
-        XCTAssertEqual(saved.port, 49_999)
+        // The advertised address joins the saved ones; the preferred address only changes
+        // after a connection to it succeeds.
+        XCTAssertEqual(saved.address, "old-target.local")
+        XCTAssertTrue(saved.endpoints.contains { $0.address == "new-target.local" && $0.port == 49_999 })
 
         var changedIdentity = refreshed
         var stagedTrust = trust
@@ -194,7 +196,7 @@ final class LSPProductPairingTests: XCTestCase {
         XCTAssertEqual(expected, original.serverSPKISHA256)
         XCTAssertEqual(advertised, changedIdentity.serverSPKISHA256)
         let persistedHosts = try await fixture.stores.hosts.load()
-        XCTAssertEqual(persistedHosts.records.first?.address, "new-target.local")
+        XCTAssertTrue(persistedHosts.records.first?.endpoints.contains { $0.address == "new-target.local" } == true)
     }
 
     func testManualEndpointPersistsAndCannotBeOverwrittenByPairedDiscovery() async throws {
@@ -231,8 +233,6 @@ final class LSPProductPairingTests: XCTestCase {
         XCTAssertEqual(manual.name, original.name)
         XCTAssertEqual(manual.address, "2001:db8::1234")
         XCTAssertEqual(manual.port, 51_234)
-        XCTAssertNil(manual.discoveryDomain)
-        XCTAssertNil(manual.interfaceName)
         XCTAssertTrue(manual.hasManualEndpoint)
         let unchangedTrust = try await fixture.stores.trust.load()
         XCTAssertEqual(unchangedTrust, LSPTrustSnapshot(records: [trust]))
@@ -246,13 +246,12 @@ final class LSPProductPairingTests: XCTestCase {
         }
         XCTAssertEqual(refreshed.address, manual.address)
         XCTAssertEqual(refreshed.port, manual.port)
-        XCTAssertNil(refreshed.interfaceName)
         XCTAssertTrue(refreshed.hasManualEndpoint)
+        XCTAssertTrue(refreshed.endpoints.contains { $0.address == "new-private-target.local" && $0.port == 49_999 })
         let persistedSnapshot = try await fixture.stores.hosts.load()
         let persisted = persistedSnapshot.records.first
         XCTAssertEqual(persisted?.address, manual.address)
         XCTAssertEqual(persisted?.port, manual.port)
-        XCTAssertNil(persisted?.interfaceName)
         XCTAssertTrue(persisted?.hasManualEndpoint == true)
     }
 

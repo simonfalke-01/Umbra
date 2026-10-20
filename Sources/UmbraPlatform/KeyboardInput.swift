@@ -28,8 +28,8 @@ public struct StreamingShortcutBinding: Equatable, Sendable {
         self.enabled = enabled
     }
 
-    /// Moonlight-compatible Ctrl+Option+Shift shortcut defaults.
-    public static let moonlightDefaults: [Self] = [
+    /// GameStream-compatible Ctrl+Option+Shift shortcut defaults.
+    public static let gameStreamDefaults: [Self] = [
         .init(action: .quitStream, character: "q", physicalKeyCode: 12),
         .init(action: .toggleInputCapture, character: "z", physicalKeyCode: 6),
         .init(action: .toggleFullscreen, character: "x", physicalKeyCode: 7),
@@ -47,7 +47,7 @@ public struct StreamingShortcutBinding: Equatable, Sendable {
 public struct ShortcutChordDetector: Sendable {
     public var bindings: [StreamingShortcutBinding]
 
-    public init(bindings: [StreamingShortcutBinding] = StreamingShortcutBinding.moonlightDefaults) {
+    public init(bindings: [StreamingShortcutBinding] = StreamingShortcutBinding.gameStreamDefaults) {
         self.bindings = bindings
     }
 
@@ -62,7 +62,7 @@ public struct ShortcutChordDetector: Sendable {
         else { return nil }
 
         // Match the character first for Latin layouts, then the physical position.
-        // This mirrors Moonlight and prevents a character match from colliding with
+        // This mirrors GameStream and prevents a character match from colliding with
         // another shortcut's physical key on non-QWERTY layouts.
         if let character {
             let folded = Character(String(character).lowercased())
@@ -126,7 +126,7 @@ public struct MacKeyboardTranslator: Sendable {
             return .shortcut(shortcut)
         }
 
-        // Moonlight intentionally discards repeat-down events. The host owns repeat.
+        // GameStream intentionally discards repeat-down events. The host owns repeat.
         guard !event.isRepeat else { return .ignored }
         guard let mapping = Self.keyMapping(
             forMacKeyCode: event.keyCode,
@@ -178,7 +178,7 @@ public struct MacKeyboardTranslator: Sendable {
         )
     }
 
-    /// Maps macOS hardware positions to the Windows VK values used by Moonlight.
+    /// Maps macOS hardware positions to the Windows VK values used by GameStream.
     public static func windowsVirtualKey(forMacKeyCode code: UInt16) -> UInt16? {
         keyMap[code]
     }
@@ -248,7 +248,7 @@ public struct MacKeyboardTranslator: Sendable {
         84: 0x62, 85: 0x63, 86: 0x64, 87: 0x65, 88: 0x66,
         89: 0x67, 91: 0x68, 92: 0x69, 95: 0x6C,
 
-        // JIS layout keys. Yen and underscore carry Sunshine's non-normalized
+        // JIS layout keys. Yen and underscore carry the host's non-normalized
         // flag so the host doesn't rewrite these physical positions.
         93: 0xDC, 94: 0xE2, 102: 0x1D, 104: 0x1C,
 

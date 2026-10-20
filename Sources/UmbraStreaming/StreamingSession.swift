@@ -1,4 +1,4 @@
-import CMoonlightBridge
+import CGameStreamProtocol
 import Foundation
 
 public enum StreamingError: Error, Sendable, Equatable {
@@ -157,7 +157,7 @@ public struct StreamingConfiguration: Sendable, Equatable {
     /// Exact Lumen fidelity request; `.unspecified` preserves legacy ANNOUNCE bytes.
     public var rtspFidelityMode: StreamingFidelityMode
 
-    /// Local moonlight-common-c input pacing policy.
+    /// Local GameStream input pacing policy.
     public var inputOptimizationMode: StreamingOptimizationMode
 
     public init(
@@ -333,7 +333,7 @@ final class SynchronousStreamingInputChannel: @unchecked Sendable {
     }
 }
 
-/// Actor-isolated control plane for the global Moonlight connection.
+/// Actor-isolated control plane for the global GameStream connection.
 /// Media callbacks never hop through the actor; supplied decoders must be thread-safe.
 public actor StreamingSession {
     private var handle: BridgeHandle?
@@ -948,7 +948,7 @@ private func bridgeAudioPacketCallback(_ pointer: UnsafeMutableRawPointer?, _ pa
 
 #if DEBUG
 /// Test-only driver for the synchronous C callback boundary. It exercises the
-/// same callback functions used by moonlight-common-c without opening a socket.
+/// same callback functions used by the GameStream protocol library without opening a socket.
 final class StreamingCallbackTestHarness: @unchecked Sendable {
     private let retainedContext: Unmanaged<CallbackContext>
     private(set) var lastVideoFrameAllocationAddress: UInt?

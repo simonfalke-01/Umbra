@@ -411,8 +411,8 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         var lastError: VideoDecoderError?
         var statistics = MediaStatisticsAccumulator()
         var latencyStatistics = VideoLatencyStatisticsAccumulator()
-        var moonlightClockMapping = VideoLatencyClockMapping(
-            sourceDomain: .moonlightClientUptime,
+        var gameStreamClockMapping = VideoLatencyClockMapping(
+            sourceDomain: .gameStreamClientUptime,
             destinationDomain: .clientMediaTime
         )
     }
@@ -572,7 +572,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             state.lastError = nil
             state.statistics.reset()
             state.latencyStatistics.reset()
-            state.moonlightClockMapping.reset()
+            state.gameStreamClockMapping.reset()
             inFlightLimiter.reset(generation: resetGeneration)
             lock.unlock()
         }
@@ -754,8 +754,8 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             lock.unlock()
             return .accepted
         }
-        if let enqueueTime = Self.moonlightTimestamp(frame.enqueueTimeMicroseconds) {
-            state.moonlightClockMapping.observe(
+        if let enqueueTime = Self.gameStreamTimestamp(frame.enqueueTimeMicroseconds) {
+            state.gameStreamClockMapping.observe(
                 source: enqueueTime,
                 destination: decoderIngressTime
             )
@@ -885,7 +885,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
               let format = state.format,
               let profile = state.profile else {
             lock.unlock()
-            completeOutstandingFrame(error: .notRunning, generation: generation)
+            completeOutstandingFrame(error: .notRunning, generation: generation, frameNumber: frame.frameNumber)
             return false
         }
         lock.unlock()
@@ -944,7 +944,7 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
                 guard frame.payloadFormat != .videoToolboxLengthPrefixed else {
                     throw VideoDecoderError.invalidAccessUnit
                 }
-                // Moonlight's AV1 depacketizer produces low-overhead OBU access units.
+                // the client's AV1 depacketizer produces low-overhead OBU access units.
                 // VideoToolbox also requires an av1C record derived from the sequence-header OBU.
                 lock.lock()
                 let hasSession = state.session != nil
@@ -998,10 +998,10 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             )
             return true
         } catch let error as VideoDecoderError {
-            completeOutstandingFrame(error: error, generation: generation)
+            completeOutstandingFrame(error: error, generation: generation, frameNumber: frame.frameNumber)
             return false
         } catch {
-            completeOutstandingFrame(error: .invalidAccessUnit, generation: generation)
+            completeOutstandingFrame(error: .invalidAccessUnit, generation: generation, frameNumber: frame.frameNumber)
             return false
         }
     }
@@ -1052,11 +1052,11 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         let sessionGeneration = state.sessionGeneration
         let hdrStaticMetadata = state.hdrStaticMetadata
         let hdrModeEnabled = state.hdrModeEnabled
-        let receiveTime = Self.moonlightTimestamp(frame.receiveTimeMicroseconds)
-            .flatMap(state.moonlightClockMapping.map)
-        let reassemblyEnqueueTime = Self.moonlightTimestamp(frame.enqueueTimeMicroseconds)
-            .flatMap(state.moonlightClockMapping.map)
-        let receiveClockCalibration = state.moonlightClockMapping.evidence
+        let receiveTime = Self.gameStreamTimestamp(frame.receiveTimeMicroseconds)
+            .flatMap(state.gameStreamClockMapping.map)
+        let reassemblyEnqueueTime = Self.gameStreamTimestamp(frame.enqueueTimeMicroseconds)
+            .flatMap(state.gameStreamClockMapping.map)
+        let receiveClockCalibration = state.gameStreamClockMapping.evidence
         lock.unlock()
 
         let duration = format.redrawRate > 0
@@ -1224,6 +1224,9 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
             AppleStreamingCapabilities.recordHardwareYUV444Proof(formatMask: profile.rawValue)
         }
         VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        // Power-efficient decoding lets the media engine clock down between frames, which shows up
+        // as multi-millisecond decode spikes at the tail.
+        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_MaximizePowerEfficiency, value: kCFBooleanFalse)
         lock.lock()
         state.sessionGeneration &+= 1
         state.session = session
@@ -1289,10 +1292,14 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         }
         guard let outstandingDepth = inFlightLimiter.release(
             generation: context.decodeGeneration
-        ) else { return }
+        ) else {
+            reportFailedOutcome(frameNumber: context.frameNumber)
+            return
+        }
         lock.lock()
         guard state.running, state.decodeGeneration == context.decodeGeneration else {
             lock.unlock()
+            reportFailedOutcome(frameNumber: context.frameNumber)
             return
         }
         state.statistics.record(.queueDepth(outstandingDepth), at: now)
@@ -1362,11 +1369,11 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         lock.withLock { decodeOutcomeHandler }?(.decoded(frameNumber: context.frameNumber))
     }
 
-    private static func moonlightTimestamp(_ microseconds: UInt64) -> VideoLatencyTimestamp? {
+    private static func gameStreamTimestamp(_ microseconds: UInt64) -> VideoLatencyTimestamp? {
         guard microseconds > 0 else { return nil }
         return VideoLatencyTimestamp(
             seconds: Double(microseconds) / 1_000_000,
-            clockDomain: .moonlightClientUptime
+            clockDomain: .gameStreamClientUptime
         )
     }
 
@@ -1376,6 +1383,9 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         frameNumber: Int? = nil,
         at time: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
+        // Every admitted frame owns one consumer slot; report it even when the
+        // lifecycle moved on, or the consumer leaks that slot permanently.
+        defer { reportFailedOutcome(frameNumber: frameNumber) }
         lock.lock()
         let failureGeneration = generation ?? state.decodeGeneration
         lock.unlock()
@@ -1394,15 +1404,19 @@ public final class VideoToolboxDecoder: VideoDecoding, VideoCodecInitializationP
         state.statistics.record(.queueDepth(outstandingDepth), at: time)
         lock.unlock()
         errorHandler(error)
-        if let frameNumber {
-            lock.withLock { decodeOutcomeHandler }?(.failed(frameNumber: frameNumber))
-        }
+    }
+
+    private func reportFailedOutcome(frameNumber: Int?) {
+        guard let frameNumber else { return }
+        lock.withLock { decodeOutcomeHandler }?(.failed(frameNumber: frameNumber))
     }
 
     private func completeOutstandingFrame(
         error: VideoDecoderError,
-        generation: UInt64
+        generation: UInt64,
+        frameNumber: Int
     ) {
+        defer { reportFailedOutcome(frameNumber: frameNumber) }
         let now = ProcessInfo.processInfo.systemUptime
         guard let outstandingDepth = inFlightLimiter.release(
             generation: generation

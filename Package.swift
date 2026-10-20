@@ -165,9 +165,9 @@ let package = Package(
             path: "Sources/UmbraLSP"
         ),
         .target(
-            name: "CMoonlightBridge",
+            name: "CGameStreamProtocol",
             dependencies: ["COpenSSL"],
-            path: "Vendor/MoonlightCommon",
+            path: "Vendor/GameStreamProtocol",
             sources: [
                 "Facade/src/UmbraClientMicrophoneRTSPExtension.c",
                 "Facade/src/UmbraOptimizationModeRTSPExtension.c",
@@ -199,7 +199,7 @@ let package = Package(
         ),
         .target(
             name: "UmbraStreaming",
-            dependencies: ["CMoonlightBridge"],
+            dependencies: ["CGameStreamProtocol"],
             path: "Sources/UmbraStreaming"
         ),
         .target(

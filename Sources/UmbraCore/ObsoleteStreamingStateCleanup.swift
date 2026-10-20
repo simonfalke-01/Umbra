@@ -1,6 +1,6 @@
 import Foundation
 
-/// Removes the retired native-streaming state without touching Moonlight-compatible state.
+/// Removes the retired native-streaming state without touching GameStream-compatible state.
 public enum ObsoleteStreamingStateCleanup {
     private static let markerName = ".obsolete-stream-state-cleanup-v1"
     private static let exactNames: Set<String> = [

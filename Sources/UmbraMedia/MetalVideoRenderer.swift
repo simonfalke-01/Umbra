@@ -3,6 +3,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import OSLog
 import QuartzCore
 import simd
 
@@ -57,6 +58,7 @@ private final class MetalRenderRunLoopExecutor: @unchecked Sendable {
     init() {
         let context = context
         thread = Thread {
+            Self.promoteCurrentThreadToRealTime()
             let runLoop = RunLoop.current
             let keepAlivePort = Port()
             runLoop.add(keepAlivePort, forMode: .common)
@@ -71,6 +73,34 @@ private final class MetalRenderRunLoopExecutor: @unchecked Sendable {
         thread.qualityOfService = .userInteractive
         thread.start()
         context.ready.wait()
+    }
+
+    /// A time-shared thread can be descheduled for many milliseconds under load, which shows up as
+    /// render-queue spikes. A Mach real-time constraint keeps presentation ahead of ordinary work;
+    /// the kernel demotes the thread if it ever overruns its budget.
+    private static func promoteCurrentThreadToRealTime() {
+        var timebase = mach_timebase_info_data_t()
+        guard mach_timebase_info(&timebase) == KERN_SUCCESS, timebase.numer != 0 else { return }
+        func ticks(_ nanoseconds: UInt64) -> UInt32 {
+            UInt32(nanoseconds * UInt64(timebase.denom) / UInt64(timebase.numer))
+        }
+        var policy = thread_time_constraint_policy_data_t(
+            period: 0,
+            computation: ticks(1_000_000),
+            constraint: ticks(2_000_000),
+            preemptible: 1
+        )
+        let count = MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size
+        _ = withUnsafeMutablePointer(to: &policy) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: count) {
+                thread_policy_set(
+                    pthread_mach_thread_np(pthread_self()),
+                    thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY),
+                    $0,
+                    mach_msg_type_number_t(count)
+                )
+            }
+        }
     }
 
     func perform(_ work: @escaping @Sendable () -> Void) {
@@ -192,6 +222,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         var reportedFirstMetalCommit = false
         var lastError: MetalRendererError?
         var dropsNewestWhenMailboxFull = false
+        var diagnosticEnqueuedFrames = 0
     }
 
     private let layer: CAMetalLayer
@@ -209,6 +240,8 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     private var rgbPipelines: [MTLPixelFormat: any MTLRenderPipelineState] = [:]
     private var appliedLayerConfiguration: LayerConfiguration?
     private var displayLink: CAMetalDisplayLink?
+    /// Per-second presentation diagnostics; touched only on the render executor.
+    private var presentationDiagnostics = PresentationDiagnostics()
     private var displayLinkGeneration: UInt64?
     private var firstMetalCommitHandler: @Sendable (Int) -> Void = { _ in }
     private var commandCommitHandler: @Sendable (Int) -> Void = { _ in }
@@ -277,7 +310,9 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         super.init()
         layer.device = device
         layer.framebufferOnly = true
-        layer.maximumDrawableCount = 2
+        // Frames present immediately and the newest always wins, so a third drawable adds no
+        // queueing; with two, nextDrawable blocks up to a refresh while the compositor holds both.
+        layer.maximumDrawableCount = 3
         layer.allowsNextDrawableTimeout = true
         layer.presentsWithTransaction = false
         layer.displaySyncEnabled = presentationActive && configuration.verticalSyncEnabled
@@ -349,6 +384,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         state.configuration = configuration
         state.usesDisplayLink = shouldUseDisplayLink
         if configurationChanged {
+            renderDiagnosticsLog.notice("display configuration changed vsync=\(configuration.verticalSyncEnabled) displayLink=\(shouldUseDisplayLink)")
             advancePresentationGenerationLocked()
             updateDesiredLayerConfigurationLocked()
         }
@@ -379,6 +415,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             framesPerSecond: configuration.nominalFramesPerSecond,
             displayRefreshRate: configuration.displayRefreshRate
         )
+        renderDiagnosticsLog.notice("pacing fps=\(configuration.nominalFramesPerSecond) refresh=\(configuration.displayRefreshRate) adaptiveWait=\(adaptiveMailboxWaitEnabled)")
         lock.signal()
         lock.unlock()
         renderExecutor.perform { [weak self] in
@@ -392,6 +429,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             lock.unlock()
             return
         }
+        renderDiagnosticsLog.notice("presentation active=\(active)")
         state.isPresentationActive = active
         state.usesDisplayLink = active
             && state.configuration.verticalSyncEnabled
@@ -431,6 +469,9 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         )
         lock.unlock()
         displayLink.preferredFrameRateRange = frameRateRange
+        renderDiagnosticsLog.notice(
+            "display link installed generation=\(expectedGeneration) fps=\(frameRateRange.minimum)-\(frameRateRange.maximum) preferred=\(String(describing: frameRateRange.preferred))"
+        )
         displayLink.delegate = self
         displayLink.add(to: .current, forMode: .common)
         self.displayLink = displayLink
@@ -497,6 +538,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             evictedFrameNumber = state.frames.removeFirst().frame.frameNumber
             state.statistics.record(.dropped(.queueOverflow), at: now)
         }
+        state.diagnosticEnqueuedFrames += 1
         state.frames.append(QueuedMetalFrame(
             frame: timedFrame,
             latencyGeneration: state.latencyGeneration.stamp,
@@ -587,6 +629,16 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         let shouldDrain = armDrainIfNeededLocked()
         let configuration = state.configuration
         lock.unlock()
+        presentationDiagnostics.recordCallback(at: now)
+        presentationDiagnostics.staleFrames += staleFrameCount
+        presentationDiagnostics.presentedFrames += 1
+        defer {
+            presentationDiagnostics.maximumEncode = max(
+                presentationDiagnostics.maximumEncode,
+                CACurrentMediaTime() - now
+            )
+            flushPresentationDiagnostics(now: CACurrentMediaTime())
+        }
 
         do {
             guard prepareImmediateLayerConfiguration(for: queuedFrame) else {
@@ -654,8 +706,16 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         #endif
         guard accepts(queuedFrame),
               layer.drawableSize.width > 0,
-              layer.drawableSize.height > 0,
-              let drawable = suppliedDrawable ?? layer.nextDrawable() else { return }
+              layer.drawableSize.height > 0 else { return }
+        let drawableRequestedAt = CACurrentMediaTime()
+        let acquiredDrawable = suppliedDrawable ?? layer.nextDrawable()
+        if suppliedDrawable == nil {
+            let wait = CACurrentMediaTime() - drawableRequestedAt
+            presentationDiagnostics.maximumDrawableWait = max(presentationDiagnostics.maximumDrawableWait, wait)
+            if wait > 0.004 { presentationDiagnostics.slowDrawableWaits += 1 }
+            if acquiredDrawable == nil { presentationDiagnostics.missingDrawables += 1 }
+        }
+        guard let drawable = acquiredDrawable else { return }
         guard accepts(queuedFrame),
               let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw MetalRendererError.commandQueueUnavailable
@@ -834,6 +894,8 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         needsUpdate update: CAMetalDisplayLink.Update
     ) {
         let now = CACurrentMediaTime()
+        presentationDiagnostics.recordCallback(at: now)
+        defer { flushPresentationDiagnostics(now: now) }
         lock.lock()
         guard state.isPresentationActive,
               state.usesDisplayLink,
@@ -845,6 +907,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         if let desiredLayerConfiguration = state.desiredLayerConfiguration,
            desiredLayerConfiguration != appliedLayerConfiguration {
             lock.unlock()
+            presentationDiagnostics.layerReconfigurations += 1
             configureLayerOnExecutor(desiredLayerConfiguration)
             return
         }
@@ -872,10 +935,12 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             return
         }
         guard let queuedFrame = state.frames.popLast() else {
+            presentationDiagnostics.emptyCallbacks += 1
             lock.unlock()
             return
         }
         let staleFrameCount = state.frames.count
+        presentationDiagnostics.staleFrames += staleFrameCount
         state.frames.removeAll(keepingCapacity: true)
         for _ in 0..<staleFrameCount {
             state.statistics.record(.dropped(.queueOverflow), at: now)
@@ -883,6 +948,13 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         state.statistics.record(.queueDepth(0), at: now)
         let configuration = state.configuration
         lock.unlock()
+        presentationDiagnostics.presentedFrames += 1
+        defer {
+            presentationDiagnostics.maximumEncode = max(
+                presentationDiagnostics.maximumEncode,
+                CACurrentMediaTime() - now
+            )
+        }
 
         do {
             let presentationTimestamp = Self.displayLinkPresentationProxyTimestamp(
@@ -915,6 +987,20 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             }
             lock.unlock()
         }
+    }
+
+    private func flushPresentationDiagnostics(now: CFTimeInterval) {
+        guard now - presentationDiagnostics.windowStart >= 1 else { return }
+        lock.lock()
+        let arrived = state.diagnosticEnqueuedFrames
+        state.diagnosticEnqueuedFrames = 0
+        let generation = state.presentationGeneration
+        lock.unlock()
+        let d = presentationDiagnostics
+        renderDiagnosticsLog.notice(
+            "present window=\(Int((now - d.windowStart) * 1000))ms arrived=\(arrived) callbacks=\(d.callbacks) presented=\(d.presentedFrames) empty=\(d.emptyCallbacks) stale=\(d.staleFrames) drawableWaitMaxMs=\(Int(d.maximumDrawableWait * 1000)) slowDrawableWaits=\(d.slowDrawableWaits) missingDrawables=\(d.missingDrawables) layerReconfig=\(d.layerReconfigurations) maxGapMs=\(Int(d.maximumGap * 1000)) maxEncodeMs=\(Int(d.maximumEncode * 1000)) generation=\(generation)"
+        )
+        presentationDiagnostics = PresentationDiagnostics(windowStart: now, lastCallback: now)
     }
 
     private func prepareImmediateLayerConfiguration(for queuedFrame: QueuedMetalFrame) -> Bool {
@@ -1246,4 +1332,28 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         return colorTexture.sample(sampleFilter, in.textureCoordinate);
     }
     """
+}
+
+private let renderDiagnosticsLog = Logger(subsystem: "app.umbra.Umbra", category: "render-diagnostics")
+
+/// Rolling one-second presentation counters used to diagnose stream stutter.
+private struct PresentationDiagnostics {
+    var windowStart: CFTimeInterval = CACurrentMediaTime()
+    var lastCallback: CFTimeInterval?
+    var callbacks = 0
+    var presentedFrames = 0
+    var emptyCallbacks = 0
+    var staleFrames = 0
+    var layerReconfigurations = 0
+    var maximumGap: CFTimeInterval = 0
+    var maximumEncode: CFTimeInterval = 0
+    var maximumDrawableWait: CFTimeInterval = 0
+    var slowDrawableWaits = 0
+    var missingDrawables = 0
+
+    mutating func recordCallback(at now: CFTimeInterval) {
+        callbacks += 1
+        if let lastCallback { maximumGap = max(maximumGap, now - lastCallback) }
+        lastCallback = now
+    }
 }

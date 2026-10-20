@@ -10,12 +10,23 @@ enum UmbraLayout {
     static let space8: CGFloat = 32
     static let space12: CGFloat = 48
 
-    static let compactControl: CGFloat = 32
+    static let compactControl: CGFloat = 24
     static let control: CGFloat = 38
-    static let applicationTileWidth: CGFloat = 168
-    static let artworkAspectRatio: CGFloat = 3.0 / 4.0
     static let cornerSmall: CGFloat = 6
     static let cornerMedium: CGFloat = 8
+    /// Application icon tiles use the macOS app-icon radius ratio.
+    static let cornerIcon: CGFloat = 14
+
+    static let hostRowHeight: CGFloat = 40
+    static let disclosureWidth: CGFloat = 12
+    static let hostSymbolWidth: CGFloat = 20
+    static let applicationIconSize: CGFloat = 64
+    static let applicationTileWidth: CGFloat = 88
+    /// Application icons align with the host name: row padding + disclosure + symbol + gaps,
+    /// less the tile's side inset around its centered icon.
+    static let shelfIndent: CGFloat = space2 + disclosureWidth + space3 + hostSymbolWidth + space3
+        - (applicationTileWidth - applicationIconSize) / 2
+    static let applicationTileHeight: CGFloat = 104
     static let accessibilityBorderWidth: CGFloat = 1
     static let readableWidth: CGFloat = 680
     static let settingsWidth: CGFloat = 760
@@ -24,7 +35,7 @@ enum UmbraLayout {
     static let settingsRowSpacing: CGFloat = 16
     static let settingsSectionSpacing: CGFloat = 24
     static let macOSControlHeight: CGFloat = 24
-    static let settingsMinimumHeight: CGFloat = 180
+    static let settingsMinimumHeight: CGFloat = 120
     static let settingsMaximumHeight: CGFloat = 620
     static let streamOverlayMaximumWidth: CGFloat = 360
     static let hostDetailsWidth: CGFloat = 520
@@ -44,6 +55,11 @@ enum UmbraLayout {
     }
 }
 
+enum UmbraMotion {
+    static let fast: Double = 0.12
+    static let normal: Double = 0.18
+}
+
 /// Solid antialiased glyphs remain readable over video without an outline or panel.
 enum StreamOverlayStyle {
     static let text = NSColor.white
@@ -57,7 +73,7 @@ enum StreamOverlayStyle {
 }
 
 enum UmbraSymbol {
-    static let host = "display"
+    static let host = "pc"
     static let application = "square.grid.2x2"
     static let running = "play.circle.fill"
     static let offline = "wifi.slash"
@@ -211,19 +227,22 @@ struct SettingsRow<Control: View>: View {
 }
 
 struct SettingsSection<Content: View>: View {
-    let title: String
+    /// Omit the title when the section is the pane's only one; the tab already names it.
+    let title: String?
     @ViewBuilder let content: Content
 
-    init(_ title: String, @ViewBuilder content: () -> Content) {
+    init(_ title: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
         self.content = content()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space3) {
-            Text(title)
-                .font(.headline)
-                .padding(.leading, UmbraLayout.settingsLabelWidth + UmbraLayout.settingsRowSpacing)
+            if let title {
+                Text(title)
+                    .font(.headline)
+                    .padding(.leading, UmbraLayout.settingsLabelWidth + UmbraLayout.settingsRowSpacing)
+            }
             VStack(alignment: .leading, spacing: UmbraLayout.space3) {
                 content
             }

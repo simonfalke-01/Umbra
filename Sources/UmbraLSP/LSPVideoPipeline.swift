@@ -22,6 +22,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         var enqueueTimes: [UInt64: UInt64] = [:]
         var active = false
         var terminal = false
+        var accessUnitsReceived: UInt64 = 0
         var hostEncoderDuration = LSPFixedDurationWindow()
         var receiveToSubmit = LSPFixedDurationWindow()
         var submitToDecode = LSPFixedDurationWindow()
@@ -38,13 +39,28 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     private let lock = NSLock()
     private var state = State()
     private var failureHandler: (@Sendable (LSPTransportError) -> Void)?
+    // A frame that never gets a decode outcome holds a decoder credit forever.
+    // Once every credit leaks, the host withholds video and no new frame arrives
+    // to trigger cleanup, so expiry must run on a timer.
+    private let outstandingExpiry: DispatchSourceTimer
+    private static let outstandingFrameTimeoutMicroseconds: UInt64 = 1_000_000
 
     public init(transport: LSPTransport, renderer: any MetalVideoRendering) {
         self.transport = transport
         self.renderer = renderer
+        outstandingExpiry = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
         transport.setVideoAccessUnitHandler { [weak self] frame in
             self?.submit(frame)
         }
+        outstandingExpiry.setEventHandler { [weak self] in
+            self?.expireStaleOutstandingFrames()
+        }
+        outstandingExpiry.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        outstandingExpiry.resume()
+    }
+
+    deinit {
+        outstandingExpiry.cancel()
     }
 
     public func setFailureHandler(_ handler: (@Sendable (LSPTransportError) -> Void)?) {
@@ -189,6 +205,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         let submitTime = Self.monotonicMicroseconds()
         let ticket = lock.withLock {
             () -> (decoder: VideoToolboxDecoder, native: LSPNativeVideoConfiguration, frameToken: Int)? in
+            state.accessUnitsReceived &+= 1
             guard let request = state.configuration,
                   state.active,
                   request.nativeConfiguration.videoGeneration == frame.videoGeneration,
@@ -488,13 +505,38 @@ public final class LSPVideoPipeline: @unchecked Sendable {
                 audioDecodeAndRenderEnqueue: nil,
                 audioUnderruns: nil,
                 audioRebuffers: nil,
-                reconnectDuration: nil
+                reconnectDuration: nil,
+                videoAccessUnitsReceived: state.accessUnitsReceived
             )
         }
     }
 
     private static func monotonicMicroseconds() -> UInt64 {
         max(1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1_000)
+    }
+
+    private func expireStaleOutstandingFrames() {
+        let now = Self.monotonicMicroseconds()
+        let expired = lock.withLock { () -> (UInt32, [(UInt64, Bool)])? in
+            guard state.active, let generation = state.configuration?.nativeConfiguration.videoGeneration else {
+                return nil
+            }
+            let stale = state.outstanding.compactMap { frameID, frame -> (UInt64, Bool)? in
+                guard !frame.reporting, now >= frame.submitTimeMicroseconds,
+                      now - frame.submitTimeMicroseconds >= Self.outstandingFrameTimeoutMicroseconds else { return nil }
+                return (frameID, frame.independent)
+            }
+            return stale.isEmpty ? nil : (generation, stale)
+        }
+        guard let expired else { return }
+        for (frameID, independent) in expired.1 {
+            recordDecodeDrop(frameID: frameID, videoGeneration: expired.0)
+            finish(
+                frameID: frameID,
+                status: independent ? .unrecoverableError : .recoverableError,
+                videoGeneration: expired.0
+            )
+        }
     }
 
     private func rendererDropped(
@@ -539,16 +581,16 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     private static func codecMask(_ configuration: LSPNativeVideoConfiguration) throws -> Int32 {
         switch (configuration.codec, configuration.profile, configuration.pixelFormat) {
-        case (1, 1, 1): MoonlightVideoFormat.h264.rawValue
-        case (1, 2, 3): MoonlightVideoFormat.h264High8YUV444.rawValue
-        case (2, 3, 1): MoonlightVideoFormat.hevc.rawValue
-        case (2, 4, 2): MoonlightVideoFormat.hevcMain10.rawValue
-        case (2, 5, 3): MoonlightVideoFormat.hevcRext8YUV444.rawValue
-        case (2, 5, 4): MoonlightVideoFormat.hevcRext10YUV444.rawValue
-        case (3, 6, 1): MoonlightVideoFormat.av1Main8.rawValue
-        case (3, 6, 2): MoonlightVideoFormat.av1Main10.rawValue
-        case (3, 7, 3): MoonlightVideoFormat.av1High8YUV444.rawValue
-        case (3, 7, 4): MoonlightVideoFormat.av1High10YUV444.rawValue
+        case (1, 1, 1): GameStreamVideoFormat.h264.rawValue
+        case (1, 2, 3): GameStreamVideoFormat.h264High8YUV444.rawValue
+        case (2, 3, 1): GameStreamVideoFormat.hevc.rawValue
+        case (2, 4, 2): GameStreamVideoFormat.hevcMain10.rawValue
+        case (2, 5, 3): GameStreamVideoFormat.hevcRext8YUV444.rawValue
+        case (2, 5, 4): GameStreamVideoFormat.hevcRext10YUV444.rawValue
+        case (3, 6, 1): GameStreamVideoFormat.av1Main8.rawValue
+        case (3, 6, 2): GameStreamVideoFormat.av1Main10.rawValue
+        case (3, 7, 3): GameStreamVideoFormat.av1High8YUV444.rawValue
+        case (3, 7, 4): GameStreamVideoFormat.av1High10YUV444.rawValue
         default: throw LSPTransportError.invalidConfiguration
         }
     }

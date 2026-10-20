@@ -40,6 +40,8 @@ public enum LSPControlMessageType: UInt16, Sendable {
     case streamEnded = 0x0220
     case clipboardUpdate = 0x0222
     case clipboardUpdateResponse = 0x0223
+    case cursorState = 0x0224
+    case cursorStateResponse = 0x0225
     case pathProbe = 0x0300
     case pathProbeAck = 0x0301
     case objectChunk = 0x0400
@@ -141,6 +143,13 @@ public struct LSPAuthenticationResponse: Equatable, Sendable {
 }
 
 /// One native LSP application returned by the authenticated host.
+/// What a host application launches, used for default icons.
+public enum LSPApplicationKind: UInt8, Equatable, Sendable {
+    case program = 0
+    case desktop = 1
+    case steam = 2
+}
+
 public struct LSPApplication: Equatable, Identifiable, Sendable {
     public var id: String
     public var name: String
@@ -148,6 +157,15 @@ public struct LSPApplication: Equatable, Identifiable, Sendable {
     public var isRunning: Bool
     public var resumeAvailable: Bool
     public var processGeneration: UInt64
+    public var kind: LSPApplicationKind = .program
+}
+
+/// Who draws the pointer during a stream, carried by START key seventeen.
+public enum LSPCursorMode: UInt8, Sendable {
+    /// The host composes its cursor into video frames.
+    case host = 0
+    /// The client draws the cursor from CURSOR_STATE while the host shows one.
+    case client = 1
 }
 
 /// Requested input-only START rates and aggregate wire budget.
@@ -167,6 +185,7 @@ public struct LSPInputStartRequest: Equatable, Sendable {
     public var receiveBatchCapacity: UInt8
     public var decoderSurfaces: UInt8
     public var maximumCaptureToPresentMicroseconds: UInt32
+    public var cursorMode: LSPCursorMode
 
     public init(
         applicationID: String,
@@ -183,7 +202,8 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         videoOffers: [LSPVideoOffer] = [],
         receiveBatchCapacity: UInt8 = 64,
         decoderSurfaces: UInt8 = 3,
-        maximumCaptureToPresentMicroseconds: UInt32 = 50_000
+        maximumCaptureToPresentMicroseconds: UInt32 = 50_000,
+        cursorMode: LSPCursorMode = .host
     ) {
         self.applicationID = applicationID
         self.resume = resume
@@ -200,6 +220,7 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         self.receiveBatchCapacity = receiveBatchCapacity
         self.decoderSurfaces = decoderSurfaces
         self.maximumCaptureToPresentMicroseconds = maximumCaptureToPresentMicroseconds
+        self.cursorMode = cursorMode
     }
 }
 
@@ -408,7 +429,7 @@ public extension LSPVideoOffer {
         return Array(offers.prefix(8))
     }
 
-    private static func codec(for format: MoonlightVideoFormat) -> VideoCodec {
+    private static func codec(for format: GameStreamVideoFormat) -> VideoCodec {
         switch format {
         case .h264, .h264High8YUV444: .h264
         case .hevc, .hevcMain10, .hevcRext8YUV444, .hevcRext10YUV444: .hevc
@@ -417,7 +438,7 @@ public extension LSPVideoOffer {
     }
 
     private static func formatRank(
-        _ format: MoonlightVideoFormat,
+        _ format: GameStreamVideoFormat,
         wantsYUV444: Bool,
         wantsTenBit: Bool
     ) -> Int {
@@ -425,7 +446,7 @@ public extension LSPVideoOffer {
     }
 
     private static func lspTuple(
-        for format: MoonlightVideoFormat
+        for format: GameStreamVideoFormat
     ) -> (codec: LSPVideoCodec, profile: LSPVideoProfile, pixel: LSPVideoPixelFormat)? {
         switch format {
         case .h264: (.h264, .h264High, .yuv4208Bit)
@@ -514,7 +535,7 @@ public struct LSPAudioOffer: Equatable, Sendable {
     public var dtx: Bool
 
     // Game audio must not use DTX: Opus classifies quiet ambience as inactive and
-    // sends silence until a loud transient, unlike continuous Moonlight audio.
+    // sends silence until a loud transient, unlike continuous GameStream audio.
     public static let adaptiveDefaults: [Self] = [
         .init(channels: 2, frameSamples: 480, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
         .init(channels: 2, frameSamples: 240, maximumBitrate: 256_000, inbandFEC: false, dtx: false),
@@ -692,6 +713,93 @@ public struct LSPClipboardUpdate: Equatable, Sendable {
     public var inlineContent: Data?
     public var objectID: UUID?
     public var sha256: Data?
+}
+
+/// One host cursor image in premultiplied RGBA.
+public struct LSPCursorShape: Equatable, Sendable {
+    public var width: Int
+    public var height: Int
+    public var hotspotX: Int
+    public var hotspotY: Int
+    /// width * height premultiplied RGBA pixels.
+    public var rgba: Data
+
+    /// Largest cursor width or height.
+    public static let maximumDimension = 256
+    /// Bundle header: big-endian u16 width, height, hotspot X, hotspot Y.
+    public static let headerLength = 8
+
+    /// Parses one validated cursor shape bundle.
+    public init?(bundle: Data) {
+        let bytes = [UInt8](bundle)
+        guard bytes.count >= Self.headerLength else { return nil }
+        func field(_ offset: Int) -> Int { Int(bytes[offset]) << 8 | Int(bytes[offset + 1]) }
+        let width = field(0), height = field(2), hotspotX = field(4), hotspotY = field(6)
+        guard (1...Self.maximumDimension).contains(width), (1...Self.maximumDimension).contains(height),
+              hotspotX < width, hotspotY < height,
+              bytes.count == Self.headerLength + width * height * 4 else { return nil }
+        self.width = width
+        self.height = height
+        self.hotspotX = hotspotX
+        self.hotspotY = hotspotY
+        rgba = Data(bytes[Self.headerLength...])
+    }
+}
+
+/// Host cursor state delivered to the stream UI.
+public struct LSPCursorState: Equatable, Sendable {
+    /// Whether the host shows its cursor; false while a game hides it for raw mouse input.
+    public var visible: Bool
+    /// Current host cursor image, or nil before the host reported one.
+    public var shape: LSPCursorShape?
+    /// Standard host cursor the client draws with its native equivalent, or nil for `shape`.
+    public var systemCursor: LSPSystemCursor?
+
+    public init(visible: Bool, shape: LSPCursorShape?, systemCursor: LSPSystemCursor? = nil) {
+        self.visible = visible
+        self.shape = shape
+        self.systemCursor = systemCursor
+    }
+}
+
+/// Standard host cursors carried by kind so the client can show its native cursor.
+public enum LSPSystemCursor: UInt8, Sendable {
+    case arrow = 1
+    case iBeam
+    case wait
+    case appStarting
+    case hand
+    case crosshair
+    case resizeWestEast
+    case resizeNorthSouth
+    case resizeNorthwestSoutheast
+    case resizeNortheastSouthwest
+    case move
+    case notAllowed
+    case help
+    case upArrow
+    case pin
+    case person
+}
+
+/// Host cursor visibility and shape reference sent while the client draws the cursor.
+public struct LSPCursorStateUpdate: Equatable, Sendable {
+    /// Largest cursor shape bundle.
+    public static let maximumShapeLength = LSPCursorShape.headerLength + 256 * 256 * 4
+    /// Largest cursor shape bundle carried inline instead of through OBJECT_CHUNK.
+    public static let maximumInlineShapeLength = 768
+
+    public var sessionID: UUID
+    public var sequence: UInt64
+    public var visible: Bool
+    /// SHA-256 of the current shape bundle, or nil before the host reported any shape.
+    public var shapeSHA256: Data?
+    /// Carried shape bundle length, or zero when the client should already hold the shape.
+    public var shapeLength: UInt32
+    public var inlineShape: Data?
+    public var objectID: UUID?
+    /// Standard cursor kind, or 0 when the shape describes the cursor.
+    public var systemCursor: UInt8 = 0
 }
 
 /// Device class used by authenticated runtime input-rate renegotiation.
@@ -1054,7 +1162,9 @@ public enum LSPControlWire {
             throw DeterministicCBORError.malformed
         }
         return try encodedApplications.map { encoded in
-            let fields = try DeterministicCBOR.exactMap(encoded, count: 6)
+            // Hosts before the kind field send six keys; the kind then defaults to a program.
+            let fields = try (try? DeterministicCBOR.exactMap(encoded, count: 7))
+                ?? DeterministicCBOR.exactMap(encoded, count: 6)
             let id = try text(fields[0], maximum: 128, allowEmpty: false)
             let name = try text(fields[1], maximum: 256, allowEmpty: false)
             let imagePath = try text(fields[2], maximum: 512, allowEmpty: true)
@@ -1065,10 +1175,15 @@ public enum LSPControlWire {
                   !resumeAvailable || isRunning else {
                 throw DeterministicCBORError.malformed
             }
+            // Unknown kinds from a newer host fall back to a generic program icon.
+            let kind = fields.count > 6
+                ? LSPApplicationKind(rawValue: try uint8(fields[6], nonzero: false)) ?? .program
+                : .program
             return LSPApplication(
                 id: id, name: name, imagePath: imagePath,
                 isRunning: isRunning, resumeAvailable: resumeAvailable,
-                processGeneration: processGeneration
+                processGeneration: processGeneration,
+                kind: kind
             )
         }
     }
@@ -1194,6 +1309,7 @@ public enum LSPControlWire {
             .unsigned(UInt64(request.decoderSurfaces)),
             .unsigned(1),
             .unsigned(UInt64(request.maximumCaptureToPresentMicroseconds)),
+            .unsigned(UInt64(request.cursorMode.rawValue)),
         ])
     }
 
@@ -1491,6 +1607,55 @@ public enum LSPControlWire {
               try uint(values[3]) == update.sequence else {
             throw DeterministicCBORError.malformed
         }
+    }
+
+    public static func cursorState(from event: LSPControlEvent) throws -> LSPCursorStateUpdate {
+        guard event.messageType == LSPControlMessageType.cursorState.rawValue,
+              !event.flags.contains(.response), event.requestID != 0 else {
+            throw DeterministicCBORError.malformed
+        }
+        let values = try DeterministicCBOR.exactMap(DeterministicCBOR.decode(event.payload), count: 9)
+        guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
+        let systemCursor = try uint(values[8])
+        guard systemCursor <= UInt64(LSPSystemCursor.person.rawValue) else { throw DeterministicCBORError.malformed }
+        var update = LSPCursorStateUpdate(
+            sessionID: try uuid(try bytes(values[1], count: 16)),
+            sequence: try uint(values[2]),
+            visible: try boolean(values[3]),
+            shapeSHA256: try nullableBytes(values[4]).map { try bytes(.bytes($0), count: 32) },
+            shapeLength: try uint32(values[5], nonzero: false),
+            inlineShape: try nullableBytes(values[6]),
+            objectID: try nullableBytes(values[7]).map { try uuid(try bytes(.bytes($0), count: 16)) }
+        )
+        update.systemCursor = UInt8(systemCursor)
+        let length = Int(update.shapeLength)
+        guard update.sequence != 0, length <= LSPCursorStateUpdate.maximumShapeLength,
+              update.shapeSHA256.map({ $0.contains(where: { $0 != 0 }) }) ?? true else {
+            throw DeterministicCBORError.malformed
+        }
+        if length == 0 {
+            guard update.inlineShape == nil, update.objectID == nil else { throw DeterministicCBORError.malformed }
+        } else if length <= LSPCursorStateUpdate.maximumInlineShapeLength {
+            guard update.shapeSHA256 != nil, let inline = update.inlineShape, inline.count == length,
+                  update.objectID == nil, LSPCursorShape(bundle: inline) != nil else {
+                throw DeterministicCBORError.malformed
+            }
+        } else {
+            guard update.shapeSHA256 != nil, update.inlineShape == nil, update.objectID != nil else {
+                throw DeterministicCBORError.malformed
+            }
+        }
+        return update
+    }
+
+    public static func cursorStateResponse(update: LSPCursorStateUpdate, shapePresent: Bool) throws -> Data {
+        try encodeMap([
+            .unsigned(1),
+            .unsigned(UInt64(LSPControlStatus.success.rawValue)),
+            .bytes(uuidBytes(update.sessionID)),
+            .unsigned(update.sequence),
+            .boolean(shapePresent),
+        ])
     }
 
     private static func nullableBytes(_ value: DeterministicCBORValue) throws -> Data? {

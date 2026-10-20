@@ -17,7 +17,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
         _ = try await service.beginSession(SessionIntent(
@@ -58,7 +57,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver,
             credentialProvider: FixedCredentialProvider(credentials: credentials),
             uuidProvider: FixedUUIDProvider(value: sessionID),
@@ -145,7 +143,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
 
@@ -186,7 +183,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
         let intent = SessionIntent(
@@ -247,7 +243,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
 
@@ -295,7 +290,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
 
@@ -332,7 +326,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
 
@@ -361,7 +354,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
 
@@ -395,7 +387,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver,
             clock: clock
         )
@@ -451,7 +442,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver,
             clock: ImmediateServiceClock()
         )
@@ -498,7 +488,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
 
@@ -543,7 +532,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
 
@@ -586,7 +574,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
         let intent = SessionIntent(hostID: host.uuid, applicationID: 1, kind: .launch)
@@ -623,7 +610,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
         let task = Task {
@@ -664,7 +650,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
 
@@ -705,7 +690,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
 
@@ -746,7 +730,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
         let first = Task {
@@ -804,7 +787,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
         let first = Task {
@@ -856,7 +838,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: BlockingStreamDriver()
         )
         let first = Task {
@@ -909,7 +890,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             streamDriver: driver
         )
 
@@ -941,8 +921,7 @@ final class SessionServiceTests: XCTestCase {
         let service = UmbraApplicationService(
             persistence: MemorySnapshotStore(UmbraSnapshot(hosts: [host])),
             clientProvider: FakeClientProvider(value: client),
-            discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear)
+            discovery: nil
         )
 
         do {
@@ -970,7 +949,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             clock: clock,
             cancelConfirmationAttempts: 3,
             cancelConfirmationInterval: .seconds(1)
@@ -1006,7 +984,6 @@ final class SessionServiceTests: XCTestCase {
             persistence: store,
             clientProvider: FakeClientProvider(value: client),
             discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear),
             clock: clock,
             cancelConfirmationAttempts: 3,
             cancelConfirmationInterval: .seconds(1)

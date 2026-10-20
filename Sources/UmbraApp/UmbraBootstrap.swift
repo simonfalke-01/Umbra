@@ -141,7 +141,6 @@ enum UmbraBootstrap {
         let identityProvider = FileBackedClientIdentityProvider()
         let uniqueID = try identityProvider.clientID()
         let clientIdentity = try identityProvider.identity()
-        let compatibilityVersion = NVIDIAServerCompatibilityUpdater().cachedMaximumVersion
         let clientProvider = try AuthenticatedGameStreamClientProvider(
             uniqueID: uniqueID,
             identityProvider: identityProvider
@@ -161,8 +160,7 @@ enum UmbraBootstrap {
             clientProvider: clientProvider,
             discovery: nil,
             pairingAdapter: pairingAdapter,
-            clientIdentityFingerprint: clientIdentity.persistenceFingerprint,
-            maximumSupportedNVIDIAVersion: compatibilityVersion
+            clientIdentityFingerprint: clientIdentity.persistenceFingerprint
         )
     }
 

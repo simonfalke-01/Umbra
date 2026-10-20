@@ -5,13 +5,7 @@ struct RootView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if store.selectedHostID == nil {
-                    HostBrowserView(store: store)
-                } else {
-                    ApplicationBrowserView(store: store)
-                }
-            }
+            LibraryView(store: store)
         }
         .background(MainWindowConfigurator(mode: store.preferences.settings.uiDisplayMode))
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -80,8 +74,6 @@ struct RootView: View {
             if let host = store.host(id: id) {
                 HostDetailsSheet(host: host, store: store)
             }
-        case let .networkResult(result):
-            NetworkResultSheet(result: result)
         }
     }
 

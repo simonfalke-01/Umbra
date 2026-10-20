@@ -196,7 +196,7 @@ public enum StreamingConfigurationMapper {
         selectedVideoFormat: Int32
     ) throws -> StreamingConfiguration {
         try bootstrap.preferences.validate()
-        guard let exactVideoFormat = MoonlightVideoFormat(rawValue: selectedVideoFormat) else {
+        guard let exactVideoFormat = GameStreamVideoFormat(rawValue: selectedVideoFormat) else {
             throw UmbraIntegrationError.unsupportedVideoConfiguration(
                 bootstrap.preferences.videoCodecPreference
             )
@@ -229,7 +229,7 @@ public enum StreamingConfigurationMapper {
         configuration.audioConfiguration = audioConfiguration(bootstrap.preferences.audioConfiguration)
         configuration.clientRefreshRateTimes100 = bootstrap.clientRefreshRateX100 ?? 0
         // The native macOS decoder/render path is pinned to VideoToolbox's
-        // Rec.601 encoder request, matching the reference Moonlight client.
+        // Rec.601 encoder request, matching the reference GameStream client.
         configuration.colorSpace = 0
         configuration.fullColorRange = true
         configuration.remoteInputAESKey = bootstrap.remoteInputCredentials.key
@@ -263,7 +263,7 @@ public enum StreamingConfigurationMapper {
             }
         }
         // VideoToolbox can recover HEVC and AV1 reference-frame loss through the
-        // decoder reset/IDR path, matching Moonlight's native macOS renderers.
+        // decoder reset/IDR path, matching the client's native macOS renderers.
         configuration.videoCapabilities = 0x04 | 0x40
         configuration.audioCapabilities = 0x10 // arbitrary audio packet duration
         return configuration
@@ -292,7 +292,7 @@ public enum StreamingConfigurationMapper {
     }
 
     private static func hostProvesCodecLossless(
-        _ format: MoonlightVideoFormat,
+        _ format: GameStreamVideoFormat,
         support: HostCodecSupport
     ) -> Bool {
         switch format {

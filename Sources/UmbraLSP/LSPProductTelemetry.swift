@@ -35,6 +35,8 @@ public struct LSPProductTelemetrySnapshot: Equatable, Sendable {
     public var audioUnderruns: UInt64?
     public var audioRebuffers: UInt64?
     public var reconnectDuration: LSPDistributionSnapshot?
+    /// Video access units received from the host; stalls reveal a hung host encoder.
+    public var videoAccessUnitsReceived: UInt64? = nil
 }
 
 struct LSPFixedDurationWindow: Sendable {

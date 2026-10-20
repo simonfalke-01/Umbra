@@ -30,12 +30,12 @@ typeset -a legal_resource_sources=(
     "$repository_root/LICENSE"
     "$repository_root/NOTICE.md"
     "$repository_root/THIRD_PARTY_NOTICES.md"
-    "$repository_root/Vendor/MoonlightCommon/PROVENANCE.md"
+    "$repository_root/Vendor/GameStreamProtocol/PROVENANCE.md"
     "$repository_root/OPENSSL_LICENSE.txt"
     "$repository_root/OPUS_LICENSE.txt"
-    "$repository_root/Vendor/MoonlightCommon/Upstream/LICENSE.txt"
-    "$repository_root/Vendor/MoonlightCommon/Upstream/enet/LICENSE"
-    "$repository_root/Vendor/MoonlightCommon/Upstream/nanors/LICENSE"
+    "$repository_root/Vendor/GameStreamProtocol/Upstream/LICENSE.txt"
+    "$repository_root/Vendor/GameStreamProtocol/Upstream/enet/LICENSE"
+    "$repository_root/Vendor/GameStreamProtocol/Upstream/nanors/LICENSE"
 )
 
 cleanup() {
@@ -381,14 +381,14 @@ app_identifier="$(plutil -extract CFBundleIdentifier raw "$app_root/Contents/Inf
 cp "$repository_root/LICENSE" "$app_root/Contents/Resources/LICENSE"
 cp "$repository_root/NOTICE.md" "$app_root/Contents/Resources/NOTICE.md"
 cp "$repository_root/THIRD_PARTY_NOTICES.md" "$app_root/Contents/Resources/THIRD_PARTY_NOTICES.md"
-cp "$repository_root/Vendor/MoonlightCommon/PROVENANCE.md" "$app_root/Contents/Resources/MOONLIGHT_PROVENANCE.md"
+cp "$repository_root/Vendor/GameStreamProtocol/PROVENANCE.md" "$app_root/Contents/Resources/MOONLIGHT_PROVENANCE.md"
 cp "$repository_root/OPENSSL_LICENSE.txt" "$app_root/Contents/Resources/OpenSSL-Apache-2.0.txt"
 cp "$repository_root/OPUS_LICENSE.txt" "$app_root/Contents/Resources/Opus-BSD-3-Clause.txt"
-cp "$repository_root/Vendor/MoonlightCommon/Upstream/LICENSE.txt" \
+cp "$repository_root/Vendor/GameStreamProtocol/Upstream/LICENSE.txt" \
     "$app_root/Contents/Resources/moonlight-common-c-GPL-3.0.txt"
-cp "$repository_root/Vendor/MoonlightCommon/Upstream/enet/LICENSE" \
+cp "$repository_root/Vendor/GameStreamProtocol/Upstream/enet/LICENSE" \
     "$app_root/Contents/Resources/ENet-MIT.txt"
-cp "$repository_root/Vendor/MoonlightCommon/Upstream/nanors/LICENSE" \
+cp "$repository_root/Vendor/GameStreamProtocol/Upstream/nanors/LICENSE" \
     "$app_root/Contents/Resources/nanors-MIT.txt"
 
 resource_bundle="$build_root/Umbra_UmbraApp.bundle"

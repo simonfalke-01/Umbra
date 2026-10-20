@@ -34,7 +34,7 @@ final class IntegrationAdapterTests: XCTestCase {
         XCTAssertEqual(request.url?.port, 47_989)
     }
 
-    func testNativeVideoAdapterPreservesRecoveryRequestForMoonlightRFIIDRHandling() {
+    func testNativeVideoAdapterPreservesRecoveryRequestForGameStreamRFIIDRHandling() {
         XCTAssertEqual(
             NativeVideoDecoderAdapter.streamingDisposition(
                 for: UmbraMedia.VideoFrameDisposition.requestKeyFrame
@@ -173,7 +173,7 @@ final class IntegrationAdapterTests: XCTestCase {
         )
         let pairing = Task {
             try await adapter.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "1234",
                 appVersion: "7.1.0",
                 isNVIDIAServerSoftware: false
@@ -181,7 +181,7 @@ final class IntegrationAdapterTests: XCTestCase {
         }
         await coordinator.waitUntilStarted()
 
-        await adapter.cancel(hostID: "sunshine")
+        await adapter.cancel(hostID: "lumen")
 
         switch await pairing.result {
         case .success:
@@ -199,7 +199,7 @@ final class IntegrationAdapterTests: XCTestCase {
 
         do {
             _ = try await adapter.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "1234",
                 appVersion: "7.1.0",
                 isNVIDIAServerSoftware: false
@@ -361,7 +361,7 @@ final class IntegrationAdapterTests: XCTestCase {
         XCTAssertEqual(configuration.clientRefreshRateTimes100, 0)
     }
 
-    func testPlatformPacketsMapToMoonlightProtocolConstants() {
+    func testPlatformPacketsMapToGameStreamProtocolConstants() {
         XCTAssertEqual(
             PlatformStreamingInputSink.command(for: .keyboard(.init(
                 virtualKey: 0x41,
@@ -900,7 +900,7 @@ final class IntegrationAdapterTests: XCTestCase {
         XCTAssertEqual(
             finishCount,
             0,
-            "Final audio/resource teardown must remain behind native close and its Moonlight cleanup callbacks."
+            "Final audio/resource teardown must remain behind native close and its GameStream cleanup callbacks."
         )
         do {
             _ = try await driver.prepare(makeBootstrap())
@@ -1790,7 +1790,7 @@ final class IntegrationAdapterTests: XCTestCase {
         audioController.detach(renderer)
     }
 
-    func testSunshineHDRMetadataPacksExactMDCVAndContentLightBlobs() throws {
+    func testLumenHDRMetadataPacksExactMDCVAndContentLightBlobs() throws {
         let source = StreamingHDRMetadata(
             redX: 35_400,
             redY: 14_600,
@@ -1942,7 +1942,7 @@ final class IntegrationAdapterTests: XCTestCase {
     }
 
     func testDriverPreparationReusesMediaButRenegotiatesRefreshedHostCapabilities() async throws {
-        let available = MoonlightVideoFormat.hevc.rawValue | MoonlightVideoFormat.av1Main8.rawValue
+        let available = GameStreamVideoFormat.hevc.rawValue | GameStreamVideoFormat.av1Main8.rawValue
         let mediaProvider = RecordingMediaProvider(availableVideoFormats: available)
         let session = FakeStreamingSession()
         let factory = FakeStreamingSessionFactory(session: session)
@@ -1958,8 +1958,8 @@ final class IntegrationAdapterTests: XCTestCase {
         refreshed.host.codecSupport = [.av1Main8]
         let second = try await driver.prepare(refreshed)
 
-        XCTAssertEqual(first.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
-        XCTAssertEqual(second.selectedVideoFormat, MoonlightVideoFormat.av1Main8.rawValue)
+        XCTAssertEqual(first.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
+        XCTAssertEqual(second.selectedVideoFormat, GameStreamVideoFormat.av1Main8.rawValue)
         XCTAssertEqual(mediaProvider.makeCount, 1)
 
         let run = Task { try await driver.run(refreshed) { _ in } }
@@ -1967,7 +1967,7 @@ final class IntegrationAdapterTests: XCTestCase {
         await session.finishSuccessfully()
         _ = try await run.value
 
-        XCTAssertEqual(factory.configuration?.selectedVideoFormat, MoonlightVideoFormat.av1Main8.rawValue)
+        XCTAssertEqual(factory.configuration?.selectedVideoFormat, GameStreamVideoFormat.av1Main8.rawValue)
         XCTAssertEqual(mediaProvider.makeCount, 1)
     }
 
@@ -2087,7 +2087,7 @@ private actor IntegrationServerInfoTransport: HTTPTransport {
         <root status_code="200">
           <hostname>Integration Host</hostname><uniqueid>integration-host</uniqueid>
           <PairStatus>0</PairStatus><currentgame>0</currentgame>
-          <state>SUNSHINE_SERVER_FREE</state>
+          <state>LUMEN_SERVER_FREE</state>
         </root>
         """.utf8)
         return (
@@ -2464,7 +2464,7 @@ private final class RecordingMediaProvider: StreamingMediaProviding, @unchecked 
     var audioCleanUpCount: Int { lock.withLock { storedAudioCleanUpCount } }
     var lastBootstrap: StreamBootstrap? { lock.withLock { storedLastBootstrap } }
 
-    init(availableVideoFormats: Int32 = MoonlightVideoFormat.h264.rawValue) {
+    init(availableVideoFormats: Int32 = GameStreamVideoFormat.h264.rawValue) {
         self.availableVideoFormats = availableVideoFormats
     }
 

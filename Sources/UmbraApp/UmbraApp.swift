@@ -72,6 +72,14 @@ struct UmbraApp: App {
             requestedStream = nil
             deferredStreamArguments = processArguments
         }
+        #if DEBUG
+        // Renders the library with sample hosts for visual review; never compiled into release.
+        if ProcessInfo.processInfo.environment["UMBRA_DEMO"] == "1" {
+            composition = nil
+            _store = StateObject(wrappedValue: AppStore(service: DemoUmbraClientService()))
+            return
+        }
+        #endif
         do {
             let composition = try LiveApplicationComposition()
             self.composition = composition

@@ -7,7 +7,7 @@ final class LatencyTelemetryTests: XCTestCase {
         let metadata = VideoFrameLatencyMetadata(
             correlationID: identity,
             receiveClockCalibration: VideoLatencyClockCalibrationEvidence(
-                sourceDomain: .moonlightClientUptime,
+                sourceDomain: .gameStreamClientUptime,
                 destinationDomain: .clientMediaTime,
                 observationCount: 3,
                 estimatedOffsetSeconds: 10,
@@ -123,15 +123,15 @@ final class LatencyTelemetryTests: XCTestCase {
 
     func testClockMappingUsesMinimumObservedOffsetAndRejectsWrongDomain() throws {
         var mapping = VideoLatencyClockMapping(
-            sourceDomain: .moonlightClientUptime,
+            sourceDomain: .gameStreamClientUptime,
             destinationDomain: .clientMediaTime
         )
         mapping.observe(
-            source: VideoLatencyTimestamp(seconds: 1, clockDomain: .moonlightClientUptime),
+            source: VideoLatencyTimestamp(seconds: 1, clockDomain: .gameStreamClientUptime),
             destination: VideoLatencyTimestamp(seconds: 101.004, clockDomain: .clientMediaTime)
         )
         mapping.observe(
-            source: VideoLatencyTimestamp(seconds: 2, clockDomain: .moonlightClientUptime),
+            source: VideoLatencyTimestamp(seconds: 2, clockDomain: .gameStreamClientUptime),
             destination: VideoLatencyTimestamp(seconds: 102.001, clockDomain: .clientMediaTime)
         )
         mapping.observe(
@@ -143,7 +143,7 @@ final class LatencyTelemetryTests: XCTestCase {
         XCTAssertEqual(mapping.minimumOffsetSeconds ?? -1, 100.001, accuracy: 0.000_001)
         let mapped = try XCTUnwrap(mapping.map(VideoLatencyTimestamp(
             seconds: 1.5,
-            clockDomain: .moonlightClientUptime
+            clockDomain: .gameStreamClientUptime
         )))
         XCTAssertEqual(mapped.clockDomain, .clientMediaTime)
         XCTAssertEqual(mapped.seconds, 101.501, accuracy: 0.000_001)
@@ -336,7 +336,7 @@ final class LatencyTelemetryTests: XCTestCase {
             from: commit,
             preferredProxy: target,
             preferredEvidence: .displayLinkPresentationTarget,
-            commandCompletion: VideoLatencyTimestamp(seconds: 5.001, clockDomain: .moonlightClientUptime)
+            commandCompletion: VideoLatencyTimestamp(seconds: 5.001, clockDomain: .gameStreamClientUptime)
         )
 
         let snapshot = try XCTUnwrap(accumulator.snapshot())
@@ -413,10 +413,10 @@ final class LatencyTelemetryTests: XCTestCase {
 
     func testClockMappingResetRemovesCalibration() {
         var mapping = VideoLatencyClockMapping(
-            sourceDomain: .moonlightClientUptime,
+            sourceDomain: .gameStreamClientUptime,
             destinationDomain: .clientMediaTime
         )
-        let source = VideoLatencyTimestamp(seconds: 1, clockDomain: .moonlightClientUptime)
+        let source = VideoLatencyTimestamp(seconds: 1, clockDomain: .gameStreamClientUptime)
         mapping.observe(
             source: source,
             destination: VideoLatencyTimestamp(seconds: 10, clockDomain: .clientMediaTime)

@@ -2,7 +2,7 @@ import XCTest
 @testable import UmbraServices
 
 final class NVIDIAServerCompatibilityPolicyTests: XCTestCase {
-    func testSunshineDoesNotUseNVIDIAVersionGate() throws {
+    func testLumenDoesNotUseNVIDIAVersionGate() throws {
         let policy = try XCTUnwrap(NVIDIAServerCompatibilityPolicy())
         XCTAssertTrue(policy.isSupported(isNVIDIAServerSoftware: false, gfeVersion: nil))
         XCTAssertTrue(policy.isSupported(isNVIDIAServerSoftware: false, gfeVersion: "invalid"))
@@ -17,7 +17,7 @@ final class NVIDIAServerCompatibilityPolicyTests: XCTestCase {
         XCTAssertTrue(policy.isSupported(isNVIDIAServerSoftware: true, gfeVersion: "3.x"))
     }
 
-    func testBundledMoonlightSentinelRejectsOnlyFutureOutOfRangeVersions() throws {
+    func testBundledGameStreamSentinelRejectsOnlyFutureOutOfRangeVersions() throws {
         let policy = try XCTUnwrap(NVIDIAServerCompatibilityPolicy())
         XCTAssertTrue(policy.isSupported(isNVIDIAServerSoftware: true, gfeVersion: "3.23.0.74"))
         XCTAssertTrue(policy.isSupported(isNVIDIAServerSoftware: true, gfeVersion: "99.99.99.99"))

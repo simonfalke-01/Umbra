@@ -191,8 +191,6 @@ final class AppStore: ObservableObject {
             wake(currentHost)
         case .details:
             presentedSheet = .details(currentHost.id)
-        case .testNetwork:
-            testNetwork(currentHost)
         case .rename:
             presentedSheet = .rename(currentHost.id)
         case .remove:
@@ -572,29 +570,6 @@ final class AppStore: ObservableObject {
                 upsert(try await service.wakeHost(id: host.id))
             } catch {
                 presentFailure(title: "Couldn’t Wake Host", error: error, ownedBy: operationToken)
-            }
-        }
-    }
-
-    func testNetwork(_ host: HostDisplayModel) {
-        let operationToken = beginOperation(OperationPresentation(
-            kind: .testing,
-            title: "Testing Network",
-            message: "Checking whether required streaming ports are reachable...",
-            progress: nil,
-            isCancellable: true
-        ))
-        activeTask = Task { [weak self] in
-            guard let self else { return }
-            defer { finishOperation(operationToken) }
-            do {
-                let result = try await service.testNetwork(for: host.id)
-                try Task.checkCancellation()
-                presentedSheet = .networkResult(result)
-            } catch is CancellationError {
-                return
-            } catch {
-                presentFailure(title: "Network Test Failed", error: error, ownedBy: operationToken)
             }
         }
     }

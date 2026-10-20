@@ -5,7 +5,6 @@ enum HostBrowserActionKind: String, Hashable, Sendable {
     case pair
     case wake
     case details
-    case testNetwork
     case rename
     case remove
 }
@@ -82,7 +81,7 @@ struct HostBrowserPresentation: Hashable, Sendable {
             primaryActions.append(defaultAction)
         }
 
-        var managementActions = [Self.testNetworkAction, Self.renameAction]
+        var managementActions = [Self.renameAction]
         if defaultAction?.kind != .details {
             managementActions.append(Self.detailsAction)
         }
@@ -180,11 +179,6 @@ struct HostBrowserPresentation: Hashable, Sendable {
         title: "Show Details",
         compactTitle: "Details",
         symbol: UmbraSymbol.details
-    )
-    private static let testNetworkAction = HostBrowserActionDescriptor(
-        kind: .testNetwork,
-        title: "Test Network...",
-        symbol: UmbraSymbol.test
     )
     private static let renameAction = HostBrowserActionDescriptor(
         kind: .rename,

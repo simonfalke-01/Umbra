@@ -146,10 +146,6 @@ public struct ContinuousServiceClock: ServiceClock, Sendable {
     }
 }
 
-public protocol ConnectivityTesting: Sendable {
-    func testRequiredPorts() async -> ConnectivityTestResult
-}
-
 public protocol HostPairingAdapting: Sendable {
     func pair(
         host: HostAddress,

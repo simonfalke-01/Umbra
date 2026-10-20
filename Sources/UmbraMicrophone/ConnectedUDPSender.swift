@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Pre-binds the same UDP client port in both address families, then connects
-/// only the socket matching MoonlightCommon's selected numeric RTSP peer.
+/// only the socket matching GameStreamCommon's selected numeric RTSP peer.
 public final class ConnectedMicrophoneUDPSender: MicrophoneDatagramSending, @unchecked Sendable {
     private let lock = NSLock()
     private var descriptorsByFamily: [Int32: Int32]

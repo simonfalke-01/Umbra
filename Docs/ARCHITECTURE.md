@@ -18,7 +18,7 @@ UmbraApp
     +-- UmbraIntegration / UmbraStreaming
           session adapters and bounded media delivery
             |
-            +-- CMoonlightBridge -> pinned moonlight-common-c
+            +-- CGameStreamProtocol -> pinned GameStream protocol library
             +-- UmbraMedia -> VideoToolbox + Metal + AudioQueue
             +-- UmbraOpus / UmbraMicrophone
     +-- UmbraLSP -> UmbraLSPTransport -> CLSPCore
@@ -26,7 +26,7 @@ UmbraApp
           over raw UDP + kqueue + wolfSSL DTLS 1.3 + libSRTP
 ```
 
-`moonlight-common-c` owns the production GameStream RTSP/RTP/control wire,
+the vendored GameStream protocol library owns the production GameStream RTSP/RTP/control wire,
 encryption, FEC, depacketization, and input transport. The C facade converts its
 callbacks into bounded Swift-facing media and lifecycle interfaces. Per-frame
 work does not run on a Swift actor or the main thread.
@@ -100,7 +100,7 @@ without microphone; required mode fails locally or marks the LSP session failed.
 ## Session policies
 
 An immutable effective policy is resolved once per session and passed through
-bootstrap, retries, the Moonlight bridge, decode, render, input, and telemetry.
+bootstrap, retries, the GameStream bridge, decode, render, input, and telemetry.
 
 | Concern | Latency | Quality |
 | --- | --- | --- |
@@ -113,7 +113,7 @@ These are bounded scheduling objectives, not performance guarantees. Explicit
 advanced settings can change the effective result and must be recorded with
 the measurement.
 
-Both modes retain legacy Moonlight packet ordering and reliable ENet delivery.
+Both modes retain legacy GameStream packet ordering and reliable ENet delivery.
 Codec, HDR, and YUV 4:4:4 remain explicit preferences rather than implicit mode
 changes.
 
@@ -145,7 +145,7 @@ the microphone, which makes the same preflight fail closed before streaming.
 
 ## Trust and identity
 
-Legacy Moonlight pairing remains available for compatibility. Its four-digit
+Legacy GameStream pairing remains available for compatibility. Its four-digit
 PIN transcript is not a modern password-authenticated key exchange and must not
 be described as brute-force resistant.
 
@@ -228,8 +228,8 @@ input and optical rig.
    teardown.
 2. Warnings-as-errors debug and release builds.
 3. Self-contained package, code-signature, and static-dependency checks.
-4. Legacy integration with an unmodified Moonlight client and a deployed Lumen
-   or Sunshine host.
+4. Legacy integration with an unmodified GameStream client and a deployed Lumen
+   or Lumen host.
 5. Hardware evidence for codec/HDR tuples, audio compatibility, controllers,
    fullscreen, and display behavior.
 6. Causally correlated latency runs on a declared mode, protocol, hardware,

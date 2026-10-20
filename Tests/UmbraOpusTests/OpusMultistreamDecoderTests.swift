@@ -8,7 +8,7 @@ import XCTest
 final class OpusMultistreamDecoderTests: XCTestCase {
     func testEncoderGeneratedStereoPacketDecodesToOwnedFloatAndCoreAudioBuffer() throws {
         let decoder = OpusMultistreamDecoder()
-        try decoder.configureThrowing(format: .moonlightStereo)
+        try decoder.configureThrowing(format: .gameStreamStereo)
         decoder.start()
 
         let frame = try decoder.decode(packet: CompressedAudioPacket(data: try makeStereoPacket()))
@@ -34,7 +34,7 @@ final class OpusMultistreamDecoderTests: XCTestCase {
     func testSubmitDeliversRealDecodedBufferToRenderer() throws {
         let renderer = RecordingAudioRenderer()
         let decoder = OpusMultistreamDecoder(renderer: renderer)
-        try decoder.configureThrowing(format: .moonlightStereo)
+        try decoder.configureThrowing(format: .gameStreamStereo)
         decoder.start()
 
         decoder.submit(packet: CompressedAudioPacket(data: try makeStereoPacket()))
@@ -45,12 +45,12 @@ final class OpusMultistreamDecoderTests: XCTestCase {
         XCTAssertNil(decoder.lastError)
     }
 
-    func testMoonlightStereoFivePointOneAndSevenPointOneLayoutsConfigure() throws {
+    func testGameStreamStereoFivePointOneAndSevenPointOneLayoutsConfigure() throws {
         let decoder = OpusMultistreamDecoder()
         for format in [
-            OpusStreamFormat.moonlightStereo,
-            .moonlightFivePointOne,
-            .moonlightSevenPointOne,
+            OpusStreamFormat.gameStreamStereo,
+            .gameStreamFivePointOne,
+            .gameStreamSevenPointOne,
         ] {
             try decoder.configureThrowing(format: format)
             XCTAssertEqual(decoder.currentFormat, format)
@@ -96,18 +96,18 @@ final class OpusMultistreamDecoderTests: XCTestCase {
             XCTAssertEqual(error as? OpusDecoderError, .notConfigured)
         }
 
-        try decoder.configureThrowing(format: .moonlightStereo)
+        try decoder.configureThrowing(format: .gameStreamStereo)
         XCTAssertThrowsError(try decoder.decode(packet: CompressedAudioPacket(data: Data()))) { error in
             XCTAssertEqual(error as? OpusDecoderError, .notRunning)
         }
 
         decoder.start()
-        let oversized = Data(repeating: 0, count: OpusMultistreamDecoder.maximumMoonlightPacketSize + 1)
+        let oversized = Data(repeating: 0, count: OpusMultistreamDecoder.maximumGameStreamPacketSize + 1)
         XCTAssertThrowsError(try decoder.decode(packet: CompressedAudioPacket(data: oversized))) { error in
             XCTAssertEqual(
                 error as? OpusDecoderError,
                 .packetTooLarge(
-                    maximum: OpusMultistreamDecoder.maximumMoonlightPacketSize,
+                    maximum: OpusMultistreamDecoder.maximumGameStreamPacketSize,
                     actual: oversized.count
                 )
             )
@@ -120,7 +120,7 @@ final class OpusMultistreamDecoderTests: XCTestCase {
 
     func testMalformedOpusPacketReportsLibopusError() throws {
         let decoder = OpusMultistreamDecoder()
-        try decoder.configureThrowing(format: .moonlightStereo)
+        try decoder.configureThrowing(format: .gameStreamStereo)
         decoder.start()
 
         XCTAssertThrowsError(
@@ -136,7 +136,7 @@ final class OpusMultistreamDecoderTests: XCTestCase {
 
     func testEmptyPacketUsesLibopusPacketLossConcealmentAndResetIsDeterministic() throws {
         let decoder = OpusMultistreamDecoder()
-        try decoder.configureThrowing(format: .moonlightStereo)
+        try decoder.configureThrowing(format: .gameStreamStereo)
         decoder.start()
         let packet = CompressedAudioPacket(data: try makeStereoPacket())
 
@@ -150,7 +150,7 @@ final class OpusMultistreamDecoderTests: XCTestCase {
 
     func testSustainedOpusDecodingWithPLCKeepsStereoSignalContinuous() throws {
         let decoder = OpusMultistreamDecoder()
-        try decoder.configureThrowing(format: .moonlightStereo)
+        try decoder.configureThrowing(format: .gameStreamStereo)
         decoder.start()
         let packets = try makeStereoPackets(count: 100)
         let lostPacketIndices: Set<Int> = [7, 16, 44, 73]
@@ -218,7 +218,7 @@ private final class RecordingAudioRenderer: AudioEngineRendering, @unchecked Sen
 }
 
 private extension OpusStreamFormat {
-    static let moonlightStereo = OpusStreamFormat(
+    static let gameStreamStereo = OpusStreamFormat(
         audioConfiguration: AudioOutputLayout.stereo.audioConfiguration,
         sampleRate: 48_000,
         channelCount: 2,
@@ -228,7 +228,7 @@ private extension OpusStreamFormat {
         mapping: [0, 1, 0, 0, 0, 0, 0, 0]
     )
 
-    static let moonlightFivePointOne = OpusStreamFormat(
+    static let gameStreamFivePointOne = OpusStreamFormat(
         audioConfiguration: AudioOutputLayout.surround51.audioConfiguration,
         sampleRate: 48_000,
         channelCount: 6,
@@ -238,7 +238,7 @@ private extension OpusStreamFormat {
         mapping: [0, 4, 1, 5, 2, 3, 0, 0]
     )
 
-    static let moonlightSevenPointOne = OpusStreamFormat(
+    static let gameStreamSevenPointOne = OpusStreamFormat(
         audioConfiguration: AudioOutputLayout.surround71.audioConfiguration,
         sampleRate: 48_000,
         channelCount: 8,
@@ -268,7 +268,7 @@ private func makeStereoPackets(count: Int) throws -> [Data] {
             input[frame * 2] = 0.65 * sin(2 * .pi * 440 * time)
             input[(frame * 2) + 1] = 0.35 * sin(2 * .pi * 660 * time)
         }
-        var encoded = [UInt8](repeating: 0, count: OpusMultistreamDecoder.maximumMoonlightPacketSize)
+        var encoded = [UInt8](repeating: 0, count: OpusMultistreamDecoder.maximumGameStreamPacketSize)
         let length = input.withUnsafeBufferPointer { pcm in
             encoded.withUnsafeMutableBufferPointer { output in
                 opus_encode_float(

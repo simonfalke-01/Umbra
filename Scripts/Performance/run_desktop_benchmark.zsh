@@ -29,7 +29,7 @@ usage() {
     print -r -- "  --client-telemetry <path>    Optional JSONL telemetry export"
     print -r -- "  --network-kind <kind>        lan|wifi|vpn|cellular|wan|unknown"
     print -r -- "  --declared-mode <mode>       latency|quality|unknown"
-    print -r -- "  --client-protocol <kind>     vanilla-moonlight|umbra-legacy|umbra-v2"
+    print -r -- "  --client-protocol <kind>     standard-gamestream|umbra-legacy|umbra-v2"
     print -r -- "  --output-root <path>         Real, non-symlink artifact parent"
     print -r -- "  --dry-run                    Validate safety checks without launching"
 }
@@ -495,8 +495,8 @@ fi
     print -u2 -r -- "--declared-mode must be latency, quality, or unknown."
     exit 2
 }
-[[ "$client_protocol" == (vanilla-moonlight|umbra-legacy|umbra-v2) ]] || {
-    print -u2 -r -- "--client-protocol must be vanilla-moonlight, umbra-legacy, or umbra-v2."
+[[ "$client_protocol" == (standard-gamestream|umbra-legacy|umbra-v2) ]] || {
+    print -u2 -r -- "--client-protocol must be standard-gamestream, umbra-legacy, or umbra-v2."
     exit 2
 }
 [[ -d "$packaged_app" && ! -L "$packaged_app" ]] || {

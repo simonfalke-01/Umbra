@@ -60,13 +60,13 @@ public struct AppleStreamingCapabilities: Sendable, Equatable {
 
     /// Exact hardware decoder tuples which may be offered by a native protocol.
     /// Family availability never promotes an unproven 10-bit or 4:4:4 tuple.
-    public var supportedHardwareVideoFormats: [MoonlightVideoFormat] {
+    public var supportedHardwareVideoFormats: [GameStreamVideoFormat] {
         let mask = supportedVideoFormatMask
-        return MoonlightVideoFormat.allCases.filter { mask & $0.rawValue != 0 }
+        return GameStreamVideoFormat.allCases.filter { mask & $0.rawValue != 0 }
     }
 
     /// Returns whether the active machine has direct evidence for one exact tuple.
-    public func supportsHardwareVideoFormat(_ format: MoonlightVideoFormat) -> Bool {
+    public func supportsHardwareVideoFormat(_ format: GameStreamVideoFormat) -> Bool {
         supportedVideoFormatMask & format.rawValue != 0
     }
 
@@ -85,7 +85,7 @@ public struct AppleStreamingCapabilities: Sendable, Equatable {
             hasDefaultAudioOutput: defaultDevice != nil,
             supportsNativeAudioOutput: nativeAudioAvailable,
             // Querying a routed virtual device's stream configuration can activate it.
-            // Keep this unknown until the audio backend opens at Moonlight audio init.
+            // Keep this unknown until the audio backend opens at GameStream audio init.
             audioOutputChannelCount: 0,
             supportsHardwareHEVCMain10: hardwareTupleProofs.supports(.hevcMain10),
             supportsHardwareAV1Main10: hardwareTupleProofs.supports(.av1Main10),
@@ -136,7 +136,7 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
         return lock.withLock { storedExactMask & VideoCodecProfile.yuv444Mask }
     }
 
-    func supports(_ format: MoonlightVideoFormat) -> Bool {
+    func supports(_ format: GameStreamVideoFormat) -> Bool {
         _ = yuv444Mask
         return lock.withLock { storedExactMask & format.rawValue != 0 }
     }
@@ -156,7 +156,7 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
     private static func probeExactHardwareTuples() -> Int32 {
         let probes: [Probe] = [
             Probe(
-                formatMask: MoonlightVideoFormat.hevcMain10.rawValue,
+                formatMask: GameStreamVideoFormat.hevcMain10.rawValue,
                 codecType: kCMVideoCodecType_HEVC,
                 initialization: Data([
                     0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x02, 0x20,
@@ -170,7 +170,7 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
                 payloadFormat: .annexB
             ),
             Probe(
-                formatMask: MoonlightVideoFormat.av1Main10.rawValue,
+                formatMask: GameStreamVideoFormat.av1Main10.rawValue,
                 codecType: kCMVideoCodecType_AV1,
                 initialization: Data([
                     0x12, 0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00,
@@ -179,7 +179,7 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
                 payloadFormat: .av1LowOverheadOBU
             ),
             Probe(
-                formatMask: MoonlightVideoFormat.h264High8YUV444.rawValue,
+                formatMask: GameStreamVideoFormat.h264High8YUV444.rawValue,
                 codecType: kCMVideoCodecType_H264,
                 initialization: Data([
                     0x00, 0x00, 0x00, 0x01, 0x67, 0xf4, 0x00, 0x0a, 0x91, 0x96,
@@ -190,7 +190,7 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
                 payloadFormat: .annexB
             ),
             Probe(
-                formatMask: MoonlightVideoFormat.hevcRext8YUV444.rawValue,
+                formatMask: GameStreamVideoFormat.hevcRext8YUV444.rawValue,
                 codecType: kCMVideoCodecType_HEVC,
                 initialization: Data([
                     0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff,
@@ -206,7 +206,7 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
                 payloadFormat: .annexB
             ),
             Probe(
-                formatMask: MoonlightVideoFormat.hevcRext10YUV444.rawValue,
+                formatMask: GameStreamVideoFormat.hevcRext10YUV444.rawValue,
                 codecType: kCMVideoCodecType_HEVC,
                 initialization: Data([
                     0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff,
@@ -222,13 +222,13 @@ private final class HardwareVideoTupleProofs: @unchecked Sendable {
                 payloadFormat: .annexB
             ),
             Probe(
-                formatMask: MoonlightVideoFormat.av1High8YUV444.rawValue,
+                formatMask: GameStreamVideoFormat.av1High8YUV444.rawValue,
                 codecType: kCMVideoCodecType_AV1,
                 initialization: Data([0x12, 0x00, 0x0a, 0x06, 0x38, 0x15, 0x7f, 0xfd, 0x80, 0x40]),
                 payloadFormat: .av1LowOverheadOBU
             ),
             Probe(
-                formatMask: MoonlightVideoFormat.av1High10YUV444.rawValue,
+                formatMask: GameStreamVideoFormat.av1High10YUV444.rawValue,
                 codecType: kCMVideoCodecType_AV1,
                 initialization: Data([0x12, 0x00, 0x0a, 0x06, 0x38, 0x15, 0x7f, 0xfd, 0x88, 0x40]),
                 payloadFormat: .av1LowOverheadOBU

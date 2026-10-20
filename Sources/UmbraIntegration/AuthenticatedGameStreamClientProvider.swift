@@ -5,7 +5,7 @@ import UmbraPairing
 import UmbraServices
 
 /// Produces GameStream clients with the certificate and mutual-TLS behavior
-/// required after pairing. Sunshine receives its real unique ID while NVIDIA
+/// required after pairing. Lumen receives its real unique ID while NVIDIA
 /// GameStream retains the legacy ID behavior expected by GeForce Experience.
 public struct AuthenticatedGameStreamClientProvider: GameStreamClientProviding, @unchecked Sendable {
     public let uniqueID: String

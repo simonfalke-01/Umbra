@@ -91,7 +91,7 @@ final class PreferencesTests: XCTestCase {
         }
     }
 
-    func testDefaultBitrateMatchesMoonlightReferenceTable() {
+    func testDefaultBitrateMatchesGameStreamReferenceTable() {
         XCTAssertEqual(StreamingPreferences.defaultBitrateKbps(width: 640, height: 360, fps: 30, yuv444: false), 1_000)
         XCTAssertEqual(StreamingPreferences.defaultBitrateKbps(width: 1_920, height: 1_080, fps: 60, yuv444: false), 20_000)
         XCTAssertEqual(StreamingPreferences.defaultBitrateKbps(width: 3_840, height: 2_160, fps: 120, yuv444: false), 113_000)
@@ -214,7 +214,6 @@ final class PreferencesTests: XCTestCase {
             configurationWarnings: false,
             richPresence: false,
             gamepadMouse: false,
-            detectNetworkBlocking: false,
             showPerformanceOverlay: true,
             swapMouseButtons: true,
             muteOnFocusLoss: true,

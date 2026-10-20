@@ -31,8 +31,7 @@ final class HostServiceTests: XCTestCase {
         let service = UmbraApplicationService(
             persistence: store,
             clientProvider: FakeClientProvider(value: FakeGameStreamClient()),
-            discovery: nil,
-            connectivityTester: FakeConnectivityTester(result: .clear)
+            discovery: nil
         )
 
         let rename = Task { try await service.renameHost(id: host.uuid, name: "Renamed") }
@@ -470,27 +469,23 @@ final class HostServiceTests: XCTestCase {
         XCTAssertNil(saved.hosts[0].currentGameID)
     }
 
-    func testWakeRenameDetailsConnectivityAndRemoval() async throws {
+    func testWakeRenameDetailsAndRemoval() async throws {
         let host = makeHost()
         let store = MemorySnapshotStore(UmbraSnapshot(hosts: [host]))
         let client = FakeGameStreamClient()
         let wake = FakeWakeSender()
-        let blocked = [ConnectivityPort(.udp, 47_998)]
         let service = makeService(
             store: store,
             client: client,
-            wake: wake,
-            connectivity: FakeConnectivityTester(result: .blocked(blocked))
+            wake: wake
         )
 
         let renamed = try await service.renameHost(id: host.uuid, name: "  Living Room  ")
         XCTAssertEqual(renamed.name, "Living Room")
         XCTAssertTrue(renamed.hasCustomName)
         let details = try await service.details(hostID: host.uuid)
-        let connectivity = await service.testConnectivity()
         let woken = try await service.wakeHost(id: host.uuid)
         XCTAssertTrue(details.canWake)
-        XCTAssertEqual(connectivity, .blocked(blocked))
         XCTAssertEqual(woken.status, .unknown)
         try await service.removeHost(id: host.uuid)
         let remaining = try await service.hosts()
@@ -613,7 +608,6 @@ final class HostServiceTests: XCTestCase {
         discoveryEnabled: Bool = true,
         resolver: any DiscoveredServiceResolving = LocalNameServiceResolver(),
         wake: any WakeOnLANSending = FakeWakeSender(),
-        connectivity: any ConnectivityTesting = FakeConnectivityTester(result: .clear),
         pairing: (any HostPairingAdapting)? = nil,
         offlineFailureThreshold: Int = 2,
         clientIdentityFingerprint: Data? = nil,
@@ -626,7 +620,6 @@ final class HostServiceTests: XCTestCase {
             discoveryEnabled: discoveryEnabled,
             discoveryResolver: resolver,
             wakeSender: wake,
-            connectivityTester: connectivity,
             pairingAdapter: pairing,
             pollInterval: .seconds(3_600),
             offlineFailureThreshold: offlineFailureThreshold,

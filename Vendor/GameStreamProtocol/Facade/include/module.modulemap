@@ -1,4 +1,4 @@
-module CMoonlightBridge {
+module CGameStreamProtocol {
     header "UmbraStreamingBridge.h"
     export *
 }

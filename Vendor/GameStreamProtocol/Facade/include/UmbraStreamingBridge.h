@@ -10,17 +10,17 @@ extern "C" {
 #endif
 
 /*
- * Stable C ABI for moonlight-common-c.
+ * Stable C ABI for the GameStream protocol library.
  *
- * A process can own multiple idle sessions, but moonlight-common-c has global
+ * A process can own multiple idle sessions, but the GameStream protocol library has global
  * connection state, so only one session may be starting/connected at a time.
  * `umbra_stream_session_start()` is blocking and must run on a dedicated serial
  * executor. `cancel()` is idempotent and safe from another thread; it
  * interrupts a pending start or stops a live connection. A cancelled start
- * returns `UMBRA_STREAM_ERROR_CANCELLED` unless moonlight-common-c reports a
+ * returns `UMBRA_STREAM_ERROR_CANCELLED` unless the GameStream protocol library reports a
  * more specific failure first.
  *
- * Callbacks may arrive concurrently on Moonlight networking threads. Callback
+ * Callbacks may arrive concurrently on GameStream networking threads. Callback
  * payload pointers are borrowed only for the duration of the callback, except
  * for `UmbraVideoFrame.data`, whose ownership may be taken explicitly with
  * `umbra_video_frame_take_data()`. The callback context is caller-owned and
@@ -148,7 +148,7 @@ typedef struct UmbraStreamConfiguration {
     /* Exact Lumen fidelity request; unspecified emits no extension. */
     UmbraStreamFidelityMode rtsp_fidelity_mode;
 
-    /* Local moonlight-common-c input pacing policy. */
+    /* Local GameStream input pacing policy. */
     UmbraStreamOptimizationMode input_optimization_mode;
 } UmbraStreamConfiguration;
 

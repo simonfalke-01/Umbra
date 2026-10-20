@@ -34,7 +34,7 @@
       "properties": {
         "network_kind": {"enum": ["lan", "wifi", "vpn", "cellular", "wan", "unknown"]},
         "optimization_mode": {"enum": ["latency", "quality", "unknown"]},
-        "client_protocol": {"enum": ["vanilla-moonlight", "umbra-legacy", "umbra-v2"]},
+        "client_protocol": {"enum": ["standard-gamestream", "umbra-legacy", "umbra-v2"]},
         "host": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
@@ -111,7 +111,7 @@
       "required": ["optimization_mode", "client_protocol"],
       "properties": {
         "optimization_mode": {"enum": ["latency", "quality", "unknown"]},
-        "client_protocol": {"enum": ["vanilla-moonlight", "umbra-legacy", "umbra-v2", "unknown"]}
+        "client_protocol": {"enum": ["standard-gamestream", "umbra-legacy", "umbra-v2", "unknown"]}
       },
       "additionalProperties": false
     },
@@ -123,7 +123,7 @@
         "errors": {"type": "array", "items": {"type": "string"}},
         "samples": {"type": "integer", "minimum": 0},
         "mode": {"enum": ["latency", "quality"]},
-        "client_protocol": {"enum": ["vanilla-moonlight", "umbra-legacy", "umbra-v2"]},
+        "client_protocol": {"enum": ["standard-gamestream", "umbra-legacy", "umbra-v2"]},
         "method": {"type": "string"},
         "one_way_split_available": {"type": "boolean"},
         "maximum_measurement_error_bound_ns": {"type": "integer", "minimum": 0},

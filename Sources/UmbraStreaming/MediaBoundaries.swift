@@ -3,7 +3,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
-/// Immutable codec negotiation passed from moonlight-common-c to a VideoToolbox decoder.
+/// Immutable codec negotiation passed from the GameStream protocol library to a VideoToolbox decoder.
 public struct VideoStreamFormat: Sendable, Equatable {
     public let codecMask: Int32
     public let width: Int
@@ -170,7 +170,7 @@ public struct OpusStreamFormat: Sendable, Equatable {
     }
 }
 
-/// An owned Opus packet copied from the Moonlight receive thread.
+/// An owned Opus packet copied from the GameStream receive thread.
 public struct CompressedAudioPacket: Sendable, Equatable {
     public let data: Data
 

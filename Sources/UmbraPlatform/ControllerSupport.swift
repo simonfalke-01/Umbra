@@ -303,7 +303,7 @@ public enum ControllerStateMapper {
     }
 }
 
-/// Combines physical controllers into Moonlight's single-controller mode.
+/// Combines physical controllers into the client's single-controller mode.
 /// Samples are evaluated in connection order so equal-magnitude stick input has
 /// a deterministic winner instead of depending on dictionary iteration order.
 public enum ControllerStateMerger {
@@ -449,7 +449,7 @@ public enum ControllerNavigationEvent: Equatable, Sendable {
     case showSettings
 }
 
-/// Edge- and repeat-aware mapper matching Moonlight's controller UI navigation.
+/// Edge- and repeat-aware mapper matching the client's controller UI navigation.
 public struct ControllerNavigationStateMachine: Sendable {
     public static let defaultAnalogRepeatInterval: TimeInterval = 0.15
 
@@ -680,7 +680,7 @@ public enum ControllerTouchMapper {
     }
 }
 
-/// Deterministic lowest-free-slot allocation matching Moonlight's player ordering.
+/// Deterministic lowest-free-slot allocation matching the client's player ordering.
 public struct ControllerSlotRegistry<ID: Hashable & Sendable>: Sendable {
     public let maximumControllerCount: Int
     private var slots: [ID?]

@@ -17,7 +17,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
 
         let activePairing = Task {
             try await coordinator.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "1234",
                 appVersion: "7.1.0.0"
             )
@@ -26,7 +26,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
 
         do {
             _ = try await coordinator.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "5678",
                 appVersion: "7.1.0.0"
             )
@@ -70,7 +70,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
 
         let pairingTask = Task {
             try await coordinator.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "1234",
                 appVersion: "7.1.0.0"
             )
@@ -98,7 +98,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
         )
 
         do {
-            try await coordinator.unpair(host: HostAddress(host: "sunshine.test"))
+            try await coordinator.unpair(host: HostAddress(host: "lumen.test"))
             XCTFail("Rejected unpair unexpectedly succeeded")
         } catch {
             XCTAssertEqual(error as? PairingError, .unpairRejected(statusCode: 503))
@@ -120,7 +120,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
 
         do {
             _ = try await coordinator.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "1234",
                 appVersion: "7.1.0.0"
             )
@@ -132,8 +132,8 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
     }
 
     func testFiveStageSHA256TranscriptPinsCertificateOnlyAfterMutualProof() async throws {
-        let clientIdentity = try makeEphemeralIdentity(commonName: "Test Moonlight Client", serialNumber: Data([1]))
-        let serverIdentity = try makeEphemeralIdentity(commonName: "Test Sunshine Host", serialNumber: Data([2]))
+        let clientIdentity = try makeEphemeralIdentity(commonName: "Test GameStream Client", serialNumber: Data([1]))
+        let serverIdentity = try makeEphemeralIdentity(commonName: "Test Lumen Host", serialNumber: Data([2]))
         let random = SequenceRandomSource([
             Data(0x00...0x0F),
             Data(0x10...0x1F),
@@ -151,7 +151,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
             appVersion: "7.1.0.0",
             randomSource: random
         )
-        let host = HostAddress(host: "sunshine.test")
+        let host = HostAddress(host: "lumen.test")
         let progress = ProgressRecorder()
 
         let result = try await coordinator.pair(
@@ -261,7 +261,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
         XCTAssertEqual(exchangeCount, 0)
     }
 
-    func testStageOneTimeoutExplainsSunshineStaleSessionRecovery() async throws {
+    func testStageOneTimeoutExplainsLumenStaleSessionRecovery() async throws {
         let identity = try makeEphemeralIdentity()
         let coordinator = GameStreamPairingCoordinator(
             transcript: TimeoutTranscript(),
@@ -272,14 +272,14 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
 
         do {
             _ = try await coordinator.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "5764",
                 appVersion: "7.0.0.0"
             )
             XCTFail("Expected the held PIN request to time out")
         } catch let PairingError.transport(stage, message) {
             XCTAssertEqual(stage, .requestingServerCertificate)
-            XCTAssertTrue(message.contains("restart Sunshine"))
+            XCTAssertTrue(message.contains("restart Lumen"))
         }
     }
 
@@ -334,7 +334,7 @@ final class GameStreamPairingCoordinatorTests: XCTestCase {
 
         do {
             _ = try await coordinator.pair(
-                host: HostAddress(host: "sunshine.test"),
+                host: HostAddress(host: "lumen.test"),
                 pin: "1234",
                 appVersion: "7.1.0.0"
             )

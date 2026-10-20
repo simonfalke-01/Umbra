@@ -22,6 +22,9 @@ public struct PointerCaptureState: Equatable, Sendable {
     public var displayCount: Int
     public var regionLockPolicy: PointerRegionLockPolicy
     public var cursorVisibleInAbsoluteMode: Bool
+    /// The host draws no cursor and the Mac cursor stands in for it; it must move freely to every
+    /// screen edge, so it is never confined to the video region.
+    public var clientDrawnCursor: Bool = false
 
     public init(
         mode: PointerMode = .relative,
@@ -48,7 +51,7 @@ public struct PointerCaptureState: Equatable, Sendable {
     }
 
     public var locksPointerToVideoRegion: Bool {
-        guard isCaptured, mode == .absolute else { return false }
+        guard isCaptured, mode == .absolute, !clientDrawnCursor else { return false }
         switch regionLockPolicy {
         case .enabled: return true
         case .disabled: return false
@@ -71,6 +74,8 @@ public enum PointerCaptureEvent: Equatable, Sendable {
     case toggleRegionLock
     case resetRegionLockToAutomatic
     case toggleCursorVisibility
+    case cursorVisibilityChanged(Bool)
+    case clientDrawnCursorChanged(Bool)
 }
 
 public struct PointerCaptureStateMachine: Sendable {
@@ -98,6 +103,10 @@ public struct PointerCaptureStateMachine: Sendable {
             state.regionLockPolicy = .automatic
         case .toggleCursorVisibility:
             state.cursorVisibleInAbsoluteMode.toggle()
+        case .cursorVisibilityChanged(let visible):
+            state.cursorVisibleInAbsoluteMode = visible
+        case .clientDrawnCursorChanged(let active):
+            state.clientDrawnCursor = active
         }
         return state
     }
@@ -148,7 +157,7 @@ public struct VirtualTrackpadTouchEvent: Equatable, Sendable {
     }
 }
 
-/// Pure gesture state for Moonlight-compatible virtual-trackpad input.
+/// Pure gesture state for GameStream-compatible virtual-trackpad input.
 /// One finger moves/clicks, two fingers right-click, and a stationary hold
 /// begins a left/right drag. Timed releases are exposed through `advance(to:)`
 /// so callers can drive the state with their normal event/timer loop.

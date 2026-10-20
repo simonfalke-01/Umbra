@@ -5,7 +5,7 @@ import XCTest
 final class GameStreamXMLParserTests: XCTestCase {
     private let parser = GameStreamXMLParser()
 
-    func testParsesServerInfoAndMoonlightBusyGameSemantics() throws {
+    func testParsesServerInfoAndGameStreamBusyGameSemantics() throws {
         let xml = Data("""
         <?xml version="1.0" encoding="utf-8"?>
         <root status_code="200" status_message="OK">
@@ -46,7 +46,7 @@ final class GameStreamXMLParserTests: XCTestCase {
 
     func testClearsStaleCurrentGameWhenServerIsNotBusyAndUsesDefaults() throws {
         let data = Data("""
-        <root status_code="200"><hostname></hostname><uniqueid>x</uniqueid><currentgame>9</currentgame><state>SUNSHINE_SERVER_FREE</state><PairStatus>0</PairStatus></root>
+        <root status_code="200"><hostname></hostname><uniqueid>x</uniqueid><currentgame>9</currentgame><state>LUMEN_SERVER_FREE</state><PairStatus>0</PairStatus></root>
         """.utf8)
         let info = try parser.parseServerInfo(data)
 
@@ -63,7 +63,7 @@ final class GameStreamXMLParserTests: XCTestCase {
           <hostname>Host</hostname>
           <uniqueid>host-1</uniqueid>
           <currentgame>42</currentgame>
-          <state>SUNSHINE_SERVER_BUSY</state>
+          <state>LUMEN_SERVER_BUSY</state>
           <PairStatus>0</PairStatus>
         </root>
         """.utf8)
@@ -74,7 +74,7 @@ final class GameStreamXMLParserTests: XCTestCase {
         XCTAssertEqual(info.pairState, .notPaired)
     }
 
-    func testParsesApplicationListIncludingEmptySunshineTitle() throws {
+    func testParsesApplicationListIncludingEmptyLumenTitle() throws {
         let data = Data("""
         <root status_code="200" status_message="OK">
           <App><AppTitle>Desktop</AppTitle><ID>1</ID><IsHdrSupported>1</IsHdrSupported><IsAppCollectorGame>0</IsAppCollectorGame></App>

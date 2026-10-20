@@ -20,7 +20,7 @@ final class WakeOnLANTests: XCTestCase {
         XCTAssertThrowsError(try WakeOnLAN.magicPacket(macAddress: "01:23:45:67:89:XX"))
     }
 
-    func testBuildsMoonlightStaticAndBasePortRelativePorts() {
+    func testBuildsGameStreamStaticAndBasePortRelativePorts() {
         XCTAssertEqual(WakeOnLAN.dynamicPorts(baseHTTPPort: 47_989), [47_998, 47_999, 48_000, 48_002, 48_010])
         XCTAssertEqual(WakeOnLAN.dynamicPorts(baseHTTPPort: 48_989), [48_998, 48_999, 49_000, 49_002, 49_010])
         XCTAssertEqual(WakeOnLAN.ports(baseHTTPPorts: [47_989]), [9, 47_009, 47_998, 47_999, 48_000, 48_002, 48_010])

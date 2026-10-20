@@ -3,7 +3,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
-/// Immutable codec negotiation passed from moonlight-common-c to the native decoder.
+/// Immutable codec negotiation passed from the GameStream protocol library to the native decoder.
 public struct VideoStreamFormat: Sendable, Equatable {
     public let codecMask: Int32
     public let width: Int
@@ -148,8 +148,8 @@ public protocol HDRMetadataReceiving: AnyObject, Sendable {
 public enum VideoLatencyClockDomain: Sendable, Equatable {
     /// Core Animation's monotonic media-time clock used by VideoToolbox and Metal telemetry.
     case clientMediaTime
-    /// Moonlight's client-local monotonic clock, whose epoch begins when its timing layer starts.
-    case moonlightClientUptime
+    /// the client's client-local monotonic clock, whose epoch begins when its timing layer starts.
+    case gameStreamClientUptime
     /// The RTP presentation timeline. It may be synthesized from client receive time and is not
     /// evidence of host capture time or synchronized to either client monotonic clock.
     case streamPresentationTimeline
@@ -188,7 +188,7 @@ public struct VideoFrameCorrelationID: Sendable, Equatable, Hashable {
 
 /// Calibrates two monotonic clocks with different epochs using the smallest observed offset.
 ///
-/// Moonlight records receive/reassembly time on `PltGetMicroseconds()`, while the native media
+/// GameStream records receive/reassembly time on `PltGetMicroseconds()`, while the native media
 /// pipeline uses `CACurrentMediaTime()`. Sampling at the Swift decoder boundary introduces a
 /// non-negative delivery delay, so the smallest observed offset is the least-biased available
 /// mapping. The resulting receive-to-decode measurement remains a calibrated client-side proxy.

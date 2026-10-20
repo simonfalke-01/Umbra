@@ -181,7 +181,7 @@ static inline int umbra_microphone_sample_ring_take_960(
     return 1;
 }
 
-// Real-time-safe SPSC storage for decoded output PCM. The Moonlight decoder is
+// Real-time-safe SPSC storage for decoded output PCM. The GameStream decoder is
 // the sole producer and the AudioQueue output callback is the sole consumer.
 // Packet end positions preserve source-packet accounting without allocating or
 // locking in either path.

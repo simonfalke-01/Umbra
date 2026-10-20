@@ -82,6 +82,7 @@ public actor LSPProductClient {
     private var pairingDiscoveryMutationHandler: (@Sendable (LSPPairingDiscoveryMutation) -> Void)?
     private var transportConfiguration = LSPTransportConfiguration()
     private var clipboardHandler: (@Sendable (UUID, LSPClipboardContent) -> Void)?
+    private var cursorHandler: (@Sendable (UUID, LSPCursorState) -> Void)?
 
     public init(
         trustStore: JSONFileStore<LSPTrustSnapshot>,
@@ -854,7 +855,8 @@ public actor LSPProductClient {
             videoOffers: offers,
             receiveBatchCapacity: receiveBatchCapacity,
             decoderSurfaces: decoderSurfaces,
-            maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds
+            maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds,
+            cursorMode: preferences.useMacCursor ? .client : .host
         )
     }
 
@@ -872,7 +874,8 @@ public actor LSPProductClient {
         videoOffers: [LSPVideoOffer],
         receiveBatchCapacity: UInt8 = 64,
         decoderSurfaces: UInt8 = 3,
-        maximumCaptureToPresentMicroseconds: UInt32 = 50_000
+        maximumCaptureToPresentMicroseconds: UInt32 = 50_000,
+        cursorMode: LSPCursorMode = .host
     ) async throws -> LSPClientSession {
         guard startAttempts[hostID] == nil, !endpointEditHostIDs.contains(hostID) else {
             throw LSPControlStatus.busy
@@ -929,7 +932,8 @@ public actor LSPProductClient {
                         videoOffers: videoOffers,
                         receiveBatchCapacity: receiveBatchCapacity,
                         decoderSurfaces: decoderSurfaces,
-                        maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds
+                        maximumCaptureToPresentMicroseconds: maximumCaptureToPresentMicroseconds,
+                        cursorMode: cursorMode
                     ))
                     return session
                 } catch {
@@ -1266,7 +1270,7 @@ public actor LSPProductClient {
                 0,
                 NI_NUMERICHOST
             ) == 0 else { continue }
-            let address = String(cString: buffer)
+            let address = String(decoding: buffer.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
             if !addresses.contains(address) { addresses.append(address) }
         }
         return Array(addresses.prefix(LSPHostRecord.maximumEndpointsPerSource))
@@ -1333,6 +1337,22 @@ public actor LSPProductClient {
         }
     }
 
+    /// Installs the receiver for host cursor state on current and future sessions.
+    public func setCursorHandler(_ handler: (@Sendable (UUID, LSPCursorState) -> Void)?) async {
+        cursorHandler = handler
+        for (hostID, session) in sessions {
+            await session.setCursorHandler(Self.sessionCursorHandler(handler, hostID: hostID))
+        }
+    }
+
+    private static func sessionCursorHandler(
+        _ handler: (@Sendable (UUID, LSPCursorState) -> Void)?,
+        hostID: UUID
+    ) -> (@Sendable (LSPCursorState) -> Void)? {
+        guard let handler else { return nil }
+        return { state in handler(hostID, state) }
+    }
+
     /// Sends content copied on this Mac to the host clipboard through the current input authority.
     public func sendClipboard(hostID: UUID, content: LSPClipboardContent) async throws {
         guard let session = sessions[hostID], await session.state == .inputActive else {
@@ -1357,6 +1377,7 @@ public actor LSPProductClient {
 
     private func configureSessionHandlers(_ session: LSPClientSession, hostID: UUID) async {
         await session.setClipboardHandler(Self.sessionClipboardHandler(clipboardHandler, hostID: hostID))
+        await session.setCursorHandler(Self.sessionCursorHandler(cursorHandler, hostID: hostID))
         let trustStore = self.trustStore
         await session.setCertificateRotationHandler { updated in
             do {

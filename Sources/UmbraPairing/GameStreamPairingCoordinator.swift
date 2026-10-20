@@ -337,7 +337,7 @@ public final class GameStreamPairingCoordinator: PairingCoordinating, @unchecked
                (error as? URLError)?.code == .timedOut {
                 throw PairingError.transport(
                     stage: stage,
-                    message: "The host did not finish PIN confirmation. Sunshine may retain a stale pending pairing session after a timeout; restart Sunshine before retrying."
+                    message: "The host did not finish PIN confirmation. Lumen may retain a stale pending pairing session after a timeout; restart Lumen before retrying."
                 )
             }
             throw PairingError.transport(stage: stage, message: error.localizedDescription)

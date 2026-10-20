@@ -4,17 +4,17 @@ import UmbraNetworking
 @testable import UmbraPairing
 
 final class PairingHTTPTranscriptTests: XCTestCase {
-    func testNVIDIAPairingUsesLegacyIDWhileSunshineUsesTrueID() async throws {
+    func testNVIDIAPairingUsesLegacyIDWhileLumenUsesTrueID() async throws {
         let identity = try makeEphemeralIdentity()
         let nvidiaTransport = RecordingPairingTransport()
-        let sunshineTransport = RecordingPairingTransport()
+        let hostTransport = RecordingPairingTransport()
         let nvidia = URLSessionPairingHTTPTranscript(
             plainTransport: nvidiaTransport,
             uniqueID: "true-client-id",
             useTrueUniqueID: false
         )
-        let sunshine = URLSessionPairingHTTPTranscript(
-            plainTransport: sunshineTransport,
+        let lumen = URLSessionPairingHTTPTranscript(
+            plainTransport: hostTransport,
             uniqueID: "true-client-id",
             useTrueUniqueID: true
         )
@@ -28,14 +28,14 @@ final class PairingHTTPTranscriptTests: XCTestCase {
         )
 
         _ = try await nvidia.exchange(request)
-        _ = try await sunshine.exchange(request)
+        _ = try await lumen.exchange(request)
 
         let nvidiaRequests = await nvidiaTransport.requests
-        let sunshineRequests = await sunshineTransport.requests
+        let hostRequests = await hostTransport.requests
         let nvidiaRequest = try XCTUnwrap(nvidiaRequests.first)
-        let sunshineRequest = try XCTUnwrap(sunshineRequests.first)
+        let hostRequest = try XCTUnwrap(hostRequests.first)
         XCTAssertEqual(queryValue("uniqueid", in: nvidiaRequest), GameStreamRequestBuilder.legacyNVIDIAUniqueID)
-        XCTAssertEqual(queryValue("uniqueid", in: sunshineRequest), "true-client-id")
+        XCTAssertEqual(queryValue("uniqueid", in: hostRequest), "true-client-id")
     }
 
     func testCertificateRequestAllowsTimeForHumanPINConfirmation() async throws {

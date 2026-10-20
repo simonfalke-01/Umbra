@@ -2,9 +2,9 @@ import UmbraCore
 import UmbraMedia
 import UmbraServices
 
-/// Selects one exact Moonlight client video format from independently reported
-/// client and host capabilities. Sunshine SCM bits must never be intersected
-/// directly with Moonlight client-format bits because their positions differ.
+/// Selects one exact GameStream client video format from independently reported
+/// client and host capabilities. Lumen SCM bits must never be intersected
+/// directly with GameStream client-format bits because their positions differ.
 public struct VideoFormatNegotiator: Sendable {
     public init() {}
 
@@ -14,12 +14,12 @@ public struct VideoFormatNegotiator: Sendable {
         application: StreamApplication,
         preferences: StreamingPreferences
     ) throws -> StreamPreparationResult {
-        let clientFormats = availableVideoFormats & MoonlightVideoFormat.knownMask
+        let clientFormats = availableVideoFormats & GameStreamVideoFormat.knownMask
         let commonFormats = clientFormats & Self.clientFormatMask(
             for: host.codecSupport,
             maxLumaPixelsHEVC: host.maxLumaPixelsHEVC
         )
-        // Modern Sunshine hosts can enable HDR for applications that don't carry
+        // Modern Lumen hosts can enable HDR for applications that don't carry
         // NVIDIA's legacy per-app certification flag. Treat that flag as advisory.
         let wantsHDR = preferences.enableHDR
         let wantsYUV444 = preferences.enableYUV444
@@ -80,39 +80,39 @@ public struct VideoFormatNegotiator: Sendable {
         )
     }
 
-    /// Explicit Sunshine SCM to Moonlight client-format mapping.
+    /// Explicit Lumen SCM to GameStream client-format mapping.
     public static func clientFormatMask(
         for hostSupport: HostCodecSupport,
         maxLumaPixelsHEVC: Int = 0
     ) -> Int32 {
         var formats: Int32 = 0
-        if hostSupport.contains(.h264) { formats |= MoonlightVideoFormat.h264.rawValue }
+        if hostSupport.contains(.h264) { formats |= GameStreamVideoFormat.h264.rawValue }
         if hostSupport.contains(.h264High8YUV444) {
-            formats |= MoonlightVideoFormat.h264High8YUV444.rawValue
+            formats |= GameStreamVideoFormat.h264High8YUV444.rawValue
         }
         if hostSupport.contains(.hevc) || maxLumaPixelsHEVC > 0 {
-            formats |= MoonlightVideoFormat.hevc.rawValue
+            formats |= GameStreamVideoFormat.hevc.rawValue
         }
         if hostSupport.contains(.hevcMain10) {
-            formats |= MoonlightVideoFormat.hevcMain10.rawValue
+            formats |= GameStreamVideoFormat.hevcMain10.rawValue
         }
         if hostSupport.contains(.hevcRext8YUV444) {
-            formats |= MoonlightVideoFormat.hevcRext8YUV444.rawValue
+            formats |= GameStreamVideoFormat.hevcRext8YUV444.rawValue
         }
         if hostSupport.contains(.hevcRext10YUV444) {
-            formats |= MoonlightVideoFormat.hevcRext10YUV444.rawValue
+            formats |= GameStreamVideoFormat.hevcRext10YUV444.rawValue
         }
         if hostSupport.contains(.av1Main8) {
-            formats |= MoonlightVideoFormat.av1Main8.rawValue
+            formats |= GameStreamVideoFormat.av1Main8.rawValue
         }
         if hostSupport.contains(.av1Main10) {
-            formats |= MoonlightVideoFormat.av1Main10.rawValue
+            formats |= GameStreamVideoFormat.av1Main10.rawValue
         }
         if hostSupport.contains(.av1High8YUV444) {
-            formats |= MoonlightVideoFormat.av1High8YUV444.rawValue
+            formats |= GameStreamVideoFormat.av1High8YUV444.rawValue
         }
         if hostSupport.contains(.av1High10YUV444) {
-            formats |= MoonlightVideoFormat.av1High10YUV444.rawValue
+            formats |= GameStreamVideoFormat.av1High10YUV444.rawValue
         }
         return formats
     }
@@ -124,7 +124,7 @@ public struct VideoFormatNegotiator: Sendable {
     }
 
     private func hostProvesLossless(
-        _ format: MoonlightVideoFormat,
+        _ format: GameStreamVideoFormat,
         support: HostCodecSupport
     ) -> Bool {
         switch format {
@@ -139,7 +139,7 @@ public struct VideoFormatNegotiator: Sendable {
         }
     }
 
-    private func fidelityRank(_ format: MoonlightVideoFormat) -> Int {
+    private func fidelityRank(_ format: GameStreamVideoFormat) -> Int {
         switch (format.isYUV444, format.isTenBit) {
         case (true, true): 0
         case (true, false): 1
@@ -148,7 +148,7 @@ public struct VideoFormatNegotiator: Sendable {
         }
     }
 
-    private func fidelityClass(_ format: MoonlightVideoFormat) -> StreamVideoFidelityClass {
+    private func fidelityClass(_ format: GameStreamVideoFormat) -> StreamVideoFidelityClass {
         switch (format.isYUV444, format.isTenBit) {
         case (true, true): .codecLosslessYUV44410Bit
         case (true, false): .codecLosslessYUV4448Bit
@@ -157,7 +157,7 @@ public struct VideoFormatNegotiator: Sendable {
         }
     }
 
-    private func basePriority(preferences: StreamingPreferences) -> [MoonlightVideoFormat] {
+    private func basePriority(preferences: StreamingPreferences) -> [GameStreamVideoFormat] {
         switch preferences.videoCodecPreference {
         case .automatic:
             if preferences.videoDecoderPreference == .software {
@@ -173,7 +173,7 @@ public struct VideoFormatNegotiator: Sendable {
         }
     }
 
-    private func allFormats(for family: CodecFamily) -> [MoonlightVideoFormat] {
+    private func allFormats(for family: CodecFamily) -> [GameStreamVideoFormat] {
         switch family {
         case .h264:
             [.h264High8YUV444, .h264]
@@ -185,9 +185,9 @@ public struct VideoFormatNegotiator: Sendable {
     }
 
     private func preferred(
-        _ formats: [MoonlightVideoFormat],
-        where predicate: KeyPath<MoonlightVideoFormat, Bool>
-    ) -> [MoonlightVideoFormat] {
+        _ formats: [GameStreamVideoFormat],
+        where predicate: KeyPath<GameStreamVideoFormat, Bool>
+    ) -> [GameStreamVideoFormat] {
         formats.filter { $0[keyPath: predicate] }
             + formats.filter { !$0[keyPath: predicate] }
     }

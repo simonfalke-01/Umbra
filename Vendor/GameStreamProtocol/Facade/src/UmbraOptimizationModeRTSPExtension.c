@@ -116,7 +116,7 @@ bool umbra_optimization_mode_rtsp_append_announce(char **payload, int *payload_l
         return false;
     }
 
-    /* Legacy/NVIDIA sessions must retain the pinned Moonlight ANNOUNCE bytes.
+    /* Legacy/NVIDIA sessions must retain the pinned GameStream ANNOUNCE bytes.
      * Umbra's dedicated marker is emitted only alongside an explicitly gated
      * Lumen optimization or fidelity extension. */
     if (mode == UMBRA_STREAM_OPTIMIZATION_MODE_LEGACY &&

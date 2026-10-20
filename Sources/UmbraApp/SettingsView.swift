@@ -18,6 +18,7 @@ enum SettingsTab: String, CaseIterable, Hashable {
 private enum ResolutionPreset: String, CaseIterable, Identifiable {
     case native
     case nativeExcludingNotch
+    case nativeExcludingNotchHalf
     case p720
     case p1080
     case p1440
@@ -29,6 +30,7 @@ private enum ResolutionPreset: String, CaseIterable, Identifiable {
         switch self {
         case .native: "Native"
         case .nativeExcludingNotch: "Native (Excluding Notch)"
+        case .nativeExcludingNotchHalf: "Native (Excluding Notch) ½"
         case .p720: "720p (1280 × 720)"
         case .p1080: "1080p (1920 × 1080)"
         case .p1440: "1440p (2560 × 1440)"
@@ -39,7 +41,7 @@ private enum ResolutionPreset: String, CaseIterable, Identifiable {
 
     var dimensions: (width: Int, height: Int)? {
         switch self {
-        case .native, .nativeExcludingNotch: nil
+        case .native, .nativeExcludingNotch, .nativeExcludingNotchHalf: nil
         case .p720: (1_280, 720)
         case .p1080: (1_920, 1_080)
         case .p1440: (2_560, 1_440)
@@ -52,6 +54,7 @@ private enum ResolutionPreset: String, CaseIterable, Identifiable {
 private enum FrameRatePreset: Int, CaseIterable, Identifiable {
     case fps30 = 30
     case fps60 = 60
+    case fps120 = 120
     case custom = -1
 
     var id: Self { self }
@@ -59,6 +62,7 @@ private enum FrameRatePreset: Int, CaseIterable, Identifiable {
         switch self {
         case .fps30: "30 FPS"
         case .fps60: "60 FPS"
+        case .fps120: "120 FPS"
         case .custom: "Custom"
         }
     }
@@ -309,7 +313,7 @@ private struct GeneralSettingsView: View {
                 )
                 PreferenceToggle(
                     "Quit app on host after ending stream",
-                    message: "The host closes the streamed app when the stream ends. Unsaved progress may be lost.",
+                    message: "Unsaved work in the app is lost.",
                     binding: preferences.binding(for: \.quitAppAfter)
                 )
             }
@@ -343,12 +347,10 @@ private struct GeneralSettingsView: View {
                 PreferenceToggle("Show connection quality warnings", binding: preferences.binding(for: \.connectionWarnings))
                 PreferenceToggle(
                     "Share activity with Discord",
-                    message: "Shows the streamed app in your Discord status.",
                     binding: preferences.binding(for: \.richPresence)
                 )
                 PreferenceToggle(
                     "Keep the display awake while streaming",
-                    message: "Prevents the screen saver and display sleep during an active stream.",
                     binding: preferences.binding(for: \.keepAwake)
                 )
             }
@@ -368,6 +370,7 @@ private struct VideoSettingsView: View {
         switch preferences.settings.displayResolutionPolicy {
         case .native: return .native
         case .nativeExcludingNotch: return .nativeExcludingNotch
+        case .nativeExcludingNotchHalf: return .nativeExcludingNotchHalf
         case .configured: break
         }
         return switch (preferences.settings.width, preferences.settings.height) {
@@ -446,7 +449,7 @@ private struct VideoSettingsView: View {
     var body: some View {
         SettingsPane(tab: .video) {
             SettingsSection("Resolution and frame rate") {
-                SettingsRow("Display", message: "Automatic uses the display containing Umbra when the stream starts.") {
+                SettingsRow("Display") {
                     CompactMenuPicker(
                         title: "Display",
                         options: displaySelections,
@@ -456,7 +459,7 @@ private struct VideoSettingsView: View {
                     )
                 }
 
-                SettingsRow("Resolution", message: "Values above the host, display, decoder, or network limit may cause errors or stutter.") {
+                SettingsRow("Resolution") {
                     CompactMenuPicker(
                         title: "Resolution",
                         options: ResolutionPreset.allCases,
@@ -466,7 +469,7 @@ private struct VideoSettingsView: View {
                 }
 
                 if resolution == .custom {
-                    SettingsRow("Custom resolution", message: "The host may not change its display resolution automatically.") {
+                    SettingsRow("Custom resolution") {
                         CustomResolutionControl(preferences: preferences)
                     }
                 }
@@ -496,7 +499,7 @@ private struct VideoSettingsView: View {
                     StreamOptimizationModePicker(preferences: preferences)
                 }
 
-                SettingsRow("Video bitrate", message: "Lower values help slower connections; higher values can improve image quality.") {
+                SettingsRow("Video bitrate") {
                     VStack(alignment: .leading, spacing: UmbraLayout.space2) {
                         HStack {
                             CompactSlider(
@@ -518,9 +521,9 @@ private struct VideoSettingsView: View {
                     }
                 }
 
-                SettingsRow("Display mode", message: "Borderless Windowed integrates best with macOS Spaces; Fullscreen may reduce overhead.") {
+                SettingsRow("Window mode") {
                     CompactMenuPicker(
-                        title: "Display mode",
+                        title: "Window mode",
                         options: WindowMode.streamChoices,
                         selection: preferences.binding(for: \.windowMode),
                         optionLabel: \.label
@@ -585,6 +588,10 @@ private struct VideoSettingsView: View {
                 case .nativeExcludingNotch:
                     preferences.update {
                         $0.displayResolutionPolicy = .nativeExcludingNotch
+                    }
+                case .nativeExcludingNotchHalf:
+                    preferences.update {
+                        $0.displayResolutionPolicy = .nativeExcludingNotchHalf
                     }
                 case .custom:
                     customResolutionWidthText = String(preferences.settings.width)
@@ -996,7 +1003,7 @@ struct AudioSettingsView: View {
 
     var body: some View {
         SettingsPane(tab: .audio) {
-            SettingsSection("Audio") {
+            SettingsSection {
                 SettingsRow("Speaker layout") {
                     CompactMenuPicker(
                         title: "Speaker layout",
@@ -1007,7 +1014,7 @@ struct AudioSettingsView: View {
                 }
                 PreferenceToggle(
                     "Mute host speakers while streaming",
-                    message: "Restart an app already running on the host for this change to take effect.",
+                    message: "Applies the next time an app starts on the host.",
                     binding: Binding(
                         get: { !preferences.settings.playAudioOnHost },
                         set: { preferences.update(\.playAudioOnHost, to: !$0) }
@@ -1015,14 +1022,10 @@ struct AudioSettingsView: View {
                 )
                 PreferenceToggle(
                     "Mute stream in the background",
-                    message: "Mutes streamed audio while another app is active.",
                     binding: preferences.binding(for: \.muteOnFocusLoss)
                 )
                 PreferenceToggle(
                     UmbraLocalization.string("Use Mac microphone on host"),
-                    message: UmbraLocalization.string(
-                        "Makes this Mac’s microphone available to compatible Lumen hosts. macOS asks for permission when enabled."
-                    ),
                     binding: clientMicrophoneBinding
                 )
                 SettingsRow(
@@ -1031,7 +1034,8 @@ struct AudioSettingsView: View {
                         ? UmbraLocalization.string(
                             "The selected microphone is disconnected. Reconnect it or choose another input."
                         )
-                        : nil
+                        : nil,
+                    isEnabled: preferences.settings.clientMicrophoneEnabled
                 ) {
                     CompactMenuPicker(
                         title: UmbraLocalization.string("Microphone"),
@@ -1043,7 +1047,7 @@ struct AudioSettingsView: View {
                 PreferenceToggle(
                     UmbraLocalization.string("Require microphone for streaming"),
                     message: UmbraLocalization.string(
-                        "Fails stream startup instead of continuing without microphone forwarding."
+                        "The stream won’t start without it."
                     ),
                     binding: preferences.binding(for: \.clientMicrophoneRequired)
                 )
@@ -1137,13 +1141,18 @@ struct InputSettingsView: View {
 
     var body: some View {
         SettingsPane(tab: .input) {
-            SettingsSection("Mouse and keyboard") {
+            SettingsSection {
+                PreferenceToggle(
+                    "Use Mac cursor",
+                    message: "Shows the Mac cursor with the host's cursor shape and Mac pointer speed. Games that hide the cursor get raw mouse input. Lumen hosts only.",
+                    binding: preferences.binding(for: \.useMacCursor)
+                )
                 PreferenceToggle(
                     "Use absolute mouse mode",
-                    message: "Uses absolute pointer input without capturing the local cursor. Most games require relative mouse mode.",
+                    message: "Most games need this off.",
                     binding: preferences.binding(for: \.absoluteMouseMode)
                 )
-                SettingsRow("Capture system keyboard shortcuts", message: "Sends shortcuts such as Command-Tab to the host.") {
+                SettingsRow("Capture system keyboard shortcuts") {
                     CompactMenuPicker(
                         title: "Capture system keyboard shortcuts",
                         options: CaptureSystemKeysMode.allCases,
@@ -1181,14 +1190,6 @@ struct InputSettingsView: View {
                         }
                     }
                 }
-                PreferenceToggle(
-                    "Use touchscreen as a virtual trackpad",
-                    message: "When disabled, touch input directly controls the remote pointer.",
-                    binding: Binding(
-                        get: { !preferences.settings.absoluteTouchMode },
-                        set: { preferences.update(\.absoluteTouchMode, to: !$0) }
-                    )
-                )
                 PreferenceToggle("Swap left and right mouse buttons", binding: preferences.binding(for: \.swapMouseButtons))
                 PreferenceToggle("Reverse mouse scrolling direction", binding: preferences.binding(for: \.reverseScrollDirection))
             }
@@ -1220,15 +1221,13 @@ private struct ControllerSettingsView: View {
 
     var body: some View {
         SettingsPane(tab: .gamepad) {
-            SettingsSection("Controller") {
+            SettingsSection {
                 PreferenceToggle(
                     "Swap A/B and X/Y buttons",
-                    message: "Uses a Nintendo-style face-button layout.",
                     binding: preferences.binding(for: \.swapFaceButtons)
                 )
                 PreferenceToggle(
                     "Keep one controller connected",
-                    message: "Presents a controller to the host even when none is connected to this Mac.",
                     binding: Binding(
                         get: { !preferences.settings.multiController },
                         set: { preferences.update(\.multiController, to: !$0) }
@@ -1240,7 +1239,6 @@ private struct ControllerSettingsView: View {
                 )
                 PreferenceToggle(
                     "Allow controller input in the background",
-                    message: "Sends controller input while another app is active.",
                     binding: preferences.binding(for: \.backgroundGamepad)
                 )
             }
@@ -1249,33 +1247,14 @@ private struct ControllerSettingsView: View {
 }
 
 private struct AdvancedSettingsView: View {
-    private enum AWDLStatus {
-        case checking
-        case enabled
-        case disabled
-        case unavailable
-        case failed
-
-        var label: String {
-            switch self {
-            case .checking: "Checking…"
-            case .enabled: "Enabled"
-            case .disabled: "Disabled"
-            case .unavailable: "Unavailable"
-            case .failed: "Couldn’t Check"
-            }
-        }
-    }
-
     @ObservedObject var preferences: PreferencesStore
     @State private var showsResetConfirmation = false
-    @State private var awdlStatus: AWDLStatus = .checking
     @State private var awdlHelperStatus: AWDLHelperRegistrationStatus = .notRegistered
     @State private var awdlHelperError: String?
 
     var body: some View {
         SettingsPane(tab: .advanced) {
-            SettingsSection("Video pipeline") {
+            SettingsSection("Video") {
                 SettingsRow("Video decoder") {
                     CompactMenuPicker(
                         title: "Video decoder",
@@ -1305,19 +1284,16 @@ private struct AdvancedSettingsView: View {
                 }
                 PreferenceToggle(
                     "Vertical sync",
-                    message: "Matches presentation to the display. Turning it off may show tearing.",
                     binding: preferences.binding(for: \.enableVSync)
                 )
                 PreferenceToggle(
                     "Frame pacing",
-                    message: "Uses display timing to reduce uneven frame delivery.",
                     binding: preferences.binding(for: \.framePacing),
                     enabled: preferences.settings.enableVSync,
                     disabledReason: "Turn on vertical sync to use frame pacing."
                 )
                 PreferenceToggle(
                     "Allow bitrates above 150 Mbps",
-                    message: "Allows very high bitrates on compatible hosts. Use a wired network.",
                     binding: Binding(
                         get: { preferences.settings.unlockBitrate },
                         set: { enabled in
@@ -1327,28 +1303,16 @@ private struct AdvancedSettingsView: View {
                 )
             }
 
-            SettingsSection("Network and diagnostics") {
-                SettingsRow("Network packet size", message: "Automatic is recommended. Custom values must be between 1,024 and 65,507 bytes.") {
+            SettingsSection("Network") {
+                SettingsRow("Network packet size") {
                     PacketSizeField(preferences: preferences)
                 }
                 PreferenceToggle(
                     "Find hosts on the local network",
                     binding: preferences.binding(for: \.enableMDNS)
                 )
-                PreferenceToggle(
-                    "Check for blocked connections",
-                    message: "Runs connection checks when a host cannot be reached.",
-                    binding: preferences.binding(for: \.detectNetworkBlocking)
-                )
                 SettingsRow(
-                    "AWDL interface",
-                    message: "Current Apple Wireless Direct Link state on this Mac."
-                ) {
-                    Text(awdlStatus.label)
-                        .foregroundStyle(.secondary)
-                }
-                SettingsRow(
-                    "AWDL network helper",
+                    "Network helper",
                     message: awdlHelperError ?? awdlHelperMessage
                 ) {
                     HStack(spacing: UmbraLayout.space2) {
@@ -1360,23 +1324,19 @@ private struct AdvancedSettingsView: View {
                     }
                 }
                 PreferenceToggle(
-                    "Disable AWDL while streaming",
-                    message: "Uses the approved helper without prompting, then restores AWDL when streaming ends. While active, AirDrop, Sidecar, and peer-to-peer AirPlay are unavailable.",
+                    "Pause AirDrop and AirPlay while streaming",
                     binding: preferences.binding(for: \.disableAWDLWhileStreaming),
-                    enabled: awdlHelperStatus == .enabled || preferences.settings.disableAWDLWhileStreaming,
-                    disabledReason: "Set up and approve Umbra's restricted network helper first."
+                    enabled: awdlHelperStatus == .enabled || preferences.settings.disableAWDLWhileStreaming
                 )
                 PreferenceToggle(
                     "Show performance overlay",
-                    message: "Displays real-time stream performance information over the video.",
                     binding: preferences.binding(for: \.showPerformanceOverlay)
                 )
             }
 
-            SettingsSection("Lumen Streaming Protocol") {
+            SettingsSection("Lumen hosts") {
                 SettingsRow(
-                    "Network profile",
-                    message: "Adaptive is safe on ordinary networks. Competition requires an explicit wired-link capacity ceiling."
+                    "Network profile"
                 ) {
                     Picker("Network profile", selection: Binding(
                         get: { preferences.settings.lspNetworkProfile },
@@ -1388,10 +1348,11 @@ private struct AdvancedSettingsView: View {
                             preferences.update(\.lspNetworkProfile, to: profile)
                         }
                     )) {
-                        Text("Adaptive low latency").tag(LSPNetworkProfilePreference.adaptiveLowLatency)
-                        Text("Competition LAN").tag(LSPNetworkProfilePreference.competitionLAN)
+                        Text("Adaptive").tag(LSPNetworkProfilePreference.adaptiveLowLatency)
+                        Text("Competition (wired)").tag(LSPNetworkProfilePreference.competitionLAN)
                     }
-                    .frame(width: 220)
+                    .labelsHidden()
+                    .fixedSize()
                 }
                 SettingsRow("Competition capacity") {
                     Stepper(
@@ -1406,26 +1367,21 @@ private struct AdvancedSettingsView: View {
                 LSPRateSettingsRows(preferences: preferences)
                 PreferenceToggle(
                     "Request microphone permission when pairing",
-                    message: "Re-pair an existing host to change its granted permissions.",
                     binding: preferences.binding(for: \.lspPairMicrophonePermission)
                 )
                 PreferenceToggle(
                     "Request application quit permission when pairing",
-                    message: "Lets Umbra quit only the application that its own stream started.",
                     binding: preferences.binding(for: \.lspPairQuitPermission)
                 )
                 PreferenceToggle(
-                    "Share clipboard with Lumen hosts",
-                    message: "Copies text between this Mac and the host while streaming. "
-                        + "Hosts paired before this was available need clipboard access enabled in Lumen's client permissions.",
+                    "Share clipboard",
                     binding: preferences.binding(for: \.lspClipboardSharing)
                 )
             }
 
             SettingsSection("Defaults") {
                 SettingsRow(
-                    "Umbra settings",
-                    message: "Returns streaming, input, audio, and interface preferences to their defaults."
+                    "Umbra settings"
                 ) {
                     Button("Restore Defaults...", role: .destructive) {
                         showsResetConfirmation = true
@@ -1447,23 +1403,9 @@ private struct AdvancedSettingsView: View {
         }
         .task {
             refreshAWDLHelperStatus()
-            await refreshAWDLStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshAWDLHelperStatus()
-            Task { await refreshAWDLStatus() }
-        }
-    }
-
-    private func refreshAWDLStatus() async {
-        do {
-            switch try await SystemAWDLInterfaceCommandExecutor().currentState() {
-            case .up: awdlStatus = .enabled
-            case .down: awdlStatus = .disabled
-            case .unavailable: awdlStatus = .unavailable
-            }
-        } catch {
-            awdlStatus = .failed
         }
     }
 
@@ -1654,7 +1596,7 @@ struct HDRPreferenceToggle: View {
 
     var body: some View {
         PreferenceToggle(
-            "Enable HDR",
+            "HDR",
             message: hdrAvailable ? nil : "No HDR-capable display is currently available.",
             binding: preferences.binding(for: \.enableHDR),
             enabled: hdrAvailable || preferences.settings.enableHDR,

@@ -24,18 +24,18 @@ REQUIRED_LEGAL_RESOURCES = {
     "NOTICE.md": REPOSITORY_ROOT / "NOTICE.md",
     "THIRD_PARTY_NOTICES.md": REPOSITORY_ROOT / "THIRD_PARTY_NOTICES.md",
     "MOONLIGHT_PROVENANCE.md": (
-        REPOSITORY_ROOT / "Vendor/MoonlightCommon/PROVENANCE.md"
+        REPOSITORY_ROOT / "Vendor/GameStreamProtocol/PROVENANCE.md"
     ),
     "OpenSSL-Apache-2.0.txt": REPOSITORY_ROOT / "OPENSSL_LICENSE.txt",
     "Opus-BSD-3-Clause.txt": REPOSITORY_ROOT / "OPUS_LICENSE.txt",
     "moonlight-common-c-GPL-3.0.txt": (
-        REPOSITORY_ROOT / "Vendor/MoonlightCommon/Upstream/LICENSE.txt"
+        REPOSITORY_ROOT / "Vendor/GameStreamProtocol/Upstream/LICENSE.txt"
     ),
     "ENet-MIT.txt": (
-        REPOSITORY_ROOT / "Vendor/MoonlightCommon/Upstream/enet/LICENSE"
+        REPOSITORY_ROOT / "Vendor/GameStreamProtocol/Upstream/enet/LICENSE"
     ),
     "nanors-MIT.txt": (
-        REPOSITORY_ROOT / "Vendor/MoonlightCommon/Upstream/nanors/LICENSE"
+        REPOSITORY_ROOT / "Vendor/GameStreamProtocol/Upstream/nanors/LICENSE"
     ),
 }
 

@@ -277,6 +277,15 @@ namespace umbra::lsp {
     /** @brief Queue one allocation-free relative-pointer capture record. */
     [[nodiscard]] clsp_status_t submit_pointer(const clsp_pointer_sample_t &sample) noexcept;
 
+    /** @brief Queue one allocation-free absolute-pointer capture record. */
+    [[nodiscard]] clsp_status_t submit_absolute_pointer(const clsp_absolute_pointer_sample_t &sample) noexcept;
+
+    /**
+     * @brief Drop relative capture motion while the client draws an absolute cursor.
+     * @param inside_video Whether that cursor is over the video; presses and scrolls outside it are dropped.
+     */
+    [[nodiscard]] clsp_status_t set_pointer_motion_absolute(bool absolute, bool inside_video) noexcept;
+
     /** @brief Queue one allocation-free keyboard or pointer-button edge. */
     [[nodiscard]] clsp_status_t submit_input_edge(const clsp_input_edge_t &edge) noexcept;
 

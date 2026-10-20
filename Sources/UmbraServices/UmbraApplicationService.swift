@@ -127,7 +127,6 @@ public protocol UmbraApplicationServicing: Sendable {
     func renameHost(id: String, name: String) async throws -> StreamHost
     func removeHost(id: String) async throws
     func details(hostID: String) async throws -> HostDetails
-    func testConnectivity() async -> ConnectivityTestResult
     func beginSession(_ intent: SessionIntent) async throws -> StreamSession
     func stopSession(quitHostApplication: Bool) async throws -> StreamSession
     @discardableResult
@@ -201,7 +200,6 @@ public actor UmbraApplicationService: UmbraApplicationServicing {
     private let discovery: (any BonjourDiscovering)?
     private let discoveryResolver: any DiscoveredServiceResolving
     private let wakeSender: any WakeOnLANSending
-    private let connectivityTester: any ConnectivityTesting
     private let pairingAdapter: (any HostPairingAdapting)?
     private let streamDriver: (any StreamSessionDriving)?
     private let credentialProvider: any RemoteInputCredentialProviding
@@ -244,7 +242,6 @@ public actor UmbraApplicationService: UmbraApplicationServicing {
         discoveryEnabled: Bool = true,
         discoveryResolver: any DiscoveredServiceResolving = LocalNameServiceResolver(),
         wakeSender: any WakeOnLANSending = NetworkWakeOnLANSender(),
-        connectivityTester: any ConnectivityTesting = NetworkFrameworkConnectivityTester(),
         pairingAdapter: (any HostPairingAdapting)? = nil,
         streamDriver: (any StreamSessionDriving)? = nil,
         credentialProvider: any RemoteInputCredentialProviding = SecureRemoteInputCredentialProvider(),
@@ -266,7 +263,6 @@ public actor UmbraApplicationService: UmbraApplicationServicing {
         self.discoveryEnabled = discoveryEnabled
         self.discoveryResolver = discoveryResolver
         self.wakeSender = wakeSender
-        self.connectivityTester = connectivityTester
         self.pairingAdapter = pairingAdapter
         self.streamDriver = streamDriver
         self.credentialProvider = credentialProvider
@@ -714,10 +710,6 @@ public actor UmbraApplicationService: UmbraApplicationServicing {
         return latest
     }
 
-    public func testConnectivity() async -> ConnectivityTestResult {
-        await connectivityTester.testRequiredPorts()
-    }
-
     public func currentSession() -> StreamSession? { activeSession }
 
     @discardableResult
@@ -1052,7 +1044,7 @@ public actor UmbraApplicationService: UmbraApplicationServicing {
     }
 
     /// `/cancel` acknowledges receipt before the host process has necessarily stopped the app.
-    /// Moonlight keeps the quit operation pending until serverinfo reports no current game, so
+    /// GameStream keeps the quit operation pending until serverinfo reports no current game, so
     /// Umbra does the same instead of optimistically clearing persisted state.
     private func cancelAndConfirmHostApplication(
         hostID: String,

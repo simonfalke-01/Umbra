@@ -35,7 +35,7 @@ public struct UmbraCLICommandExecutor: Sendable {
         }
     }
 
-    /// Executes a validated command. Parser warnings are written to standard error with Moonlight's
+    /// Executes a validated command. Parser warnings are written to standard error with the client's
     /// conventional `Warning:` prefix and preserved in the returned transcript.
     public func execute(
         _ command: UmbraCommand,

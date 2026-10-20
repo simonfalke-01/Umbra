@@ -9,7 +9,7 @@ final class PairingCryptoTests: XCTestCase {
         XCTAssertEqual(try PairingDigest.forServerVersion("6.5.0.0"), .sha1)
         XCTAssertEqual(try PairingDigest.forServerVersion("7.0.0.0"), .sha256)
         XCTAssertEqual(try PairingDigest.forServerVersion("2025.122.0"), .sha256)
-        XCTAssertThrowsError(try PairingDigest.forServerVersion("sunshine"))
+        XCTAssertThrowsError(try PairingDigest.forServerVersion("lumen"))
 
         let salt = Data(0..<16)
         XCTAssertEqual(

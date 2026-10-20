@@ -636,6 +636,13 @@ extern "C" {
     int64_t horizontal_scroll;  ///< Relative horizontal scroll delta.
   } clsp_pointer_sample_t;
 
+  /** @brief Allocation-free absolute-pointer record over the whole remote display. */
+  typedef struct clsp_absolute_pointer_sample {
+    uint64_t sample_time_microseconds;  ///< Nonzero client monotonic capture time.
+    uint32_t x;  ///< Horizontal position in Q0.32, zero at the left edge.
+    uint32_t y;  ///< Vertical position in Q0.32, zero at the top edge.
+  } clsp_absolute_pointer_sample_t;
+
   /** @brief Physical input edge kinds accepted by the native capture boundary. */
   typedef enum clsp_input_edge_kind {
     CLSP_INPUT_EDGE_KEY_DOWN = 1,  ///< Keyboard HID usage became pressed.
@@ -1431,6 +1438,20 @@ extern "C" {
     clsp_core_t *core,
     const clsp_pointer_sample_t *sample
   );
+
+  /** @brief Submit one latest absolute pointer position. */
+  clsp_status_t clsp_core_submit_absolute_pointer(
+    clsp_core_t *core,
+    const clsp_absolute_pointer_sample_t *sample
+  );
+
+  /**
+   * @brief Select whether pointer motion is absolute and whether the client cursor is over the video.
+   *
+   * While absolute, relative motion from native capture is dropped. While absolute and outside
+   * the video, pointer-button presses and scrolling are dropped too; releases always pass.
+   */
+  clsp_status_t clsp_core_set_pointer_motion_absolute(clsp_core_t *core, uint8_t absolute, uint8_t inside_video);
 
   /** @brief Submit one ordered keyboard or pointer-button transition. */
   clsp_status_t clsp_core_submit_input_edge(

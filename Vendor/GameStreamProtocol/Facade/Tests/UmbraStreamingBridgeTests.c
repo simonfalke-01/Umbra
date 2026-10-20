@@ -601,7 +601,7 @@ static void test_optimization_mode_announce_is_exact_bounded_and_isolated(void) 
     assert(umbra_optimization_mode_rtsp_test_current() == UMBRA_STREAM_OPTIMIZATION_MODE_LEGACY);
 }
 
-static void test_optimization_mode_is_snapshotted_into_moonlight_stream_configuration(void) {
+static void test_optimization_mode_is_snapshotted_into_stream_configuration(void) {
     assert(UMBRA_STREAM_OPTIMIZATION_MODE_LEGACY == STREAM_OPTIMIZATION_MODE_LEGACY);
     assert(UMBRA_STREAM_OPTIMIZATION_MODE_LATENCY == STREAM_OPTIMIZATION_MODE_LATENCY);
     assert(UMBRA_STREAM_OPTIMIZATION_MODE_QUALITY == STREAM_OPTIMIZATION_MODE_QUALITY);
@@ -1313,14 +1313,14 @@ static void test_idle_lifecycle_and_guards(void) {
     assert(umbra_stream_session_destroy(session) == UMBRA_STREAM_OK);
 }
 
-static void test_connected_keyboard_send_reaches_moonlight_input_boundary(void) {
+static void test_connected_keyboard_send_reaches_protocol_input_boundary(void) {
     UmbraStreamConfiguration configuration = valid_configuration();
     int32_t result = 0;
     UmbraStreamSession *session = umbra_stream_session_create(&configuration, NULL, &result);
     assert(session != NULL);
     assert(result == UMBRA_STREAM_OK);
 
-    // A successful Moonlight input send requires initializeInputStream() and
+    // A successful GameStream input send requires initializeInputStream() and
     // startInputStream(), which are performed by a real LiStartConnection().
     // This harness has no live host, so -2 is the strongest safe proof that the
     // connected bridge branch reached LiSendKeyboardEvent2() rather than being
@@ -1758,7 +1758,7 @@ static void test_connection_termination_maps_error_and_state(void) {
 int main(void) {
     test_configuration_defaults_and_validation();
     test_optimization_mode_announce_is_exact_bounded_and_isolated();
-    test_optimization_mode_is_snapshotted_into_moonlight_stream_configuration();
+    test_optimization_mode_is_snapshotted_into_stream_configuration();
     test_split_modes_keep_nvidia_announce_legacy_and_lumen_both_active();
     test_input_batching_delay_is_mode_isolated_and_latency_has_no_sleep();
     test_legacy_and_quality_input_wire_packets_are_byte_for_byte_identical();
@@ -1775,7 +1775,7 @@ int main(void) {
     test_client_microphone_setup_rejects_malformed_success();
     test_rtsp_parser_preserves_duplicate_microphone_headers_for_rejection();
     test_idle_lifecycle_and_guards();
-    test_connected_keyboard_send_reaches_moonlight_input_boundary();
+    test_connected_keyboard_send_reaches_protocol_input_boundary();
     test_destroy_waits_for_input_send_already_inside_facade();
     test_create_rejects_invalid_configuration();
     test_callback_and_lifecycle_guards();
@@ -1794,6 +1794,6 @@ int main(void) {
     test_audio_packet_preserves_packet_loss_concealment();
     test_audio_lifecycle_maps_each_callback_once();
     test_connection_termination_maps_error_and_state();
-    puts("CMoonlightBridge tests passed");
+    puts("CGameStreamProtocol tests passed");
     return 0;
 }

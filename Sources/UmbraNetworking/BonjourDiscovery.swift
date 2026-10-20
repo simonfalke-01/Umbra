@@ -4,7 +4,7 @@ import Network
 
 /// Network protocol advertised by a discovered host service.
 public enum DiscoveredHostProtocol: Hashable, Sendable {
-    /// Moonlight-compatible GameStream over `_nvstream._tcp`.
+    /// GameStream-compatible GameStream over `_nvstream._tcp`.
     case legacyGameStream
 
     /// Native Lumen Streaming Protocol over `_lumen-stream._udp`.

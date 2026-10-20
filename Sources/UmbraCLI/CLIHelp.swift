@@ -10,7 +10,7 @@ public enum CLIHelpTopic: String, CaseIterable, Equatable, Sendable {
     case telemetry
 }
 
-/// Stable, dependency-free help text for the Moonlight-compatible CLI surface.
+/// Stable, dependency-free help text for the GameStream-compatible CLI surface.
 public enum CLIHelp {
     public static func text(for topic: CLIHelpTopic, applicationName: String = "umbra") -> String {
         return switch topic {

@@ -3159,6 +3159,34 @@ extern "C" clsp_status_t clsp_core_submit_pointer(
   return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_pointer(*sample); });
 }
 
+extern "C" clsp_status_t clsp_core_submit_absolute_pointer(
+  clsp_core_t *core,
+  const clsp_absolute_pointer_sample_t *sample
+) {
+  if (core == nullptr || sample == nullptr) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  if (callback_stack_contains(core)) {
+    return CLSP_STATUS_REENTRANT_CALLBACK;
+  }
+  core_producer_lease producer_lease {core};
+  if (!producer_lease.active()) return CLSP_STATUS_INVALID_STATE;
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) { return runtime.submit_absolute_pointer(*sample); });
+}
+
+extern "C" clsp_status_t clsp_core_set_pointer_motion_absolute(
+  clsp_core_t *core,
+  const uint8_t absolute,
+  const uint8_t inside_video
+) {
+  if (core == nullptr || absolute > 1U || inside_video > 1U) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.set_pointer_motion_absolute(absolute != 0U, inside_video != 0U);
+  });
+}
+
 extern "C" clsp_status_t clsp_core_submit_input_edge(
   clsp_core_t *core,
   const clsp_input_edge_t *edge

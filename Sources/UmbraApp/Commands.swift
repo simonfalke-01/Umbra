@@ -111,10 +111,10 @@ struct UmbraCommands: Commands {
             }
             Divider()
             Button(UmbraLocalization.string("Umbra Setup Guide")) {
-                open("https://github.com/moonlight-stream/moonlight-docs/wiki/Setup-Guide")
+                open("https://github.com/simonfalke-01/Lumen/blob/main/docs/getting_started.md")
             }
             Button(UmbraLocalization.string("Troubleshooting")) {
-                open("https://github.com/moonlight-stream/moonlight-docs/wiki/Troubleshooting")
+                open("https://github.com/simonfalke-01/Lumen/blob/main/docs/troubleshooting.md")
             }
         }
     }

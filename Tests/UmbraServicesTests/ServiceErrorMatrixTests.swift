@@ -54,23 +54,6 @@ final class ServiceErrorMatrixTests: XCTestCase {
         XCTAssertEqual(mapped, .authenticationFailed("client credential could not be loaded"))
     }
 
-    func testBlockedPortsProduceTypedUserFacingSessionFailure() {
-        let blocked = [
-            ConnectivityPort(.tcp, 48_010),
-            ConnectivityPort(.udp, 47_998),
-        ]
-
-        let failure = UmbraServiceError.networkBlocked(blocked).sessionFailure(stage: .connection)
-
-        XCTAssertEqual(failure.kind, .networkBlocked)
-        XCTAssertEqual(failure.stage, .connection)
-        XCTAssertEqual(failure.failingPorts, [48_010, 47_998])
-        XCTAssertEqual(
-            failure.message,
-            "The network blocked required ports: TCP 48010, UDP 47998."
-        )
-    }
-
     func testUnsupportedServerErrorProvidesHostSpecificMessage() {
         let error = UmbraServiceError.unsupportedServer("host-1")
 

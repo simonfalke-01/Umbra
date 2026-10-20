@@ -54,9 +54,9 @@ public protocol PairingHTTPTranscript: Sendable {
 }
 
 public struct URLSessionPairingHTTPTranscript: PairingHTTPTranscript, Sendable {
-    /// Moonlight waits indefinitely for host-side PIN entry. URLSession has no
+    /// GameStream waits indefinitely for host-side PIN entry. URLSession has no
     /// explicit infinite request timeout, so use a one-day bound while keeping
-    /// Task cancellation immediate. This avoids poisoning Sunshine's pending
+    /// Task cancellation immediate. This avoids poisoning the host's pending
     /// pairing map during normal human confirmation delays.
     public static let defaultPINConfirmationTimeout: TimeInterval = 24 * 60 * 60
 

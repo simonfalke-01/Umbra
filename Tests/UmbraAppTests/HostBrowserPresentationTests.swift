@@ -79,7 +79,7 @@ final class HostBrowserPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             presentation.actionGroups.flatMap(\.actions).map(\.kind),
-            [.openApplications, .testNetwork, .rename, .details, .remove]
+            [.openApplications, .rename, .details, .remove]
         )
         XCTAssertEqual(
             presentation.actionGroups.flatMap(\.actions).last?.role,
@@ -94,7 +94,7 @@ final class HostBrowserPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             presentation.actionGroups.flatMap(\.actions).map(\.kind),
-            [.details, .testNetwork, .rename, .remove]
+            [.details, .rename, .remove]
         )
     }
 

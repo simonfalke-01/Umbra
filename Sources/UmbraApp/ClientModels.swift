@@ -52,6 +52,13 @@ struct ApplicationID: Hashable, Codable, Identifiable, Sendable {
     var id: Int { rawValue }
 }
 
+/// What an application launches; chooses the default icon when the host sends no artwork.
+enum ApplicationKind: Hashable, Sendable {
+    case program
+    case desktop
+    case steam
+}
+
 struct ApplicationDisplayModel: Identifiable, Hashable, Sendable {
     let id: ApplicationID
     let hostID: HostID
@@ -60,6 +67,7 @@ struct ApplicationDisplayModel: Identifiable, Hashable, Sendable {
     var isRunning: Bool
     var isHidden: Bool
     var isDirectLaunch: Bool
+    var kind: ApplicationKind = .program
 }
 
 struct ApplicationBrowserContext: Equatable, Sendable {
@@ -85,39 +93,6 @@ struct PairingPreparation: Hashable, Sendable {
     let provisionalSPKIFingerprint: String?
     let requestedPermissions: [String]
     let effectivePermissions: [String]
-}
-
-enum NetworkTestOutcome: Hashable, Sendable {
-    case clear
-    case blocked(ports: [String])
-    case unavailable
-
-    var title: String {
-        switch self {
-        case .clear: "Network Looks Ready"
-        case .blocked: "Connection May Be Blocked"
-        case .unavailable: "Network Test Unavailable"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .clear: "checkmark.circle"
-        case .blocked: "exclamationmark.triangle"
-        case .unavailable: "network.slash"
-        }
-    }
-
-    var message: String {
-        switch self {
-        case .clear:
-            "This network does not appear to block the ports Umbra needs. If connecting still fails, check the host firewall."
-        case let .blocked(ports):
-            "This network appears to block required streaming ports: \(ports.joined(separator: ", ")). Streaming over the internet may not work on this connection."
-        case .unavailable:
-            "No connection-testing server could be reached. Check the internet connection and try again later."
-        }
-    }
 }
 
 enum LoadingState<Value> {
@@ -161,7 +136,6 @@ enum PresentedSheet: Identifiable, Equatable {
     case pair(HostID, pin: String)
     case rename(HostID)
     case details(HostID)
-    case networkResult(NetworkTestOutcome)
 
     var id: String {
         switch self {
@@ -169,7 +143,6 @@ enum PresentedSheet: Identifiable, Equatable {
         case let .pair(id, _): "pair-\(id.rawValue)"
         case let .rename(id): "rename-\(id.rawValue)"
         case let .details(id): "details-\(id.rawValue)"
-        case .networkResult: "network-result"
         }
     }
 }

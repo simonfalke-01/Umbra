@@ -95,7 +95,7 @@ final class CLIParserTests: XCTestCase {
         XCTAssertTrue(help.contains("exact backup path"))
     }
 
-    func testStreamParsesCompleteMoonlightOptionSurface() throws {
+    func testStreamParsesCompleteGameStreamOptionSurface() throws {
         let parsed = parser.parse(arguments: [
             "stream",
             "--resolution=3440X1440",
@@ -481,8 +481,8 @@ extension CLIParserTests {
         XCTAssertTrue(lsp.standardError.contains("generates a six-digit PIN"))
 
         XCTAssertEqual(
-            parser.parse(arguments: ["pair", "sunshine", "--pin", "1234"]).command,
-            .pair(PairHostCommand(host: "sunshine", pin: "1234"))
+            parser.parse(arguments: ["pair", "lumen", "--pin", "1234"]).command,
+            .pair(PairHostCommand(host: "lumen", pin: "1234"))
         )
     }
 

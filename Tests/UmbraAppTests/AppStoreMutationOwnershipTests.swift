@@ -326,7 +326,6 @@ private final class ApplicationMutationServiceSpy: UmbraClientServicing {
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw unused() }
     func deleteHost(id: HostID) async throws { throw unused() }
     func wakeHost(id: HostID) async throws -> HostDisplayModel { throw unused() }
-    func testNetwork(for id: HostID) async throws -> NetworkTestOutcome { throw unused() }
     func launchApplication(id: ApplicationID, on hostID: HostID, resume: Bool) async throws { throw unused() }
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws { throw unused() }
 

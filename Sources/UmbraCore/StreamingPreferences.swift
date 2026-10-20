@@ -43,7 +43,7 @@ public enum UIDisplayMode: Int, Codable, CaseIterable, Sendable {
     case fullscreen
 }
 
-/// Legacy Moonlight-compatible values retained only to migrate existing preferences.
+/// Legacy GameStream-compatible values retained only to migrate existing preferences.
 /// New app-language preferences use BCP-47 tags outside the streaming model.
 public enum AppLanguage: Int, Codable, CaseIterable, Sendable {
     case automatic
@@ -134,6 +134,18 @@ public enum DisplayResolutionPolicy: String, Codable, CaseIterable, Sendable {
     case native
     /// Use the selected display's logical dimensions below any camera housing.
     case nativeExcludingNotch
+    /// Use half the selected display's dimensions below any camera housing.
+    case nativeExcludingNotchHalf
+
+    /// Whether the stream covers only the area below the camera housing.
+    public var excludesDisplayCutouts: Bool {
+        self == .nativeExcludingNotch || self == .nativeExcludingNotchHalf
+    }
+
+    /// Divisor applied to the display's native pixel dimensions.
+    public var nativeDivisor: Int {
+        self == .nativeExcludingNotchHalf ? 2 : 1
+    }
 }
 
 public enum StreamOptimizationMode: String, CaseIterable, Hashable, Sendable {
@@ -435,13 +447,15 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var enableMDNS: Bool
     public var quitAppAfter: Bool
     public var absoluteMouseMode: Bool
+    /// Draws the Mac cursor over the stream while the host shows its cursor, and switches to
+    /// relative raw input while a game hides it. Requires a Lumen host.
+    public var useMacCursor: Bool
     public var absoluteTouchMode: Bool
     public var framePacing: Bool
     public var connectionWarnings: Bool
     public var configurationWarnings: Bool
     public var richPresence: Bool
     public var gamepadMouse: Bool
-    public var detectNetworkBlocking: Bool
     public var showPerformanceOverlay: Bool
     public var swapMouseButtons: Bool
     public var muteOnFocusLoss: Bool
@@ -496,13 +510,13 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         enableMDNS: Bool = true,
         quitAppAfter: Bool = false,
         absoluteMouseMode: Bool = false,
+        useMacCursor: Bool = true,
         absoluteTouchMode: Bool = true,
         framePacing: Bool = true,
         connectionWarnings: Bool = true,
         configurationWarnings: Bool = true,
         richPresence: Bool = true,
         gamepadMouse: Bool = true,
-        detectNetworkBlocking: Bool = true,
         showPerformanceOverlay: Bool = false,
         swapMouseButtons: Bool = false,
         muteOnFocusLoss: Bool = false,
@@ -568,13 +582,13 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.enableMDNS = enableMDNS
         self.quitAppAfter = quitAppAfter
         self.absoluteMouseMode = absoluteMouseMode
+        self.useMacCursor = useMacCursor
         self.absoluteTouchMode = absoluteTouchMode
         self.framePacing = framePacing
         self.connectionWarnings = connectionWarnings
         self.configurationWarnings = configurationWarnings
         self.richPresence = richPresence
         self.gamepadMouse = gamepadMouse
-        self.detectNetworkBlocking = detectNetworkBlocking
         self.showPerformanceOverlay = showPerformanceOverlay
         self.swapMouseButtons = swapMouseButtons
         self.muteOnFocusLoss = muteOnFocusLoss
@@ -629,13 +643,13 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case enableMDNS
         case quitAppAfter
         case absoluteMouseMode
+        case useMacCursor
         case absoluteTouchMode
         case framePacing
         case connectionWarnings
         case configurationWarnings
         case richPresence
         case gamepadMouse
-        case detectNetworkBlocking
         case showPerformanceOverlay
         case swapMouseButtons
         case muteOnFocusLoss
@@ -750,13 +764,13 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             enableMDNS: try container.decodeIfPresent(Bool.self, forKey: .enableMDNS) ?? defaults.enableMDNS,
             quitAppAfter: try container.decodeIfPresent(Bool.self, forKey: .quitAppAfter) ?? defaults.quitAppAfter,
             absoluteMouseMode: try container.decodeIfPresent(Bool.self, forKey: .absoluteMouseMode) ?? defaults.absoluteMouseMode,
+            useMacCursor: try container.decodeIfPresent(Bool.self, forKey: .useMacCursor) ?? defaults.useMacCursor,
             absoluteTouchMode: try container.decodeIfPresent(Bool.self, forKey: .absoluteTouchMode) ?? defaults.absoluteTouchMode,
             framePacing: framePacing,
             connectionWarnings: try container.decodeIfPresent(Bool.self, forKey: .connectionWarnings) ?? defaults.connectionWarnings,
             configurationWarnings: try container.decodeIfPresent(Bool.self, forKey: .configurationWarnings) ?? defaults.configurationWarnings,
             richPresence: try container.decodeIfPresent(Bool.self, forKey: .richPresence) ?? defaults.richPresence,
             gamepadMouse: try container.decodeIfPresent(Bool.self, forKey: .gamepadMouse) ?? defaults.gamepadMouse,
-            detectNetworkBlocking: try container.decodeIfPresent(Bool.self, forKey: .detectNetworkBlocking) ?? defaults.detectNetworkBlocking,
             showPerformanceOverlay: try container.decodeIfPresent(Bool.self, forKey: .showPerformanceOverlay) ?? defaults.showPerformanceOverlay,
             swapMouseButtons: try container.decodeIfPresent(Bool.self, forKey: .swapMouseButtons) ?? defaults.swapMouseButtons,
             muteOnFocusLoss: try container.decodeIfPresent(Bool.self, forKey: .muteOnFocusLoss) ?? defaults.muteOnFocusLoss,

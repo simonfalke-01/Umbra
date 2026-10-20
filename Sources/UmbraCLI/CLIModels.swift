@@ -161,11 +161,11 @@ public struct TelemetryHostCommand: Equatable, Sendable {
     public init(host: String, lsp: CLILSPOptions = .init()) { self.host = host; self.lsp = lsp }
 }
 
-/// Conventional process exit codes used by the Moonlight-compatible command surface.
+/// Conventional process exit codes used by the GameStream-compatible command surface.
 public enum CLIExitCode: Int32, Equatable, Sendable {
     case success = 0
     case failure = 1
-    /// Moonlight Qt uses -1 when a requested host cannot be reached or is not paired.
+    /// the reference GameStream client uses -1 when a requested host cannot be reached or is not paired.
     case hostUnavailable = -1
 }
 
@@ -201,7 +201,7 @@ public struct CLIExecutionResult: Equatable, Sendable {
 
 /// The deterministic result of command-line parsing.
 public enum CLIParseResult: Equatable, Sendable {
-    /// Parsing succeeded. Warnings mirror Moonlight's advisory FPS and bitrate diagnostics.
+    /// Parsing succeeded. Warnings mirror the client's advisory FPS and bitrate diagnostics.
     case ready(command: UmbraCommand, warnings: [String])
     /// Parsing completed without a command, such as help, version, or a usage error.
     case terminal(CLIExecutionResult)

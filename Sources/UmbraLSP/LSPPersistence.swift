@@ -136,7 +136,7 @@ public struct LSPHostEndpoint: Codable, Hashable, Sendable {
 
 /// Persisted LSP host independent of legacy GameStream host records.
 ///
-/// A host keeps every address it has been reached at, like Moonlight: Bonjour names,
+/// A host keeps every address it has been reached at, like GameStream: Bonjour names,
 /// learned LAN addresses, and manual (for example, public) addresses. Connections try
 /// them in order of recent success, so changing networks never strands a saved host.
 public struct LSPHostRecord: Codable, Hashable, Identifiable, Sendable {

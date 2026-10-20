@@ -1,18 +1,18 @@
 # Umbra
 
 Umbra is a native Apple Silicon macOS streaming client. Its production path is
-compatible with Sunshine, Lumen, and other Moonlight/GameStream hosts through
-the pinned `moonlight-common-c` core. SwiftUI and AppKit provide the macOS UI;
+compatible with Lumen, Lumen, and other GameStream/GameStream hosts through
+the pinned GameStream protocol library core. SwiftUI and AppKit provide the macOS UI;
 VideoToolbox, Metal, AudioQueue, Network.framework, and GameController provide
 the platform integrations.
 
 Umbra exposes two session policies:
 
 - **Latency** uses a one-frame compressed queue, two decoder submissions,
-  immediate presentation, and removes Moonlight's deliberate one-millisecond
+  immediate presentation, and removes the client's deliberate one-millisecond
   mouse/stylus batching wait.
 - **Quality** uses a two-frame compressed queue, five decoder submissions, and
-  display-linked presentation while retaining Moonlight's historical input
+  display-linked presentation while retaining the client's historical input
   pacing and reliability.
 
 Quality mode is not a lossless-stream claim. The separate
@@ -20,8 +20,8 @@ Quality mode is not a lossless-stream claim. The separate
 the exact codec tuple; it preserves samples only after the encoder-input
 conversion boundary.
 
-The current baseline uses the legacy GameStream path for Sunshine, Lumen, and
-other Moonlight-compatible hosts. See
+The current baseline uses the legacy GameStream path for Lumen, Lumen, and
+other GameStream-compatible hosts. See
 [Architecture](Docs/ARCHITECTURE.md) and [Compatibility and validation
 status](Docs/FEATURE_PARITY.md).
 

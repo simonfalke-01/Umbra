@@ -65,8 +65,8 @@ final class SettingsSnapshotTests: XCTestCase {
                     representation.pixelsHigh,
                     Int((rendered.height * expectedScale).rounded())
                 )
-                XCTAssertGreaterThanOrEqual(rendered.height, UmbraLayout.settingsMinimumHeight)
-                XCTAssertLessThanOrEqual(rendered.height, UmbraLayout.settingsMaximumHeight)
+                XCTAssertGreaterThanOrEqual(rendered.height, UmbraLayout.settingsMinimumHeight, "\(tab) \(appearance.name)")
+                XCTAssertLessThanOrEqual(rendered.height, UmbraLayout.settingsMaximumHeight, "\(tab) \(appearance.name)")
                 XCTAssertFalse(rendered.windowIsResizable)
                 XCTAssertFalse(rendered.verticalScrollMetrics.isEmpty)
                 for metrics in rendered.verticalScrollMetrics {
@@ -80,7 +80,7 @@ final class SettingsSnapshotTests: XCTestCase {
                             metrics.viewportHeight,
                             metrics.documentHeight,
                             accuracy: 1,
-                            "A compact pane must not retain an empty scroll viewport below its content."
+                            "\(tab) \(appearance.name): a compact pane must not retain an empty scroll viewport below its content."
                         )
                     }
                 }

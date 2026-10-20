@@ -36,7 +36,7 @@ private actor ServerInfoRecordingTransport: HTTPTransport {
         <root status_code="200">
           <hostname>Test Host</hostname><uniqueid>host-id</uniqueid>
           <PairStatus>0</PairStatus><currentgame>0</currentgame>
-          <state>SUNSHINE_SERVER_FREE</state>
+          <state>LUMEN_SERVER_FREE</state>
         </root>
         """.utf8)
         return (

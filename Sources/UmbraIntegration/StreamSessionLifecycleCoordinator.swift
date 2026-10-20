@@ -14,7 +14,7 @@ public protocol StreamSessionLifecycleCoordinating: Sendable {
     /// The native session may still be delivering stop-phase callbacks when this runs.
     func finishPresentation() async
     /// Releases final non-callback resources after `StreamingSession.close()` has completed
-    /// Moonlight stop, thread join, and media cleanup.
+    /// GameStream stop, thread join, and media cleanup.
     func finish() async
 }
 

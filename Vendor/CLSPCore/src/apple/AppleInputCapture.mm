@@ -58,6 +58,7 @@ struct clsp_apple_input_capture {
   std::uint32_t pointer_generation {};  ///< Aggregate pointer-source arrival generation.
   std::uint64_t pointer_rate_window_start {};  ///< First motion timestamp in current measurement window.
   std::uint64_t pointer_last_offer {};  ///< Last coarse pointer-rate publication time.
+  std::uint32_t pointer_published_hz {};  ///< Pointer rate in the last published offer, or 0 before any.
   std::uint64_t pointer_samples {};  ///< Cumulative pointer samples in this generation.
   std::uint64_t pointer_window_samples {};  ///< Samples in current pointer-rate window.
   std::uint64_t pointer_previous_sample {};  ///< Previous pointer timestamp for interval distribution.
@@ -69,6 +70,8 @@ struct clsp_apple_input_capture {
   std::array<std::uint32_t, 16> controller_buttons {};  ///< Last emitted digital-button masks.
   std::array<std::uint64_t, 16> controller_rate_window_start {};  ///< Controller state-rate window origins.
   std::array<std::uint64_t, 16> controller_last_offer {};  ///< Last controller-rate offer time.
+  std::array<std::uint32_t, 16> controller_published_state_hz {};  ///< State rate in the last published offer.
+  std::array<std::uint32_t, 16> controller_published_sensor_hz {};  ///< Sensor rate in the last published offer.
   std::array<std::uint64_t, 16> controller_samples {};  ///< Cumulative controller-state samples.
   std::array<std::uint64_t, 16> controller_window_samples {};  ///< Current controller-rate samples.
   std::array<std::uint64_t, 16> controller_previous_sample {};  ///< Previous controller-state timestamps.
@@ -116,7 +119,19 @@ namespace {
     return timestamp_microseconds(capture, mach_absolute_time());
   }
 
-  /** @brief Publish one honest <=4 Hz measured native capture-rate offer. */
+  /**
+   * @brief Whether a newly measured rate differs enough from the last offered one to renegotiate.
+   *
+   * Each offer is a reliable request/response with the host, so re-offering an unchanged rate
+   * every window floods the control channel the session depends on.
+   */
+  [[nodiscard]] bool materially_changed(const std::uint32_t measured, const std::uint32_t published) noexcept {
+    if (published == 0U) return measured != 0U;
+    const auto difference = measured > published ? measured - published : published - measured;
+    return static_cast<std::uint64_t>(difference) * 4U > published;
+  }
+
+  /** @brief Publish one measured native capture-rate offer, at most every five seconds and only on material change. */
   void publish_measured_rate(
     clsp_apple_input_capture &capture,
     const std::uint8_t device_type,
@@ -125,6 +140,7 @@ namespace {
     const std::uint64_t timestamp,
     std::uint64_t &window_start,
     std::uint64_t &last_offer,
+    std::uint32_t &published_hz,
     std::uint64_t &window_samples,
     std::uint64_t &previous_sample,
     std::uint32_t &minimum_interval,
@@ -148,12 +164,22 @@ namespace {
     }
     previous_sample = timestamp;
     ++window_samples;
-    if (timestamp <= window_start || timestamp - last_offer < 250'000U) return;
+    // Five-second windows give a stable rate; short windows swing with every pause in motion.
+    if (timestamp <= window_start || timestamp - last_offer < 5'000'000U) return;
     const auto elapsed = timestamp - window_start;
     const auto measured = static_cast<std::uint32_t>(std::min<std::uint64_t>(
       maximum_state_rate,
       window_samples * 1'000'000U / elapsed
     ));
+    if (!materially_changed(measured, published_hz)) {
+      last_offer = timestamp;
+      window_start = timestamp;
+      window_samples = 0;
+      minimum_interval = UINT32_MAX;
+      maximum_interval = 0;
+      return;
+    }
+    published_hz = measured;
     const auto packet_bytes = static_cast<std::uint64_t>(maximum_state_packet_bytes) + 12U + 16U + 28U;
     const auto spacing_snapshot = spacing.snapshot(
       CLSP_NATIVE_TIMING_AVAILABLE | CLSP_NATIVE_TIMING_CLIENT_MONOTONIC |
@@ -222,7 +248,7 @@ namespace {
     const std::uint64_t timestamp,
     const bool has_motion
   ) noexcept {
-    if (timestamp - capture.controller_last_offer[slot] < 250'000U) return;
+    if (timestamp - capture.controller_last_offer[slot] < 5'000'000U) return;
     const auto state_elapsed = capture.controller_rate_window_start[slot] == 0U ? 0U :
       timestamp - capture.controller_rate_window_start[slot];
     const auto sensor_elapsed = capture.controller_sensor_rate_window_start[slot] == 0U ? 0U :
@@ -236,6 +262,21 @@ namespace {
       capture.controller_sensor_window_samples[slot] * 1'000'000U / sensor_elapsed
     ));
     if (state_rate == 0U && sensor_rate == 0U) return;
+    if (!materially_changed(state_rate, capture.controller_published_state_hz[slot]) &&
+        !materially_changed(sensor_rate, capture.controller_published_sensor_hz[slot])) {
+      capture.controller_last_offer[slot] = timestamp;
+      capture.controller_rate_window_start[slot] = timestamp;
+      capture.controller_window_samples[slot] = 0U;
+      capture.controller_minimum_interval[slot] = UINT32_MAX;
+      capture.controller_maximum_interval[slot] = 0U;
+      capture.controller_sensor_rate_window_start[slot] = timestamp;
+      capture.controller_sensor_window_samples[slot] = 0U;
+      capture.controller_sensor_minimum_interval[slot] = UINT32_MAX;
+      capture.controller_sensor_maximum_interval[slot] = 0U;
+      return;
+    }
+    capture.controller_published_state_hz[slot] = state_rate;
+    capture.controller_published_sensor_hz[slot] = sensor_rate;
     const auto state_wire_bytes = std::uint64_t {88U + 12U + 16U + 28U};
     const auto sensor_wire_bytes = std::uint64_t {36U + 12U + 16U + 28U};
     const auto state_interval = capture.controller_minimum_interval[slot] != UINT32_MAX;
@@ -378,6 +419,21 @@ namespace {
     }
   }
 
+  /** @brief Return the NX device-dependent modifierFlags bit for one HID modifier usage. */
+  [[nodiscard]] NSUInteger appkit_modifier_device_mask(const std::uint16_t usage) noexcept {
+    switch (usage) {
+      case 0xE0: return 0x00000001U;  // NX_DEVICELCTLKEYMASK
+      case 0xE1: return 0x00000002U;  // NX_DEVICELSHIFTKEYMASK
+      case 0xE2: return 0x00000020U;  // NX_DEVICELALTKEYMASK
+      case 0xE3: return 0x00000008U;  // NX_DEVICELCMDKEYMASK
+      case 0xE4: return 0x00002000U;  // NX_DEVICERCTLKEYMASK
+      case 0xE5: return 0x00000004U;  // NX_DEVICERSHIFTKEYMASK
+      case 0xE6: return 0x00000040U;  // NX_DEVICERALTKEYMASK
+      case 0xE7: return 0x00000010U;  // NX_DEVICERCMDKEYMASK
+      default: return 0U;
+    }
+  }
+
   /** @brief Convert one AppKit uptime timestamp to nonzero monotonic microseconds. */
   [[nodiscard]] std::uint64_t appkit_timestamp(const clsp_apple_input_capture &capture, NSEvent *event) noexcept {
     const auto seconds = event.timestamp;
@@ -398,6 +454,7 @@ namespace {
       timestamp,
       capture.pointer_rate_window_start,
       capture.pointer_last_offer,
+      capture.pointer_published_hz,
       capture.pointer_window_samples,
       capture.pointer_previous_sample,
       capture.pointer_minimum_interval,
@@ -418,6 +475,15 @@ namespace {
     NSEvent *event,
     const std::uint64_t timestamp
   ) noexcept {
+    // macOS can swallow modifier releases (app switcher, Mission Control, system
+    // shortcuts); resynchronize every modifier from the authoritative flags first.
+    for (std::uint16_t modifier = 0xE0U; modifier <= 0xE7U; ++modifier) {
+      const auto held = (event.modifierFlags & appkit_modifier_device_mask(modifier)) != 0;
+      if (modifier < capture.keyboard.size() && capture.keyboard[modifier] && !held) {
+        capture.keyboard[modifier] = false;
+        submit_edge(capture, timestamp, modifier, CLSP_INPUT_EDGE_KEY_UP);
+      }
+    }
     const auto usage = appkit_hid_usage(event.keyCode);
     if (usage == 0U || usage >= capture.keyboard.size()) return;
     if (event.type == NSEventTypeFlagsChanged) {
@@ -426,7 +492,11 @@ namespace {
         submit_edge(capture, timestamp, usage, CLSP_INPUT_EDGE_KEY_UP);
         return;
       }
-      const auto pressed = !capture.keyboard[usage];
+      // Read the device-dependent modifier bit instead of toggling: capture can
+      // start while a modifier is held (Cmd-Tab back in), and a toggle would
+      // turn that first release into a stuck host-side press.
+      const auto pressed = (event.modifierFlags & appkit_modifier_device_mask(usage)) != 0;
+      if (capture.keyboard[usage] == pressed) return;
       capture.keyboard[usage] = pressed;
       submit_edge(
         capture,
@@ -696,6 +766,8 @@ namespace {
     capture.controller_buttons[slot] = 0;
     capture.controller_rate_window_start[slot] = 0;
     capture.controller_last_offer[slot] = 0;
+    capture.controller_published_state_hz[slot] = 0;
+    capture.controller_published_sensor_hz[slot] = 0;
     capture.controller_samples[slot] = 0;
     capture.controller_window_samples[slot] = 0;
     capture.controller_previous_sample[slot] = 0;
@@ -1130,6 +1202,7 @@ namespace {
     capture->pointer_window_samples = 0;
     capture->pointer_rate_window_start = 0;
     capture->pointer_last_offer = 0;
+    capture->pointer_published_hz = 0;
     capture->pointer_previous_sample = 0;
     capture->pointer_minimum_interval = UINT32_MAX;
     capture->pointer_maximum_interval = 0;

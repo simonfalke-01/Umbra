@@ -992,7 +992,6 @@ private final class AppStoreClientServiceSpy: UmbraClientServicing {
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw unused() }
     func deleteHost(id: HostID) async throws { throw unused() }
     func wakeHost(id: HostID) async throws -> HostDisplayModel { throw unused() }
-    func testNetwork(for id: HostID) async throws -> NetworkTestOutcome { throw unused() }
     func setApplicationHidden(id: ApplicationID, on hostID: HostID, hidden: Bool) async throws { throw unused() }
     func setDirectLaunch(id: ApplicationID, on hostID: HostID, enabled: Bool) async throws { throw unused() }
 

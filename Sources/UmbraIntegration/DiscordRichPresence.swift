@@ -209,14 +209,14 @@ struct UnixDiscordIPCTransport: DiscordIPCTransporting, Sendable {
 /// Local Discord IPC integration. It never starts Discord, performs network
 /// requests, or reads user/account data. Failures are intentionally discarded.
 public final class DiscordRichPresenceService: RichPresenceManaging, @unchecked Sendable {
-    /// The application ID used by Moonlight's upstream Rich Presence integration.
-    public static let moonlightApplicationID = "594668102021677159"
+    /// The application ID used by the client's upstream Rich Presence integration.
+    public static let gameStreamApplicationID = "594668102021677159"
 
     private let clientID: String
     private let transport: any DiscordIPCTransporting
     private let queue = DispatchQueue(label: "app.umbra.discord-rich-presence", qos: .utility)
 
-    public convenience init(clientID: String = moonlightApplicationID) {
+    public convenience init(clientID: String = gameStreamApplicationID) {
         self.init(clientID: clientID, transport: UnixDiscordIPCTransport())
     }
 

@@ -8,32 +8,32 @@ import XCTest
 final class VideoFormatNegotiatorTests: XCTestCase {
     private let negotiator = VideoFormatNegotiator()
 
-    func testSunshineSCMMapsExplicitlyToEveryMoonlightClientFormat() {
+    func testLumenSCMMapsExplicitlyToEveryGameStreamClientFormat() {
         XCTAssertEqual(
             VideoFormatNegotiator.clientFormatMask(for: .allKnown),
-            MoonlightVideoFormat.knownMask
+            GameStreamVideoFormat.knownMask
         )
         XCTAssertNotEqual(
             Int32(bitPattern: HostCodecSupport.hevcRext8YUV444.rawValue),
-            MoonlightVideoFormat.hevcRext8YUV444.rawValue
+            GameStreamVideoFormat.hevcRext8YUV444.rawValue
         )
     }
 
     func testMaxLumaCapabilityCanProveBaseHEVCWithoutSCMBit() throws {
         let selection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue,
             host: host(support: [], maxLumaPixelsHEVC: 8_294_400),
             application: application,
             preferences: .default
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
     }
 
     func testAutomaticSDRUsesPinnedHEVCThenH264ThenAV1Priority() throws {
-        let allBase = MoonlightVideoFormat.h264.rawValue
-            | MoonlightVideoFormat.hevc.rawValue
-            | MoonlightVideoFormat.av1Main8.rawValue
+        let allBase = GameStreamVideoFormat.h264.rawValue
+            | GameStreamVideoFormat.hevc.rawValue
+            | GameStreamVideoFormat.av1Main8.rawValue
         let selection = try negotiator.select(
             availableVideoFormats: allBase,
             host: host(support: [.h264, .hevc, .av1Main8]),
@@ -41,7 +41,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             preferences: .default
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
         XCTAssertFalse(selection.isHDR)
 
         let h264 = try negotiator.select(
@@ -56,37 +56,37 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             application: application,
             preferences: .default
         )
-        XCTAssertEqual(h264.selectedVideoFormat, MoonlightVideoFormat.h264.rawValue)
-        XCTAssertEqual(av1.selectedVideoFormat, MoonlightVideoFormat.av1Main8.rawValue)
+        XCTAssertEqual(h264.selectedVideoFormat, GameStreamVideoFormat.h264.rawValue)
+        XCTAssertEqual(av1.selectedVideoFormat, GameStreamVideoFormat.av1Main8.rawValue)
     }
 
     func testAutomaticSoftwareUsesPinnedH264ThenHEVCPriority() throws {
         var preferences = StreamingPreferences.default
         preferences.videoDecoderPreference = .software
         let selection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.h264.rawValue
-                | MoonlightVideoFormat.hevc.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.h264.rawValue
+                | GameStreamVideoFormat.hevc.rawValue,
             host: host(support: [.h264, .hevc]),
             application: application,
             preferences: preferences
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.h264.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.h264.rawValue)
 
         let hevc = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue,
             host: host(support: [.hevc]),
             application: application,
             preferences: preferences
         )
-        XCTAssertEqual(hevc.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
+        XCTAssertEqual(hevc.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
     }
 
     func testAutomaticHDRPrefersHEVCMain10ThenAV1Main10() throws {
         var preferences = StreamingPreferences.default
         preferences.enableHDR = true
-        let available = MoonlightVideoFormat.hevcMain10.rawValue
-            | MoonlightVideoFormat.av1Main10.rawValue
+        let available = GameStreamVideoFormat.hevcMain10.rawValue
+            | GameStreamVideoFormat.av1Main10.rawValue
 
         let hevc = try negotiator.select(
             availableVideoFormats: available,
@@ -101,17 +101,17 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             preferences: preferences
         )
 
-        XCTAssertEqual(hevc.selectedVideoFormat, MoonlightVideoFormat.hevcMain10.rawValue)
+        XCTAssertEqual(hevc.selectedVideoFormat, GameStreamVideoFormat.hevcMain10.rawValue)
         XCTAssertTrue(hevc.isHDR)
-        XCTAssertEqual(av1.selectedVideoFormat, MoonlightVideoFormat.av1Main10.rawValue)
+        XCTAssertEqual(av1.selectedVideoFormat, GameStreamVideoFormat.av1Main10.rawValue)
         XCTAssertTrue(av1.isHDR)
     }
 
-    func testHDRTransferPreferenceDoesNotChangeLegacyMoonlightNegotiation() throws {
+    func testHDRTransferPreferenceDoesNotChangeLegacyGameStreamNegotiation() throws {
         var preferences = StreamingPreferences.default
         preferences.enableHDR = true
-        let available = MoonlightVideoFormat.hevcMain10.rawValue
-            | MoonlightVideoFormat.av1Main10.rawValue
+        let available = GameStreamVideoFormat.hevcMain10.rawValue
+            | GameStreamVideoFormat.av1Main10.rawValue
         let streamHost = host(support: [.hevcMain10, .av1Main10])
 
         preferences.hdrTransferPreference = .automatic
@@ -144,14 +144,14 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         var preferences = StreamingPreferences.default
         preferences.enableHDR = true
         let selection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue
-                | MoonlightVideoFormat.av1Main10.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue
+                | GameStreamVideoFormat.av1Main10.rawValue,
             host: host(support: [.hevc, .av1Main10]),
             application: application,
             preferences: preferences
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.av1Main10.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.av1Main10.rawValue)
         XCTAssertTrue(selection.isHDR)
     }
 
@@ -165,13 +165,13 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         )
 
         let selection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevcMain10.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevcMain10.rawValue,
             host: host(support: [.hevcMain10]),
             application: uncertifiedDesktop,
             preferences: preferences
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.hevcMain10.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.hevcMain10.rawValue)
         XCTAssertTrue(selection.isHDR)
     }
 
@@ -179,13 +179,13 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         var preferences = StreamingPreferences.default
         preferences.enableHDR = true
         let selection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue,
             host: host(support: [.hevc]),
             application: application,
             preferences: preferences
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
         XCTAssertFalse(selection.isHDR)
     }
 
@@ -194,15 +194,15 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         preferences.videoCodecPreference = .hevc
 
         let fallback = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.h264.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.h264.rawValue,
             host: host(support: [.h264]),
             application: application,
             preferences: preferences
         )
-        XCTAssertEqual(fallback.selectedVideoFormat, MoonlightVideoFormat.h264.rawValue)
+        XCTAssertEqual(fallback.selectedVideoFormat, GameStreamVideoFormat.h264.rawValue)
 
         XCTAssertThrowsError(try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.av1Main8.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.av1Main8.rawValue,
             host: host(support: [.av1Main8]),
             application: application,
             preferences: preferences
@@ -214,7 +214,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
     func testForcedAV1FallsBackToHEVCThenH264AndRejectsNoCommonFormat() throws {
         var preferences = StreamingPreferences.default
         preferences.videoCodecPreference = .av1
-        let available = MoonlightVideoFormat.h264.rawValue | MoonlightVideoFormat.hevc.rawValue
+        let available = GameStreamVideoFormat.h264.rawValue | GameStreamVideoFormat.hevc.rawValue
 
         let hevc = try negotiator.select(
             availableVideoFormats: available,
@@ -222,15 +222,15 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             application: application,
             preferences: preferences
         )
-        XCTAssertEqual(hevc.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
+        XCTAssertEqual(hevc.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
 
         let h264 = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.h264.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.h264.rawValue,
             host: host(support: [.h264]),
             application: application,
             preferences: preferences
         )
-        XCTAssertEqual(h264.selectedVideoFormat, MoonlightVideoFormat.h264.rawValue)
+        XCTAssertEqual(h264.selectedVideoFormat, GameStreamVideoFormat.h264.rawValue)
 
         XCTAssertThrowsError(try negotiator.select(
             availableVideoFormats: 0x0020,
@@ -245,8 +245,8 @@ final class VideoFormatNegotiatorTests: XCTestCase {
     func testYUV444RequiresExplicitProofAndRetainsYUV420Fallback() throws {
         var preferences = StreamingPreferences.default
         preferences.enableYUV444 = true
-        let available = MoonlightVideoFormat.hevc.rawValue
-            | MoonlightVideoFormat.hevcRext8YUV444.rawValue
+        let available = GameStreamVideoFormat.hevc.rawValue
+            | GameStreamVideoFormat.hevcRext8YUV444.rawValue
         let provenHost = host(support: [.hevc, .hevcRext8YUV444])
 
         let proven = try negotiator.select(
@@ -256,15 +256,15 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             preferences: preferences
         )
         let fallback = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue,
             host: provenHost,
             application: application,
             preferences: preferences
         )
 
-        XCTAssertEqual(proven.selectedVideoFormat, MoonlightVideoFormat.hevcRext8YUV444.rawValue)
+        XCTAssertEqual(proven.selectedVideoFormat, GameStreamVideoFormat.hevcRext8YUV444.rawValue)
         XCTAssertTrue(proven.isYUV444)
-        XCTAssertEqual(fallback.selectedVideoFormat, MoonlightVideoFormat.hevc.rawValue)
+        XCTAssertEqual(fallback.selectedVideoFormat, GameStreamVideoFormat.hevc.rawValue)
         XCTAssertFalse(fallback.isYUV444)
     }
 
@@ -272,26 +272,26 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         var preferences = StreamingPreferences.default
         preferences.enableYUV444 = true
         let yuvSelection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue
-                | MoonlightVideoFormat.av1High8YUV444.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue
+                | GameStreamVideoFormat.av1High8YUV444.rawValue,
             host: host(support: [.hevc, .av1High8YUV444]),
             application: application,
             preferences: preferences
         )
         XCTAssertEqual(
             yuvSelection.selectedVideoFormat,
-            MoonlightVideoFormat.av1High8YUV444.rawValue
+            GameStreamVideoFormat.av1High8YUV444.rawValue
         )
 
         preferences.enableHDR = true
         let hdrSelection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevcRext8YUV444.rawValue
-                | MoonlightVideoFormat.av1Main10.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevcRext8YUV444.rawValue
+                | GameStreamVideoFormat.av1Main10.rawValue,
             host: host(support: [.hevcRext8YUV444, .av1Main10]),
             application: application,
             preferences: preferences
         )
-        XCTAssertEqual(hdrSelection.selectedVideoFormat, MoonlightVideoFormat.av1Main10.rawValue)
+        XCTAssertEqual(hdrSelection.selectedVideoFormat, GameStreamVideoFormat.av1Main10.rawValue)
         XCTAssertTrue(hdrSelection.isHDR)
         XCTAssertFalse(hdrSelection.isYUV444)
     }
@@ -309,9 +309,9 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         var preferences = StreamingPreferences.default
         preferences.fidelityPreference = .codecLosslessRequired
         preferences.enableHDR = true
-        let available = MoonlightVideoFormat.hevc.rawValue
-            | MoonlightVideoFormat.hevcMain10.rawValue
-            | MoonlightVideoFormat.hevcRext10YUV444.rawValue
+        let available = GameStreamVideoFormat.hevc.rawValue
+            | GameStreamVideoFormat.hevcMain10.rawValue
+            | GameStreamVideoFormat.hevcRext10YUV444.rawValue
         let selection = try negotiator.select(
             availableVideoFormats: available,
             host: host(support: [.hevc, .hevcMain10, .hevcRext10YUV444, .hevcLossless]),
@@ -319,7 +319,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             preferences: preferences
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.hevcRext10YUV444.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.hevcRext10YUV444.rawValue)
         XCTAssertEqual(selection.fidelity, .codecLosslessYUV44410Bit)
         XCTAssertFalse(selection.fidelity.preservesSourceRGBExactly)
 
@@ -339,10 +339,10 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         var preferences = StreamingPreferences.default
         preferences.fidelityPreference = .codecLosslessRequired
         let selection = try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.hevc.rawValue
-                | MoonlightVideoFormat.hevcMain10.rawValue
-                | MoonlightVideoFormat.hevcRext8YUV444.rawValue
-                | MoonlightVideoFormat.hevcRext10YUV444.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.hevc.rawValue
+                | GameStreamVideoFormat.hevcMain10.rawValue
+                | GameStreamVideoFormat.hevcRext8YUV444.rawValue
+                | GameStreamVideoFormat.hevcRext10YUV444.rawValue,
             host: host(support: [
                 .hevc, .hevcMain10, .hevcRext8YUV444, .hevcRext10YUV444, .hevcLossless,
             ]),
@@ -350,7 +350,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
             preferences: preferences
         )
 
-        XCTAssertEqual(selection.selectedVideoFormat, MoonlightVideoFormat.hevcRext8YUV444.rawValue)
+        XCTAssertEqual(selection.selectedVideoFormat, GameStreamVideoFormat.hevcRext8YUV444.rawValue)
         XCTAssertEqual(selection.fidelity, .codecLosslessYUV4448Bit)
         XCTAssertFalse(selection.isHDR)
     }
@@ -359,7 +359,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         var preferences = StreamingPreferences.default
         preferences.fidelityPreference = .codecLosslessRequired
         XCTAssertThrowsError(try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.h264.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.h264.rawValue,
             host: host(support: [.h264, .h264Lossless]),
             application: application,
             preferences: preferences
@@ -368,7 +368,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         preferences.optimizationMode = .latency
         XCTAssertThrowsError(try preferences.validate())
         XCTAssertThrowsError(try negotiator.select(
-            availableVideoFormats: MoonlightVideoFormat.h264High8YUV444.rawValue,
+            availableVideoFormats: GameStreamVideoFormat.h264High8YUV444.rawValue,
             host: host(support: [.h264High8YUV444, .h264Lossless]),
             application: application,
             preferences: preferences
@@ -396,7 +396,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         XCTAssertEqual(
             try StreamingConfigurationMapper.configuration(
                 for: quality,
-                selectedVideoFormat: MoonlightVideoFormat.hevc.rawValue
+                selectedVideoFormat: GameStreamVideoFormat.hevc.rawValue
             ).rtspFidelityMode,
             .unspecified
         )
@@ -406,7 +406,7 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         XCTAssertEqual(
             try StreamingConfigurationMapper.configuration(
                 for: quality,
-                selectedVideoFormat: MoonlightVideoFormat.hevc.rawValue
+                selectedVideoFormat: GameStreamVideoFormat.hevc.rawValue
             ).rtspFidelityMode,
             .unspecified
         )
@@ -418,14 +418,14 @@ final class VideoFormatNegotiatorTests: XCTestCase {
         bootstrap.effectivePolicy = .resolve(for: bootstrap.preferences)
         XCTAssertThrowsError(try StreamingConfigurationMapper.configuration(
             for: bootstrap,
-            selectedVideoFormat: MoonlightVideoFormat.hevc.rawValue
+            selectedVideoFormat: GameStreamVideoFormat.hevc.rawValue
         ))
 
         bootstrap.host.codecSupport.insert(.hevcLossless)
         XCTAssertEqual(
             try StreamingConfigurationMapper.configuration(
                 for: bootstrap,
-                selectedVideoFormat: MoonlightVideoFormat.hevc.rawValue
+                selectedVideoFormat: GameStreamVideoFormat.hevc.rawValue
             ).rtspFidelityMode,
             .codecLosslessRequired
         )

@@ -385,7 +385,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         } catch {
             lastLSPHosts = []
             eventHandler?(.sessionWarning(
-                "Saved Lumen hosts are unavailable; Moonlight-compatible hosts can still be discovered."
+                "Saved Lumen hosts couldn’t be loaded."
             ))
         }
         eventHandler?(.hosts(combinedHosts()))
@@ -547,21 +547,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         return displayHost(try await service.wakeHost(id: id.rawValue))
     }
 
-    func testNetwork(for id: HostID) async throws -> NetworkTestOutcome {
-        if lspHostID(id) != nil {
-            return .unavailable
-        }
-        _ = try await service.details(hostID: id.rawValue)
-        switch await service.testConnectivity() {
-        case .clear:
-            return .clear
-        case let .blocked(ports):
-            return .blocked(ports: ports.map(\.description))
-        case .inconclusive:
-            return .unavailable
-        }
-    }
-
     func applications(for id: HostID, includeHidden: Bool) async throws -> [ApplicationDisplayModel] {
         if let hostID = lspHostID(id), let lspProduct {
             try await configureLSPTransport(lspProduct)
@@ -586,7 +571,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     artworkURL: nil,
                     isRunning: application.isRunning,
                     isHidden: false,
-                    isDirectLaunch: false
+                    isDirectLaunch: false,
+                    kind: ApplicationKind(application.kind)
                 ))
             }
             lspApplicationIDs[id] = wireIDs
@@ -685,56 +671,45 @@ final class LiveUmbraClientService: UmbraClientServicing {
             )
             return
         }
-        do {
-            let runtimeResolution = preferenceResolver(preferences.settings)
-            let resolvedPreferences = runtimeResolution.preferences
-            if resolvedPreferences.configurationWarnings {
-                var warningMessages: [String] = []
-                if preferences.settings.enableHDR && !resolvedPreferences.enableHDR {
-                    warningMessages.append(
-                        "The selected display cannot present HDR. Umbra will use SDR for this stream."
-                    )
-                }
-                if resolvedPreferences.audioConfiguration
-                    != preferences.settings.audioConfiguration {
-                    warningMessages.append(
-                        "The active audio device cannot play the selected surround layout. Umbra will use Stereo for this stream."
-                    )
-                }
-                let host = try await service.details(hostID: hostID.rawValue).host
-                if let application = host.applications.first(where: { $0.id == id.rawValue }) {
-                    warningMessages.append(contentsOf: configurationWarningEvaluator.warnings(
-                        host: host,
-                        application: application,
-                        preferences: resolvedPreferences
-                    ).map(\.message))
-                }
-                var deliveredWarnings = Set<String>()
-                warningMessages = warningMessages.filter {
-                    deliveredWarnings.insert($0).inserted
-                }
-                if !warningMessages.isEmpty {
-                    eventHandler?(.configurationWarnings(warningMessages))
-                }
-            }
-            _ = try await service.beginSession(
-                runtimeResolution.sessionIntent(
-                    hostID: hostID.rawValue,
-                    applicationID: id.rawValue,
-                    kind: resume ? .resume : .launch
-                ),
-                uiActivationUptime: activationUptime
-            )
-        } catch {
-            guard preferences.settings.detectNetworkBlocking else { throw error }
-            if case let .blocked(ports) = await service.testConnectivity() {
-                throw UmbraClientServiceError.unavailable(
-                    "\(error.localizedDescription) Required ports appear blocked: "
-                        + ports.map(\.description).joined(separator: ", ")
+        let runtimeResolution = preferenceResolver(preferences.settings)
+        let resolvedPreferences = runtimeResolution.preferences
+        if resolvedPreferences.configurationWarnings {
+            var warningMessages: [String] = []
+            if preferences.settings.enableHDR && !resolvedPreferences.enableHDR {
+                warningMessages.append(
+                    "The selected display cannot present HDR. Umbra will use SDR for this stream."
                 )
             }
-            throw error
+            if resolvedPreferences.audioConfiguration
+                != preferences.settings.audioConfiguration {
+                warningMessages.append(
+                    "The active audio device cannot play the selected surround layout. Umbra will use Stereo for this stream."
+                )
+            }
+            let host = try await service.details(hostID: hostID.rawValue).host
+            if let application = host.applications.first(where: { $0.id == id.rawValue }) {
+                warningMessages.append(contentsOf: configurationWarningEvaluator.warnings(
+                    host: host,
+                    application: application,
+                    preferences: resolvedPreferences
+                ).map(\.message))
+            }
+            var deliveredWarnings = Set<String>()
+            warningMessages = warningMessages.filter {
+                deliveredWarnings.insert($0).inserted
+            }
+            if !warningMessages.isEmpty {
+                eventHandler?(.configurationWarnings(warningMessages))
+            }
         }
+        _ = try await service.beginSession(
+            runtimeResolution.sessionIntent(
+                hostID: hostID.rawValue,
+                applicationID: id.rawValue,
+                kind: resume ? .resume : .launch
+            ),
+            uiActivationUptime: activationUptime
+        )
     }
 
     /// Starts a CLI-resolved stream through the same native window, decoder, renderer, and input
@@ -796,6 +771,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 applicationName: applicationName,
                 preferences: preferences
             )
+            await startLSPCursorSync(product: product, streamWindow: streamWindow, streamID: streamID)
             session = try await product.startInput(
                 hostID: hostID,
                 applicationID: applicationID,
@@ -854,6 +830,31 @@ final class LiveUmbraClientService: UmbraClientServicing {
         await startLSPClipboardSync(product: product, hostID: hostID, streamID: streamID)
     }
 
+    /// Routes host cursor state to the stream window and its pointer mode to native capture.
+    /// Installed before START so the host's first cursor state reaches the window.
+    private func startLSPCursorSync(
+        product: LSPProductClient,
+        streamWindow: StreamWindowController,
+        streamID: UUID
+    ) async {
+        streamWindow.onMacCursorModeChanged = { [weak self] absolute, insideVideo in
+            self?.lspInputCapture.setPointerMotion(absolute: absolute, insideVideo: insideVideo)
+        }
+        streamWindow.onAbsolutePointer = { [weak self] timestamp, x, y in
+            self?.lspInputCapture.submitAbsolutePointer(sampleTimeMicroseconds: timestamp, x: x, y: y)
+        }
+        await product.setCursorHandler { [weak self] remoteHostID, state in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeLSPStreamID == streamID,
+                      self.activeLSPHostID == nil || self.activeLSPHostID == remoteHostID else { return }
+                self.streamWindow?.applyHostCursor(state)
+            }
+        }
+        // Show the Mac cursor from the start; the host's first cursor state, when it sends one,
+        // replaces this with its shape or hides it for a game.
+        streamWindow.applyHostCursor(LSPCursorState(visible: true, shape: nil))
+    }
+
     private func startLSPClipboardSync(product: LSPProductClient, hostID: UUID, streamID: UUID) async {
         stopLSPClipboardSync()
         guard preferences.settings.lspClipboardSharing else { return }
@@ -876,7 +877,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         // A clear queued by an earlier stop must not land after this handler is installed.
         await lspClipboardHandlerClearTask?.value
         guard lspClipboardSync === sync else { return }
-        await product.setClipboardHandler { remoteHostID, content in
+        await product.setClipboardHandler { [weak self] remoteHostID, content in
             Task { @MainActor [weak self] in
                 guard let self, self.isActiveLSPStream(streamID, hostID: remoteHostID) else { return }
                 self.lspClipboardSync?.applyRemote(.init(text: content.text, html: content.html, png: content.png))
@@ -966,8 +967,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
         lspDeviceOfferTask?.cancel()
         lspDeviceOfferTask = nil
         lspInputCapture.stop()
+        lspInputCapture.setPointerMotion(absolute: false, insideVideo: false)
         streamWindow?.onTextCommit = nil
         stopLSPClipboardSync()
+        await lspProduct?.setCursorHandler(nil)
         let stopResult = await lspProduct?.stop(hostID: hostID) ?? .notRunning
         markLSPHostSession(hostID: hostID, runningApplicationID: nil)
         await streamWindow?.finish()
@@ -1344,11 +1347,35 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
         }
         lspTelemetryTask = Task { @MainActor [weak self, session] in
+            // The host encodes at least its minimum frame rate even for static content,
+            // so seconds without a single access unit mean its encoder hung (an NVENC
+            // driver deadlock was observed). Reconnecting makes the host rebuild it.
+            var lastVideoAccessUnits: UInt64?
+            var stalledVideoTicks = 0
             while !Task.isCancelled {
                 guard let self,
                       await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
                 self.latestLSPTelemetry = try? await session.telemetrySnapshot()
                 self.latestLSPReconnectTelemetry = await self.lspProduct?.reconnectTelemetry(hostID: hostID)
+                if let received = await self.lspProduct?.productTelemetry(hostID: hostID)?.videoAccessUnitsReceived,
+                   await session.state == .inputActive,
+                   self.lspReconnectTasks[hostID] == nil {
+                    if received == lastVideoAccessUnits {
+                        // Startup reports zero until the first frame; only a flow that stopped is a stall.
+                        if received > 0 { stalledVideoTicks += 1 }
+                    } else {
+                        lastVideoAccessUnits = received
+                        stalledVideoTicks = 0
+                    }
+                    if stalledVideoTicks >= 4 {
+                        stalledVideoTicks = 0
+                        lastVideoAccessUnits = nil
+                        self.lspFailureHandler("Video stopped arriving from the host; reconnecting to restart its encoder.")
+                        Task { @MainActor [weak self] in
+                            try? await self?.reconnectLSPInput(hostID: hostID, reason: .transportLoss)
+                        }
+                    }
+                }
                 if let telemetry = self.latestLSPTelemetry {
                     let devices = await self.lspProduct?.deviceRateTelemetry(hostID: hostID) ?? []
                     let productTelemetry = await self.lspProduct?.productTelemetry(hostID: hostID)
@@ -2195,7 +2222,6 @@ final class LiveApplicationComposition {
         let lspProduct = try LSPProductClient.applicationSupport(videoRenderer: streamWindow.videoRenderer)
 
         let securePorts = SecurePortRegistry()
-        let compatibilityUpdater = NVIDIAServerCompatibilityUpdater()
         let identityProvider = FileBackedClientIdentityProvider()
         let uniqueID = try identityProvider.clientID()
         let clientIdentity = try identityProvider.identity()
@@ -2277,7 +2303,7 @@ final class LiveApplicationComposition {
             lifecycle: lifecycle,
             microphonePreparer: SystemClientMicrophonePreparer(),
             diagnosticHandler: { [supportLogger] message in
-                supportLogger?.record(source: "Moonlight", level: .debug, message: message)
+                supportLogger?.record(source: "GameStream", level: .debug, message: message)
             },
             startupTelemetry: startupTelemetry
         )
@@ -2289,8 +2315,7 @@ final class LiveApplicationComposition {
             pairingAdapter: pairingAdapter,
             streamDriver: streamDriver,
             clientIdentityFingerprint: clientIdentity.persistenceFingerprint,
-            startupTelemetry: startupTelemetry,
-            maximumSupportedNVIDIAVersion: compatibilityUpdater.cachedMaximumVersion
+            startupTelemetry: startupTelemetry
         )
         clientService = LiveUmbraClientService(
             service: applicationService,
@@ -2315,7 +2340,6 @@ final class LiveApplicationComposition {
         streamWindow.onStopRequested = { [weak clientService] quitHostApplication in
             await clientService?.stopFromStreamWindow(quitHostApplication: quitHostApplication)
         }
-        Task { await compatibilityUpdater.refresh(applicationService) }
     }
 
     func stopForApplicationTermination() async {
@@ -2332,5 +2356,15 @@ final class LiveApplicationComposition {
                 .appendingPathComponent("app.umbra.Umbra", isDirectory: true)
                 .appendingPathComponent("Logs", isDirectory: true)
         ))
+    }
+}
+
+private extension ApplicationKind {
+    init(_ kind: LSPApplicationKind) {
+        switch kind {
+        case .program: self = .program
+        case .desktop: self = .desktop
+        case .steam: self = .steam
+        }
     }
 }

@@ -16,7 +16,8 @@ public final class KeepAwakeActivity {
         isActive = active
         if active {
             activity = ProcessInfo.processInfo.beginActivity(
-                options: [.userInitiated, .idleDisplaySleepDisabled],
+                // latencyCritical stops macOS from coalescing timers and wakeups during the stream.
+                options: [.userInitiated, .idleDisplaySleepDisabled, .latencyCritical],
                 reason: reason
             )
         } else if let activity {

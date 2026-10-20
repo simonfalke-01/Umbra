@@ -1306,7 +1306,9 @@ public final class LSPTransport: @unchecked Sendable {
         requestID: UInt64,
         payload: Data,
         errorResponse: Bool = false,
-        timeout: Duration = .seconds(1)
+        // Longer than the transport's three-second late-acknowledgement grace, so a response queued
+        // behind an operation awaiting a late ACK is not expired before the window frees.
+        timeout: Duration = .seconds(5)
     ) throws {
         let milliseconds = try Self.milliseconds(timeout, minimum: 20, maximum: 30_000)
         let status = payload.withUnsafeBytes { bytes in
@@ -1562,6 +1564,18 @@ public final class LSPTransport: @unchecked Sendable {
             horizontal_scroll: horizontalScroll
         )
         try Self.requireSuccess(clsp_core_submit_pointer(core, &sample))
+    }
+
+    /// Submits one latest absolute pointer position in Q0.32 remote-display coordinates.
+    public func submitAbsolutePointer(sampleTimeMicroseconds: UInt64, x: UInt32, y: UInt32) throws {
+        var sample = clsp_absolute_pointer_sample_t(sample_time_microseconds: sampleTimeMicroseconds, x: x, y: y)
+        try Self.requireSuccess(clsp_core_submit_absolute_pointer(core, &sample))
+    }
+
+    /// Selects absolute pointer motion; relative capture motion is dropped while it is set, and
+    /// presses and scrolling are dropped while the cursor is outside the video.
+    public func setPointerMotionAbsolute(_ absolute: Bool, insideVideo: Bool) throws {
+        try Self.requireSuccess(clsp_core_set_pointer_motion_absolute(core, absolute ? 1 : 0, insideVideo ? 1 : 0))
     }
 
     /// Submits one keyboard HID-usage or pointer-button lifecycle edge.

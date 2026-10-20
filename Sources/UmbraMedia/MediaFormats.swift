@@ -17,10 +17,10 @@ public enum VideoCodec: String, Sendable, CaseIterable {
     }
 }
 
-/// A single Moonlight video format value. These raw values are part of the
-/// moonlight-common client ABI and are deliberately distinct from Sunshine's
+/// A single GameStream video format value. These raw values are part of the
+/// the GameStream protocol library's client ABI and are deliberately distinct from the host's
 /// server codec-mode-support (SCM) bit positions.
-public enum MoonlightVideoFormat: Int32, Sendable, CaseIterable {
+public enum GameStreamVideoFormat: Int32, Sendable, CaseIterable {
     case h264 = 0x0001
     case h264High8YUV444 = 0x0004
     case hevc = 0x0100
@@ -67,7 +67,7 @@ public struct VideoCodecProfile: Sendable, Equatable {
     public let rawValue: Int32
 
     public init(codecMask: Int32) throws {
-        guard let format = MoonlightVideoFormat(rawValue: codecMask) else {
+        guard let format = GameStreamVideoFormat(rawValue: codecMask) else {
             throw VideoDecoderError.unsupportedCodecMask(codecMask)
         }
         switch format {
@@ -273,7 +273,7 @@ public enum AudioOutputLayout: String, Sendable, CaseIterable {
         switch self {
         case .stereo: kAudioChannelLayoutTag_Stereo
         case .surround51: kAudioChannelLayoutTag_MPEG_5_1_A
-        // Moonlight PCM order is L R C LFE rear-L rear-R side-L side-R.
+        // GameStream PCM order is L R C LFE rear-L rear-R side-L side-R.
         case .surround71: kAudioChannelLayoutTag_WAVE_7_1
         }
     }

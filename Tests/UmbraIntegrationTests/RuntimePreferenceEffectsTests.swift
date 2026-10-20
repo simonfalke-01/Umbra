@@ -30,11 +30,11 @@ final class RuntimePreferenceEffectsTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration.policy, .hardwareOnly)
-        XCTAssertEqual(configuration.upstreamMoonlightQueueCapacity, 1)
+        XCTAssertEqual(configuration.upstreamGameStreamQueueCapacity, 1)
         XCTAssertEqual(configuration.maximumOutstandingFrames, 4)
         XCTAssertEqual(configuration.capacityPolicy, .dropNewestWhenFull)
         XCTAssertEqual(configuration.rendererQueueDepth, 1)
-        XCTAssertTrue(configuration.backlogDiagnostic.contains("compressed Moonlight=1"))
+        XCTAssertTrue(configuration.backlogDiagnostic.contains("compressed GameStream=1"))
         XCTAssertTrue(configuration.backlogDiagnostic.contains("in-flight capacity=4"))
     }
 
@@ -44,12 +44,12 @@ final class RuntimePreferenceEffectsTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration.policy, .automatic)
-        XCTAssertEqual(configuration.upstreamMoonlightQueueCapacity, 2)
-        XCTAssertLessThanOrEqual(configuration.upstreamMoonlightQueueCapacity, 5)
+        XCTAssertEqual(configuration.upstreamGameStreamQueueCapacity, 2)
+        XCTAssertLessThanOrEqual(configuration.upstreamGameStreamQueueCapacity, 5)
         XCTAssertEqual(configuration.maximumOutstandingFrames, 5)
         XCTAssertEqual(configuration.capacityPolicy, .waitWhenFull)
         XCTAssertEqual(configuration.rendererQueueDepth, 1)
-        XCTAssertTrue(configuration.backlogDiagnostic.contains("compressed Moonlight=2"))
+        XCTAssertTrue(configuration.backlogDiagnostic.contains("compressed GameStream=2"))
         XCTAssertTrue(configuration.backlogDiagnostic.contains("in-flight capacity=5"))
     }
 

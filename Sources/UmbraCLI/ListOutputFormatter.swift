@@ -6,7 +6,7 @@ public enum ListProgressPhase: Equatable, Sendable {
     case loadingApplications
 }
 
-/// Formatting used by Moonlight's `list` command, isolated from networking and process I/O.
+/// Formatting used by the client's `list` command, isolated from networking and process I/O.
 public enum CLIListOutputFormatter {
     public static let csvHeader =
         "Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL"

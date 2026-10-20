@@ -91,7 +91,7 @@ final class ControllerSupportTests: XCTestCase {
     }
 
     @MainActor
-    func testHapticPlaybackIsBoundedToMoonlightMaximumDuration() {
+    func testHapticPlaybackIsBoundedToGameStreamMaximumDuration() {
         XCTAssertEqual(AppleGameControllerService.maximumHapticDuration, 30)
     }
 

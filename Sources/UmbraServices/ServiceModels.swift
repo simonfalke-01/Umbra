@@ -12,7 +12,6 @@ public enum ServiceOperation: String, Sendable {
     case applications
     case artwork
     case wake
-    case connectivityTest
     case launch
     case resume
     case cancel
@@ -27,7 +26,6 @@ public enum UmbraServiceError: Error, Equatable, Sendable {
     case hostNotPaired(String)
     case unsupportedServer(String)
     case authenticationFailed(String)
-    case networkBlocked([ConnectivityPort])
     case protocolFailure(operation: ServiceOperation, statusCode: Int?, message: String)
     case persistence(operation: ServiceOperation, message: String)
     case discovery(String)
@@ -57,8 +55,6 @@ extension UmbraServiceError: LocalizedError {
             "Host \(id) must be paired before this operation."
         case let .unsupportedServer(id):
             "Host \(id) is running an unsupported server version."
-        case let .networkBlocked(ports):
-            "The network blocked required ports: \(ports.map(\.description).joined(separator: ", "))."
         case let .protocolFailure(_, statusCode, message):
             statusCode.map { "Server returned \($0): \(message)" } ?? message
         case let .persistence(_, message):
@@ -101,9 +97,6 @@ extension UmbraServiceError: LocalizedError {
         case .authenticationFailed:
             kind = .authenticationFailed
             failingPorts = []
-        case let .networkBlocked(ports):
-            kind = .networkBlocked
-            failingPorts = ports.map(\.port)
         case .streamingUnavailable:
             kind = .decoderUnavailable
             failingPorts = []
@@ -121,39 +114,6 @@ extension UmbraServiceError: LocalizedError {
             failingPorts: failingPorts
         )
     }
-}
-
-public enum ConnectivityProtocol: String, Codable, Hashable, Sendable {
-    case tcp = "TCP"
-    case udp = "UDP"
-}
-
-public struct ConnectivityPort: Codable, Hashable, Sendable, CustomStringConvertible {
-    public var transport: ConnectivityProtocol
-    public var port: UInt16
-
-    public init(_ transport: ConnectivityProtocol, _ port: UInt16) {
-        self.transport = transport
-        self.port = port
-    }
-
-    public var description: String { "\(transport.rawValue) \(port)" }
-
-    public static let moonlightRequired: [Self] = [
-        Self(.tcp, 47_984),
-        Self(.tcp, 47_989),
-        Self(.tcp, 48_010),
-        Self(.udp, 47_998),
-        Self(.udp, 47_999),
-        Self(.udp, 48_000),
-        Self(.udp, 48_010),
-    ]
-}
-
-public enum ConnectivityTestResult: Equatable, Sendable {
-    case clear
-    case blocked([ConnectivityPort])
-    case inconclusive(String)
 }
 
 public struct HostDetails: Equatable, Sendable {
@@ -183,7 +143,7 @@ public struct SessionIntent: Sendable, Equatable {
     public var kind: SessionIntentKind
     public var preferences: StreamingPreferences
     /// Runtime-only refresh rate for the resolved target display. A nil value
-    /// leaves Moonlight's client refresh hint unspecified.
+    /// leaves the client's client refresh hint unspecified.
     public var clientRefreshRateX100: Int32?
     /// Immutable session policy resolved before entering the service layer.
     public var effectivePolicy: EffectiveStreamingPolicy
@@ -266,7 +226,7 @@ public struct StreamBootstrap: Sendable, Equatable {
 }
 
 /// The final video mode selected during local media preparation. The selected
-/// raw value is one exact Moonlight client-format bit, never a capability set.
+/// raw value is one exact GameStream client-format bit, never a capability set.
 public enum StreamVideoFidelityClass: String, Sendable, Equatable {
     case rateControlled
     case latencyRateControlled

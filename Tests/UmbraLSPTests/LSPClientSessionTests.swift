@@ -432,7 +432,7 @@ final class LSPClientSessionTests: XCTestCase {
             audioOutputChannelCount: 2,
             supportsHardwareHEVCMain10: true,
             supportsHardwareAV1Main10: true,
-            supportedHardwareYUV444FormatMask: MoonlightVideoFormat.hevcRext10YUV444.rawValue
+            supportedHardwareYUV444FormatMask: GameStreamVideoFormat.hevcRext10YUV444.rawValue
         )
         let offers = LSPVideoOffer.hardwareOffers(
             capabilities: capabilities,
@@ -588,7 +588,7 @@ final class LSPClientSessionTests: XCTestCase {
         )
         let values = try DeterministicCBOR.exactMap(
             DeterministicCBOR.decode(try LSPControlWire.start(request)),
-            count: 16
+            count: 17
         )
         let intent = try DeterministicCBOR.exactMap(values[1], count: 2)
         XCTAssertEqual(intent[0], .text("desktop"))
@@ -631,7 +631,7 @@ final class LSPClientSessionTests: XCTestCase {
         )
         let outer = try DeterministicCBOR.exactMap(
             DeterministicCBOR.decode(try LSPControlWire.start(request)),
-            count: 16
+            count: 17
         )
         let intent = try DeterministicCBOR.exactMap(outer[1], count: 2)
         XCTAssertEqual(intent, [.text("desktop"), .boolean(true)])
@@ -651,7 +651,7 @@ final class LSPClientSessionTests: XCTestCase {
         )
         let values = try DeterministicCBOR.exactMap(
             DeterministicCBOR.decode(try LSPControlWire.start(request)),
-            count: 16
+            count: 17
         )
         let microphone = try DeterministicCBOR.exactMap(values[9], count: 6)
         XCTAssertEqual(microphone[0], .unsigned(1))

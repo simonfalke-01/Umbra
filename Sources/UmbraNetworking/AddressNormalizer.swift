@@ -13,7 +13,7 @@ public struct AddressNormalizer: Sendable {
         }
 
         if value.first == "[" {
-            return try parseURL("moonlight://\(value)", defaultPort: defaultPort)
+            return try parseURL("gamestream://\(value)", defaultPort: defaultPort)
         }
 
         // An unescaped IPv6 literal is always interpreted as a host without a port. IPv6 with a
@@ -42,7 +42,7 @@ public struct AddressNormalizer: Sendable {
     private func parseURL(_ value: String, defaultPort: UInt16) throws -> HostAddress {
         guard let components = URLComponents(string: value),
               let scheme = components.scheme?.lowercased(),
-              ["moonlight", "http", "https"].contains(scheme),
+              ["gamestream", "http", "https"].contains(scheme),
               let parsedHost = components.host,
               !parsedHost.isEmpty,
               components.user == nil,

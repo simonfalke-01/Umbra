@@ -1,7 +1,7 @@
 import Foundation
 import UmbraCore
 
-/// Parses Moonlight-compatible arguments without performing I/O or terminating the process.
+/// Parses GameStream-compatible arguments without performing I/O or terminating the process.
 public struct UmbraCLIParser: Sendable {
     public var applicationName: String
     public var version: String

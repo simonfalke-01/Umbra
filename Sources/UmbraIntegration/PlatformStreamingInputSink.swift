@@ -153,7 +153,7 @@ public final class ControllerMotionPolicy: @unchecked Sendable {
     }
 }
 
-/// Direct adapter from AppKit/GameController callbacks to MoonlightCommon's
+/// Direct adapter from AppKit/GameController callbacks to GameStreamCommon's
 /// bounded input queue. Submission remains synchronous so input does not wait
 /// behind a second client-side queue or an actor hop.
 public final class PlatformStreamingInputSink: PlatformInputPacketSink, @unchecked Sendable {
@@ -289,7 +289,7 @@ public final class PlatformStreamingInputSink: PlatformInputPacketSink, @uncheck
             (.analogTriggers, 0x001), (.rumble, 0x002), (.triggerRumble, 0x004),
             (.touchpad, 0x008), (.accelerometer, 0x010), (.gyroscope, 0x020),
             (.battery, 0x040), (.rgbLED, 0x080), (.dualTouchpad, 0x100),
-            // moonlight-common currently has no advertised adaptive-trigger capability bit.
+            // the GameStream protocol library currently has no advertised adaptive-trigger capability bit.
         ]
         for (source, destination) in mappings where capabilities.contains(source) { result |= destination }
         return result

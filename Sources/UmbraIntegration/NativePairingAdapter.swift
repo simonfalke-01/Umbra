@@ -53,7 +53,7 @@ public struct NativeHostPairingAdapter: HostPairingAdapting, Sendable {
 
 /// Creates a fresh transcript for each host so the certificate-pinned HTTPS leg
 /// uses that host's advertised/configured secure port. Callers should key the
-/// provider by hostname when several saved hosts use distinct Sunshine ports.
+/// provider by hostname when several saved hosts use distinct Lumen ports.
 public final class FactoryBackedHostPairingAdapter: HostPairingAdapting, @unchecked Sendable {
     public typealias SecurePortProvider = @Sendable (HostAddress) -> UInt16
     public typealias CoordinatorFactory = @Sendable (

@@ -50,7 +50,7 @@ private final class StreamingOutputSessionState: @unchecked Sendable {
 }
 
 /// Routes host output requests back to native GameController devices. Bridge
-/// callbacks may arrive on Moonlight worker threads, so framework interaction is
+/// callbacks may arrive on GameStream worker threads, so framework interaction is
 /// always transferred to the main actor.
 public final class StreamingSessionOutputAdapter: StreamingEventOutputHandling, ControllerMotionPolicyProviding, @unchecked Sendable {
     public typealias HDRHandler = @MainActor @Sendable (Bool, StreamingHDRMetadata?) -> Void

@@ -213,7 +213,7 @@ extension HDRStaticMetadata {
     ) -> Data? {
         guard metadata.redX != 0, metadata.maximumDisplayLuminanceNits != 0 else { return nil }
         var bytes: [UInt8] = []
-        // HEVC MDCV is GBR order; Sunshine exposes RGB order.
+        // HEVC MDCV is GBR order; Lumen exposes RGB order.
         for value in [
             metadata.greenX, metadata.greenY,
             metadata.blueX, metadata.blueY,
@@ -299,15 +299,15 @@ public final class NativeAudioDecoderAdapter: UmbraStreaming.AudioDecoding, Umbr
 /// Opus decoder and output capability before streaming can begin.
 public struct AppleStreamingMediaProvider: StreamingMediaProviding, Sendable {
     struct VideoDecoderConfiguration: Equatable {
-        /// Moonlight's separate decode-unit queue in VideoDepacketizer.c.
-        let upstreamMoonlightQueueCapacity: Int
+        /// the client's separate decode-unit queue in VideoDepacketizer.c.
+        let upstreamGameStreamQueueCapacity: Int
         let policy: VideoDecoderPolicy
         let maximumOutstandingFrames: Int
         let capacityPolicy: VideoDecodeCapacityPolicy
         let rendererQueueDepth: Int
 
         var backlogDiagnostic: String {
-            "Video backlog capacities: compressed Moonlight=\(upstreamMoonlightQueueCapacity), "
+            "Video backlog capacities: compressed GameStream=\(upstreamGameStreamQueueCapacity), "
                 + "Swift/VideoToolbox in-flight capacity=\(maximumOutstandingFrames), "
                 + "renderer capacity=\(rendererQueueDepth)."
         }
@@ -490,7 +490,7 @@ public struct AppleStreamingMediaProvider: StreamingMediaProviding, Sendable {
         case .quality: .waitWhenFull
         }
         return VideoDecoderConfiguration(
-            upstreamMoonlightQueueCapacity: Int(
+            upstreamGameStreamQueueCapacity: Int(
                 StreamingConfiguration.clampedVideoDecodeQueueCapacity(
                     policy.maximumCompressedDecodeQueueFrames
                 )

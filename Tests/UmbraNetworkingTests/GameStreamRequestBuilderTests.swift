@@ -54,7 +54,7 @@ final class GameStreamRequestBuilderTests: XCTestCase {
 
         let request = try builder.startSession(
             kind: .launch,
-            address: HostAddress(host: "sunshine.local", port: 47_984),
+            address: HostAddress(host: "lumen.local", port: 47_984),
             configuration: configuration
         )
         let values = query(request)

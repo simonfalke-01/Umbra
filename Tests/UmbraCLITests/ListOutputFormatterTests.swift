@@ -92,7 +92,7 @@ final class ListOutputFormatterTests: XCTestCase {
         )
     }
 
-    func testExecutionResultFactoriesPreserveMoonlightExitContracts() throws {
+    func testExecutionResultFactoriesPreserveGameStreamExitContracts() throws {
         XCTAssertEqual(CLIExecutionResult.success("ok\n").exitCode, 0)
         XCTAssertEqual(CLIExecutionResult.failure("failed\n").exitCode, 1)
         XCTAssertEqual(CLIExecutionResult.hostUnavailable("offline\n").exitCode, -1)

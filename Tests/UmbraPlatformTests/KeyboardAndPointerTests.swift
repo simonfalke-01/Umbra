@@ -138,7 +138,7 @@ final class KeyboardAndPointerTests: XCTestCase {
         )
     }
 
-    func testMoonlightSpecialAndInternationalKeyboardMappings() {
+    func testGameStreamSpecialAndInternationalKeyboardMappings() {
         let translator = MacKeyboardTranslator()
         let physicalMappings: [(UInt16, UInt16, UInt8)] = [
             (10, 0xE2, 0),    // ISO section / non-US backslash

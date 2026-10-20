@@ -54,7 +54,7 @@ struct AddHostSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: UmbraLayout.space6) {
-            Text("Add GameStream Host")
+            Text("Add Host")
                 .font(.title2.weight(.semibold))
 
             legacyFields
@@ -90,9 +90,6 @@ struct AddHostSheet: View {
             .textContentType(.URL)
             TextField("Port (optional)", text: $port, prompt: Text("Default"))
                 .frame(maxWidth: 160)
-            Text("Lumen hosts on your local network appear here automatically.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
     }
@@ -202,9 +199,9 @@ struct PairHostSheet: View {
 
     private var instructions: String {
         if host.id.rawValue.hasPrefix("lsp:") {
-            return "Discovery name (unverified): \(host.name)\nEnter this six-digit PIN in the Lumen admin panel. The PIN expires after two minutes."
+            return "Enter this PIN in Lumen within two minutes."
         }
-        return "Enter this PIN in the Sunshine web interface."
+        return "Enter this PIN on the host."
     }
 
     private var pairingTitle: String {
@@ -230,8 +227,6 @@ struct RenameHostSheet: View {
             VStack(alignment: .leading, spacing: UmbraLayout.space2) {
                 Text("Rename Host")
                     .font(.title2.weight(.semibold))
-                Text("Choose the name shown in Umbra. This does not rename the host computer itself.")
-                    .foregroundStyle(.secondary)
             }
 
             TextField("Host name", text: $name)
@@ -392,34 +387,5 @@ struct HostDetailsSheet: View {
                 saveError = error.localizedDescription
             }
         }
-    }
-}
-
-struct NetworkResultSheet: View {
-    let result: NetworkTestOutcome
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(spacing: UmbraLayout.space6) {
-            Image(systemName: result.symbol)
-                .font(.system(size: 44, weight: .light))
-                .symbolRenderingMode(.hierarchical)
-
-            VStack(spacing: UmbraLayout.space2) {
-                Text(result.title)
-                    .font(.title2.weight(.semibold))
-                Text(result.message)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-
-            Button("Done") { dismiss() }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-        }
-        .padding(UmbraLayout.space8)
-        .frame(width: 500)
     }
 }

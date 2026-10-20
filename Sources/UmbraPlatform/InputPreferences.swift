@@ -97,7 +97,7 @@ public struct MouseInputMapper: Sendable {
 }
 
 public enum ClipboardTextNormalizer {
-    /// Moonlight sends UTF-8 text to a Windows host. Collapsing CRLF avoids the host
+    /// GameStream sends UTF-8 text to a Windows host. Collapsing CRLF avoids the host
     /// interpreting a single source line ending as two line breaks.
     public static func normalize(_ value: String) -> String {
         value.replacingOccurrences(of: "\r\n", with: "\n")

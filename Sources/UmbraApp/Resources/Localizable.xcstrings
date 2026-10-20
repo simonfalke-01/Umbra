@@ -314,7 +314,7 @@
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "The selected microphone is disconnected. Reconnect it or choose another input." } } }
     },
     "Troubleshooting" : {
-      "comment" : "Menu item opening Moonlight troubleshooting documentation.",
+      "comment" : "Menu item opening GameStream troubleshooting documentation.",
       "extractionState" : "manual",
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Troubleshooting" } } }
     },
@@ -324,7 +324,7 @@
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Umbra Diagnostics.json" } } }
     },
     "Umbra Setup Guide" : {
-      "comment" : "Menu item opening Moonlight setup documentation.",
+      "comment" : "Menu item opening GameStream setup documentation.",
       "extractionState" : "manual",
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Umbra Setup Guide" } } }
     },

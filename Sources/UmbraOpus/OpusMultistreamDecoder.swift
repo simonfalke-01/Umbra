@@ -28,7 +28,7 @@ public enum OpusDecoderError: Error, Sendable, Equatable, CustomStringConvertibl
     public var description: String {
         switch self {
         case let .unsupportedAudioConfiguration(configuration):
-            "Unsupported Moonlight audio configuration: \(configuration)"
+            "Unsupported GameStream audio configuration: \(configuration)"
         case let .channelCountMismatch(expected, actual):
             "Audio configuration requires \(expected) channels, but Opus negotiated \(actual)"
         case let .unsupportedSampleRate(sampleRate):
@@ -44,7 +44,7 @@ public enum OpusDecoderError: Error, Sendable, Equatable, CustomStringConvertibl
         case let .invalidMapping(channel, value, codedChannelCount):
             "Opus channel \(channel) maps to \(value), but only \(codedChannelCount) coded channels exist"
         case let .packetTooLarge(maximum, actual):
-            "Opus packet is \(actual) bytes; Moonlight packets are limited to \(maximum) bytes"
+            "Opus packet is \(actual) bytes; GameStream packets are limited to \(maximum) bytes"
         case .notConfigured:
             "The Opus decoder is not configured"
         case .notRunning:
@@ -71,7 +71,7 @@ public enum OpusDecoderError: Error, Sendable, Equatable, CustomStringConvertibl
     }
 }
 
-/// An owned Float32 PCM frame in Moonlight's interleaved channel order.
+/// An owned Float32 PCM frame in the client's interleaved channel order.
 ///
 /// Channels are FL, FR for stereo; FL, FR, C, LFE, rear-L, rear-R for 5.1;
 /// and FL, FR, C, LFE, rear-L, rear-R, side-L, side-R for 7.1.
@@ -127,9 +127,9 @@ public struct InterleavedPCMFrame: Sendable, Equatable {
 }
 
 /// Thread-safe native decoder for the Opus multistream configuration supplied
-/// by moonlight-common-c.
+/// by the GameStream protocol library.
 public final class OpusMultistreamDecoder: AudioDecoding, AudioDiscontinuityHandling, @unchecked Sendable {
-    public static let maximumMoonlightPacketSize = 1_400
+    public static let maximumGameStreamPacketSize = 1_400
 
     private struct Configuration {
         let streamFormat: OpusStreamFormat
@@ -302,7 +302,7 @@ public final class OpusMultistreamDecoder: AudioDecoding, AudioDiscontinuityHand
     }
 
     /// Synchronously decodes one owned packet. Empty packets intentionally invoke
-    /// libopus packet-loss concealment, matching moonlight-common-c semantics.
+    /// libopus packet-loss concealment, matching the GameStream protocol library semantics.
     public func decode(packet: CompressedAudioPacket) throws -> InterleavedPCMFrame {
         lock.lock()
         defer { lock.unlock() }
@@ -345,9 +345,9 @@ public final class OpusMultistreamDecoder: AudioDecoding, AudioDiscontinuityHand
         guard state.isRunning else {
             throw OpusDecoderError.notRunning
         }
-        guard packet.data.count <= Self.maximumMoonlightPacketSize else {
+        guard packet.data.count <= Self.maximumGameStreamPacketSize else {
             throw OpusDecoderError.packetTooLarge(
-                maximum: Self.maximumMoonlightPacketSize,
+                maximum: Self.maximumGameStreamPacketSize,
                 actual: packet.data.count
             )
         }

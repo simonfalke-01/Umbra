@@ -89,7 +89,7 @@ final class StreamingCallbackMappingTests: XCTestCase {
         XCTAssertEqual(video.lifecycle, [.start, .stop, .cleanup])
     }
 
-    func testHDRModeCopiesSunshineStaticMetadataBeforePublishingEvent() {
+    func testHDRModeCopiesLumenStaticMetadataBeforePublishingEvent() {
         let video = RecordingStreamingVideoDecoder()
         let events = LockedStreamingRecorder<StreamingEvent>()
         let harness = StreamingCallbackTestHarness(

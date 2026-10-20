@@ -38,7 +38,6 @@ protocol UmbraClientServicing: AnyObject {
     func updateHostEndpoint(id: HostID, endpoint: HostEndpointInput) async throws -> HostDisplayModel
     func deleteHost(id: HostID) async throws
     func wakeHost(id: HostID) async throws -> HostDisplayModel
-    func testNetwork(for id: HostID) async throws -> NetworkTestOutcome
     func applications(for id: HostID, includeHidden: Bool) async throws -> [ApplicationDisplayModel]
     func launchApplication(id: ApplicationID, on hostID: HostID, resume: Bool) async throws
     func launchApplication(
@@ -95,7 +94,6 @@ final class UnavailableUmbraClientService: UmbraClientServicing {
     func renameHost(id: HostID, name: String) async throws -> HostDisplayModel { throw error }
     func deleteHost(id: HostID) async throws { throw error }
     func wakeHost(id: HostID) async throws -> HostDisplayModel { throw error }
-    func testNetwork(for id: HostID) async throws -> NetworkTestOutcome { throw error }
     func applications(for id: HostID, includeHidden: Bool) async throws -> [ApplicationDisplayModel] { throw error }
     func launchApplication(id: ApplicationID, on hostID: HostID, resume: Bool) async throws { throw error }
     func quitApplication(id: ApplicationID, on hostID: HostID) async throws { throw error }

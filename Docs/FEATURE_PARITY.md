@@ -1,17 +1,17 @@
 # Compatibility and validation status
 
 Umbra is a native Apple Silicon macOS client. This checklist records implemented
-legacy Moonlight behavior and the hardware or human validation that remains. A
+legacy GameStream behavior and the hardware or human validation that remains. A
 checked item means repository coverage exists; it is not a blanket performance,
 HDR, accessibility, or hardware-matrix claim.
 
-The pinned comparison source is the local `reference/moonlight-qt` checkout at
+The pinned comparison source is the local `reference/gamestream-client` checkout at
 commit `d2f6990b`. The checkout is intentionally not part of the Umbra source tree.
 
 ## Hosts and onboarding
 
 - [x] Discover `_nvstream._tcp` hosts on the local network.
-- [x] Add hosts by DNS name, IPv4, IPv6, or `moonlight://` address.
+- [x] Add hosts by DNS name, IPv4, IPv6, or `gamestream://` address.
 - [x] Poll online, offline, paired, unpaired, and busy state.
 - [x] Pair with the host using the PIN and certificate flow.
 - [x] Pin and persist the host certificate and client identity securely.
@@ -30,7 +30,7 @@ commit `d2f6990b`. The checkout is intentionally not part of the Umbra source tr
 
 ## Streaming
 
-- [x] Negotiate and transport sessions through `moonlight-common-c`.
+- [x] Negotiate and transport sessions through the vendored GameStream protocol library.
 - [x] Decode H.264, HEVC, and AV1 using VideoToolbox where supported.
 - [ ] Support HDR/EDR and YUV 4:4:4 where the host and display support them.
 - [x] Pace frames and honor V-Sync, frame-pacing, resolution, FPS, and bitrate.

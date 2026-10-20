@@ -6,7 +6,7 @@
 #include <stdbool.h>
 
 /*
- * The pinned Moonlight transport is process-global. The facade configures this
+ * The pinned GameStream transport is process-global. The facade configures this
  * extension immediately before LiStartConnection(), and clears it immediately
  * after that blocking call returns on every success, failure, or cancellation
  * path. Legacy/NVIDIA mode emits no Umbra or Lumen attributes. The dedicated

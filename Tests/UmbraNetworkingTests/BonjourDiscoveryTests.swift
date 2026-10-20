@@ -35,7 +35,7 @@ final class BonjourDiscoveryTests: XCTestCase {
         scheduler.fireNext()
         let recoveredBrowser = try XCTUnwrap(factory.browser(at: 1))
         let recoveredService = DiscoveredHostService(
-            name: "Sunshine",
+            name: "Lumen",
             type: "_nvstream._tcp.",
             domain: "local."
         )

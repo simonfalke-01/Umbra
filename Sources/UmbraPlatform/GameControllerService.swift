@@ -41,7 +41,7 @@ public final class AppleGameControllerService: ControllerOutputServicing {
             }
         }
     }
-    /// Set before `start()`. Matches Moonlight's single-vs-multi-controller preference.
+    /// Set before `start()`. Matches the client's single-vs-multi-controller preference.
     public var multiControllerEnabled = true {
         didSet {
             guard oldValue != multiControllerEnabled else { return }

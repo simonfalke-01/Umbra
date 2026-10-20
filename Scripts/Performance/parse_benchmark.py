@@ -539,7 +539,7 @@ def parse_input_network_decomposition(
         if mode not in {"latency", "quality"}:
             errors.append(f"input trace {index} has invalid mode")
             continue
-        if client_protocol not in {"vanilla-moonlight", "umbra-legacy", "umbra-v2"}:
+        if client_protocol not in {"standard-gamestream", "umbra-legacy", "umbra-v2"}:
             errors.append(f"input trace {index} has invalid client protocol")
             continue
         if selected_mode is None:
@@ -670,7 +670,7 @@ def parse_client_telemetry(
     client_protocol = record.get("client_protocol")
     if optimization_mode not in {"latency", "quality"}:
         errors.append("telemetry summary has invalid optimization mode")
-    if client_protocol not in {"vanilla-moonlight", "umbra-legacy", "umbra-v2"}:
+    if client_protocol not in {"standard-gamestream", "umbra-legacy", "umbra-v2"}:
         errors.append("telemetry summary has invalid client protocol")
     provenance = record.get("provenance")
     if not isinstance(provenance, str) or not provenance.strip():
@@ -825,7 +825,7 @@ def reported_library_interval(value: Any) -> dict[str, Any] | None:
     return {
         "value_ms": float(value),
         "uncertainty_ms": 100.0,
-        "basis": "Moonlight library reported rounded elapsed duration",
+        "basis": "GameStream library reported rounded elapsed duration",
         "threshold_eligible": False,
     }
 
@@ -1399,7 +1399,7 @@ def validate_report(report: dict[str, Any], schema: dict[str, Any]) -> None:
         raise ValueError("report matrix has invalid network kind")
     if matrix.get("optimization_mode") not in {"latency", "quality", "unknown"}:
         raise ValueError("report matrix has invalid optimization mode")
-    if matrix.get("client_protocol") not in {"vanilla-moonlight", "umbra-legacy", "umbra-v2"}:
+    if matrix.get("client_protocol") not in {"standard-gamestream", "umbra-legacy", "umbra-v2"}:
         raise ValueError("report matrix has invalid client protocol")
     telemetry_matrix = report.get("telemetry_matrix")
     if not isinstance(telemetry_matrix, dict):

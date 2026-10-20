@@ -60,12 +60,12 @@ public struct KeyboardModifierMask: OptionSet, Equatable, Sendable {
 }
 
 public struct KeyboardPacket: Equatable, Sendable {
-    /// Windows virtual-key code expected by the Moonlight input protocol.
+    /// Windows virtual-key code expected by the GameStream input protocol.
     public var virtualKey: UInt16
     public var action: KeyAction
     public var modifiers: KeyboardModifierMask
     public var isExtended: Bool
-    /// Sunshine keyboard-event flags. Most keys use zero; international keys
+    /// Lumen keyboard-event flags. Most keys use zero; international keys
     /// that must bypass host-side layout normalization use bit 0.
     public var flags: UInt8
 

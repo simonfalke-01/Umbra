@@ -17,7 +17,7 @@ public struct SystemTrustEvaluator: ServerTrustEvaluating {
     }
 }
 
-/// Pins the exact DER bytes of the leaf certificate, matching Moonlight's host-certificate model.
+/// Pins the exact DER bytes of the leaf certificate, matching the client's host-certificate model.
 /// The self-signed GameStream certificate may fail normal PKI validation, so equality with the
 /// certificate captured by the pairing flow is the authoritative check.
 public struct PinnedCertificateEvaluator: ServerTrustEvaluating {

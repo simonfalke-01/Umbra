@@ -300,11 +300,6 @@ actor FakeWakeSender: WakeOnLANSending {
     }
 }
 
-struct FakeConnectivityTester: ConnectivityTesting, Sendable {
-    let result: ConnectivityTestResult
-    func testRequiredPorts() async -> ConnectivityTestResult { result }
-}
-
 actor ImmediateServiceClock: ServiceClock {
     private(set) var sleepCount = 0
 

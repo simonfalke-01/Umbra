@@ -17,6 +17,12 @@
 #include "SecurityProviders.h"
 #include "TransportFeedback.h"
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2447,9 +2453,23 @@ namespace umbra::lsp {
       if (!authenticated_.load(std::memory_order_acquire) || sample.sample_time_microseconds == 0) {
         return sample.sample_time_microseconds == 0 ? CLSP_STATUS_INVALID_ARGUMENT : CLSP_STATUS_NOT_AUTHENTICATED;
       }
+      auto filtered = sample;
+      if (pointer_motion_absolute_.load(std::memory_order_acquire)) {
+        // The client draws the cursor and sends its position; relative motion would fight it, and
+        // scrolling outside the video belongs to the Mac.
+        filtered.delta_x = 0;
+        filtered.delta_y = 0;
+        if (!pointer_inside_video_.load(std::memory_order_acquire)) {
+          filtered.vertical_scroll = 0;
+          filtered.horizontal_scroll = 0;
+        }
+        if (filtered.vertical_scroll == 0 && filtered.horizontal_scroll == 0) {
+          return CLSP_STATUS_OK;
+        }
+      }
       CaptureRecord record {
         .kind = CaptureKind::pointer,
-        .pointer = sample,
+        .pointer = filtered,
         .device_generation = std::max<std::uint32_t>(
           1U,
           published_pointer_generation_.load(std::memory_order_acquire)
@@ -2460,6 +2480,33 @@ namespace umbra::lsp {
       (void)sample;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
+    }
+
+    /** @brief Queue one bounded absolute-pointer record. */
+    [[nodiscard]] clsp_status_t submit_absolute_pointer(const clsp_absolute_pointer_sample_t &sample) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!authenticated_.load(std::memory_order_acquire) || sample.sample_time_microseconds == 0) {
+        return sample.sample_time_microseconds == 0 ? CLSP_STATUS_INVALID_ARGUMENT : CLSP_STATUS_NOT_AUTHENTICATED;
+      }
+      CaptureRecord record {
+        .kind = CaptureKind::absolute_pointer,
+        .absolute_pointer = sample,
+        .device_generation = std::max<std::uint32_t>(
+          1U,
+          published_pointer_generation_.load(std::memory_order_acquire)
+        ),
+      };
+      return enqueue_capture(record);
+#else
+      (void)sample;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
+    [[nodiscard]] clsp_status_t set_pointer_motion_absolute(const bool absolute, const bool inside_video) noexcept {
+      pointer_inside_video_.store(inside_video, std::memory_order_release);
+      pointer_motion_absolute_.store(absolute, std::memory_order_release);
+      return CLSP_STATUS_OK;
     }
 
     /** @brief Queue one bounded keyboard or pointer-button edge. */
@@ -2473,6 +2520,12 @@ namespace umbra::lsp {
       if (edge.sample_time_microseconds == 0 || !known_kind || edge.reserved_zero != 0 || edge.control_id == 0 ||
           (pointer && edge.control_id > 5U)) {
         return CLSP_STATUS_INVALID_ARGUMENT;
+      }
+      if (edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN && pointer_motion_absolute_.load(std::memory_order_acquire) &&
+          !pointer_inside_video_.load(std::memory_order_acquire)) {
+        // A press with the Mac cursor outside the video is a Mac click. Releases always pass so held
+        // buttons cannot stick.
+        return CLSP_STATUS_OK;
       }
       CaptureRecord record {
         .kind = CaptureKind::edge,
@@ -2753,6 +2806,7 @@ namespace umbra::lsp {
     /** @brief Capture-record discriminator for the bounded native ring. */
     enum class CaptureKind : std::uint8_t {
       pointer,  ///< Relative pointer sample.
+      absolute_pointer,  ///< Latest absolute pointer position.
       edge,  ///< Keyboard or pointer-button edge.
       neutralize,  ///< Stop accepting new physical state after queued releases.
       controller_edge,  ///< Controller lifecycle or digital button edge.
@@ -2766,6 +2820,7 @@ namespace umbra::lsp {
     struct CaptureRecord {
       CaptureKind kind {CaptureKind::neutralize};  ///< Record kind.
       clsp_pointer_sample_t pointer {};  ///< Pointer fields when `kind` is pointer.
+      clsp_absolute_pointer_sample_t absolute_pointer {};  ///< Fields when `kind` is absolute_pointer.
       clsp_input_edge_t edge {};  ///< Edge fields when `kind` is edge.
       clsp_controller_edge_t controller_edge {};  ///< Controller edge fields.
       clsp_controller_state_t controller_state {};  ///< Controller analog fields.
@@ -4005,9 +4060,35 @@ namespace umbra::lsp {
                CLSP_STATUS_SOCKET_FAILURE;
     }
 
+    /**
+     * @brief Run the worker under a Mach real-time constraint so frame delivery is never queued
+     * behind time-shared threads. The kernel demotes the thread if it overruns its budget.
+     */
+    static void promote_worker_to_real_time() noexcept {
+#if defined(__APPLE__)
+      mach_timebase_info_data_t timebase {};
+      if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0) return;
+      const auto ticks = [&](const std::uint64_t nanoseconds) {
+        return static_cast<std::uint32_t>(nanoseconds * timebase.denom / timebase.numer);
+      };
+      thread_time_constraint_policy_data_t policy {};
+      policy.period = 0;
+      policy.computation = ticks(500'000);
+      policy.constraint = ticks(1'000'000);
+      policy.preemptible = 1;
+      (void)thread_policy_set(
+        pthread_mach_thread_np(pthread_self()),
+        THREAD_TIME_CONSTRAINT_POLICY,
+        reinterpret_cast<thread_policy_t>(&policy),
+        THREAD_TIME_CONSTRAINT_POLICY_COUNT
+      );
+#endif
+    }
+
     /** @brief Static pthread entry point. */
     static void *worker_entry(void *opaque) noexcept {
       auto *self = static_cast<Impl *>(opaque);
+      promote_worker_to_real_time();
       self->run_worker();
       return nullptr;
     }
@@ -4020,9 +4101,15 @@ namespace umbra::lsp {
         std::array<struct kevent, 8> events {};
         const auto urgent_repair_timer = configuration_.profile == CLSP_PROFILE_COMPETITION_LAN &&
                                          video_gap_tracker_.size() != 0;
+        auto timeout_nanoseconds = urgent_repair_timer ? 100'000L : 1'000'000L;
+        if (next_input_due_us_ != 0) {
+          const auto wait_now = monotonic_microseconds();
+          const auto until_due = next_input_due_us_ > wait_now ? next_input_due_us_ - wait_now : 0U;
+          timeout_nanoseconds = std::min<long>(timeout_nanoseconds, static_cast<long>(until_due) * 1'000L);
+        }
         const timespec timeout {
           .tv_sec = 0,
-          .tv_nsec = urgent_repair_timer ? 100'000L : 1'000'000L,
+          .tv_nsec = timeout_nanoseconds,
         };
         const auto count = kevent(kqueue_, nullptr, 0, events.data(), static_cast<int>(events.size()), &timeout);
         if (count < 0 && errno != EINTR) {
@@ -4930,6 +5017,8 @@ namespace umbra::lsp {
       switch (record.kind) {
         case CaptureKind::pointer:
           return record.pointer.sample_time_microseconds;
+        case CaptureKind::absolute_pointer:
+          return record.absolute_pointer.sample_time_microseconds;
         case CaptureKind::edge:
           return record.edge.sample_time_microseconds;
         case CaptureKind::controller_edge:
@@ -5000,19 +5089,30 @@ namespace umbra::lsp {
         if (!capture_accepting_) {
           continue;
         }
-        if (record.kind == CaptureKind::pointer) {
-          ++pointer_ordinal_;
-          const auto result = pointer_composer_.add_relative(
-            record.device_generation,
-            pointer_ordinal_,
-            record.pointer.delta_x,
-            record.pointer.delta_y,
-            record.pointer.vertical_scroll,
-            record.pointer.horizontal_scroll
-          );
+        if (record.kind == CaptureKind::pointer || record.kind == CaptureKind::absolute_pointer) {
+          auto result = lumen::lsp::input_plane::pointer_compose_result::accepted;
+          if (record.kind == CaptureKind::absolute_pointer) {
+            ++pointer_ordinal_;
+            result = pointer_composer_.set_absolute(
+              record.device_generation,
+              pointer_ordinal_,
+              record.absolute_pointer.x,
+              record.absolute_pointer.y
+            );
+          } else {
+            ++pointer_ordinal_;
+            result = pointer_composer_.add_relative(
+              record.device_generation,
+              pointer_ordinal_,
+              record.pointer.delta_x,
+              record.pointer.delta_y,
+              record.pointer.vertical_scroll,
+              record.pointer.horizontal_scroll
+            );
+          }
           if (result == lumen::lsp::input_plane::pointer_compose_result::accepted) {
             pointer_dirty_ = true;
-            pointer_sample_time_us_ = record.pointer.sample_time_microseconds;
+            pointer_sample_time_us_ = capture_record_timestamp(record);
             pointer_composed_microseconds_ = composed_microseconds;
           } else if (result != lumen::lsp::input_plane::pointer_compose_result::batch_full) {
             return CLSP_STATUS_INTERNAL_FAILURE;
@@ -5141,6 +5241,7 @@ namespace umbra::lsp {
 
     /** @brief Send baseline, due edge retries, and latest cumulative pointer state. */
     [[nodiscard]] clsp_status_t transmit_input() noexcept {
+      next_input_due_us_ = 0;
       if (!input_configured_) {
         return CLSP_STATUS_OK;
       }
@@ -5162,28 +5263,50 @@ namespace umbra::lsp {
           return status;
         }
       }
+      // Send every kind that is due in this pass, and remember when the earliest rate-held one
+      // becomes due so the worker wakes exactly then instead of on its next 1 ms tick.
+      const auto hold_until = [&](const std::uint64_t last_sent, const std::uint64_t interval) {
+        const auto due = last_sent + interval;
+        if (next_input_due_us_ == 0 || due < next_input_due_us_) next_input_due_us_ = due;
+      };
       const auto pointer_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.pointer_rate);
-      if (pointer_dirty_ && (last_pointer_sent_us_ == 0 || now - last_pointer_sent_us_ >= pointer_interval)) {
-        return send_pointer(now);
+      if (pointer_dirty_) {
+        if (last_pointer_sent_us_ == 0 || now - last_pointer_sent_us_ >= pointer_interval) {
+          if (const auto status = send_pointer(now); status != CLSP_STATUS_OK) return status;
+        } else {
+          hold_until(last_pointer_sent_us_, pointer_interval);
+        }
       }
       const auto controller_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.controller_rate);
       const auto sensor_interval = std::max<std::uint64_t>(1U, 1'000'000U / input_configuration_.sensor_rate);
       for (std::size_t index = 0; index < controller_states_.size(); ++index) {
         auto &state = controller_states_[index];
-        if (state.dirty && (state.last_sent_us == 0 || now - state.last_sent_us >= controller_interval)) {
-          return send_controller_state(index, now);
+        if (state.dirty) {
+          if (state.last_sent_us == 0 || now - state.last_sent_us >= controller_interval) {
+            if (const auto status = send_controller_state(index, now); status != CLSP_STATUS_OK) return status;
+          } else {
+            hold_until(state.last_sent_us, controller_interval);
+          }
         }
         for (std::size_t sensor_index = 0; sensor_index < 2; ++sensor_index) {
           auto &sensor = controller_sensors_[index][sensor_index];
-          if (sensor.dirty && (sensor.last_sent_us == 0 || now - sensor.last_sent_us >= sensor_interval)) {
-            return send_controller_sensor(index, sensor_index, now);
+          if (sensor.dirty) {
+            if (sensor.last_sent_us == 0 || now - sensor.last_sent_us >= sensor_interval) {
+              if (const auto status = send_controller_sensor(index, sensor_index, now); status != CLSP_STATUS_OK) return status;
+            } else {
+              hold_until(sensor.last_sent_us, sensor_interval);
+            }
           }
         }
       }
       for (std::size_t index = 0; index < touch_states_.size(); ++index) {
         auto &touch = touch_states_[index];
-        if (touch.dirty && (touch.last_sent_us == 0 || now - touch.last_sent_us >= controller_interval)) {
-          return send_touch_state(index, now);
+        if (touch.dirty) {
+          if (touch.last_sent_us == 0 || now - touch.last_sent_us >= controller_interval) {
+            if (const auto status = send_touch_state(index, now); status != CLSP_STATUS_OK) return status;
+          } else {
+            hold_until(touch.last_sent_us, controller_interval);
+          }
         }
       }
       return CLSP_STATUS_OK;
@@ -9443,19 +9566,27 @@ namespace umbra::lsp {
         PendingInboundRequest *pending_request = nullptr;
         if (command.response) {
           pending_request = pending_inbound_request(command.request_id);
-          if (pending_request == nullptr) return CLSP_STATUS_INVALID_STATE;
+          if (pending_request == nullptr) {
+            // Already answered (a retransmitted request reached the session twice); drop the duplicate.
+            --next_message_id_;
+            continue;
+          }
           const auto now = monotonic_microseconds();
+          // Responses are cached to answer retransmitted requests; the host's retries end within a
+          // few seconds, and frequent requests (cursor state) would exhaust a long-lived cache.
           const auto cached = inbound_response_cache_.insert(
             command.request_id,
             {
               .identity = pending_request->identity,
-              .retention_deadline_microseconds = saturating_add(now, 120'000'000U),
+              .retention_deadline_microseconds = saturating_add(now, 10'000'000U),
             },
             pending_request->frame.bytes(),
             encoded,
             now
           );
-          if (cached != lumen::lsp::response_cache_result::stored && cached != lumen::lsp::response_cache_result::hit) {
+          if (cached != lumen::lsp::response_cache_result::stored && cached != lumen::lsp::response_cache_result::hit &&
+              cached != lumen::lsp::response_cache_result::capacity_exhausted &&
+              cached != lumen::lsp::response_cache_result::conflicting_request) {
             return CLSP_STATUS_INTERNAL_FAILURE;
           }
         }
@@ -9553,8 +9684,17 @@ namespace umbra::lsp {
           );
         }
       }
+      // The window gives up after five transmissions, a few hundred milliseconds on a LAN; the host
+      // briefly stops reading its socket while it activates media (NVIDIA profiles, audio), so allow
+      // a late acknowledgement, which every later host frame carries, before failing the transport.
       if (outbound_window_.has_failed(now)) {
-        return CLSP_STATUS_TIMEOUT;
+        if (control_failure_pending_since_ == 0) {
+          control_failure_pending_since_ = now;
+        } else if (now - control_failure_pending_since_ >= control_failure_grace_microseconds) {
+          return CLSP_STATUS_TIMEOUT;
+        }
+      } else {
+        control_failure_pending_since_ = 0;
       }
       while (auto *retained = outbound_window_.due(now)) {
         const auto status = dtls_.send_application_data(retained->frame.bytes());
@@ -9580,10 +9720,14 @@ namespace umbra::lsp {
     }
 
     /** @brief Fail the worker without exposing parser/security details to the peer. */
-    void fail_worker(const clsp_status_t status, const char *stage = nullptr) noexcept {
-      if (stage != nullptr) {
-        std::fprintf(stderr, "LSP transport failed during %s (status=%u).\n", stage, static_cast<unsigned int>(status));
-      }
+    void fail_worker(const clsp_status_t status, const char *stage = nullptr, const int line = __builtin_LINE()) noexcept {
+      std::fprintf(
+        stderr,
+        "LSP transport failed during %s (status=%u, Runtime.cpp:%d).\n",
+        stage != nullptr ? stage : "worker step",
+        static_cast<unsigned int>(status),
+        line
+      );
       clear_deferred_video_batch();
       capture_accepting_.store(false, std::memory_order_release);
       capture_read_.store(capture_write_.load(std::memory_order_acquire), std::memory_order_release);
@@ -9614,8 +9758,9 @@ namespace umbra::lsp {
 
     /** @brief Attribute one bounded ring failure to its exact native device generation. */
     void record_capture_drop(const CaptureRecord &record) noexcept {
-      if (record.kind == CaptureKind::pointer || record.kind == CaptureKind::edge) {
-        const auto pointer_edge = record.kind == CaptureKind::pointer ||
+      if (record.kind == CaptureKind::pointer || record.kind == CaptureKind::absolute_pointer ||
+          record.kind == CaptureKind::edge) {
+        const auto pointer_edge = record.kind != CaptureKind::edge ||
                                   record.edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_DOWN ||
                                   record.edge.kind == CLSP_INPUT_EDGE_POINTER_BUTTON_UP;
         if (pointer_edge && record.device_generation != 0U &&
@@ -9648,6 +9793,7 @@ namespace umbra::lsp {
           generation = record.touch_state.instance_generation;
           break;
         case CaptureKind::pointer:
+        case CaptureKind::absolute_pointer:
         case CaptureKind::edge:
         case CaptureKind::neutralize:
           return;
@@ -9724,6 +9870,7 @@ namespace umbra::lsp {
     unsigned int peer_address_size_ {};  ///< Encoded peer-address size.
     int socket_ {-1};  ///< Connected nonblocking UDP socket.
     int kqueue_ {-1};  ///< Socket readiness and producer wake owner.
+    std::uint64_t next_input_due_us_ {0};  ///< Earliest rate-held input send time, or zero.
     int socket_family_ {};  ///< Active address family for ECN and complete IP accounting.
     bool mutex_ready_ {};  ///< Mutex initialization state.
     bool condition_ready_ {};  ///< Condition initialization state.
@@ -9749,6 +9896,8 @@ namespace umbra::lsp {
     SrtpSession srtp_;  ///< Directional AEAD AES-128-GCM contexts.
     lumen::lsp::selective_ack_window receive_window_;  ///< Peer logical-frame receive/ACK state.
     lumen::lsp::outbound_control_window<maximum_control_frame> outbound_window_;  ///< Byte-identical retry state.
+    static constexpr std::uint64_t control_failure_grace_microseconds = 3'000'000U;  ///< Late-ACK allowance after the final retry.
+    std::uint64_t control_failure_pending_since_ {};  ///< When the window first reported an exhausted operation, or 0.
     lumen::lsp::response_cache<maximum_control_frame, maximum_control_frame> inbound_response_cache_;  ///< Host request response replay.
     lumen::lsp::control_rto rto_;  ///< Local-path bounded RTO estimator.
     std::array<ControlCommand, control_queue_capacity> control_queue_ {};  ///< Pre-wire bounded queue.
@@ -9859,6 +10008,8 @@ namespace umbra::lsp {
     PathIntentControlFrame path_intent_control_ {};  ///< Optional nonfatal reliable probe intent.
     std::atomic<std::size_t> capture_read_ {0};  ///< Worker-owned SPSC read cursor.
     std::atomic<std::size_t> capture_write_ {0};  ///< Capture-source-owned SPSC write cursor.
+    std::atomic<bool> pointer_motion_absolute_ {false};  ///< Drop relative capture motion for a client-drawn cursor.
+    std::atomic<bool> pointer_inside_video_ {true};  ///< Whether the client-drawn cursor is over the video.
     std::atomic<std::uint32_t> published_pointer_generation_ {1};  ///< Logical pointer generation available to AppKit/native capture.
     std::array<std::atomic<std::uint32_t>, 16> published_controller_generations_ {};  ///< Active controller generations.
     std::array<std::atomic<std::uint32_t>, 16> published_touch_generations_ {};  ///< Active touch-device generations.
@@ -10225,6 +10376,14 @@ namespace umbra::lsp {
   ) const noexcept {
     return impl_ == nullptr ? 0U :
                               impl_->input_attributed_wire_bytes(offer_type, device_id, instance_generation);
+  }
+
+  clsp_status_t Runtime::submit_absolute_pointer(const clsp_absolute_pointer_sample_t &sample) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->submit_absolute_pointer(sample);
+  }
+
+  clsp_status_t Runtime::set_pointer_motion_absolute(const bool absolute, const bool inside_video) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->set_pointer_motion_absolute(absolute, inside_video);
   }
 
   clsp_status_t Runtime::submit_pointer(const clsp_pointer_sample_t &sample) noexcept {

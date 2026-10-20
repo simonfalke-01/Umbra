@@ -181,6 +181,9 @@ public actor LSPClientSession {
     private var clipboardHandler: (@Sendable (LSPClipboardContent) -> Void)?
     private var nextClipboardSequence: UInt64 = 1
     private var lastReceivedClipboardSequence: UInt64 = 0
+    private var cursorHandler: (@Sendable (LSPCursorState) -> Void)?
+    /// Shapes received on this session keyed by bundle SHA-256, oldest first.
+    private var cursorShapes: [(sha256: Data, shape: LSPCursorShape)] = []
     private var incomingObjects: [UUID: LSPIncomingObject] = [:]
     private var completedObjects: [UUID: Data] = [:]
     private var bufferedObjectBytes = 0
@@ -532,9 +535,12 @@ public actor LSPClientSession {
             case .competitionLAN: LSPAudioOffer.competitionDefaults
             }
         }
+        // START can switch the host display mode, which makes the host re-probe its
+        // encoders; that alone takes seconds, so the 2 s control default times out.
         let event = try await transport.request(
             messageType: LSPControlMessageType.start.rawValue,
-            payload: try LSPControlWire.start(resolvedRequest)
+            payload: try LSPControlWire.start(resolvedRequest),
+            timeout: .seconds(15)
         )
         let response = try LSPControlWire.startResponse(from: event)
         guard videoSelection(response.videoSelection, matches: resolvedRequest) else {
@@ -816,7 +822,8 @@ public actor LSPClientSession {
             audioQueuedMilliseconds: audio.audioQueuedMilliseconds,
             audioUnderruns: audio.audioUnderruns,
             audioRebuffers: audio.audioRebuffers,
-            reconnectDuration: reconnectDuration.snapshot()
+            reconnectDuration: reconnectDuration.snapshot(),
+            videoAccessUnitsReceived: video?.videoAccessUnitsReceived
         )
     }
 
@@ -1169,6 +1176,17 @@ public actor LSPClientSession {
         terminationObserver.set(handler)
     }
 
+    /// Sends one absolute pointer position for a client-drawn cursor.
+    public nonisolated func submitAbsolutePointer(sampleTimeMicroseconds: UInt64, x: UInt32, y: UInt32) throws {
+        try transport.submitAbsolutePointer(sampleTimeMicroseconds: sampleTimeMicroseconds, x: x, y: y)
+    }
+
+    /// Selects absolute pointer motion; relative capture motion is dropped while it is set, and
+    /// presses and scrolling are dropped while the cursor is outside the video.
+    public nonisolated func setPointerMotionAbsolute(_ absolute: Bool, insideVideo: Bool) throws {
+        try transport.setPointerMotionAbsolute(absolute, insideVideo: insideVideo)
+    }
+
     /// Sends one AppKit/IOHID relative-pointer record without actor or Task work per sample.
     public nonisolated func submitPointer(
         sampleTimeMicroseconds: UInt64,
@@ -1321,6 +1339,8 @@ public actor LSPClientSession {
                 Task { await self?.receiveCertificateRotation(event) }
             } else if event.messageType == LSPControlMessageType.clipboardUpdate.rawValue {
                 Task { await self?.receiveClipboardUpdate(event) }
+            } else if event.messageType == LSPControlMessageType.cursorState.rawValue {
+                Task { await self?.receiveCursorState(event) }
             }
         }
         transport.setPathProbeHandler { [weak self] event in
@@ -1331,6 +1351,79 @@ public actor LSPClientSession {
     /// Returns the permissions the host granted this authenticated association.
     public func permissions() -> LSPPermission {
         effectivePermissions
+    }
+
+    /// Installs the receiver for host cursor state while START requested a client-drawn cursor.
+    public func setCursorHandler(_ handler: (@Sendable (LSPCursorState) -> Void)?) {
+        cursorHandler = handler
+    }
+
+    private static let maximumCachedCursorShapes = 64
+
+    private func receiveCursorState(_ event: LSPControlEvent) {
+        let update: LSPCursorStateUpdate
+        do {
+            update = try LSPControlWire.cursorState(from: event)
+        } catch {
+            rejectControl(event, responseType: .cursorStateResponse, status: .malformed)
+            return
+        }
+        guard let cursorHandler else {
+            rejectControl(event, responseType: .cursorStateResponse, status: .unsupported)
+            return
+        }
+        guard inputAuthority?.sessionID == update.sessionID else {
+            rejectControl(event, responseType: .cursorStateResponse, status: .staleGeneration)
+            return
+        }
+        var shape: LSPCursorShape?
+        if let sha256 = update.shapeSHA256 {
+            if update.shapeLength > 0 {
+                let bundle: Data
+                if let inline = update.inlineShape {
+                    bundle = inline
+                } else {
+                    guard let objectID = update.objectID,
+                          let bytes = completedObjects[objectID],
+                          bytes.count == Int(update.shapeLength) else {
+                        rejectControl(event, responseType: .cursorStateResponse, status: .staleGeneration)
+                        return
+                    }
+                    _ = takeObject(objectID)
+                    bundle = bytes
+                }
+                guard Data(SHA256.hash(data: bundle)) == sha256, let parsed = LSPCursorShape(bundle: bundle) else {
+                    rejectControl(event, responseType: .cursorStateResponse, status: .malformed)
+                    return
+                }
+                cursorShapes.removeAll { $0.sha256 == sha256 }
+                if cursorShapes.count == Self.maximumCachedCursorShapes { cursorShapes.removeFirst() }
+                cursorShapes.append((sha256, parsed))
+                shape = parsed
+            } else if let index = cursorShapes.firstIndex(where: { $0.sha256 == sha256 }) {
+                let cached = cursorShapes.remove(at: index)
+                cursorShapes.append(cached)
+                shape = cached.shape
+            }
+        }
+        let shapePresent = update.shapeSHA256 == nil || shape != nil
+        // A missing shape is requested again through the response; keep the previous image meanwhile.
+        if shapePresent {
+            cursorHandler(LSPCursorState(
+                visible: update.visible,
+                shape: shape,
+                systemCursor: LSPSystemCursor(rawValue: update.systemCursor)
+            ))
+        }
+        do {
+            try transport.sendControlResponse(
+                messageType: LSPControlMessageType.cursorStateResponse.rawValue,
+                requestID: event.requestID,
+                payload: try LSPControlWire.cursorStateResponse(update: update, shapePresent: shapePresent)
+            )
+        } catch {
+            failSession((error as? LSPTransportError) ?? .internalFailure)
+        }
     }
 
     /// Installs the receiver for host clipboard content; nil declines host clipboard updates.
@@ -2113,8 +2206,9 @@ public actor LSPClientSession {
         failSession(error)
     }
 
-    private func failSession(_ error: LSPTransportError) {
+    private func failSession(_ error: LSPTransportError, line: UInt = #line) {
         if terminationObserver.hasTerminalEvent || state == .stopped { return }
+        FileHandle.standardError.write(Data("LSP session failed: \(error) at LSPClientSession.swift:\(line)\n".utf8))
         if case .failed = state { return }
         videoPipeline?.disablePublication()
         try? transport.stop()

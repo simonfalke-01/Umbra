@@ -14,6 +14,8 @@ final class LSPAppKitInputCapture {
     private var focusObservers: [NSObjectProtocol] = []
     private var scheduledSourceStart: Task<Void, Never>?
     private var isStartingSources = false
+    private var pointerMotionAbsolute = false
+    private var pointerInsideVideo = false
 
     init(targetWindow: NSWindow?) {
         self.targetWindow = targetWindow
@@ -33,6 +35,7 @@ final class LSPAppKitInputCapture {
         stop()
         guard let targetWindow else { throw LSPTransportError.invalidState }
         self.session = session
+        try session.setPointerMotionAbsolute(pointerMotionAbsolute, insideVideo: pointerInsideVideo)
         let center = NotificationCenter.default
         focusObservers = [
             center.addObserver(
@@ -47,7 +50,10 @@ final class LSPAppKitInputCapture {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.scheduleSourceStart() }
+                MainActor.assumeIsolated {
+                    self?.reclaimKeyWindowIfOrphaned()
+                    self?.scheduleSourceStart()
+                }
             },
             center.addObserver(
                 forName: NSWindow.didResignKeyNotification,
@@ -72,6 +78,23 @@ final class LSPAppKitInputCapture {
             },
         ]
         try startSourcesThrowing()
+    }
+
+    /// Selects Mac-cursor absolute motion and whether that cursor is over the video.
+    func setPointerMotion(absolute: Bool, insideVideo: Bool) {
+        pointerMotionAbsolute = absolute
+        pointerInsideVideo = insideVideo
+        do {
+            try session?.setPointerMotionAbsolute(absolute, insideVideo: insideVideo)
+        } catch {
+            failureHandler?(error)
+        }
+    }
+
+    /// Sends one Mac-cursor position while this window owns input capture.
+    func submitAbsolutePointer(sampleTimeMicroseconds: UInt64, x: UInt32, y: UInt32) {
+        guard pointerMotionAbsolute, nativeCapture != nil, let session else { return }
+        try? session.submitAbsolutePointer(sampleTimeMicroseconds: sampleTimeMicroseconds, x: x, y: y)
     }
 
     /// Pauses all capture, neutralizes held state, commits text, then restarts with a fresh baseline.
@@ -105,6 +128,15 @@ final class LSPAppKitInputCapture {
             self.scheduledSourceStart = nil
             self.startSources()
         }
+    }
+
+    /// Reactivation (Cmd-Tab, Spaces, Dock) does not always make the stream window key,
+    /// which left capture off until the user clicked the stream. Claim key status unless
+    /// another visible Umbra window legitimately holds it.
+    private func reclaimKeyWindowIfOrphaned() {
+        guard let targetWindow, targetWindow.isVisible, !targetWindow.isKeyWindow else { return }
+        if let keyWindow = NSApp.keyWindow, keyWindow !== targetWindow, keyWindow.isVisible { return }
+        targetWindow.makeKeyAndOrderFront(nil)
     }
 
     /// Returns whether the exact stream window currently owns application input focus.

@@ -341,7 +341,7 @@ final class SettingsInteractionTests: XCTestCase {
 
         let hdrControl = try XCTUnwrap(
             descendants(of: hostingView, type: NSControl.self).first {
-                $0.accessibilityLabel() == "Enable HDR"
+                $0.accessibilityLabel() == "HDR"
             }
         )
         XCTAssertTrue(hdrControl.isEnabled)
@@ -353,7 +353,7 @@ final class SettingsInteractionTests: XCTestCase {
         XCTAssertFalse(preferences.settings.enableHDR)
         let updatedControl = try XCTUnwrap(
             descendants(of: hostingView, type: NSControl.self).first {
-                $0.accessibilityLabel() == "Enable HDR"
+                $0.accessibilityLabel() == "HDR"
             }
         )
         XCTAssertFalse(updatedControl.isEnabled)
@@ -517,7 +517,7 @@ final class SettingsInteractionTests: XCTestCase {
 
         let displayModePicker = try XCTUnwrap(
             descendants(of: hostingView, type: NSPopUpButton.self).first {
-                $0.accessibilityLabel() == "Display mode"
+                $0.accessibilityLabel() == "Window mode"
             }
         )
         XCTAssertEqual(displayModePicker.itemTitles, [
