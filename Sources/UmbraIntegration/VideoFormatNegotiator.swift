@@ -166,7 +166,8 @@ public struct VideoFormatNegotiator: Sendable {
             return [CodecFamily.hevc, .h264, .av1].flatMap(allFormats(for:))
         case .h264:
             return allFormats(for: .h264)
-        case .hevc, .hevcHDRDeprecated:
+        case .hevc, .hevcHDRDeprecated, .bc1:
+            // GameStream hosts have no BC1 stream, so the BC1 preference streams HEVC there.
             return allFormats(for: .hevc) + [.h264]
         case .av1:
             return allFormats(for: .av1) + allFormats(for: .hevc) + [.h264]

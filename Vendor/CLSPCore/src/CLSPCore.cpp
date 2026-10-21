@@ -1325,9 +1325,14 @@ namespace {
        ((value.profile == CLSP_VIDEO_PROFILE_AV1_MAIN &&
          (value.pixel_format == CLSP_VIDEO_PIXEL_420_8 || value.pixel_format == CLSP_VIDEO_PIXEL_420_10)) ||
         (value.profile == CLSP_VIDEO_PROFILE_AV1_HIGH &&
-         (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10))));
+         (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10)))) ||
+      (value.codec == CLSP_VIDEO_CODEC_BC1 && value.profile == CLSP_VIDEO_PROFILE_BC1 &&
+       value.pixel_format == CLSP_VIDEO_PIXEL_420_8);
+    // BT.709 SDR, or a BT.709 picture coded with Lumen's NVENC BT.601 RGB-input conversion.
     const auto sdr = value.color_primaries == 1U && value.transfer_characteristics == 1U &&
-                     value.matrix_coefficients == 1U;
+                     (value.matrix_coefficients == 1U ||
+                      (value.matrix_coefficients == 6U && value.pixel_format == CLSP_VIDEO_PIXEL_420_8 &&
+                       value.full_range == 0U));
     const auto hdr = value.codec != CLSP_VIDEO_CODEC_H264 &&
                      (value.pixel_format == CLSP_VIDEO_PIXEL_420_10 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10) &&
                      value.full_range == 0U && value.color_primaries == 9U &&
@@ -1360,8 +1365,10 @@ namespace {
            value.recovery_epoch != 0U && value.udp_payload_size == 1'200U &&
            value.primary_payload_type >= 96U && value.primary_payload_type <= 127U && valid_profile &&
            value.full_range <= 1U && (sdr || hdr) && value.delivery == CLSP_VIDEO_DELIVERY_COMPLETE_ACCESS_UNIT &&
-           ((value.codec == CLSP_VIDEO_CODEC_AV1 && value.payload_format == CLSP_VIDEO_PAYLOAD_AV1_LOW_OVERHEAD_OBU) ||
-            (value.codec != CLSP_VIDEO_CODEC_AV1 && value.payload_format == CLSP_VIDEO_PAYLOAD_ANNEX_B)) &&
+           (((value.codec == CLSP_VIDEO_CODEC_AV1 || value.codec == CLSP_VIDEO_CODEC_BC1) &&
+             value.payload_format == CLSP_VIDEO_PAYLOAD_AV1_LOW_OVERHEAD_OBU) ||
+            (value.codec != CLSP_VIDEO_CODEC_AV1 && value.codec != CLSP_VIDEO_CODEC_BC1 &&
+             value.payload_format == CLSP_VIDEO_PAYLOAD_ANNEX_B)) &&
            value.decoder_surfaces >= 2U && value.decoder_surfaces <= 4U &&
            value.frame_marking_extension == 1U && value.absolute_capture_extension == 2U &&
            value.frame_id_extension == 3U && value.input_watermark_extension == 4U &&
@@ -3053,6 +3060,14 @@ extern "C" clsp_status_t clsp_core_start_path_discovery(clsp_core_t *core) {
   return with_runtime(core, [](umbra::lsp::Runtime &runtime) {
     return runtime.start_path_discovery();
   });
+}
+
+extern "C" uint16_t clsp_core_local_udp_payload_limit(const clsp_core_t *core) {
+  if (core == nullptr || callback_stack_contains(core)) {
+    return 1'472;
+  }
+  std::shared_lock runtime_lock(core->runtime_mutex);
+  return core->runtime == nullptr ? std::uint16_t {1'472} : core->runtime->local_udp_payload_limit();
 }
 
 extern "C" clsp_status_t clsp_core_send_path_probe(

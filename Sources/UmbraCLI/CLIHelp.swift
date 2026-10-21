@@ -112,7 +112,7 @@ public enum CLIHelp {
               -bitrate, --bitrate <kbps>      Specify bitrate in Kbps
               -packet-size, --packet-size <n> Specify video packet size
               -display-mode, --display-mode <fullscreen|windowed|borderless>
-              -video-codec, --video-codec <auto|H.264|HEVC|AV1>
+              -video-codec, --video-codec <auto|H.264|HEVC|AV1|BC1>
               -video-decoder, --video-decoder <auto|software|hardware>
 
             Audio and input options:

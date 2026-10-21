@@ -1211,6 +1211,12 @@ public final class LSPTransport: @unchecked Sendable {
         try Self.requireSuccess(clsp_core_activate_video(core, videoGeneration))
     }
 
+    /// UDP payload limit of the local interface routing to the host: the jumbo family ceiling
+    /// clamped to the interface MTU minus IP/UDP headers, or 1,472 when undetected.
+    public var localMaximumUDPPayload: UInt16 {
+        clsp_core_local_udp_payload_limit(core)
+    }
+
     /// Enables native RFC 8899 search after video ACK and renderer activation.
     public func startPathDiscovery() throws {
         try Self.requireSuccess(clsp_core_start_path_discovery(core))

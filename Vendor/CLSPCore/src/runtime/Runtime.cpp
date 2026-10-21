@@ -42,6 +42,8 @@
   #include <arpa/inet.h>
   #include <fcntl.h>
   #include <mach/mach_time.h>
+  #include <ifaddrs.h>
+  #include <net/if.h>
   #include <netdb.h>
   #include <netinet/in.h>
   #include <os/log.h>
@@ -56,7 +58,12 @@
 
 namespace umbra::lsp {
   namespace {
-    constexpr std::size_t maximum_udp_payload = 1'472;  ///< LSP/1 standard-Ethernet IPv4 ceiling.
+    constexpr std::size_t maximum_udp_payload = 8'972;  ///< LSP/1 9,000-byte jumbo-frame IPv4 ceiling.
+    constexpr std::size_t standard_udp_payload = 1'472;  ///< Standard 1,500-byte Ethernet IPv4 ceiling.
+    constexpr std::uint16_t ipv4_jumbo_udp_payload_ceiling = 8'972;  ///< 9,000-byte MTU minus IPv4/UDP headers.
+    constexpr std::uint16_t ipv6_jumbo_udp_payload_ceiling = 8'952;  ///< 9,000-byte MTU minus IPv6/UDP headers.
+    constexpr std::uint16_t ipv4_standard_udp_payload_ceiling = 1'472;  ///< 1,500-byte MTU minus IPv4/UDP headers.
+    constexpr std::uint16_t ipv6_standard_udp_payload_ceiling = 1'452;  ///< 1,500-byte MTU minus IPv6/UDP headers.
     constexpr std::size_t maximum_control_payload = 1'100;  ///< DTLS-safe deterministic-CBOR payload ceiling.
     constexpr std::size_t maximum_control_frame = lumen::lsp::lspc_header_size + maximum_control_payload;
     constexpr std::size_t receive_batch_size = 64;  ///< Initial bounded receive batch.
@@ -593,9 +600,253 @@ namespace umbra::lsp {
       true, 7, 8, 1, 7, 0, 0, 0, 7, 8, 2
     ));
 
-    /** @brief One fixed-size reference-counted UDP receive slab. */
+    /**
+     * @brief Authenticated 1,200-to-1,400-to-ceiling RFC 8899 DPLPMTUD state with jumbo ceilings.
+     *
+     * Mirrors Photon's `transport::path_mtu_discovery` transitions, but clamps to the 9,000-byte
+     * jumbo family ceiling instead of standard Ethernet, confirms the standard-Ethernet size before
+     * a jumbo ceiling, and keeps every candidate four-byte aligned because LSPP padding is whole
+     * RTCP words behind a 20-byte SRTCP trailer.
+     */
+    class NativePathMtuDiscovery {
+    public:
+      static constexpr std::uint16_t base_payload_bytes = 1'200;  ///< Conservatively usable initial payload.
+      static constexpr std::uint16_t fast_probe_payload_bytes = 1'400;  ///< Mandatory initial fast-search target.
+
+      /** @brief Construct discovery state and clamp the effective non-fragmenting ceiling. */
+      constexpr explicit NativePathMtuDiscovery(const lumen::lsp::transport::path_mtu_config config) noexcept:
+          config_(config),
+          ceiling_payload_bytes_(effective_ceiling(config)),
+          upper_exclusive_(static_cast<std::uint32_t>(ceiling_payload_bytes_) + 1U),
+          valid_(ceiling_payload_bytes_ >= base_payload_bytes) {
+      }
+
+      /** @brief Return whether negotiated bounds retain the 1,200-byte safe base. */
+      [[nodiscard]] constexpr bool valid() const noexcept {
+        return valid_;
+      }
+
+      /** @brief Return the largest authenticated confirmed UDP payload. */
+      [[nodiscard]] constexpr std::uint16_t current_payload_bytes() const noexcept {
+        return current_payload_bytes_;
+      }
+
+      /** @brief Return the effective non-fragmenting path ceiling. */
+      [[nodiscard]] constexpr std::uint16_t ceiling_payload_bytes() const noexcept {
+        return ceiling_payload_bytes_;
+      }
+
+      /** @brief Return the next fast, standard-Ethernet, ceiling, or bounded-search candidate. */
+      [[nodiscard]] constexpr std::uint16_t candidate_payload_bytes() const noexcept {
+        if (!valid_ || outstanding_) {
+          return 0;
+        }
+        if (!fast_search_complete_) {
+          const auto fast_candidate = std::min(fast_probe_payload_bytes, ceiling_payload_bytes_);
+          if (fast_candidate > current_payload_bytes_ && fast_candidate < upper_exclusive_) {
+            return fast_candidate;
+          }
+        }
+        if (current_payload_bytes_ >= ceiling_payload_bytes_ ||
+            upper_exclusive_ <= static_cast<std::uint32_t>(current_payload_bytes_) + 1U) {
+          return 0;
+        }
+        // On a jumbo-capable interface, confirm standard Ethernet before the jumbo ceiling so a
+        // peer or switch without jumbo frames never leaves the path below today's 1,500-byte MTU.
+        const auto standard = standard_ceiling(config_);
+        if (ceiling_payload_bytes_ > standard && current_payload_bytes_ < standard && upper_exclusive_ > standard) {
+          return standard;
+        }
+        if (upper_exclusive_ == static_cast<std::uint32_t>(ceiling_payload_bytes_) + 1U) {
+          return ceiling_payload_bytes_;
+        }
+        auto candidate = (static_cast<std::uint32_t>(current_payload_bytes_) +
+                          (upper_exclusive_ - current_payload_bytes_) / 2U) & ~3U;
+        if (candidate <= current_payload_bytes_) {
+          candidate = (static_cast<std::uint32_t>(current_payload_bytes_) + 4U) & ~3U;
+        }
+        return candidate > current_payload_bytes_ && candidate < upper_exclusive_ ?
+                 static_cast<std::uint16_t>(candidate) :
+                 0;
+      }
+
+      /** @brief Begin one authenticated application-data-free padded path probe. */
+      constexpr lumen::lsp::transport::path_mtu_result start_probe(
+        const std::uint64_t probe_id,
+        const std::uint64_t now_microseconds,
+        const std::uint64_t smoothed_rtt_microseconds
+      ) noexcept {
+        using lumen::lsp::transport::path_mtu_result;
+        if (!valid_) return path_mtu_result::invalid_configuration;
+        if (outstanding_) return path_mtu_result::probe_outstanding;
+        if (probe_id == 0) return path_mtu_result::invalid_probe_id;
+        const auto candidate = candidate_payload_bytes();
+        if (candidate == 0) return path_mtu_result::no_candidate;
+        if (fast_search_complete_) {
+          if (smoothed_rtt_microseconds == 0) return path_mtu_result::invalid_rtt;
+          if (has_probed_ &&
+              (now_microseconds < last_probe_microseconds_ ||
+               now_microseconds - last_probe_microseconds_ < smoothed_rtt_microseconds)) {
+            return path_mtu_result::probe_too_soon;
+          }
+        }
+        outstanding_ = {
+          .probe_id = probe_id,
+          .payload_bytes = candidate,
+          .sent_microseconds = now_microseconds,
+        };
+        last_probe_microseconds_ = now_microseconds;
+        has_probed_ = true;
+        return path_mtu_result::accepted;
+      }
+
+      /** @brief Confirm an exact authenticated `PATH_PROBE_ACK`. */
+      constexpr lumen::lsp::transport::path_mtu_result acknowledge_probe(
+        const std::uint64_t probe_id,
+        const std::uint16_t received_payload_bytes
+      ) noexcept {
+        if (!outstanding_ || outstanding_.probe_id != probe_id ||
+            outstanding_.payload_bytes != received_payload_bytes) {
+          return lumen::lsp::transport::path_mtu_result::unexpected_ack;
+        }
+        current_payload_bytes_ = received_payload_bytes;
+        fast_search_complete_ = true;
+        outstanding_ = {};
+        return lumen::lsp::transport::path_mtu_result::accepted;
+      }
+
+      /** @brief Mark the outstanding probe lost without reducing the confirmed payload. */
+      constexpr lumen::lsp::transport::path_mtu_result probe_timed_out() noexcept {
+        if (!outstanding_) {
+          return lumen::lsp::transport::path_mtu_result::no_outstanding_probe;
+        }
+        upper_exclusive_ = std::min<std::uint32_t>(upper_exclusive_, outstanding_.payload_bytes);
+        fast_search_complete_ = true;
+        outstanding_ = {};
+        return lumen::lsp::transport::path_mtu_result::accepted;
+      }
+
+      /** @brief Reopen bounded upward search after RFC 8899's PMTU_RAISE_TIMER. */
+      constexpr lumen::lsp::transport::path_mtu_result raise_timer_elapsed() noexcept {
+        using lumen::lsp::transport::path_mtu_result;
+        if (!valid_) return path_mtu_result::invalid_configuration;
+        if (outstanding_) return path_mtu_result::probe_outstanding;
+        if (current_payload_bytes_ >= ceiling_payload_bytes_) return path_mtu_result::no_candidate;
+        upper_exclusive_ = static_cast<std::uint32_t>(ceiling_payload_bytes_) + 1U;
+        fast_search_complete_ = true;
+        return path_mtu_result::accepted;
+      }
+
+      /** @brief Return the single outstanding probe. */
+      [[nodiscard]] constexpr lumen::lsp::transport::path_probe outstanding_probe() const noexcept {
+        return outstanding_;
+      }
+
+    private:
+      /** @brief Smallest configured and jumbo family ceiling, four-byte aligned. */
+      [[nodiscard]] static constexpr std::uint16_t effective_ceiling(
+        const lumen::lsp::transport::path_mtu_config &config
+      ) noexcept {
+        const auto family_ceiling = static_cast<unsigned int>(
+          config.ip_version == lumen::lsp::transport::path_ip_version::ipv4 ? ipv4_jumbo_udp_payload_ceiling :
+                                                                              ipv6_jumbo_udp_payload_ceiling
+        );
+        return static_cast<std::uint16_t>(~3U & std::min({
+          static_cast<unsigned int>(config.sender_interface_limit),
+          static_cast<unsigned int>(config.receiver_advertised_limit),
+          static_cast<unsigned int>(config.operator_configured_limit),
+          family_ceiling,
+        }));
+      }
+
+      /** @brief Standard 1,500-byte Ethernet ceiling for the family. */
+      [[nodiscard]] static constexpr std::uint16_t standard_ceiling(
+        const lumen::lsp::transport::path_mtu_config &config
+      ) noexcept {
+        return config.ip_version == lumen::lsp::transport::path_ip_version::ipv4 ? ipv4_standard_udp_payload_ceiling :
+                                                                                   ipv6_standard_udp_payload_ceiling;
+      }
+
+      lumen::lsp::transport::path_mtu_config config_ {};  ///< Negotiated path limits.
+      lumen::lsp::transport::path_probe outstanding_ {};  ///< Single authenticated outstanding probe.
+      std::uint64_t last_probe_microseconds_ = 0;  ///< Most recent probe transmission time.
+      std::uint16_t current_payload_bytes_ = base_payload_bytes;  ///< Largest confirmed payload.
+      std::uint16_t ceiling_payload_bytes_ = 0;  ///< Effective non-fragmenting ceiling.
+      std::uint32_t upper_exclusive_ = 0;  ///< First known failing size or ceiling plus one.
+      bool fast_search_complete_ = false;  ///< Whether the 1,400-byte fast probe resolved.
+      bool has_probed_ = false;  ///< Whether the last-probe timestamp is meaningful.
+      bool valid_ = false;  ///< Static configuration validity.
+    };
+
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+    /**
+     * @brief Return the UDP payload limit of the local interface that routes a connected socket.
+     *
+     * The kernel bound the connected socket to the route's source address; the interface owning
+     * that address supplies the link MTU. The result is the family's jumbo ceiling clamped to the
+     * interface MTU minus IP/UDP headers, four-byte aligned for LSPP padding, and never below the
+     * mandatory 1,200-byte base. Detection failure keeps the standard-Ethernet ceiling.
+     *
+     * @param descriptor Connected UDP socket.
+     * @param family `AF_INET` or `AF_INET6`.
+     * @return Sender-interface UDP payload limit.
+     */
+    [[nodiscard]] std::uint16_t connected_interface_udp_payload_limit(const int descriptor, const int family) noexcept {
+      const bool ipv4 = family == AF_INET;
+      const std::uint16_t fallback = ipv4 ? ipv4_standard_udp_payload_ceiling :
+                                            ipv6_standard_udp_payload_ceiling;
+      const std::uint16_t jumbo = ipv4 ? ipv4_jumbo_udp_payload_ceiling :
+                                         ipv6_jumbo_udp_payload_ceiling;
+      const unsigned int headers = ipv4 ? 28U : 48U;
+      sockaddr_storage local {};
+      socklen_t local_size = sizeof(local);
+      if (getsockname(descriptor, reinterpret_cast<sockaddr *>(&local), &local_size) != 0 || local.ss_family != family) {
+        return fallback;
+      }
+      ifaddrs *interfaces = nullptr;
+      if (getifaddrs(&interfaces) != 0 || interfaces == nullptr) {
+        return fallback;
+      }
+      const char *name = nullptr;
+      for (auto *entry = interfaces; entry != nullptr && name == nullptr; entry = entry->ifa_next) {
+        if (entry->ifa_addr == nullptr || entry->ifa_addr->sa_family != family || entry->ifa_name == nullptr) {
+          continue;
+        }
+        if (ipv4) {
+          const auto &candidate = *reinterpret_cast<const sockaddr_in *>(entry->ifa_addr);
+          const auto &bound = reinterpret_cast<const sockaddr_in &>(local);
+          if (candidate.sin_addr.s_addr == bound.sin_addr.s_addr) {
+            name = entry->ifa_name;
+          }
+        } else {
+          const auto &candidate = *reinterpret_cast<const sockaddr_in6 *>(entry->ifa_addr);
+          const auto &bound = reinterpret_cast<const sockaddr_in6 &>(local);
+          if (std::memcmp(&candidate.sin6_addr, &bound.sin6_addr, sizeof(in6_addr)) == 0 &&
+              (bound.sin6_scope_id == 0 || candidate.sin6_scope_id == 0 ||
+               candidate.sin6_scope_id == bound.sin6_scope_id)) {
+            name = entry->ifa_name;
+          }
+        }
+      }
+      unsigned int mtu = 0;
+      for (auto *entry = interfaces; entry != nullptr && name != nullptr; entry = entry->ifa_next) {
+        if (entry->ifa_addr != nullptr && entry->ifa_addr->sa_family == AF_LINK && entry->ifa_data != nullptr &&
+            entry->ifa_name != nullptr && std::strcmp(entry->ifa_name, name) == 0) {
+          mtu = static_cast<const if_data *>(entry->ifa_data)->ifi_mtu;
+          break;
+        }
+      }
+      freeifaddrs(interfaces);
+      if (mtu <= headers) {
+        return fallback;
+      }
+      const auto limit = std::min<unsigned int>(jumbo, mtu - headers) & ~3U;
+      return static_cast<std::uint16_t>(std::max<unsigned int>(limit, safe_udp_payload));
+    }
+#endif
+
+    /** @brief Reference-count metadata for one fixed-size UDP receive slab. */
     struct VideoReceiveSlab {
-      std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< In-place recv/SRTP/plaintext storage.
       std::uint32_t generation {};  ///< Nonzero token incarnation.
       std::uint32_t references {};  ///< Worker-owned live references.
     };
@@ -603,14 +854,22 @@ namespace umbra::lsp {
     /** @brief Configuration-time fixed receive pool with generation-safe tokens. */
     class VideoReceivePool {
     public:
-      /** @brief Allocate a bounded slab/free-index arena. */
-      [[nodiscard]] bool configure(const std::size_t count) noexcept {
-        if (count == 0 || count > maximum_video_receive_slabs || slabs_) {
+      /**
+       * @brief Allocate a bounded slab/free-index arena.
+       *
+       * @param count Slab count.
+       * @param slab_bytes Per-slab in-place recv/SRTP/plaintext capacity: the path payload ceiling.
+       */
+      [[nodiscard]] bool configure(const std::size_t count, const std::size_t slab_bytes) noexcept {
+        if (count == 0 || count > maximum_video_receive_slabs || slab_bytes == 0 ||
+            slab_bytes > maximum_udp_payload || slabs_) {
           return false;
         }
         auto slabs = std::unique_ptr<VideoReceiveSlab[]> {new (std::nothrow) VideoReceiveSlab[count]};
         auto free_indices = std::unique_ptr<std::uint32_t[]> {new (std::nothrow) std::uint32_t[count]};
-        if (!slabs || !free_indices) {
+        // Default-initialized so untouched jumbo slabs stay uncommitted zero-fill pages.
+        auto storage = std::unique_ptr<std::uint8_t[]> {new (std::nothrow) std::uint8_t[count * slab_bytes]};
+        if (!slabs || !free_indices || !storage) {
           return false;
         }
         for (std::size_t index = 0; index < count; ++index) {
@@ -618,6 +877,8 @@ namespace umbra::lsp {
         }
         slabs_ = std::move(slabs);
         free_indices_ = std::move(free_indices);
+        storage_ = std::move(storage);
+        slab_bytes_ = slab_bytes;
         capacity_ = count;
         free_count_ = count;
         return true;
@@ -639,7 +900,7 @@ namespace umbra::lsp {
         slab.references = 1;
         token = (static_cast<std::uint64_t>(slab.generation) << 32U) |
                 (static_cast<std::uint64_t>(index) + 1U);
-        bytes = slab.bytes;
+        bytes = slab_storage(index);
         return true;
       }
 
@@ -669,13 +930,17 @@ namespace umbra::lsp {
       /** @brief Borrow complete mutable slab storage for one live token. */
       [[nodiscard]] std::span<std::uint8_t> mutable_bytes(const std::uint64_t token) noexcept {
         auto *slab = find(token);
-        return slab == nullptr ? std::span<std::uint8_t> {} : std::span<std::uint8_t> {slab->bytes};
+        return slab == nullptr ? std::span<std::uint8_t> {} : slab_storage(static_cast<std::uint32_t>(token) - 1U);
       }
 
       /** @brief Borrow complete immutable slab storage for one live token. */
       [[nodiscard]] std::span<const std::uint8_t> bytes(const std::uint64_t token) const noexcept {
         const auto *slab = find(token);
-        return slab == nullptr ? std::span<const std::uint8_t> {} : std::span<const std::uint8_t> {slab->bytes};
+        return slab == nullptr ? std::span<const std::uint8_t> {} :
+                                 std::span<const std::uint8_t> {
+                                   storage_.get() + static_cast<std::size_t>(static_cast<std::uint32_t>(token) - 1U) * slab_bytes_,
+                                   slab_bytes_
+                                 };
       }
 
       /** @brief Return whether configuration storage exists. */
@@ -690,12 +955,19 @@ namespace umbra::lsp {
         }
         slabs_.reset();
         free_indices_.reset();
+        storage_.reset();
+        slab_bytes_ = 0;
         capacity_ = 0;
         free_count_ = 0;
         return true;
       }
 
     private:
+      /** @brief Borrow the mutable bytes of one slab index. */
+      [[nodiscard]] std::span<std::uint8_t> slab_storage(const std::uint32_t index) noexcept {
+        return {storage_.get() + static_cast<std::size_t>(index) * slab_bytes_, slab_bytes_};
+      }
+
       /** @brief Resolve one mutable generation-safe token. */
       [[nodiscard]] VideoReceiveSlab *find(const std::uint64_t token) noexcept {
         const auto index_plus_one = static_cast<std::uint32_t>(token);
@@ -720,6 +992,8 @@ namespace umbra::lsp {
 
       std::unique_ptr<VideoReceiveSlab[]> slabs_ {};  ///< Fixed packet storage.
       std::unique_ptr<std::uint32_t[]> free_indices_ {};  ///< O(1) free stack.
+      std::unique_ptr<std::uint8_t[]> storage_ {};  ///< Contiguous `capacity_ * slab_bytes_` packet bytes.
+      std::size_t slab_bytes_ {};  ///< Per-slab packet capacity.
       std::size_t capacity_ {};  ///< Allocated slab count.
       std::size_t free_count_ {};  ///< Free-stack depth.
     };
@@ -1705,10 +1979,18 @@ namespace umbra::lsp {
       reassembly_capacity += std::min<std::size_t>(available, maximum_transport_overhead);
       const auto frame_slabs = (reassembly_capacity + minimum_retained_video_payload_bytes - 1U) /
                                minimum_retained_video_payload_bytes;
-      const auto requested_slabs = frame_slabs > (maximum_video_receive_slabs - 256U) / 2U ?
-                                     maximum_video_receive_slabs :
-                                     frame_slabs * 2U + 256U;
-      if (!video_receive_pool_.configure(requested_slabs)) {
+      auto requested_slabs = frame_slabs > (maximum_video_receive_slabs - 256U) / 2U ?
+                               maximum_video_receive_slabs :
+                               frame_slabs * 2U + 256U;
+      // Slabs hold the whole non-fragmenting path ceiling. A jumbo path keeps the slab count but
+      // bounds the arena to twice the standard-Ethernet footprint; jumbo datagrams carry ~6x the
+      // bytes per slab, and the arena is committed lazily, page by page, as slabs are touched.
+      const std::size_t slab_bytes = path_mtu_ ? path_mtu_->ceiling_payload_bytes() : standard_udp_payload;
+      if (slab_bytes > standard_udp_payload) {
+        const auto jumbo_slabs = requested_slabs * standard_udp_payload * 2U / slab_bytes;
+        requested_slabs = std::min(requested_slabs, std::max<std::size_t>(jumbo_slabs, 512U));
+      }
+      if (!video_receive_pool_.configure(requested_slabs, slab_bytes)) {
         release_retained_frame_pool(pool);
         rollback_media_identifiers_locked(ssrc_count, payload_type_count);
         pthread_mutex_unlock(&mutex_);
@@ -2047,6 +2329,16 @@ namespace umbra::lsp {
       (void) received_payload_size;
       return CLSP_STATUS_UNSUPPORTED;
 #endif
+    }
+
+    /** @brief Return the local-interface UDP payload limit advertised to the host. */
+    [[nodiscard]] std::uint16_t local_udp_payload_limit() const noexcept {
+      return local_udp_payload_limit_.load(std::memory_order_acquire);
+    }
+
+    /** @brief Return the reverse-pacer burst unit: standard Ethernet, or the confirmed jumbo payload. */
+    [[nodiscard]] std::size_t reverse_burst_payload_bytes() const noexcept {
+      return std::max<std::size_t>(standard_udp_payload, current_udp_payload_size_.load(std::memory_order_acquire));
     }
 
     /** @brief Return the authenticated confirmed UDP payload ceiling. */
@@ -3285,9 +3577,11 @@ namespace umbra::lsp {
          ((value.profile == CLSP_VIDEO_PROFILE_AV1_MAIN &&
            (value.pixel_format == CLSP_VIDEO_PIXEL_420_8 || value.pixel_format == CLSP_VIDEO_PIXEL_420_10)) ||
           (value.profile == CLSP_VIDEO_PROFILE_AV1_HIGH &&
-           (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10))));
+           (value.pixel_format == CLSP_VIDEO_PIXEL_444_8 || value.pixel_format == CLSP_VIDEO_PIXEL_444_10)))) ||
+        (value.codec == CLSP_VIDEO_CODEC_BC1 && value.profile == CLSP_VIDEO_PROFILE_BC1 &&
+         value.pixel_format == CLSP_VIDEO_PIXEL_420_8);
       const auto valid_payload_format =
-        value.codec == CLSP_VIDEO_CODEC_AV1 ?
+        value.codec == CLSP_VIDEO_CODEC_AV1 || value.codec == CLSP_VIDEO_CODEC_BC1 ?
           value.payload_format == CLSP_VIDEO_PAYLOAD_AV1_LOW_OVERHEAD_OBU :
           value.payload_format == CLSP_VIDEO_PAYLOAD_ANNEX_B;
       const auto ten_bit = value.pixel_format == CLSP_VIDEO_PIXEL_420_10 ||
@@ -3295,6 +3589,8 @@ namespace umbra::lsp {
       const auto valid_color =
         (value.color_primaries == 1U && value.transfer_characteristics == 1U &&
          value.matrix_coefficients == 1U) ||
+        (value.color_primaries == 1U && value.transfer_characteristics == 1U && value.matrix_coefficients == 6U &&
+         value.pixel_format == CLSP_VIDEO_PIXEL_420_8 && value.full_range == 0U) ||
         (value.codec != CLSP_VIDEO_CODEC_H264 && ten_bit && value.full_range == 0U &&
          value.color_primaries == 9U && value.matrix_coefficients == 9U &&
          (value.transfer_characteristics == 16U || value.transfer_characteristics == 18U));
@@ -3717,12 +4013,8 @@ namespace umbra::lsp {
         .maximum_pacing_bits_per_second = maximum_rate,
         .competition_capacity_bits_per_second = competition_rate,
         .reserved_overhead_bits_per_second = 0,
-        .maximum_rtt_microseconds = competition ?
-          static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            UINT32_MAX,
-            std::max<std::uint64_t>(10'000U, initial_srtt)
-          )) :
-          100'000U,
+        // Same budgets as Lumen's video controller: RTT rise above the path floor that counts as queueing.
+        .rtt_inflation_budget_microseconds = competition ? 20'000U : 50'000U,
         .queue_delay_budget_microseconds = competition ? 2'000U : 10'000U,
       });
       if (microphone_congestion_->error() != lumen::lsp::transport::controller_error::none) {
@@ -4012,11 +4304,12 @@ namespace umbra::lsp {
   #ifdef IP_RECVTOS
         (void) setsockopt(socket_, IPPROTO_IP, IP_RECVTOS, &receive_ecn, sizeof(receive_ecn));
   #endif
+        const auto interface_limit = connected_interface_udp_payload_limit(socket_, AF_INET);
         path_mtu_.emplace(lumen::lsp::transport::path_mtu_config {
           .ip_version = lumen::lsp::transport::path_ip_version::ipv4,
-          .sender_interface_limit = 1'472,
-          .receiver_advertised_limit = 1'472,
-          .operator_configured_limit = 1'472,
+          .sender_interface_limit = interface_limit,
+          .receiver_advertised_limit = interface_limit,
+          .operator_configured_limit = ipv4_jumbo_udp_payload_ceiling,
         });
       } else if (socket_family_ == AF_INET6) {
   #ifdef IPV6_DONTFRAG
@@ -4031,16 +4324,24 @@ namespace umbra::lsp {
   #ifdef IPV6_RECVTCLASS
         (void) setsockopt(socket_, IPPROTO_IPV6, IPV6_RECVTCLASS, &receive_ecn, sizeof(receive_ecn));
   #endif
+        const auto interface_limit = connected_interface_udp_payload_limit(socket_, AF_INET6);
         path_mtu_.emplace(lumen::lsp::transport::path_mtu_config {
           .ip_version = lumen::lsp::transport::path_ip_version::ipv6,
-          .sender_interface_limit = 1'452,
-          .receiver_advertised_limit = 1'452,
-          .operator_configured_limit = 1'452,
+          .sender_interface_limit = interface_limit,
+          .receiver_advertised_limit = interface_limit,
+          .operator_configured_limit = ipv6_jumbo_udp_payload_ceiling,
         });
       }
       if (!path_mtu_ || !path_mtu_->valid()) {
         return CLSP_STATUS_INVALID_CONFIGURATION;
       }
+      local_udp_payload_limit_.store(path_mtu_->ceiling_payload_bytes(), std::memory_order_release);
+      os_log_info(
+        OS_LOG_DEFAULT,
+        "LSP UDP path payload ceiling: family=%{public}d ceiling=%{public}u",
+        socket_family_,
+        static_cast<unsigned int>(path_mtu_->ceiling_payload_bytes())
+      );
       current_udp_payload_size_.store(1'200U, std::memory_order_release);
       receive_udp_payload_size_.store(1'200U, std::memory_order_release);
       kqueue_ = kqueue();
@@ -4297,6 +4598,20 @@ namespace umbra::lsp {
         auto kernel_timestamped = false;
         if (received < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+          // A connected UDP socket reports ICMP feedback on the next receive. "Packet too big"
+          // answers an oversize don't-fragment probe, and unreachable errors are transient path
+          // events; neither means the socket is dead.
+          if (errno == EMSGSIZE) {
+            if (outbound_path_probe_.active || outbound_path_probe_.pending_send) fail_outbound_path_probe(arrival_microseconds);
+            increment(RuntimeCounter::dropped);
+            continue;
+          }
+          if (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH ||
+              errno == EHOSTDOWN || errno == ENETDOWN) {
+            increment(RuntimeCounter::dropped);
+            continue;
+          }
+          os_log_error(OS_LOG_DEFAULT, "LSP UDP receive failed: errno=%{public}d", errno);
           return CLSP_STATUS_SOCKET_FAILURE;
         }
         if (received == 0) {
@@ -4997,7 +5312,7 @@ namespace umbra::lsp {
       const auto reverse_capacity = std::max<std::uint64_t>(
         selected.reserved_input_wire_bits_per_second / 500U +
           microphone_congestion_rate_bits_per_second_ / 25U,
-        2U * static_cast<std::uint64_t>(maximum_udp_payload + ip_udp_overhead_bytes()) * 8U
+        2U * static_cast<std::uint64_t>(reverse_burst_payload_bytes() + ip_udp_overhead_bytes()) * 8U
       );
       reverse_tokens_bits_ = std::min(reverse_tokens_bits_, reverse_capacity);
       pthread_mutex_lock(&mutex_);
@@ -6148,7 +6463,7 @@ namespace umbra::lsp {
            std::numeric_limits<std::uint64_t>::max() : elapsed * rate / 1'000'000U);
       const auto capacity = std::max<std::uint64_t>(
         input_rate / 500U + microphone_rate / 25U,
-        2U * static_cast<std::uint64_t>(maximum_udp_payload + ip_udp_overhead_bytes()) * 8U
+        2U * static_cast<std::uint64_t>(reverse_burst_payload_bytes() + ip_udp_overhead_bytes()) * 8U
       );
       reverse_tokens_bits_ = earned >= capacity || reverse_tokens_bits_ >= capacity - earned ?
                                capacity : reverse_tokens_bits_ + earned;
@@ -6665,19 +6980,28 @@ namespace umbra::lsp {
         return CLSP_STATUS_OK;
       }
       if (sent < 0 && errno == EMSGSIZE) {
-        pthread_mutex_lock(&mutex_);
-        if (path_mtu_) {
-          (void) path_mtu_->probe_timed_out();
-        }
-        last_path_raise_microseconds_ = now;
-        current_udp_payload_size_.store(1'200U, std::memory_order_release);
-        outbound_path_probe_ = {};
-        emitted_path_probe_id_.store(0, std::memory_order_release);
-        emitted_path_probe_size_.store(0, std::memory_order_release);
-        pthread_mutex_unlock(&mutex_);
+        // Don't-fragment rejected the oversize probe locally: a failed probe, never a socket
+        // failure. The confirmed PLPMTU stays; only the search upper bound shrinks.
+        fail_outbound_path_probe(now);
         return CLSP_STATUS_OK;
       }
       return CLSP_STATUS_SOCKET_FAILURE;
+    }
+
+    /** @brief Record the outstanding PLPMTU probe as failed and keep the confirmed size. */
+    void fail_outbound_path_probe(const std::uint64_t now) noexcept {
+      pthread_mutex_lock(&mutex_);
+      if (path_mtu_) {
+        (void) path_mtu_->probe_timed_out();
+        current_udp_payload_size_.store(path_mtu_->current_payload_bytes(), std::memory_order_release);
+      }
+      last_path_raise_microseconds_ = now;
+      outbound_path_probe_ = {};
+      path_probe_notification_pending_ = false;
+      emitted_path_probe_id_.store(0, std::memory_order_release);
+      emitted_path_probe_size_.store(0, std::memory_order_release);
+      increment(RuntimeCounter::path_probe_timeouts);
+      pthread_mutex_unlock(&mutex_);
     }
 
     /** @brief Drive native RFC 8899 search, conservative timer retry, and bounded intent callbacks. */
@@ -6727,7 +7051,8 @@ namespace umbra::lsp {
             emitted_path_probe_id_.store(0, std::memory_order_release);
             emitted_path_probe_size_.store(0, std::memory_order_release);
             increment(RuntimeCounter::path_probe_timeouts);
-            current_udp_payload_size_.store(1'200U, std::memory_order_release);
+            // RFC 8899: a lost probe bounds the search but does not reduce the confirmed PLPMTU.
+            current_udp_payload_size_.store(path_mtu_->current_payload_bytes(), std::memory_order_release);
             last_path_raise_microseconds_ = now;
             pthread_mutex_unlock(&mutex_);
           } else {
@@ -7790,7 +8115,7 @@ namespace umbra::lsp {
     [[nodiscard]] lumen::lsp::transport::rtx_deadline_estimate rtx_deadline_estimate() const noexcept {
       if (configuration_.profile == CLSP_PROFILE_COMPETITION_LAN &&
           configuration_.competition_capacity_mbps != 0) {
-        const auto bits = static_cast<std::uint64_t>(current_udp_payload_size_.load(std::memory_order_acquire)) * 8U;
+        const auto bits = static_cast<std::uint64_t>(receive_udp_payload_size_.load(std::memory_order_acquire)) * 8U;
         const auto rate = static_cast<std::uint64_t>(configuration_.competition_capacity_mbps) * 1'000'000U;
         return {
           .reverse_feedback_microseconds = competition_reorder_delay_microseconds,
@@ -8160,7 +8485,7 @@ namespace umbra::lsp {
       }
       auto destination = mutable_retained_frame_bytes(buffer);
       std::size_t offset = 0;
-      if (video_configuration_.codec == CLSP_VIDEO_CODEC_AV1) {
+      if (video_configuration_.codec == CLSP_VIDEO_CODEC_AV1 || video_configuration_.codec == CLSP_VIDEO_CODEC_BC1) {
         lumen::lsp::media::av1_depacketizer depacketizer {destination};
         lumen::lsp::media::av1_depacketization_result state;
         for (std::size_t index = 0; index < completed.slices.size(); ++index) {
@@ -8378,7 +8703,7 @@ namespace umbra::lsp {
         .expected_payload_type = video_configuration_.primary_payload_type,
         .recovered_payload_type = recovered_rtp->header.payload_type,
         .recovered_packet_bytes = recovered.bytes_written,
-        .maximum_packet_bytes = current_udp_payload_size_.load(std::memory_order_acquire),
+        .maximum_packet_bytes = receive_udp_payload_size_.load(std::memory_order_acquire),
         .now_microseconds = now,
         .frame_deadline_microseconds = frame_deadline,
       });
@@ -8523,7 +8848,7 @@ namespace umbra::lsp {
         video_configuration_.rtx_associated_payload_type,
         reconstructed_lease.bytes()
       );
-      if (!reconstructed || reconstructed.bytes_written > current_udp_payload_size_.load(std::memory_order_acquire)) {
+      if (!reconstructed || reconstructed.bytes_written > receive_udp_payload_size_.load(std::memory_order_acquire)) {
         record_authenticated_malformed_repair(now);
         return false;
       }
@@ -9101,7 +9426,7 @@ namespace umbra::lsp {
       }
       const auto reverse_capacity = std::max<std::uint64_t>(
         input_rate / 500U + microphone_congestion_rate_bits_per_second_ / 25U,
-        2U * static_cast<std::uint64_t>(maximum_udp_payload + ip_udp_overhead_bytes()) * 8U
+        2U * static_cast<std::uint64_t>(reverse_burst_payload_bytes() + ip_udp_overhead_bytes()) * 8U
       );
       reverse_tokens_bits_ = std::min(reverse_tokens_bits_, reverse_capacity);
       if (snapshot.minimum_unsustainable) {
@@ -9927,6 +10252,9 @@ namespace umbra::lsp {
     std::atomic<std::uint64_t> published_latest_edge_id_ {0};  ///< Coarse newest assigned edge ID.
     std::atomic<std::uint64_t> published_latest_edge_time_ {0};  ///< Coarse newest edge capture time.
     std::atomic<std::uint16_t> current_udp_payload_size_ {1'200};  ///< Authenticated confirmed ceiling.
+    std::atomic<std::uint16_t> local_udp_payload_limit_ {
+      static_cast<std::uint16_t>(standard_udp_payload)
+    };  ///< Connected-interface DPLPMTUD ceiling advertised to the host.
     std::atomic<std::uint16_t> receive_udp_payload_size_ {1'200};  ///< Independently confirmed host-to-client ceiling.
     std::atomic<std::uint32_t> authenticated_connection_generation_ {0};  ///< Published SERVER_HELLO generation.
     std::atomic<std::uint64_t> emitted_path_probe_id_ {0};  ///< Native probe offered to Swift.
@@ -9949,7 +10277,7 @@ namespace umbra::lsp {
     native_rtp_reception_stats flexfec_reception_;  ///< FlexFEC-SSRC RR loss/jitter/SR state.
     native_rtp_reception_stats rtx_reception_;  ///< RTX-SSRC RR loss/jitter/SR state.
     native_rtp_reception_stats audio_reception_;  ///< Cumulative host-audio RR loss/jitter/SR state.
-    std::optional<lumen::lsp::transport::path_mtu_discovery> path_mtu_ {};  ///< RFC 8899 search state.
+    std::optional<NativePathMtuDiscovery> path_mtu_ {};  ///< RFC 8899 search state.
     std::array<VideoFrameMetadata, 2> video_metadata_ {};  ///< Repeated metadata for two incomplete frames.
     std::array<DeliveredVideoFrame, video_delivery_queue_capacity> delivered_video_frames_ {};  ///< Exact native-to-Swift decoder submissions.
     std::array<VideoRetiredFrame, 128> video_retired_frames_ {};  ///< Mirrors the inbound SRTP replay window.
@@ -10294,6 +10622,10 @@ namespace umbra::lsp {
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
                               impl_->confirm_path_probe(probe_id, received_payload_size);
+  }
+
+  std::uint16_t Runtime::local_udp_payload_limit() const noexcept {
+    return impl_ == nullptr ? static_cast<std::uint16_t>(standard_udp_payload) : impl_->local_udp_payload_limit();
   }
 
   std::uint16_t Runtime::current_udp_payload_size() const noexcept {

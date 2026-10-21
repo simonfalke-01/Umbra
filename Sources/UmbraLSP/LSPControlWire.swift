@@ -196,7 +196,7 @@ public struct LSPInputStartRequest: Equatable, Sendable {
         reconciliationRate: UInt32 = 250,
         maximumInputWireBitsPerSecond: UInt64 = 32_000_000,
         audioOffers: [LSPAudioOffer] = [],
-        offeredMaximumUDPPayload: UInt16 = 1_472,
+        offeredMaximumUDPPayload: UInt16 = LSPControlWire.maximumUDPPayload,
         microphoneOffer: LSPMicrophoneOffer? = nil,
         networkProfile: UInt8 = 0,
         videoOffers: [LSPVideoOffer] = [],
@@ -229,6 +229,8 @@ public enum LSPVideoCodec: UInt8, CaseIterable, Sendable {
     case h264 = 1
     case hevc = 2
     case av1 = 3
+    /// Intra-only BC1 blocks for links of 10 Gbit/s or more, carried in one AV1 padding OBU.
+    case bc1 = 4
 }
 
 /// LSP codec-profile identifier frozen by video schema revision three.
@@ -240,6 +242,7 @@ public enum LSPVideoProfile: UInt8, CaseIterable, Sendable {
     case hevcRangeExtensions = 5
     case av1Main = 6
     case av1High = 7
+    case bc1 = 8
 }
 
 /// Exact decoded pixel tuple frozen by video schema revision three.
@@ -277,6 +280,13 @@ public struct LSPVideoColorDescription: Equatable, Sendable {
         matrixCoefficients: 1,
         fullRange: false
     )
+    /// BT.709 picture coded with Lumen's NVENC RGB-input conversion, which is BT.601 limited range.
+    public static let rec709BT601Matrix = Self(
+        colorPrimaries: 1,
+        transferCharacteristics: 1,
+        matrixCoefficients: 6,
+        fullRange: false
+    )
     public static let rec2020PQ = Self(
         colorPrimaries: 9,
         transferCharacteristics: 16,
@@ -294,6 +304,7 @@ public struct LSPVideoColorDescription: Equatable, Sendable {
         if colorPrimaries == 1, transferCharacteristics == 1, matrixCoefficients == 1 {
             return true
         }
+        if self == .rec709BT601Matrix { return true }
         return !fullRange && colorPrimaries == 9 && matrixCoefficients == 9 &&
             (transferCharacteristics == 16 || transferCharacteristics == 18)
     }
@@ -375,6 +386,7 @@ public extension LSPVideoOffer {
         case .h264: [.h264]
         case .hevc, .hevcHDRDeprecated: [.hevc, .h264]
         case .av1: [.av1, .hevc, .h264]
+        case .bc1: [.hevc, .h264]
         }
         let formatOrder = priority.flatMap { codec in
             capabilities.supportedHardwareVideoFormats
@@ -395,6 +407,25 @@ public extension LSPVideoOffer {
         }
 
         var offers: [Self] = []
+        if codecPreference == .bc1, !enableHDR, capabilities.supportsBC1Textures {
+            // BC1 is fixed-rate, so the bitrate fields are informational; the host paces BC1 at
+            // the rate its blocks need. HEVC and H.264 follow for hosts without BC1 support.
+            offers.append(.init(
+                codec: .bc1,
+                profile: .bc1,
+                width: width,
+                height: height,
+                refreshNumerator: refreshNumerator,
+                refreshDenominator: refreshDenominator,
+                preferredBitsPerSecond: preferredBitsPerSecond,
+                maximumBitsPerSecond: maximumBitsPerSecond,
+                pixelFormat: .yuv4208Bit,
+                color: .rec709SDR,
+                supportsFlexFEC: true,
+                supportsRTX: true,
+                maximumAccessUnitBytes: maximumAccessUnitBytes
+            ))
+        }
         for format in formatOrder where format.isYUV444 == enableYUV444 {
             guard let tuple = Self.lspTuple(for: format) else { continue }
             let colors: [LSPVideoColorDescription]
@@ -405,6 +436,9 @@ public extension LSPVideoOffer {
                 case .pq: [.rec2020PQ]
                 case .hlg: [.rec2020HLG]
                 }
+            } else if tuple.pixel == .yuv4208Bit {
+                // The host picks whichever twin matches the conversion its encoder uses.
+                colors = [.rec709SDR, .rec709BT601Matrix]
             } else {
                 colors = [.rec709SDR]
             }
@@ -888,6 +922,13 @@ public struct LSPPathProbeIntent: Equatable, Sendable {
 
 /// Exact deterministic-CBOR codecs shared with Lumen's control server.
 public enum LSPControlWire {
+    /// Largest LSP UDP payload: a 9,000-byte jumbo-frame IPv4 path (IPv6 tops out at 8,952).
+    public static let maximumUDPPayload: UInt16 = 8_972
+    /// Whether a UDP payload size lies between the mandatory 1,200-byte base and the jumbo ceiling.
+    static func isValidUDPPayload<T: BinaryInteger>(_ size: T) -> Bool {
+        size >= 1_200 && size <= maximumUDPPayload
+    }
+
     private static let videoSchemaVersion: UInt64 = 3
 
     public static func clientHello(clientNonce: Data) throws -> Data {
@@ -1218,7 +1259,7 @@ public enum LSPControlWire {
               (50...1_000).contains(request.reconciliationRate),
               (1...32_000_000).contains(request.maximumInputWireBitsPerSecond),
               (1...12).contains(request.audioOffers.count),
-              (1_200...1_472).contains(request.offeredMaximumUDPPayload),
+              LSPControlWire.isValidUDPPayload(request.offeredMaximumUDPPayload),
               request.networkProfile <= 1,
               (1...8).contains(request.videoOffers.count),
               (1...64).contains(request.receiveBatchCapacity),
@@ -1851,7 +1892,7 @@ public enum LSPControlWire {
     }
 
     public static func pathProbe(probeID: UInt64, udpPayloadSize: UInt16) throws -> Data {
-        guard probeID != 0, (1_200...1_472).contains(udpPayloadSize) else {
+        guard probeID != 0, isValidUDPPayload(udpPayloadSize) else {
             throw DeterministicCBORError.malformed
         }
         return try encodeMap([
@@ -1870,7 +1911,7 @@ public enum LSPControlWire {
         guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
         let probeID = try uint(values[1])
         let size = try uint(values[2])
-        guard probeID != 0, (1_200...1_472).contains(size) else { throw DeterministicCBORError.malformed }
+        guard probeID != 0, isValidUDPPayload(size) else { throw DeterministicCBORError.malformed }
         return .init(probeID: probeID, udpPayloadSize: UInt16(size))
     }
 
@@ -1887,7 +1928,7 @@ public enum LSPControlWire {
         guard try uint(values[0]) == 1 else { throw DeterministicCBORError.malformed }
         let probeID = try uint(values[1])
         let size = try uint(values[2])
-        guard probeID != 0, (1_200...1_472).contains(size) else { throw DeterministicCBORError.malformed }
+        guard probeID != 0, isValidUDPPayload(size) else { throw DeterministicCBORError.malformed }
         return .init(probeID: probeID, udpPayloadSize: UInt16(size))
     }
 
@@ -2004,7 +2045,7 @@ public enum LSPControlWire {
               mapping.allSatisfy({ UInt32($0) < channels }),
               [120, 240, 480, 960].contains(frameSamples),
               (6_000...2_048_000).contains(bitrate),
-              (1_200...1_472).contains(udpPayload), preroll == 1
+              isValidUDPPayload(udpPayload), preroll == 1
         else {
             throw DeterministicCBORError.malformed
         }
@@ -2129,7 +2170,7 @@ public enum LSPControlWire {
             matrixCoefficients: color.matrixCoefficients,
             fullRange: color.fullRange,
             delivery: UInt8(delivery),
-            payloadFormat: codec == .av1 ? LSPVideoPayloadFormat.av1LowOverheadOBU.rawValue : LSPVideoPayloadFormat.annexB.rawValue,
+            payloadFormat: codec == .av1 || codec == .bc1 ? LSPVideoPayloadFormat.av1LowOverheadOBU.rawValue : LSPVideoPayloadFormat.annexB.rawValue,
             width: width,
             height: height,
             refreshNumerator: refreshNumerator,
@@ -2169,6 +2210,7 @@ public enum LSPControlWire {
         case .h264: 2
         case .hevc: 3
         case .av1: 1
+        case .bc1: 0
         }
         guard encodedUnits.count == expectedCount else { throw DeterministicCBORError.malformed }
         let units = try encodedUnits.map { value -> Data in
@@ -2201,6 +2243,8 @@ public enum LSPControlWire {
             }
         case .av1:
             guard isCanonicalAV1SequenceHeader(units[0]) else { throw DeterministicCBORError.malformed }
+        case .bc1:
+            break
         }
         return .init(codec: codec, units: units)
     }
@@ -2289,7 +2333,8 @@ public enum LSPControlWire {
              (.av1, .av1Main, .yuv4208Bit),
              (.av1, .av1Main, .yuv42010Bit),
              (.av1, .av1High, .yuv4448Bit),
-             (.av1, .av1High, .yuv44410Bit):
+             (.av1, .av1High, .yuv44410Bit),
+             (.bc1, .bc1, .yuv4208Bit):
             true
         default:
             false

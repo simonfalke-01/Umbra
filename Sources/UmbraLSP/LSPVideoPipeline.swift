@@ -16,7 +16,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     private struct State {
         var configuration: LSPVideoConfigurationRequest?
-        var decoder: VideoToolboxDecoder?
+        var decoder: (any LSPFrameDecoding)?
         var outstanding: [UInt64: FrameState] = [:]
         var pendingCommits: Set<UInt64> = []
         var enqueueTimes: [UInt64: UInt64] = [:]
@@ -73,6 +73,15 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     public func configure(_ request: LSPVideoConfigurationRequest) throws -> Bool {
         if lock.withLock({ state.configuration == request }) { return false }
         let native = request.nativeConfiguration
+        if native.codec == LSPVideoCodec.bc1.rawValue {
+            let decoder = try BC1MetalDecoder(
+                renderer: renderer,
+                width: Int(native.width),
+                height: Int(native.height),
+                maximumOutstandingFrames: Int(native.decoderSurfaces)
+            )
+            return try install(decoder, request: request)
+        }
         let codecMask = try Self.codecMask(native)
         guard let nativePayloadFormat = LSPVideoPayloadFormat(rawValue: native.payloadFormat) else {
             throw LSPTransportError.invalidConfiguration
@@ -114,6 +123,11 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             metadata: Self.hdrMetadata(request.hdrMetadata, transfer: native.transferCharacteristics)
         )
         try decoder.prepareCodecInitializationThrowing(initialization, payloadFormat: payloadFormat)
+        return try install(decoder, request: request)
+    }
+
+    private func install(_ decoder: any LSPFrameDecoding, request: LSPVideoConfigurationRequest) throws -> Bool {
+        let native = request.nativeConfiguration
         decoder.installDecodeOutcomeHandler { [weak self] outcome in
             self?.decoded(outcome, videoGeneration: native.videoGeneration)
         }
@@ -124,7 +138,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             decoder.cleanUpPreservingRenderer()
             throw error
         }
-        let old = lock.withLock { () -> VideoToolboxDecoder? in
+        let old = lock.withLock { () -> (any LSPFrameDecoding)? in
             let old = state.decoder
             state.configuration = request
             state.decoder = decoder
@@ -169,7 +183,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     /// Stops publication, drains VT callbacks, flushes mailbox ownership, and releases frame handles.
     public func stop() {
         transport.setVideoAccessUnitHandler(nil)
-        let decoder = lock.withLock { () -> VideoToolboxDecoder? in
+        let decoder = lock.withLock { () -> (any LSPFrameDecoding)? in
             defer { state = State() }
             return state.decoder
         }
@@ -185,7 +199,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     }
 
     public func abortConfiguration() {
-        let decoder = lock.withLock { () -> VideoToolboxDecoder? in
+        let decoder = lock.withLock { () -> (any LSPFrameDecoding)? in
             defer { state = State() }
             return state.decoder
         }
@@ -194,7 +208,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     public func retireAfterHandoff() {
         transport.setVideoAccessUnitHandler(nil)
-        let decoder = lock.withLock { () -> VideoToolboxDecoder? in
+        let decoder = lock.withLock { () -> (any LSPFrameDecoding)? in
             defer { state = State() }
             return state.decoder
         }
@@ -204,7 +218,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
     private func submit(_ frame: LSPEncodedVideoAccessUnit) {
         let submitTime = Self.monotonicMicroseconds()
         let ticket = lock.withLock {
-            () -> (decoder: VideoToolboxDecoder, native: LSPNativeVideoConfiguration, frameToken: Int)? in
+            () -> (decoder: any LSPFrameDecoding, native: LSPNativeVideoConfiguration, frameToken: Int)? in
             state.accessUnitsReceived &+= 1
             guard let request = state.configuration,
                   state.active,
@@ -255,7 +269,8 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             presentationTimeMicroseconds: frame.captureTimeMicroseconds,
             rtpTimestamp: frame.rtpTimestamp,
             isHDR: ticket.native.transferCharacteristics != 1,
-            colorSpace: ticket.native.colorPrimaries == 9 ? VideoColorSpace.rec2020.rawValue : VideoColorSpace.rec709.rawValue,
+            colorSpace: ticket.native.colorPrimaries == 9 ? VideoColorSpace.rec2020.rawValue :
+                ticket.native.matrixCoefficients == 6 ? VideoColorSpace.rec601.rawValue : VideoColorSpace.rec709.rawValue,
             isFullRange: ticket.native.fullRange,
             hostCaptureTimeMicroseconds: frame.captureTimeMicroseconds,
             appliedInputStateSequence: frame.inputStateSequence,
@@ -491,7 +506,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
 
     public func telemetrySnapshot() -> LSPProductTelemetrySnapshot {
         let decoder = lock.withLock { state.decoder }
-        let decoderStatistics = decoder?.statistics()
+        let decoderStatistics = decoder?.pipelineStatistics()
         return lock.withLock {
             .init(
                 videoDecoderStatistics: decoderStatistics,

@@ -551,6 +551,7 @@ private extension UmbraCLIParser {
             case "h.264": preferences.videoCodecPreference = .h264
             case "hevc": preferences.videoCodecPreference = .hevc
             case "av1": preferences.videoCodecPreference = .av1
+            case "bc1": preferences.videoCodecPreference = .bc1
             default:
                 return invalidChoice(name: "video-codec", value: value)
             }

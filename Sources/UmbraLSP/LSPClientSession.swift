@@ -1,8 +1,11 @@
 import CryptoKit
 import Foundation
+import OSLog
 import UmbraCore
 import UmbraLSPTransport
 import UmbraMedia
+
+private let lspSessionLog = Logger(subsystem: "app.umbra.Umbra", category: "lsp-session")
 
 /// Product-visible LSP connection state at application/control frequency.
 public enum LSPClientSessionState: Equatable, Sendable {
@@ -529,6 +532,12 @@ public actor LSPClientSession {
         case .adaptiveLowLatency: 0
         case .competitionLAN: 1
         }
+        // Advertise what the local interface routing to the host can carry without
+        // fragmentation, so a jumbo-frame link (e.g. Thunderbolt Bridge) lets DPLPMTUD grow.
+        resolvedRequest.offeredMaximumUDPPayload = max(
+            1_200,
+            min(resolvedRequest.offeredMaximumUDPPayload, transport.localMaximumUDPPayload)
+        )
         if resolvedRequest.audioOffers.isEmpty {
             resolvedRequest.audioOffers = switch transportProfile {
             case .adaptiveLowLatency: LSPAudioOffer.adaptiveDefaults
@@ -1732,7 +1741,11 @@ public actor LSPClientSession {
     }
 
     private func processVideoConfiguration(_ event: LSPControlEvent) async {
-        guard let request = try? LSPControlWire.videoConfig(from: event) else {
+        let request: LSPVideoConfigurationRequest
+        do {
+            request = try LSPControlWire.videoConfig(from: event)
+        } catch {
+            lspSessionLog.error("VIDEO_CONFIG rejected while decoding: \(String(describing: error), privacy: .public)")
             failSession(.internalFailure)
             return
         }
@@ -1746,13 +1759,17 @@ public actor LSPClientSession {
                 do {
                     _ = try videoPipeline.configure(request)
                     status = .success
-                } catch is VideoDecoderError {
+                } catch let error as VideoDecoderError {
+                    lspSessionLog.error("Video decoder rejected the configuration: \(String(describing: error), privacy: .public)")
                     videoPipeline.abortConfiguration()
                     status = .unsupportedMediaTuple
                 } catch {
+                    lspSessionLog.error("Video pipeline configuration failed: \(String(describing: error), privacy: .public)")
                     videoPipeline.abortConfiguration()
                     status = .internalFailure
                 }
+            } else {
+                lspSessionLog.error("VIDEO_CONFIG does not match the START selection")
             }
         }
         do {
@@ -1778,6 +1795,7 @@ public actor LSPClientSession {
                 configurationFailure = status == .unsupportedMediaTuple ? .unsupported : .internalFailure
             }
         } catch {
+            lspSessionLog.error("Video activation failed: \(String(describing: error), privacy: .public)")
             if status == .success { videoPipeline?.abortConfiguration() }
             failSession((error as? LSPTransportError) ?? .internalFailure)
             return

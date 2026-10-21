@@ -111,6 +111,11 @@
       "extractionState" : "manual",
       "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "AV1" } } }
     },
+    "BC1 (Thunderbolt)" : {
+      "comment" : "Video codec option for a fast Thunderbolt link; do not translate BC1 or Thunderbolt.",
+      "extractionState" : "manual",
+      "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "BC1 (Thunderbolt)" } } }
+    },
     "System Renderer" : {
       "comment" : "Renderer option that uses the system-native presentation path.",
       "extractionState" : "manual",

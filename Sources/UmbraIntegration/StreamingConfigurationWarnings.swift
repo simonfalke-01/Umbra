@@ -155,7 +155,7 @@ public struct StreamingConfigurationWarningEvaluator: StreamingConfigurationWarn
             return !support.intersection([.h264, .hevc, .hevcMain10, .av1Main8, .av1Main10]).isEmpty
         case .h264:
             return !support.intersection(.allH264).isEmpty
-        case .hevc, .hevcHDRDeprecated:
+        case .hevc, .hevcHDRDeprecated, .bc1:
             return !support.intersection(.allHEVC.union(.h264)).isEmpty
         case .av1:
             return !support.intersection(.allAV1.union(.allHEVC).union(.h264)).isEmpty
@@ -177,7 +177,7 @@ public struct StreamingConfigurationWarningEvaluator: StreamingConfigurationWarn
                     && !hostSupport.intersection(.allAV1).isEmpty)
         case .h264:
             return software || capabilities.supportsHardwareH264
-        case .hevc, .hevcHDRDeprecated:
+        case .hevc, .hevcHDRDeprecated, .bc1:
             return ((software || capabilities.supportsHardwareHEVC)
                 && !hostSupport.intersection(.allHEVC).isEmpty)
                 || ((software || capabilities.supportsHardwareH264)
@@ -205,7 +205,7 @@ public struct StreamingConfigurationWarningEvaluator: StreamingConfigurationWarn
                     && !hostSupport.intersection([.av1Main10, .av1High10YUV444]).isEmpty)
         case .h264:
             return false
-        case .hevc, .hevcHDRDeprecated:
+        case .hevc, .hevcHDRDeprecated, .bc1:
             return capabilities.supportsHardwareHEVCMain10
         case .av1:
             return (capabilities.supportsHardwareAV1Main10
@@ -227,9 +227,9 @@ public struct StreamingConfigurationWarningEvaluator: StreamingConfigurationWarn
             requiredMask = 0x0004
         case (.h264, true):
             return false
-        case (.hevc, false), (.hevcHDRDeprecated, false):
+        case (.hevc, false), (.hevcHDRDeprecated, false), (.bc1, false):
             requiredMask = 0x0C00
-        case (.hevc, true), (.hevcHDRDeprecated, true):
+        case (.hevc, true), (.hevcHDRDeprecated, true), (.bc1, true):
             requiredMask = 0x0800
         case (.av1, false):
             requiredMask = 0xCC00
@@ -245,7 +245,7 @@ public struct StreamingConfigurationWarningEvaluator: StreamingConfigurationWarn
             return !support.intersection(.all10Bit).isEmpty
         case .h264:
             return false
-        case .hevc, .hevcHDRDeprecated:
+        case .hevc, .hevcHDRDeprecated, .bc1:
             return !support.intersection([.hevcMain10, .hevcRext10YUV444]).isEmpty
         case .av1:
             return !support.intersection([
@@ -269,9 +269,9 @@ public struct StreamingConfigurationWarningEvaluator: StreamingConfigurationWarn
             required = .h264High8YUV444
         case (.h264, true):
             return false
-        case (.hevc, false), (.hevcHDRDeprecated, false):
+        case (.hevc, false), (.hevcHDRDeprecated, false), (.bc1, false):
             required = [.hevcRext8YUV444, .hevcRext10YUV444]
-        case (.hevc, true), (.hevcHDRDeprecated, true):
+        case (.hevc, true), (.hevcHDRDeprecated, true), (.bc1, true):
             required = .hevcRext10YUV444
         case (.av1, false):
             required = [

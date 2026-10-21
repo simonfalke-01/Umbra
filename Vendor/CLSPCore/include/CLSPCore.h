@@ -148,6 +148,7 @@ extern "C" {
     CLSP_VIDEO_CODEC_H264 = 1,  ///< H.264/AVC.
     CLSP_VIDEO_CODEC_HEVC = 2,  ///< H.265/HEVC.
     CLSP_VIDEO_CODEC_AV1 = 3,  ///< Alliance for Open Media AV1.
+    CLSP_VIDEO_CODEC_BC1 = 4,  ///< Lumen intra-only BC1 blocks carried as one AV1 padding OBU.
   } clsp_video_codec_t;
 
   /** @brief Codec profile identifiers frozen by LSP video schema revision three. */
@@ -159,6 +160,7 @@ extern "C" {
     CLSP_VIDEO_PROFILE_HEVC_REXT = 5,  ///< HEVC Range Extensions 4:4:4.
     CLSP_VIDEO_PROFILE_AV1_MAIN = 6,  ///< AV1 Main 4:2:0.
     CLSP_VIDEO_PROFILE_AV1_HIGH = 7,  ///< AV1 High 4:4:4.
+    CLSP_VIDEO_PROFILE_BC1 = 8,  ///< BC1 4-bit-per-pixel RGB blocks.
   } clsp_video_profile_t;
 
   /** @brief Exact decoded pixel tuples frozen by video schema revision three. */
@@ -1347,6 +1349,15 @@ extern "C" {
 
   /** @brief Enable native 1,200-to-1,400-to-family-ceiling DPLPMTUD. */
   clsp_status_t clsp_core_start_path_discovery(clsp_core_t *core);
+
+  /**
+   * @brief Return the UDP payload limit of the local interface routing to the host.
+   *
+   * The jumbo family ceiling (8,972 IPv4 / 8,952 IPv6) clamped to the connected interface MTU
+   * minus IP/UDP headers; 1,472 before a socket is connected or when detection fails. Valid
+   * after authentication; this is the client's START offered maximum UDP payload.
+   */
+  uint16_t clsp_core_local_udp_payload_limit(const clsp_core_t *core);
 
   /** @brief Queue one reliable client PATH_PROBE intent and its exact-size LSPP. */
   clsp_status_t clsp_core_send_path_probe(

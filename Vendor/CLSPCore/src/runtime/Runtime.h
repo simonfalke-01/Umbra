@@ -313,6 +313,9 @@ namespace umbra::lsp {
     /** @brief Restart the unchanged input generation with one exact fresh neutral baseline. */
     [[nodiscard]] clsp_status_t restart_input_baseline(std::uint64_t baseline_id) noexcept;
 
+    /** @brief Return the connected-interface UDP payload limit (jumbo-capable DPLPMTUD ceiling). */
+    [[nodiscard]] std::uint16_t local_udp_payload_limit() const noexcept;
+
     /** @brief Return the authenticated confirmed UDP payload ceiling. */
     [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept;
 

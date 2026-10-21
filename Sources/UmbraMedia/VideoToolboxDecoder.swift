@@ -2081,7 +2081,10 @@ func resolvedColorMetadata(
     imageBuffer: CVImageBuffer
 ) -> VideoColorMetadata {
     let colorSpace: VideoColorSpace
-    if attachment(imageBuffer, kCVImageBufferColorPrimariesKey, equals: kCVImageBufferColorPrimaries_ITU_R_2020) {
+    // The YUV matrix decides the conversion; a BT.709 picture can be coded with a BT.601 matrix.
+    if attachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, equals: kCVImageBufferYCbCrMatrix_ITU_R_601_4) {
+        colorSpace = .rec601
+    } else if attachment(imageBuffer, kCVImageBufferColorPrimariesKey, equals: kCVImageBufferColorPrimaries_ITU_R_2020) {
         colorSpace = .rec2020
     } else if attachment(imageBuffer, kCVImageBufferColorPrimariesKey, equals: kCVImageBufferColorPrimaries_ITU_R_709_2) {
         colorSpace = .rec709
@@ -2181,6 +2184,7 @@ private func decodedFormatMatches(
               imageBuffer,
               key: kCVImageBufferYCbCrMatrixKey,
               expected: context.matrixCoefficientsCode == 9 ? kCVImageBufferYCbCrMatrix_ITU_R_2020 :
+                  context.matrixCoefficientsCode == 6 ? kCVImageBufferYCbCrMatrix_ITU_R_601_4 :
                   kCVImageBufferYCbCrMatrix_ITU_R_709_2
           )
     else { return false }

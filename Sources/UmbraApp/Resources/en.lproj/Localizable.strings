@@ -13,6 +13,7 @@
 "H.264" = "H.264";
 "HEVC (H.265)" = "HEVC (H.265)";
 "AV1" = "AV1";
+"BC1 (Thunderbolt)" = "BC1 (Thunderbolt)";
 "Force Hardware Decoding" = "Force Hardware Decoding";
 "Force Software Decoding" = "Force Software Decoding";
 "Compatibility Probe" = "Compatibility Probe";

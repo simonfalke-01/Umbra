@@ -693,7 +693,8 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         configuration: MetalDisplayConfiguration,
         displayLinkPresentationTimestamp: TimeInterval? = nil
     ) throws {
-        let frame = queuedFrame.frame
+        var queuedFrame = queuedFrame
+        var frame = queuedFrame.frame
         let encodeStartedAt = CACurrentMediaTime()
         #if DEBUG
         let hooks = currentTestingHooks()
@@ -716,6 +717,26 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             if acquiredDrawable == nil { presentationDiagnostics.missingDrawables += 1 }
         }
         guard let drawable = acquiredDrawable else { return }
+        if suppliedDrawable == nil {
+            // nextDrawable can block until the next vblank when two frames land in one refresh.
+            // Draw whatever is newest once the drawable is ours instead of the frame dequeued
+            // before the wait, which would present a stale frame and push the new one back.
+            let now = ProcessInfo.processInfo.systemUptime
+            lock.lock()
+            if let newest = state.frames.last,
+               newest.layerConfigurationGeneration == queuedFrame.layerConfigurationGeneration {
+                let superseded = state.frames.count
+                state.frames.removeAll(keepingCapacity: true)
+                for _ in 0..<superseded {
+                    state.statistics.record(.dropped(.queueOverflow), at: now)
+                }
+                state.statistics.record(.queueDepth(0), at: now)
+                queuedFrame = newest
+                frame = newest.frame
+                presentationDiagnostics.staleFrames += superseded
+            }
+            lock.unlock()
+        }
         guard accepts(queuedFrame),
               let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw MetalRendererError.commandQueueUnavailable

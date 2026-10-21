@@ -13,8 +13,10 @@ public enum VideoCodecPreference: Int, Codable, CaseIterable, Sendable {
     @available(*, deprecated, message: "HDR is now controlled separately by enableHDR")
     case hevcHDRDeprecated
     case av1
+    /// Intra-only BC1 blocks for a 10 Gbit/s or faster link such as Thunderbolt; Lumen hosts only.
+    case bc1
 
-    public static let allCases: [VideoCodecPreference] = [.automatic, .h264, .hevc, .av1]
+    public static let allCases: [VideoCodecPreference] = [.automatic, .h264, .hevc, .av1, .bc1]
 }
 
 public enum VideoDecoderPreference: Int, Codable, CaseIterable, Sendable {

@@ -27,12 +27,13 @@ extension VideoCodecPreference: Identifiable {
         case Self.h264.rawValue: UmbraLocalization.string("H.264")
         case Self.hevc.rawValue, Self.legacyHDRRawValue: UmbraLocalization.string("HEVC (H.265)")
         case Self.av1.rawValue: UmbraLocalization.string("AV1")
+        case Self.bc1.rawValue: UmbraLocalization.string("BC1 (Thunderbolt)")
         default: UmbraLocalization.string("Automatic")
         }
     }
 
     static var macOSChoices: [VideoCodecPreference] {
-        [.automatic, .h264, .hevc, .av1]
+        [.automatic, .h264, .hevc, .av1, .bc1]
     }
 
     var normalizedForAppSettings: VideoCodecPreference {
