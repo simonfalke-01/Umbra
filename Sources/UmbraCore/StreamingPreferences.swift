@@ -454,6 +454,9 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
     public var useMacCursor: Bool
     public var absoluteTouchMode: Bool
     public var framePacing: Bool
+    /// Umbra Sync: with vertical sync off, keeps immediate presentation but lets a ProMotion or
+    /// Adaptive-Sync display refresh when each frame lands, so the stream never tears.
+    public var umbraSync: Bool
     public var connectionWarnings: Bool
     public var configurationWarnings: Bool
     public var richPresence: Bool
@@ -515,6 +518,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         useMacCursor: Bool = true,
         absoluteTouchMode: Bool = true,
         framePacing: Bool = true,
+        umbraSync: Bool = true,
         connectionWarnings: Bool = true,
         configurationWarnings: Bool = true,
         richPresence: Bool = true,
@@ -587,6 +591,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         self.useMacCursor = useMacCursor
         self.absoluteTouchMode = absoluteTouchMode
         self.framePacing = framePacing
+        self.umbraSync = umbraSync
         self.connectionWarnings = connectionWarnings
         self.configurationWarnings = configurationWarnings
         self.richPresence = richPresence
@@ -648,6 +653,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
         case useMacCursor
         case absoluteTouchMode
         case framePacing
+        case umbraSync
         case connectionWarnings
         case configurationWarnings
         case richPresence
@@ -769,6 +775,7 @@ public struct StreamingPreferences: Codable, Hashable, Sendable {
             useMacCursor: try container.decodeIfPresent(Bool.self, forKey: .useMacCursor) ?? defaults.useMacCursor,
             absoluteTouchMode: try container.decodeIfPresent(Bool.self, forKey: .absoluteTouchMode) ?? defaults.absoluteTouchMode,
             framePacing: framePacing,
+            umbraSync: try container.decodeIfPresent(Bool.self, forKey: .umbraSync) ?? true,
             connectionWarnings: try container.decodeIfPresent(Bool.self, forKey: .connectionWarnings) ?? defaults.connectionWarnings,
             configurationWarnings: try container.decodeIfPresent(Bool.self, forKey: .configurationWarnings) ?? defaults.configurationWarnings,
             richPresence: try container.decodeIfPresent(Bool.self, forKey: .richPresence) ?? defaults.richPresence,

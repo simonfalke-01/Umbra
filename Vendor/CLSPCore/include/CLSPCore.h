@@ -202,7 +202,7 @@ extern "C" {
     uint32_t structure_size;  ///< Must equal `sizeof(clsp_endpoint_t)`.
     clsp_const_byte_span_t host;  ///< UTF-8 DNS name or numeric IP literal, at most 255 bytes.
     uint16_t port;  ///< Nonzero LSP UDP application port.
-    uint16_t reserved_zero;  ///< Reserved and required to be zero.
+    uint16_t bound_interface_index;  ///< Nonzero pins the socket to this interface (IP_BOUND_IF); zero lets the OS route.
     uint8_t server_spki_sha256[32];  ///< Required nonzero SHA-256 leaf SubjectPublicKeyInfo pin.
   } clsp_endpoint_t;
 
@@ -1358,6 +1358,15 @@ extern "C" {
    * after authentication; this is the client's START offered maximum UDP payload.
    */
   uint16_t clsp_core_local_udp_payload_limit(const clsp_core_t *core);
+
+  /** @brief Return the UDP socket's achieved SO_RCVBUF in bytes; zero before a socket is open. */
+  uint32_t clsp_core_receive_buffer_bytes(const clsp_core_t *core);
+
+  /**
+   * @brief Return and reset the receive worker's longest turn and its count of turns of 5 ms or
+   * more since the previous call; both zero when no runtime is open.
+   */
+  void clsp_core_take_worker_turn_summary(clsp_core_t *core, uint64_t *max_turn_microseconds, uint64_t *slow_turns);
 
   /** @brief Queue one reliable client PATH_PROBE intent and its exact-size LSPP. */
   clsp_status_t clsp_core_send_path_probe(

@@ -56,11 +56,20 @@ public struct LSPTransportEndpoint: Equatable, Sendable {
     /// SHA-256 digest of the server certificate's DER SubjectPublicKeyInfo.
     public var serverSPKISHA256: Data
 
+    /// Interface index the UDP socket is pinned to, or zero to follow the OS route.
+    public var boundInterfaceIndex: UInt16
+
     /// Creates a pinned endpoint.
-    public init(host: String, port: UInt16 = 48_030, serverSPKISHA256: Data) {
+    public init(
+        host: String,
+        port: UInt16 = 48_030,
+        serverSPKISHA256: Data,
+        boundInterfaceIndex: UInt16 = 0
+    ) {
         self.host = host
         self.port = port
         self.serverSPKISHA256 = serverSPKISHA256
+        self.boundInterfaceIndex = boundInterfaceIndex
     }
 }
 
@@ -819,6 +828,7 @@ public final class LSPTransport: @unchecked Sendable {
         native.abi_version = Self.abiVersion
         native.structure_size = UInt32(MemoryLayout<clsp_endpoint_t>.size)
         native.port = endpoint.port
+        native.bound_interface_index = endpoint.boundInterfaceIndex
         endpoint.serverSPKISHA256.withUnsafeBytes { pinBytes in
             withUnsafeMutableBytes(of: &native.server_spki_sha256) { destination in
                 destination.copyBytes(from: pinBytes)
@@ -1215,6 +1225,19 @@ public final class LSPTransport: @unchecked Sendable {
     /// clamped to the interface MTU minus IP/UDP headers, or 1,472 when undetected.
     public var localMaximumUDPPayload: UInt16 {
         clsp_core_local_udp_payload_limit(core)
+    }
+
+    /// Achieved SO_RCVBUF of the connected UDP socket, or zero before one is open.
+    public var receiveBufferBytes: UInt32 {
+        clsp_core_receive_buffer_bytes(core)
+    }
+
+    /// Longest receive-worker turn and the count of turns of 5 ms or more since the last call.
+    public func takeWorkerTurnSummary() -> (maximumTurnMicroseconds: UInt64, slowTurns: UInt64) {
+        var maximum: UInt64 = 0
+        var slow: UInt64 = 0
+        clsp_core_take_worker_turn_summary(core, &maximum, &slow)
+        return (maximum, slow)
     }
 
     /// Enables native RFC 8899 search after video ACK and renderer activation.

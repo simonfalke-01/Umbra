@@ -1176,40 +1176,46 @@ public actor LSPProductClient {
         var finalError: Error = LSPControlStatus.authenticationFailed
         // Every address is tried with the pinned host certificate, so a wrong or stale address
         // can only fail; it can never authenticate a different machine.
-        for endpoint in host.connectionCandidates() {
+        for endpoint in LSPNetworkPath.ranked(Self.preferringLocalNetwork(host.connectionCandidates())) {
             var attemptHost = host
             attemptHost.address = endpoint.address
             attemptHost.port = endpoint.port
-            for pin in pins {
-                if let attemptID {
-                    try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
-                } else {
-                    try Task.checkCancellation()
-                }
-                let candidate = try await LSPClientSession.persistent(
-                    configuration: configuration ?? transportConfiguration,
-                    identityStore: identityStore,
-                    videoRenderer: videoRenderer
-                )
-                do {
+            // A pinned better-ranked interface goes first; if it fails, the same address is
+            // retried on the OS route before moving on.
+            let paths = LSPNetworkPath.attempts(to: endpoint.address)
+            for path in paths.isEmpty ? [nil] : paths.map(Optional.some) {
+                for pin in pins {
                     if let attemptID {
-                        await candidate.beginReconnect(attemptID: attemptID)
+                        try ensureAttemptCurrent(hostID: trust.hostID, attemptID: attemptID)
+                    } else {
+                        try Task.checkCancellation()
                     }
-                    let updated = try await candidate.authenticate(
-                        host: attemptHost,
-                        trust: trust,
-                        serverSPKISHA256: pin
+                    let candidate = try await LSPClientSession.persistent(
+                        configuration: configuration ?? transportConfiguration,
+                        identityStore: identityStore,
+                        videoRenderer: videoRenderer
                     )
-                    await recordSuccessfulEndpoint(hostID: host.hostID, endpoint: endpoint)
-                    return (candidate, updated)
-                } catch let status as LSPControlStatus {
-                    // The host answered; another address reaches the same host and decision.
-                    throw status
-                } catch {
-                    finalError = error
-                    // Only a staged, already trusted certificate pin justifies another
-                    // handshake at this address; other failures move to the next address.
-                    if (error as? LSPTransportError) != .spkiMismatch { break }
+                    do {
+                        if let attemptID {
+                            await candidate.beginReconnect(attemptID: attemptID)
+                        }
+                        let updated = try await candidate.authenticate(
+                            host: attemptHost,
+                            trust: trust,
+                            serverSPKISHA256: pin,
+                            networkPath: path
+                        )
+                        await recordSuccessfulEndpoint(hostID: host.hostID, endpoint: endpoint)
+                        return (candidate, updated)
+                    } catch let status as LSPControlStatus {
+                        // The host answered; another address reaches the same host and decision.
+                        throw status
+                    } catch {
+                        finalError = error
+                        // Only a staged, already trusted certificate pin justifies another
+                        // handshake at this address; other failures move to the next path or address.
+                        if (error as? LSPTransportError) != .spkiMismatch { break }
+                    }
                 }
             }
         }
@@ -1234,6 +1240,41 @@ public actor LSPProductClient {
     ///
     /// Link-local IPv6 addresses are skipped because they are bound to one network interface
     /// and stop working after the Mac switches between Wi-Fi and Ethernet.
+    /// Moves addresses on a network this Mac is directly attached to ahead of everything else.
+    /// A public address can still reach a host at home through the router's NAT loopback, but
+    /// that sends every packet through the router and loses video under load.
+    nonisolated static func preferringLocalNetwork(_ endpoints: [LSPHostEndpoint]) -> [LSPHostEndpoint] {
+        let subnets = localIPv4Subnets()
+        let local = endpoints.filter { endpoint in
+            if endpoint.address.lowercased().hasPrefix("fe80:") { return true }
+            var address = in_addr()
+            guard inet_pton(AF_INET, endpoint.address, &address) == 1 else { return false }
+            return subnets.contains { address.s_addr & $0.mask == $0.network }
+        }
+        return local + endpoints.filter { candidate in !local.contains { $0.key == candidate.key } }
+    }
+
+    /// Network and mask (network byte order) of every active non-loopback IPv4 interface.
+    nonisolated private static func localIPv4Subnets() -> [(network: in_addr_t, mask: in_addr_t)] {
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let first = interfaces else { return [] }
+        defer { freeifaddrs(interfaces) }
+        var subnets: [(network: in_addr_t, mask: in_addr_t)] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ifa_next }
+            let flags = Int32(entry.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
+                  let address = entry.pointee.ifa_addr, address.pointee.sa_family == sa_family_t(AF_INET),
+                  let netmask = entry.pointee.ifa_netmask else { continue }
+            let host = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+            let mask = netmask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+            guard mask != 0 else { continue }
+            subnets.append((host & mask, mask))
+        }
+        return subnets
+    }
+
     nonisolated static func resolvedAddresses(of host: String) -> [String] {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC

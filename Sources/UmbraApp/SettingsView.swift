@@ -1293,6 +1293,13 @@ private struct AdvancedSettingsView: View {
                     disabledReason: "Turn on vertical sync to use frame pacing."
                 )
                 PreferenceToggle(
+                    "Umbra Sync",
+                    message: "Tear-free adaptive refresh with no added latency on ProMotion and Adaptive-Sync displays.",
+                    binding: preferences.binding(for: \.umbraSync),
+                    enabled: !preferences.settings.enableVSync,
+                    disabledReason: "Umbra Sync replaces vertical sync; turn vertical sync off to use it."
+                )
+                PreferenceToggle(
                     "Allow bitrates above 150 Mbps",
                     binding: Binding(
                         get: { preferences.settings.unlockBitrate },

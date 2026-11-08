@@ -149,6 +149,9 @@ public struct LSPActiveInputAuthority: Equatable, Sendable {
 /// Coarse LSP client-session coordinator over the native packet/security core.
 public actor LSPClientSession {
     public private(set) var state: LSPClientSessionState = .idle
+    /// Address and local interface this session authenticated over; nil until it does.
+    public private(set) var hostAddress: String?
+    public private(set) var networkPath: LSPNetworkPath?
     private let transport: LSPTransport
     private let identity: LSPClientIdentity
     private let transportProfile: LSPTransportProfile
@@ -443,7 +446,8 @@ public actor LSPClientSession {
     public func authenticate(
         host: LSPHostRecord,
         trust: LSPTrustRecord,
-        serverSPKISHA256: Data? = nil
+        serverSPKISHA256: Data? = nil,
+        networkPath: LSPNetworkPath? = nil
     ) async throws -> LSPTrustRecord {
         guard host.hostID == trust.hostID else { throw LSPTransportError.invalidEndpoint }
         let selectedSPKI = serverSPKISHA256 ?? trust.pendingDTLSSPKISHA256 ?? trust.dtlsSPKISHA256
@@ -453,9 +457,12 @@ public actor LSPClientSession {
         let endpoint = LSPTransportEndpoint(
             host: host.address,
             port: host.port,
-            serverSPKISHA256: selectedSPKI
+            serverSPKISHA256: selectedSPKI,
+            boundInterfaceIndex: networkPath?.boundInterfaceIndex ?? 0
         )
         let serverHello = try await connect(endpoint: endpoint)
+        hostAddress = host.address
+        self.networkPath = networkPath
         guard serverHello.hostID == trust.hostID,
               serverHello.hostIdentityKey == trust.hostIdentityKey,
               serverHello.serverSPKISHA256 == selectedSPKI,
@@ -2287,6 +2294,16 @@ public actor LSPClientSession {
 
     public func telemetrySnapshot() throws -> LSPTelemetrySnapshot {
         try transport.telemetrySnapshot()
+    }
+
+    /// Receive-worker stall evidence since the previous call; safe from any thread.
+    public nonisolated func takeWorkerTurnSummary() -> (maximumTurnMicroseconds: UInt64, slowTurns: UInt64) {
+        transport.takeWorkerTurnSummary()
+    }
+
+    /// Achieved SO_RCVBUF of the session's UDP socket, or zero before it is open.
+    public var receiveBufferBytes: UInt32 {
+        transport.receiveBufferBytes
     }
 
     public func nativeTimingSnapshot() throws -> LSPNativeTimingSnapshot {

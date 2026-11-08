@@ -234,6 +234,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private weak var streamWindow: StreamWindowController?
     private let lspMediaCapabilities: AppleStreamingCapabilities
     private let lspFailureHandler: @Sendable (String) -> Void
+    private let lspDiagnosticHandler: @Sendable (String) -> Void
     private let lspHostProbe: LSPHostProbe
     private var activeLSPStreamID: UUID?
     private var activeLSPHostID: UUID?
@@ -241,7 +242,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lspOwnerEndpoint: LSPCLIOwnerEndpoint?
     private var cliStopReplyPending = false
     private var didNotifyLSPSessionTermination = false
-    private var plannedLSPRekeyTask: Task<Void, Never>?
     private var lspTelemetryTask: Task<Void, Never>?
     private var lspDeviceOfferTask: Task<Void, Never>?
     /// Addresses of each listed GameStream host, used to fold it into the same machine's LSP entry.
@@ -255,6 +255,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
     private var lspHostStatusTask: Task<Void, Never>?
     private var networkPathMonitor: NWPathMonitor?
     private var lastNetworkPathSignature: String?
+    private var lspPathEvaluationTask: Task<Void, Never>?
+    private var lastLSPPathMove: ContinuousClock.Instant?
     private var lspHostCheckInFlight = false
     private var lspHostCheckErrors: [UUID: String] = [:]
     private var latestLSPTelemetry: LSPTelemetrySnapshot?
@@ -293,6 +295,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         streamWindow: StreamWindowController? = nil,
         lspMediaCapabilities: AppleStreamingCapabilities = .probe(),
         lspFailureHandler: @escaping @Sendable (String) -> Void = { _ in },
+        lspDiagnosticHandler: @escaping @Sendable (String) -> Void = { _ in },
         lspHostProbe: LSPHostProbe? = nil
     ) {
         self.service = service
@@ -307,6 +310,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
         self.lspInputCapture = LSPAppKitInputCapture(targetWindow: streamWindow?.inputCaptureWindow)
         self.lspMediaCapabilities = lspMediaCapabilities
         self.lspFailureHandler = lspFailureHandler
+        self.lspDiagnosticHandler = lspDiagnosticHandler
         self.lspHostProbe = lspHostProbe ?? { hostID in
             guard let lspProduct else { throw LSPTransportError.invalidState }
             try await lspProduct.probeReachability(hostID: hostID)
@@ -827,6 +831,8 @@ final class LiveUmbraClientService: UmbraClientServicing {
         }
         installLSPReconnectHandler(session: session, hostID: hostID, streamID: streamID)
         scheduleLSPMaintenance(session: session, hostID: hostID)
+        startNetworkPathMonitoring()
+        await recordLSPSessionPath(session, event: "started")
         await startLSPClipboardSync(product: product, hostID: hostID, streamID: streamID)
     }
 
@@ -960,8 +966,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
         activeLSPApplicationID = nil
         for attempt in lspReconnectTasks.values { attempt.task.cancel() }
         lspReconnectTasks.removeAll(keepingCapacity: true)
-        plannedLSPRekeyTask?.cancel()
-        plannedLSPRekeyTask = nil
         lspTelemetryTask?.cancel()
         lspTelemetryTask = nil
         lspDeviceOfferTask?.cancel()
@@ -1214,6 +1218,7 @@ final class LiveUmbraClientService: UmbraClientServicing {
             }
             installLSPReconnectHandler(session: replacement, hostID: hostID, streamID: streamID)
             scheduleLSPMaintenance(session: replacement, hostID: hostID)
+            await recordLSPSessionPath(replacement, event: "reconnected")
         } catch is CancellationError {
             lspInputCapture.stop()
             if let publishedReplacement {
@@ -1239,7 +1244,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
                 guard self.isActiveLSPStream(streamID, hostID: hostID),
                       await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true,
                       self.deactivateLSPStream(streamID, hostID: hostID) else { return }
-                self.plannedLSPRekeyTask?.cancel()
                 self.lspTelemetryTask?.cancel()
                 self.lspDeviceOfferTask?.cancel()
                 if let reconnect = self.lspReconnectTasks[hostID], reconnect.streamID == streamID {
@@ -1289,7 +1293,6 @@ final class LiveUmbraClientService: UmbraClientServicing {
                     return
                 } catch {
                     guard self.deactivateLSPStream(streamID, hostID: hostID) else { return }
-                    self.plannedLSPRekeyTask?.cancel()
                     self.lspTelemetryTask?.cancel()
                     self.lspDeviceOfferTask?.cancel()
                     self.lspInputCapture.stop()
@@ -1331,21 +1334,10 @@ final class LiveUmbraClientService: UmbraClientServicing {
     }
 
     private func scheduleLSPMaintenance(session: LSPClientSession, hostID: UUID) {
-        plannedLSPRekeyTask?.cancel()
+        // No timed rekey: a fresh association rebuilds the host's capture and encoder, a visible
+        // freeze. The host renews the association itself before any SRTP key nears its packet limit.
         lspTelemetryTask?.cancel()
         lspDeviceOfferTask?.cancel()
-        plannedLSPRekeyTask = Task { @MainActor [weak self, session] in
-            do {
-                try await Task.sleep(for: .seconds(30 * 60))
-                guard !Task.isCancelled, let self,
-                      await self.lspProduct?.isCurrentSession(session, hostID: hostID) == true else { return }
-                try await self.reconnectLSPInput(hostID: hostID, reason: .plannedRekey)
-            } catch is CancellationError {
-                return
-            } catch {
-                self?.eventHandler?(.sessionWarning("Couldn't refresh the stream's encryption keys: \(error.localizedDescription)"))
-            }
-        }
         lspTelemetryTask = Task { @MainActor [weak self, session] in
             // The host encodes at least its minimum frame rate even for static content,
             // so seconds without a single access unit mean its encoder hung (an NVENC
@@ -1945,6 +1937,57 @@ final class LiveUmbraClientService: UmbraClientServicing {
             await self?.lspProduct?.retireIdleAssociations()
             await self?.refreshLSPReachability()
         }
+        // Interfaces flap while a cable or dock settles; judge the stream's path once it has.
+        lspPathEvaluationTask?.cancel()
+        lspPathEvaluationTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            await self?.evaluateLSPMediaPath()
+        }
+    }
+
+    /// Moves the stream through the normal reconnect when its pinned interface disappeared, or
+    /// when a strictly better-ranked interface now reaches the host. Upgrades wait out a
+    /// cooldown after any move so a flapping link cannot drive a reconnect loop.
+    private func evaluateLSPMediaPath() async {
+        guard let hostID = activeLSPHostID,
+              lspReconnectTasks[hostID] == nil,
+              let session = await lspProduct?.currentSession(hostID: hostID),
+              await session.state == .inputActive,
+              let address = await session.hostAddress else { return }
+        let current = await session.networkPath
+        let best = LSPNetworkPath.attempts(to: address).first
+        let reason: String
+        if let current, !LSPNetworkPath.interfaceIsAvailable(current.interfaceName) {
+            reason = "\(current.interfaceName) is gone"
+        } else if let current, let best, best.kind < current.kind,
+                  lastLSPPathMove.map({ ContinuousClock.now - $0 >= .seconds(30) }) ?? true {
+            reason = "\(best.kind.label) \(best.interfaceName) now reaches the host"
+        } else {
+            return
+        }
+        lastLSPPathMove = ContinuousClock.now
+        lspDiagnosticHandler("LSP media path moving: \(reason)")
+        do {
+            try await reconnectLSPInput(hostID: hostID, reason: .transportLoss)
+        } catch is CancellationError {
+            return
+        } catch {
+            lspFailureHandler("Couldn't move the stream to a new network path: \(error.localizedDescription)")
+        }
+    }
+
+    /// One persistent line per association: the evidence needed to explain a bad stream later.
+    private func recordLSPSessionPath(_ session: LSPClientSession, event: String) async {
+        streamWindow?.workerTurnSummary.install { [weak session] in session?.takeWorkerTurnSummary() }
+        let path = await session.networkPath
+        let video = try? await session.activeInputAuthority().videoSelection.nativeConfiguration
+        let codec = video.flatMap { LSPVideoCodec(rawValue: $0.codec) }.map { "\($0)" } ?? "unknown"
+        let size = video.map { "\($0.width)x\($0.height)" } ?? "unknown"
+        let fps = video.map { $0.refreshDenominator == 0 ? "unknown" : String(format: "%.2f", Double($0.refreshNumerator) / Double($0.refreshDenominator)) } ?? "unknown"
+        let umbraSync = streamWindow?.umbraSyncActive.map(String.init) ?? "unknown"
+        lspDiagnosticHandler(
+            "LSP stream \(event) host=\(await session.hostAddress ?? "unknown") interface=\(path?.interfaceName ?? "unknown") type=\(path?.kind.label ?? "unknown") bound=\(path?.bound ?? false) rcvbuf=\(await session.receiveBufferBytes) codec=\(codec) size=\(size) fps=\(fps) umbraSync=\(umbraSync)"
+        )
     }
 
     /// Retries idle-host checks at the existing legacy monitor's three-second cadence.
@@ -2335,6 +2378,9 @@ final class LiveApplicationComposition {
             lspMediaCapabilities: mediaCapabilities,
             lspFailureHandler: { [supportLogger] message in
                 supportLogger?.record(source: "Streaming", level: .error, message: message)
+            },
+            lspDiagnosticHandler: { [supportLogger] message in
+                supportLogger?.record(source: "Streaming", level: .info, message: message)
             }
         )
         streamWindow.onStopRequested = { [weak clientService] quitHostApplication in

@@ -1644,7 +1644,7 @@ namespace {
   [[nodiscard]] bool valid_endpoint(const clsp_endpoint_t &endpoint) noexcept {
     if (endpoint.abi_version != CLSP_CORE_ABI_VERSION || endpoint.structure_size != sizeof(clsp_endpoint_t) ||
         endpoint.host.data == nullptr || endpoint.host.length == 0 || endpoint.host.length > 255U ||
-        endpoint.port == 0 || endpoint.reserved_zero != 0) {
+        endpoint.port == 0) {
       return false;
     }
     std::uint8_t aggregate = 0;
@@ -3060,6 +3060,29 @@ extern "C" clsp_status_t clsp_core_start_path_discovery(clsp_core_t *core) {
   return with_runtime(core, [](umbra::lsp::Runtime &runtime) {
     return runtime.start_path_discovery();
   });
+}
+
+extern "C" void clsp_core_take_worker_turn_summary(
+  clsp_core_t *core,
+  uint64_t *max_turn_microseconds,
+  uint64_t *slow_turns
+) {
+  std::uint64_t maximum = 0;
+  std::uint64_t slow = 0;
+  if (core != nullptr && !callback_stack_contains(core)) {
+    std::shared_lock runtime_lock(core->runtime_mutex);
+    if (core->runtime != nullptr) core->runtime->take_worker_turn_summary(maximum, slow);
+  }
+  if (max_turn_microseconds != nullptr) *max_turn_microseconds = maximum;
+  if (slow_turns != nullptr) *slow_turns = slow;
+}
+
+extern "C" uint32_t clsp_core_receive_buffer_bytes(const clsp_core_t *core) {
+  if (core == nullptr || callback_stack_contains(core)) {
+    return 0;
+  }
+  std::shared_lock runtime_lock(core->runtime_mutex);
+  return core->runtime == nullptr ? 0U : core->runtime->receive_buffer_bytes();
 }
 
 extern "C" uint16_t clsp_core_local_udp_payload_limit(const clsp_core_t *core) {

@@ -298,7 +298,6 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
         maintenanceTasks.removeValue(forKey: hostID)?.cancel()
         maintenanceTasks[hostID] = Task { [weak self] in
             guard let self else { return }
-            var nextRekey = ContinuousClock.now + .seconds(30 * 60)
             while !Task.isCancelled {
                 guard let current = await self.product.currentSession(hostID: hostID),
                       await current.state == .inputActive else { return }
@@ -308,16 +307,6 @@ actor LiveUmbraCLILSPService: UmbraCLILSPServicing {
                     return
                 } catch {
                     // The session retains the unacknowledged offer and retries at the next 50 ms cadence.
-                }
-                if ContinuousClock.now >= nextRekey {
-                    do {
-                        try await self.attachLocal(hostID: hostID)
-                        nextRekey = ContinuousClock.now + .seconds(30 * 60)
-                    } catch is CancellationError {
-                        return
-                    } catch {
-                        nextRekey = ContinuousClock.now + .seconds(60)
-                    }
                 }
                 try? await Task.sleep(for: .milliseconds(50))
             }

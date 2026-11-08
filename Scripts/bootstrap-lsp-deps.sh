@@ -50,6 +50,20 @@ wolfssl_profile=(
     "WOLFSSL_PQC_HYBRIDS=no"
 )
 wolfssl_profile_value="${(j:;:)wolfssl_profile}"
+# Implementation only, not profile: ARMv8 AES, PMULL GHASH, and SHA-2 instructions on arm64.
+# Cipher suites, protocol versions, and wire bytes are identical to the portable build, so
+# this stays compatible with Lumen's profile. wolfSSL's CMake options.h template omits
+# WOLFSSL_ARMASM, yet it changes struct Aes, so the installed options.h must define it too.
+if [[ "$expected_architecture" == "arm64" ]]; then
+    wolfssl_implementation="armv8-crypto"
+    # Inline-C variants avoid depending on CMake's assembler setup for the .S sources.
+    wolfssl_implementation_options=("WOLFSSL_ARM_ASM=yes" "WOLFSSL_ARMASM_INLINE=yes")
+    wolfssl_implementation_definitions="-DWOLFSSL_ARMASM"
+else
+    wolfssl_implementation="portable"
+    wolfssl_implementation_options=()
+    wolfssl_implementation_definitions=""
+fi
 libsrtp_profile=(
     "BUILD_SHARED_LIBS=OFF"
     "ENABLE_OPENSSL=OFF"
@@ -81,6 +95,7 @@ metadata_keys=(
     "wolfssl_source_sha256"
     "wolfssl_profile"
     "wolfssl_compile_definitions"
+    "wolfssl_implementation"
     "wolfssl_spake2"
     "libsrtp_version"
     "libsrtp_source_sha256"
@@ -157,6 +172,9 @@ validate_header_profile() {
         WOLFSSL_TLS13; do
         header_defines "$options" "$required_macro" || return 1
     done
+    if [[ "$wolfssl_implementation" == "armv8-crypto" ]]; then
+        header_defines "$options" WOLFSSL_ARMASM || return 1
+    fi
     for required_macro in \
         HAVE_SCRYPT \
         WOLFSSL_PUBLIC_MP \
@@ -187,6 +205,9 @@ validate_archives_and_symbols() {
     archive_has_symbol "$candidate/lib/libwolfssl.a" "_wc_ecc_mulmod_ex2" || return 1
     archive_has_symbol "$candidate/lib/libwolfssl.a" "_ecc_projective_add_point_safe" || return 1
     archive_has_symbol "$candidate/lib/libsrtp2.a" "_srtp_create" || return 1
+    if [[ "$wolfssl_implementation" == "armv8-crypto" ]]; then
+        archive_has_symbol "$candidate/lib/libwolfssl.a" "_AES_GCM_decrypt_AARCH64" || return 1
+    fi
     ar -t "$candidate/lib/libsrtp2.a" | grep -q "aes_gcm_wolfssl" || return 1
     ar -t "$candidate/lib/libsrtp2.a" | grep -q "aes_icm_wolfssl" || return 1
 }
@@ -229,6 +250,7 @@ validate_manifest() {
     require_manifest_value "$manifest" "wolfssl_source_sha256" "$wolfssl_sha256" || return 1
     require_manifest_value "$manifest" "wolfssl_profile" "$wolfssl_profile_value" || return 1
     require_manifest_value "$manifest" "wolfssl_compile_definitions" "$wolfssl_compile_definitions" || return 1
+    require_manifest_value "$manifest" "wolfssl_implementation" "$wolfssl_implementation" || return 1
     require_manifest_value "$manifest" "wolfssl_spake2" "RFC9382-P256-SHA256-HKDF-HMAC" || return 1
     require_manifest_value "$manifest" "libsrtp_version" "$libsrtp_version" || return 1
     require_manifest_value "$manifest" "libsrtp_source_sha256" "$libsrtp_sha256" || return 1
@@ -271,6 +293,7 @@ write_manifest() {
         print -r -- "wolfssl_source_sha256=$wolfssl_sha256"
         print -r -- "wolfssl_profile=$wolfssl_profile_value"
         print -r -- "wolfssl_compile_definitions=$wolfssl_compile_definitions"
+        print -r -- "wolfssl_implementation=$wolfssl_implementation"
         print -r -- "wolfssl_spake2=RFC9382-P256-SHA256-HKDF-HMAC"
         print -r -- "libsrtp_version=$libsrtp_version"
         print -r -- "libsrtp_source_sha256=$libsrtp_sha256"
@@ -345,9 +368,20 @@ cmake -S "$task_temp/wolfssl-$wolfssl_version-stable" -B "$task_temp/wolfssl-bui
     -DWOLFSSL_EXAMPLES=OFF \
     -DWOLFSSL_CRYPT_TESTS=OFF \
     "${(@)wolfssl_profile/#/-D}" \
-    -DCMAKE_C_FLAGS="$wolfssl_compile_definitions"
+    "${(@)wolfssl_implementation_options/#/-D}" \
+    -DCMAKE_C_FLAGS="$wolfssl_compile_definitions $wolfssl_implementation_definitions" \
+    -DCMAKE_ASM_FLAGS="$wolfssl_implementation_definitions"
 cmake --build "$task_temp/wolfssl-build" --parallel "$jobs"
 cmake --install "$task_temp/wolfssl-build"
+if [[ "$wolfssl_implementation" == "armv8-crypto" ]]; then
+    wolfssl_options="$staged_prefix/include/wolfssl/options.h"
+    header_defines "$wolfssl_options" WOLFSSL_AARCH64_BUILD
+    sed -i '' 's|^#define WOLFSSL_AARCH64_BUILD$|#define WOLFSSL_AARCH64_BUILD\
+\
+#undef WOLFSSL_ARMASM\
+#define WOLFSSL_ARMASM|' "$wolfssl_options"
+    header_defines "$wolfssl_options" WOLFSSL_ARMASM
+fi
 
 spake2_settings="$staged_prefix/include/wolfssl/lsp_spake2_settings.h"
 {

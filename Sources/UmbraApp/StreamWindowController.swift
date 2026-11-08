@@ -323,6 +323,38 @@ enum StreamStatisticsPresenter {
     }
 }
 
+/// Thread-safe holder for the active stream's receive-worker summary, read on the render executor.
+final class WorkerTurnSummarySource: @unchecked Sendable {
+    typealias Summary = (maximumTurnMicroseconds: UInt64, slowTurns: UInt64)
+    private let lock = NSLock()
+    private var provider: (@Sendable () -> Summary?)?
+
+    func install(_ provider: (@Sendable () -> Summary?)?) {
+        lock.withLock { self.provider = provider }
+    }
+
+    func take() -> Summary? {
+        lock.withLock { provider }?()
+    }
+}
+
+/// System-wide UDP datagrams the kernel discarded because a receive socket was full, as a
+/// delta since the previous read. Reported beside the presentation summary as stutter evidence.
+private final class UDPFullSocketDropCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var previous: UInt32?
+
+    func delta() -> UInt32? {
+        var statistics = udpstat()
+        var size = MemoryLayout<udpstat>.size
+        guard sysctlbyname("net.inet.udp.stats", &statistics, &size, nil, 0) == 0 else { return nil }
+        return lock.withLock {
+            defer { previous = statistics.udps_fullsock }
+            return previous.map { statistics.udps_fullsock &- $0 }
+        }
+    }
+}
+
 @MainActor
 struct StreamRendererConfiguration: Equatable {
     let display: MetalDisplayConfiguration
@@ -332,7 +364,9 @@ struct StreamRendererConfiguration: Equatable {
         policy: EffectiveStreamingPolicy,
         framesPerSecond: Double,
         displayRefreshRate: Double,
-        usesMetalRenderer: Bool = true
+        usesMetalRenderer: Bool = true,
+        umbraSyncPreferred: Bool = false,
+        screenSupportsVariableRefresh: Bool = false
     ) -> Self {
         let usesDisplayLink = usesMetalRenderer
             && policy.presentationIntent == .displayLinkedTearFree
@@ -340,7 +374,11 @@ struct StreamRendererConfiguration: Equatable {
         return Self(
             display: MetalDisplayConfiguration(
                 contentMode: StreamVideoPresentationPolicy.contentMode,
-                verticalSyncEnabled: usesDisplayLink
+                verticalSyncEnabled: usesDisplayLink,
+                adaptiveSyncEnabled: usesMetalRenderer
+                    && !usesDisplayLink
+                    && umbraSyncPreferred
+                    && screenSupportsVariableRefresh
             ),
             pacing: FramePacingConfiguration(
                 nominalFramesPerSecond: framesPerSecond,
@@ -384,6 +422,10 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     private let pointer: AppKitPointerInputAdapter
     private let pointerCapture = PointerCaptureCoordinator()
     private let keepAwake = KeepAwakeActivity()
+    /// Receive-worker stall evidence of the current stream for the per-minute summary line.
+    let workerTurnSummary = WorkerTurnSummarySource()
+    /// Umbra Sync state last applied to the renderer; nil before the first stream configures it.
+    private(set) var umbraSyncActive: Bool?
     private let clipboard = AppKitClipboardTextReader()
     private lazy var systemShortcutCapture = SystemShortcutCaptureCoordinator(
         state: SystemShortcutCaptureState(
@@ -507,6 +549,15 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         windowModeCoordinator = WindowModeCoordinator(driver: windowModeDriverFactory(window))
         super.init()
 
+        let fullSocketDrops = UDPFullSocketDropCounter()
+        _ = fullSocketDrops.delta()
+        let workerTurns = workerTurnSummary
+        renderer?.installPresentationSummaryHandler { message in
+            let worker = workerTurns.take().map {
+                "workerMaxTurnMs=\(String(format: "%.1f", Double($0.maximumTurnMicroseconds) / 1_000)) workerTurnsOver5ms=\($0.slowTurns)"
+            } ?? "workerMaxTurnMs=unknown workerTurnsOver5ms=unknown"
+            diagnosticHandler("\(message) \(worker) udpFullSocketDrops=\(fullSocketDrops.delta().map(String.init) ?? "unknown")")
+        }
         videoRenderer.setVideoSizeHandler { [weak contentView] size in
             contentView?.videoSize = size
         }
@@ -1649,8 +1700,17 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             policy: policy,
             framesPerSecond: preferences.exactFrameRate,
             displayRefreshRate: displayRefreshRate(for: screen),
-            usesMetalRenderer: preferences.rendererPreference != .avSampleBufferDisplayLayer
+            usesMetalRenderer: preferences.rendererPreference != .avSampleBufferDisplayLayer,
+            umbraSyncPreferred: preferences.umbraSync,
+            screenSupportsVariableRefresh: screen.map(Self.supportsVariableRefresh) ?? false
         )
+        let adaptiveSyncEnabled = rendererConfiguration.display.adaptiveSyncEnabled
+        if adaptiveSyncEnabled != umbraSyncActive {
+            umbraSyncActive = adaptiveSyncEnabled
+            diagnosticHandler(
+                "umbra sync active=\(adaptiveSyncEnabled) minInterval=\(screen?.minimumRefreshInterval ?? 0) maxInterval=\(screen?.maximumRefreshInterval ?? 0)"
+            )
+        }
         renderer?.updateDisplayConfiguration(rendererConfiguration.display)
         renderer?.updatePacingConfiguration(rendererConfiguration.pacing)
         renderer?.setPresentationActive(
@@ -1669,6 +1729,11 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             policy: preferences.displayResolutionPolicy,
             nativeGeometry: nativeGeometry
         )
+    }
+
+    /// ProMotion and Adaptive-Sync panels report a refresh interval range instead of one fixed value.
+    private static func supportsVariableRefresh(_ screen: NSScreen) -> Bool {
+        screen.maximumRefreshInterval - screen.minimumRefreshInterval > 0.000_1
     }
 
     private func displayRefreshRate(for screen: NSScreen?) -> Double {

@@ -316,6 +316,12 @@ namespace umbra::lsp {
     /** @brief Return the connected-interface UDP payload limit (jumbo-capable DPLPMTUD ceiling). */
     [[nodiscard]] std::uint16_t local_udp_payload_limit() const noexcept;
 
+    /** @brief Return the UDP socket's achieved SO_RCVBUF; zero before a socket is open. */
+    [[nodiscard]] std::uint32_t receive_buffer_bytes() const noexcept;
+
+    /** @brief Return and reset the longest worker turn and the count of turns of 5 ms or more. */
+    void take_worker_turn_summary(std::uint64_t &max_turn_microseconds, std::uint64_t &slow_turns) noexcept;
+
     /** @brief Return the authenticated confirmed UDP payload ceiling. */
     [[nodiscard]] std::uint16_t current_udp_payload_size() const noexcept;
 

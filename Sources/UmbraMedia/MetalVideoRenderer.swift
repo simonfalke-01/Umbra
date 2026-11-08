@@ -10,16 +10,28 @@ import simd
 public struct MetalDisplayConfiguration: Sendable, Equatable {
     public var contentMode: VideoContentMode
     public var verticalSyncEnabled: Bool
+    /// Umbra Sync: with vertical sync off, frames still present immediately with no display
+    /// link or pacing wait, but display sync stays on so a variable-refresh panel refreshes when
+    /// each frame lands instead of tearing mid-scan.
+    public var adaptiveSyncEnabled: Bool
     public var clearColor: SIMD4<Double>
 
     public init(
         contentMode: VideoContentMode = .aspectFit,
         verticalSyncEnabled: Bool = true,
+        adaptiveSyncEnabled: Bool = false,
         clearColor: SIMD4<Double> = SIMD4(0, 0, 0, 1)
     ) {
         self.contentMode = contentMode
         self.verticalSyncEnabled = verticalSyncEnabled
+        self.adaptiveSyncEnabled = adaptiveSyncEnabled
         self.clearColor = clearColor
+    }
+
+    /// Whether the layer synchronizes presentation with the display; only vertical sync drives
+    /// the display link.
+    var displaySyncEnabled: Bool {
+        verticalSyncEnabled || adaptiveSyncEnabled
     }
 }
 
@@ -202,7 +214,7 @@ private final class MetalFrameLease: @unchecked Sendable {
 public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDisplayLinkDelegate, @unchecked Sendable {
     private struct LayerConfiguration: Equatable {
         let color: VideoColorMetadata
-        let verticalSyncEnabled: Bool
+        let displaySyncEnabled: Bool
     }
 
     private struct State {
@@ -242,6 +254,9 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     private var displayLink: CAMetalDisplayLink?
     /// Per-second presentation diagnostics; touched only on the render executor.
     private var presentationDiagnostics = PresentationDiagnostics()
+    /// Per-minute rollup of the one-second windows; touched only on the render executor.
+    private var presentationSummary = PresentationSummary()
+    private var presentationSummaryHandler: @Sendable (String) -> Void = { _ in }
     private var displayLinkGeneration: UInt64?
     private var firstMetalCommitHandler: @Sendable (Int) -> Void = { _ in }
     private var commandCommitHandler: @Sendable (Int) -> Void = { _ in }
@@ -315,7 +330,10 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         layer.maximumDrawableCount = 3
         layer.allowsNextDrawableTimeout = true
         layer.presentsWithTransaction = false
-        layer.displaySyncEnabled = presentationActive && configuration.verticalSyncEnabled
+        layer.displaySyncEnabled = presentationActive && configuration.displaySyncEnabled
+        if configuration.adaptiveSyncEnabled {
+            renderDiagnosticsLog.notice("umbra sync active=\(!configuration.verticalSyncEnabled)")
+        }
         if presentationActive,
            Self.supportsMetalDisplayLinkPacing,
            configuration.verticalSyncEnabled {
@@ -380,11 +398,14 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             && configuration.verticalSyncEnabled
             && Self.supportsMetalDisplayLinkPacing
         let configurationChanged = configuration != state.configuration
+        if configuration.adaptiveSyncEnabled != state.configuration.adaptiveSyncEnabled {
+            renderDiagnosticsLog.notice("umbra sync active=\(configuration.adaptiveSyncEnabled && !configuration.verticalSyncEnabled)")
+        }
         let presentationClockChanged = shouldUseDisplayLink != state.usesDisplayLink
         state.configuration = configuration
         state.usesDisplayLink = shouldUseDisplayLink
         if configurationChanged {
-            renderDiagnosticsLog.notice("display configuration changed vsync=\(configuration.verticalSyncEnabled) displayLink=\(shouldUseDisplayLink)")
+            renderDiagnosticsLog.notice("display configuration changed vsync=\(configuration.verticalSyncEnabled) umbraSync=\(configuration.adaptiveSyncEnabled) displayLink=\(shouldUseDisplayLink)")
             advancePresentationGenerationLocked()
             updateDesiredLayerConfigurationLocked()
         }
@@ -445,6 +466,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         lock.broadcast()
         lock.unlock()
         renderExecutor.perform { [self] in
+            if active { presentationSummary = PresentationSummary() }
             applyPresentationClockOnExecutor(expectedGeneration: generation)
         }
         if shouldDrain { scheduleDrain() }
@@ -484,7 +506,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         let shouldUseDisplayLink = isCurrent && state.usesDisplayLink
         let displaySyncEnabled = isCurrent
             && state.isPresentationActive
-            && state.configuration.verticalSyncEnabled
+            && state.configuration.displaySyncEnabled
         lock.unlock()
         guard isCurrent else { return }
         layer.displaySyncEnabled = displaySyncEnabled
@@ -521,7 +543,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         }
         let desiredLayerConfiguration = LayerConfiguration(
             color: timedFrame.color,
-            verticalSyncEnabled: state.configuration.verticalSyncEnabled
+            displaySyncEnabled: state.configuration.displaySyncEnabled
         )
         if desiredLayerConfiguration != state.desiredLayerConfiguration {
             state.desiredLayerConfiguration = desiredLayerConfiguration
@@ -564,6 +586,11 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
 
     public func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) {
         lock.withLock { commandCommitHandler = handler }
+    }
+
+    /// Receives one presentation summary line per minute of streaming, for the persistent log.
+    public func installPresentationSummaryHandler(_ handler: @escaping @Sendable (String) -> Void) {
+        lock.withLock { presentationSummaryHandler = handler }
     }
 
     public func installFrameDropHandler(
@@ -1022,6 +1049,14 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             "present window=\(Int((now - d.windowStart) * 1000))ms arrived=\(arrived) callbacks=\(d.callbacks) presented=\(d.presentedFrames) empty=\(d.emptyCallbacks) stale=\(d.staleFrames) drawableWaitMaxMs=\(Int(d.maximumDrawableWait * 1000)) slowDrawableWaits=\(d.slowDrawableWaits) missingDrawables=\(d.missingDrawables) layerReconfig=\(d.layerReconfigurations) maxGapMs=\(Int(d.maximumGap * 1000)) maxEncodeMs=\(Int(d.maximumEncode * 1000)) generation=\(generation)"
         )
         presentationDiagnostics = PresentationDiagnostics(windowStart: now, lastCallback: now)
+        presentationSummary.add(arrived: arrived, window: d)
+        guard now - presentationSummary.windowStart >= 60 else { return }
+        let summary = presentationSummary
+        presentationSummary = PresentationSummary(windowStart: now)
+        let handler = lock.withLock { presentationSummaryHandler }
+        handler(
+            "present summary window=\(Int(now - summary.windowStart))s arrived=\(summary.arrived) presented=\(summary.presented) stale=\(summary.stale) secondsGapOver25ms=\(summary.secondsOver25Milliseconds) secondsGapOver40ms=\(summary.secondsOver40Milliseconds) worstGapMs=\(Int(summary.worstGap * 1000))"
+        )
     }
 
     private func prepareImmediateLayerConfiguration(for queuedFrame: QueuedMetalFrame) -> Bool {
@@ -1032,7 +1067,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         }
         let layerConfiguration = LayerConfiguration(
             color: queuedFrame.frame.color,
-            verticalSyncEnabled: state.configuration.verticalSyncEnabled
+            displaySyncEnabled: state.configuration.displaySyncEnabled
         )
         lock.unlock()
         configureLayerOnExecutor(layerConfiguration)
@@ -1062,7 +1097,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         guard let desiredLayerConfiguration = state.desiredLayerConfiguration else { return }
         let updated = LayerConfiguration(
             color: desiredLayerConfiguration.color,
-            verticalSyncEnabled: state.configuration.verticalSyncEnabled
+            displaySyncEnabled: state.configuration.displaySyncEnabled
         )
         guard updated != desiredLayerConfiguration else { return }
         state.desiredLayerConfiguration = updated
@@ -1109,7 +1144,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     ) async {
         let layerConfiguration = LayerConfiguration(
             color: color,
-            verticalSyncEnabled: configuration.verticalSyncEnabled
+            displaySyncEnabled: configuration.displaySyncEnabled
         )
         await withCheckedContinuation { continuation in
             renderExecutor.perform { [self] in
@@ -1124,7 +1159,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
 
         let color = layerConfiguration.color
         let useEDR = color.isHDR
-        layer.displaySyncEnabled = layerConfiguration.verticalSyncEnabled
+        layer.displaySyncEnabled = layerConfiguration.displaySyncEnabled
         layer.wantsExtendedDynamicRangeContent = useEDR
         if useEDR {
             layer.pixelFormat = .rgba16Float
@@ -1356,6 +1391,26 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
 }
 
 private let renderDiagnosticsLog = Logger(subsystem: "app.umbra.Umbra", category: "render-diagnostics")
+
+/// One minute of one-second presentation windows, reduced to the stutter evidence worth keeping.
+private struct PresentationSummary {
+    var windowStart: CFTimeInterval = CACurrentMediaTime()
+    var arrived = 0
+    var presented = 0
+    var stale = 0
+    var secondsOver25Milliseconds = 0
+    var secondsOver40Milliseconds = 0
+    var worstGap: CFTimeInterval = 0
+
+    mutating func add(arrived: Int, window: PresentationDiagnostics) {
+        self.arrived += arrived
+        presented += window.presentedFrames
+        stale += window.staleFrames
+        if window.maximumGap >= 0.025 { secondsOver25Milliseconds += 1 }
+        if window.maximumGap >= 0.040 { secondsOver40Milliseconds += 1 }
+        worstGap = max(worstGap, window.maximumGap)
+    }
+}
 
 /// Rolling one-second presentation counters used to diagnose stream stutter.
 private struct PresentationDiagnostics {

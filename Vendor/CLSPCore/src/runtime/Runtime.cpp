@@ -50,6 +50,7 @@
   #include <pthread.h>
   #include <sys/event.h>
   #include <sys/socket.h>
+  #include <sys/sysctl.h>
   #include <sys/time.h>
   #include <unistd.h>
   #include <wolfssl/options.h>
@@ -67,6 +68,9 @@ namespace umbra::lsp {
     constexpr std::size_t maximum_control_payload = 1'100;  ///< DTLS-safe deterministic-CBOR payload ceiling.
     constexpr std::size_t maximum_control_frame = lumen::lsp::lspc_header_size + maximum_control_payload;
     constexpr std::size_t receive_batch_size = 64;  ///< Initial bounded receive batch.
+    constexpr std::size_t backlog_drain_batches = 8;  ///< Extra batches per turn while the socket stays full.
+    constexpr std::uint64_t slow_worker_turn_microseconds = 5'000;  ///< Turn length counted as a stall.
+    constexpr std::uint64_t worker_turn_report_microseconds = 10'000'000;  ///< Turn statistics log cadence.
     constexpr std::size_t control_queue_capacity = 64;  ///< Bounded pre-wire control queue.
     constexpr std::size_t capture_queue_capacity = 4'096;  ///< Bounded allocation-free Apple capture ring.
     constexpr std::size_t safe_udp_payload = 1'200;  ///< Mandatory LSP/1 unprobed UDP payload.
@@ -2332,6 +2336,15 @@ namespace umbra::lsp {
     }
 
     /** @brief Return the local-interface UDP payload limit advertised to the host. */
+    [[nodiscard]] std::uint32_t receive_buffer_bytes() const noexcept {
+      return receive_buffer_bytes_.load(std::memory_order_acquire);
+    }
+
+    void take_worker_turn_summary(std::uint64_t &max_turn_microseconds, std::uint64_t &slow_turns) noexcept {
+      max_turn_microseconds = published_max_turn_microseconds_.exchange(0U, std::memory_order_relaxed);
+      slow_turns = published_slow_turns_.exchange(0U, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] std::uint16_t local_udp_payload_limit() const noexcept {
       return local_udp_payload_limit_.load(std::memory_order_acquire);
     }
@@ -4245,6 +4258,19 @@ namespace umbra::lsp {
           ::close(descriptor);
           continue;
         }
+        // The client ranked a better interface than the default route; pin egress to it
+        // before connect so source-address selection and every datagram use that link.
+        if (endpoint.bound_interface_index != 0) {
+          const int interface_index = endpoint.bound_interface_index;
+          const auto bound = candidate->ai_family == AF_INET6 ?
+            setsockopt(descriptor, IPPROTO_IPV6, IPV6_BOUND_IF, &interface_index, sizeof(interface_index)) :
+            setsockopt(descriptor, IPPROTO_IP, IP_BOUND_IF, &interface_index, sizeof(interface_index));
+          if (bound != 0) {
+            os_log_error(OS_LOG_DEFAULT, "LSP UDP interface binding failed: index=%{public}d errno=%{public}d", interface_index, errno);
+            ::close(descriptor);
+            continue;
+          }
+        }
         const auto flags = fcntl(descriptor, F_GETFL, 0);
         if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
           os_log_error(OS_LOG_DEFAULT, "LSP UDP nonblocking setup failed: errno=%{public}d", errno);
@@ -4290,6 +4316,7 @@ namespace umbra::lsp {
         return CLSP_STATUS_SOCKET_FAILURE;
       }
 
+      receive_buffer_bytes_.store(enlarge_receive_buffer(socket_), std::memory_order_release);
 #ifdef SO_TIMESTAMP_MONOTONIC
       const int enabled = 1;
       (void)setsockopt(socket_, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &enabled, sizeof(enabled));
@@ -4362,6 +4389,41 @@ namespace umbra::lsp {
     }
 
     /**
+     * @brief Grow SO_RCVBUF to the largest size the kernel accepts. The default
+     * net.inet.udp.recvspace holds only a few milliseconds of a high-bitrate
+     * video burst, so any worker hiccup overflows it and drops datagrams.
+     */
+    [[nodiscard]] static std::uint32_t enlarge_receive_buffer(const int descriptor) noexcept {
+      int initial = 0;
+      socklen_t initial_size = sizeof(initial);
+      (void)getsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &initial, &initial_size);
+      // kern.ipc.maxsockbuf bounds the request; the kernel's real ceiling sits a
+      // little lower (mbuf overhead), so step down until setsockopt accepts it.
+      std::uint64_t maximum = 0;
+      std::size_t maximum_size = sizeof(maximum);
+      if (sysctlbyname("kern.ipc.maxsockbuf", &maximum, &maximum_size, nullptr, 0) != 0 || maximum == 0) {
+        maximum = 8U * 1'024U * 1'024U;
+      }
+      maximum = std::min<std::uint64_t>(maximum, static_cast<std::uint64_t>(std::numeric_limits<int>::max()));
+      const auto step = std::max<std::uint64_t>(maximum / 32U, 64U * 1'024U);
+      for (auto candidate = maximum; candidate > static_cast<std::uint64_t>(initial); candidate -= std::min(step, candidate)) {
+        const auto requested = static_cast<int>(candidate);
+        if (setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) == 0) break;
+      }
+      int achieved = 0;
+      socklen_t achieved_size = sizeof(achieved);
+      (void)getsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &achieved, &achieved_size);
+      os_log_info(
+        OS_LOG_DEFAULT,
+        "LSP UDP receive buffer: initial=%{public}d achieved=%{public}d maxsockbuf=%{public}llu",
+        initial,
+        achieved,
+        static_cast<unsigned long long>(maximum)
+      );
+      return achieved > 0 ? static_cast<std::uint32_t>(achieved) : 0U;
+    }
+
+    /**
      * @brief Run the worker under a Mach real-time constraint so frame delivery is never queued
      * behind time-shared threads. The kernel demotes the thread if it overruns its budget.
      */
@@ -4372,17 +4434,23 @@ namespace umbra::lsp {
       const auto ticks = [&](const std::uint64_t nanoseconds) {
         return static_cast<std::uint32_t>(nanoseconds * timebase.denom / timebase.numer);
       };
+      // Size the budget to one full receive batch: authenticating 64 jumbo datagrams costs
+      // about 2 ms with portable AES-GCM, and a turn that routinely overran a 0.5 ms
+      // computation was preempted mid-batch while the socket kept filling.
       thread_time_constraint_policy_data_t policy {};
       policy.period = 0;
-      policy.computation = ticks(500'000);
-      policy.constraint = ticks(1'000'000);
+      policy.computation = ticks(2'000'000);
+      policy.constraint = ticks(4'000'000);
       policy.preemptible = 1;
-      (void)thread_policy_set(
+      const auto result = thread_policy_set(
         pthread_mach_thread_np(pthread_self()),
         THREAD_TIME_CONSTRAINT_POLICY,
         reinterpret_cast<thread_policy_t>(&policy),
         THREAD_TIME_CONSTRAINT_POLICY_COUNT
       );
+      if (result != KERN_SUCCESS) {
+        os_log_error(OS_LOG_DEFAULT, "LSP worker real-time policy rejected: kern=%{public}d", result);
+      }
 #endif
     }
 
@@ -4417,10 +4485,11 @@ namespace umbra::lsp {
           fail_worker(CLSP_STATUS_SOCKET_FAILURE);
           return;
         }
+        turn_timing_ = {.started = monotonic_microseconds()};
         if (count > 0) {
           for (int index = 0; index < count; ++index) {
             if (events[static_cast<std::size_t>(index)].filter == EVFILT_READ) {
-              status = drain_socket();
+              status = timed_drain_socket();
               last_dtls_progress = monotonic_microseconds();
               if (status != CLSP_STATUS_OK) {
                 fail_worker(status);
@@ -4512,10 +4581,20 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
-        status = process_deferred_video_batch();
+        status = timed_process_deferred_video_batch();
         if (status != CLSP_STATUS_OK) {
           fail_worker(status);
           return;
+        }
+        // Input and control went first; now empty a backlog before housekeeping so a frame
+        // burst never waits a whole turn per 64 datagrams while the kernel buffer fills.
+        for (std::size_t extra = 0; socket_backlogged_ && extra < backlog_drain_batches; ++extra) {
+          status = timed_drain_socket();
+          if (status == CLSP_STATUS_OK) status = timed_process_deferred_video_batch();
+          if (status != CLSP_STATUS_OK) {
+            fail_worker(status);
+            return;
+          }
         }
         const auto peer_liveness_now = monotonic_microseconds();
         if (active_stream_peer_timed_out(peer_liveness_now)) {
@@ -4523,7 +4602,9 @@ namespace umbra::lsp {
           return;
         }
         deliver_path_probe_events();
+        const auto deliver_started = monotonic_microseconds();
         deliver_video_frames();
+        turn_timing_.deliver += monotonic_microseconds() - deliver_started;
         if (video_configured_.load(std::memory_order_acquire)) {
           const auto video_now = monotonic_microseconds();
           expire_video_frames(video_now);
@@ -4566,8 +4647,110 @@ namespace umbra::lsp {
           return;
         }
         flush_telemetry(transport_now);
+        record_worker_turn();
       }
       flush_telemetry(monotonic_microseconds(), true);
+    }
+
+    /** @brief Per-turn phase durations of the authenticated worker loop. */
+    struct WorkerTurnTiming {
+      std::uint64_t started = 0;
+      std::uint64_t drain = 0;
+      std::uint64_t deferred = 0;  ///< Deferred video, including decrypt.
+      std::uint64_t decrypt = 0;  ///< SRTP authentication and decryption inside `deferred`.
+      std::uint64_t deliver = 0;
+    };
+
+    /** @brief Ten-second high-water marks that expose a worker stall on the next stream. */
+    struct WorkerTurnStatistics {
+      std::uint64_t window_started = 0;
+      std::uint64_t turns = 0;
+      std::uint64_t slow_turns = 0;
+      std::uint64_t backlogged_turns = 0;
+      WorkerTurnTiming slowest {};
+      std::uint64_t slowest_total = 0;
+      std::uint64_t longest_backlog_wait = 0;
+      int lowest_slow_priority = std::numeric_limits<int>::max();
+    };
+
+    [[nodiscard]] clsp_status_t timed_drain_socket() noexcept {
+      const auto started = monotonic_microseconds();
+      if (backlog_marked_at_ != 0U) {
+        turn_statistics_.longest_backlog_wait =
+          std::max(turn_statistics_.longest_backlog_wait, started - backlog_marked_at_);
+        backlog_marked_at_ = 0U;
+      }
+      const auto status = drain_socket();
+      turn_timing_.drain += monotonic_microseconds() - started;
+      return status;
+    }
+
+    [[nodiscard]] clsp_status_t timed_process_deferred_video_batch() noexcept {
+      const auto started = monotonic_microseconds();
+      const auto status = process_deferred_video_batch();
+      turn_timing_.deferred += monotonic_microseconds() - started;
+      return status;
+    }
+
+    /** @brief Current scheduling priority; real-time threads run at 97 or above. */
+    static int worker_priority() noexcept {
+      thread_extended_info_data_t info {};
+      mach_msg_type_number_t count = THREAD_EXTENDED_INFO_COUNT;
+      return thread_info(
+               pthread_mach_thread_np(pthread_self()),
+               THREAD_EXTENDED_INFO,
+               reinterpret_cast<thread_info_t>(&info),
+               &count
+             ) == KERN_SUCCESS ? info.pth_curpri : -1;
+    }
+
+    void record_worker_turn() noexcept {
+      const auto now = monotonic_microseconds();
+      const auto total = now - turn_timing_.started;
+      auto &statistics = turn_statistics_;
+      if (statistics.window_started == 0U) statistics.window_started = now;
+      ++statistics.turns;
+      if (socket_backlogged_) {
+        ++statistics.backlogged_turns;
+        backlog_marked_at_ = now;
+      }
+      if (total > published_max_turn_microseconds_.load(std::memory_order_relaxed)) {
+        published_max_turn_microseconds_.store(total, std::memory_order_relaxed);
+      }
+      if (total >= slow_worker_turn_microseconds) {
+        published_slow_turns_.fetch_add(1U, std::memory_order_relaxed);
+        ++statistics.slow_turns;
+        statistics.lowest_slow_priority = std::min(statistics.lowest_slow_priority, worker_priority());
+      }
+      if (total > statistics.slowest_total) {
+        statistics.slowest_total = total;
+        statistics.slowest = turn_timing_;
+      }
+      if (now - statistics.window_started < worker_turn_report_microseconds) return;
+      os_log_info(
+        OS_LOG_DEFAULT,
+        "LSP worker turns=%{public}llu slow=%{public}llu backlogged=%{public}llu maxTurnUs=%{public}llu "
+        "drainUs=%{public}llu deferredUs=%{public}llu decryptUs=%{public}llu reassemblyUs=%{public}llu "
+        "deliverUs=%{public}llu controlTimerUs=%{public}llu maxBacklogWaitUs=%{public}llu "
+        "priority=%{public}d slowTurnMinPriority=%{public}d",
+        static_cast<unsigned long long>(statistics.turns),
+        static_cast<unsigned long long>(statistics.slow_turns),
+        static_cast<unsigned long long>(statistics.backlogged_turns),
+        static_cast<unsigned long long>(statistics.slowest_total),
+        static_cast<unsigned long long>(statistics.slowest.drain),
+        static_cast<unsigned long long>(statistics.slowest.deferred),
+        static_cast<unsigned long long>(statistics.slowest.decrypt),
+        static_cast<unsigned long long>(statistics.slowest.deferred - std::min(statistics.slowest.deferred, statistics.slowest.decrypt)),
+        static_cast<unsigned long long>(statistics.slowest.deliver),
+        static_cast<unsigned long long>(
+          statistics.slowest_total -
+          std::min(statistics.slowest_total, statistics.slowest.drain + statistics.slowest.deferred + statistics.slowest.deliver)
+        ),
+        static_cast<unsigned long long>(statistics.longest_backlog_wait),
+        worker_priority(),
+        statistics.slow_turns == 0U ? -1 : statistics.lowest_slow_priority
+      );
+      statistics = {.window_started = now};
     }
 
     /** @brief Drain up to the bounded initial receive batch from the UDP socket. */
@@ -4578,8 +4761,11 @@ namespace umbra::lsp {
       std::size_t drained_datagrams = 0U;
       bool batch_used_kernel_timestamp = false;
       bool batch_used_fallback_timestamp = false;
+      // Cleared only when the kernel reports the socket empty; a full batch means more is queued.
+      socket_backlogged_ = true;
       for (std::size_t index = 0; index < receive_batch_size; ++index) {
-        std::array<std::uint8_t, maximum_udp_payload> fallback_packet {};
+        // Reused rather than zeroed per datagram: recvmsg overwrites exactly what is read.
+        auto &fallback_packet = fallback_receive_buffer_;
         VideoReceiveLease receive_lease;
         auto receive_storage = std::span<std::uint8_t> {fallback_packet};
         if (video_configured_.load(std::memory_order_acquire) &&
@@ -4597,7 +4783,10 @@ namespace umbra::lsp {
         auto arrival_microseconds = monotonic_microseconds();
         auto kernel_timestamped = false;
         if (received < 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            socket_backlogged_ = false;
+            break;
+          }
           // A connected UDP socket reports ICMP feedback on the next receive. "Packet too big"
           // answers an oversize don't-fragment probe, and unreachable errors are transient path
           // events; neither means the socket is dead.
@@ -4934,7 +5123,9 @@ namespace umbra::lsp {
         std::copy(datagram.end() - 16, datagram.end(), authentication_tag.begin());
         auto packet_length = datagram.size();
         bool replay = false;
+        const auto decrypt_started = monotonic_microseconds();
         const auto unprotect_status = srtp_.unprotect_video(receive_storage, packet_length, false, replay);
+        turn_timing_.decrypt += monotonic_microseconds() - decrypt_started;
         if (unprotect_status != CLSP_STATUS_OK) {
           timing_distributions_[CLSP_NATIVE_TIMING_RECEIVE_TO_AUTH].drop(
             deferred.kernel_timestamped ? CLSP_NATIVE_TIMING_KERNEL_TIMESTAMPED :
@@ -10256,6 +10447,7 @@ namespace umbra::lsp {
       static_cast<std::uint16_t>(standard_udp_payload)
     };  ///< Connected-interface DPLPMTUD ceiling advertised to the host.
     std::atomic<std::uint16_t> receive_udp_payload_size_ {1'200};  ///< Independently confirmed host-to-client ceiling.
+    std::atomic<std::uint32_t> receive_buffer_bytes_ {0};  ///< Achieved SO_RCVBUF of the open socket.
     std::atomic<std::uint32_t> authenticated_connection_generation_ {0};  ///< Published SERVER_HELLO generation.
     std::atomic<std::uint64_t> emitted_path_probe_id_ {0};  ///< Native probe offered to Swift.
     std::atomic<std::uint16_t> emitted_path_probe_size_ {0};  ///< Offered protected payload size.
@@ -10298,6 +10490,13 @@ namespace umbra::lsp {
     clsp_microphone_configuration_t microphone_configuration_ {};  ///< Installed reverse microphone tuple.
     PendingProtectedMicrophone pending_microphone_ {};  ///< Exact protected RTP retry state.
     std::array<DeferredVideoDatagram, receive_batch_size> deferred_video_ {};  ///< Current bounded priority batch.
+    std::array<std::uint8_t, maximum_udp_payload> fallback_receive_buffer_ {};  ///< Non-pooled datagram storage.
+    bool socket_backlogged_ = false;  ///< Last drain stopped at the batch bound, not an empty socket.
+    std::uint64_t backlog_marked_at_ = 0;  ///< When a turn ended with datagrams still queued.
+    WorkerTurnTiming turn_timing_ {};  ///< Phases of the current worker turn.
+    WorkerTurnStatistics turn_statistics_ {};  ///< Ten-second worker stall evidence.
+    std::atomic<std::uint64_t> published_max_turn_microseconds_ {0};  ///< Longest turn since the last read.
+    std::atomic<std::uint64_t> published_slow_turns_ {0};  ///< Turns of 5 ms or more since the last read.
     std::size_t deferred_video_count_ {};  ///< Protected video packets collected this worker turn.
     std::array<lumen::lsp::packet_slab<maximum_microphone_opus_bytes>, microphone_queue_capacity> microphone_queue_ {};  ///< Complete Opus SPSC queue.
     std::array<InputSentPacket, input_feedback_ledger_capacity>
@@ -10622,6 +10821,16 @@ namespace umbra::lsp {
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED :
                               impl_->confirm_path_probe(probe_id, received_payload_size);
+  }
+
+  void Runtime::take_worker_turn_summary(std::uint64_t &max_turn_microseconds, std::uint64_t &slow_turns) noexcept {
+    max_turn_microseconds = 0;
+    slow_turns = 0;
+    if (impl_ != nullptr) impl_->take_worker_turn_summary(max_turn_microseconds, slow_turns);
+  }
+
+  std::uint32_t Runtime::receive_buffer_bytes() const noexcept {
+    return impl_ == nullptr ? 0U : impl_->receive_buffer_bytes();
   }
 
   std::uint16_t Runtime::local_udp_payload_limit() const noexcept {
