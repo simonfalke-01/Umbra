@@ -1387,7 +1387,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         genlockTargetOffset = (targetMilliseconds ?? 0.05) / 1000
         let slackMilliseconds = defaults.object(forKey: "UmbraGenlockSlackMs") as? Double
         // Half a refresh at most: beyond that the wrapped error can no longer tell early from late.
-        genlockDesiredSlack = min(0.004, max(0.0003, (slackMilliseconds ?? 3.0) / 1000))
+        genlockDesiredSlack = min(0.004, max(0.0003, (slackMilliseconds ?? 1.5) / 1000))
         if presentMode != .genlock, presentMode != .vrrpaced, genlockWasActive, let period = vblankClock.refreshPeriod ?? Optional(1.0 / 120) {
             genlockWasActive = false
             let handler = lock.withLock { genlockReportHandler }
