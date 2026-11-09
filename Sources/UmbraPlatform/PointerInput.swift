@@ -462,15 +462,20 @@ public enum VideoScalingMode: Equatable, Sendable {
 
 public struct VideoGeometry: Equatable, Sendable {
     public var contentSize: CGSize
+    /// Where the content area starts in view coordinates, for a view larger than its video
+    /// area (a full-screen layer with the video below a camera housing).
+    public var contentOrigin: CGPoint
     public var videoSize: CGSize
     public var scalingMode: VideoScalingMode
 
     public init(
         contentSize: CGSize,
         videoSize: CGSize,
-        scalingMode: VideoScalingMode = .aspectFit
+        scalingMode: VideoScalingMode = .aspectFit,
+        contentOrigin: CGPoint = .zero
     ) {
         self.contentSize = contentSize
+        self.contentOrigin = contentOrigin
         self.videoSize = videoSize
         self.scalingMode = scalingMode
     }
@@ -480,13 +485,13 @@ public struct VideoGeometry: Equatable, Sendable {
               videoSize.width > 0, videoSize.height > 0
         else { return .zero }
         if scalingMode == .aspectFill {
-            return CGRect(origin: .zero, size: contentSize)
+            return CGRect(origin: contentOrigin, size: contentSize)
         }
         let scale = min(contentSize.width / videoSize.width, contentSize.height / videoSize.height)
         let size = CGSize(width: videoSize.width * scale, height: videoSize.height * scale)
         return CGRect(
-            x: (contentSize.width - size.width) / 2,
-            y: (contentSize.height - size.height) / 2,
+            x: contentOrigin.x + (contentSize.width - size.width) / 2,
+            y: contentOrigin.y + (contentSize.height - size.height) / 2,
             width: size.width,
             height: size.height
         )
@@ -539,10 +544,11 @@ public struct VideoGeometry: Equatable, Sendable {
             return CGPoint(x: x, y: min(max(rawY, 0), 1))
         }
 
-        var x = min(max(point.x / contentSize.width, 0), 1)
+        let local = CGPoint(x: point.x - contentOrigin.x, y: point.y - contentOrigin.y)
+        var x = min(max(local.x / contentSize.width, 0), 1)
         var y = flippedCoordinates
-            ? min(max(point.y / contentSize.height, 0), 1)
-            : min(max((contentSize.height - point.y) / contentSize.height, 0), 1)
+            ? min(max(local.y / contentSize.height, 0), 1)
+            : min(max((contentSize.height - local.y) / contentSize.height, 0), 1)
         let sourceAspect = videoSize.width / videoSize.height
         let destinationAspect = contentSize.width / contentSize.height
         if sourceAspect > destinationAspect {

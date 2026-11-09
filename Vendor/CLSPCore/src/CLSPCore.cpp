@@ -3182,6 +3182,22 @@ extern "C" clsp_status_t clsp_core_report_video_commit(
   });
 }
 
+extern "C" clsp_status_t clsp_core_report_genlock(
+  clsp_core_t *core,
+  const std::uint64_t refresh_period_ns,
+  const std::int64_t phase_correction_ns,
+  const std::uint64_t frame_id,
+  const std::uint8_t active
+) {
+  if (core == nullptr || active > 1U || refresh_period_ns < 2'000'000U || refresh_period_ns > 50'000'000U ||
+      phase_correction_ns <= -50'000'000 || phase_correction_ns >= 50'000'000) {
+    return CLSP_STATUS_INVALID_ARGUMENT;
+  }
+  return with_runtime(core, [&](umbra::lsp::Runtime &runtime) {
+    return runtime.report_genlock(refresh_period_ns, phase_correction_ns, frame_id, active == 1U);
+  });
+}
+
 extern "C" clsp_status_t clsp_core_submit_pointer(
   clsp_core_t *core,
   const clsp_pointer_sample_t *sample

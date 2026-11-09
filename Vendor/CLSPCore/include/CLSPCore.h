@@ -1423,6 +1423,16 @@ extern "C" {
     uint8_t render_mailbox_occupancy
   );
 
+  /** @brief Queue a genlock correction: the host shifts its frame release by
+   * `phase_correction_ns` (positive is later) so frames reach the client just before scanout. */
+  clsp_status_t clsp_core_report_genlock(
+    clsp_core_t *core,
+    uint64_t refresh_period_ns,
+    int64_t phase_correction_ns,
+    uint64_t frame_id,
+    uint8_t active
+  );
+
   /** @brief Install one exact authenticated input-only START_RESPONSE mapping. */
   clsp_status_t clsp_core_configure_input(
     clsp_core_t *core,

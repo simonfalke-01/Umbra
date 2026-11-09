@@ -1315,6 +1315,22 @@ public final class LSPTransport: @unchecked Sendable {
         ))
     }
 
+    /// Queues one genlock correction for the next protected LSPT packet.
+    public func reportGenlock(
+        refreshPeriodNanoseconds: UInt64,
+        phaseCorrectionNanoseconds: Int64,
+        frameID: UInt64,
+        active: Bool
+    ) throws {
+        try Self.requireSuccess(clsp_core_report_genlock(
+            core,
+            refreshPeriodNanoseconds,
+            phaseCorrectionNanoseconds,
+            frameID,
+            active ? 1 : 0
+        ))
+    }
+
     /// Reports one actual Metal command-buffer commit.
     public func reportVideoCommit(
         videoGeneration: UInt32,

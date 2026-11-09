@@ -208,6 +208,14 @@ namespace umbra::lsp {
       std::uint8_t render_mailbox_occupancy
     ) noexcept;
 
+    /** @brief Queue the newest genlock presentation-phase correction for LSPT. */
+    [[nodiscard]] clsp_status_t report_genlock(
+      std::uint64_t refresh_period_ns,
+      std::int64_t phase_correction_ns,
+      std::uint64_t frame_id,
+      bool active
+    ) noexcept;
+
     /** @brief Update native LSPV Metal-commit state. */
     [[nodiscard]] clsp_status_t report_video_commit(
       std::uint32_t video_generation,

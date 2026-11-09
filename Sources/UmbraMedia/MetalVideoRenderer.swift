@@ -3,6 +3,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import ObjectiveC
 import OSLog
 import QuartzCore
 import simd
@@ -14,17 +15,22 @@ public struct MetalDisplayConfiguration: Sendable, Equatable {
     /// link or pacing wait, but display sync stays on so a variable-refresh panel refreshes when
     /// each frame lands instead of tearing mid-scan.
     public var adaptiveSyncEnabled: Bool
+    /// The target display shows Display P3. SDR frames are then converted from Rec. 709 in the
+    /// shader rather than by WindowServer color matching, which composites every frame.
+    public var wideGamutDisplay: Bool
     public var clearColor: SIMD4<Double>
 
     public init(
         contentMode: VideoContentMode = .aspectFit,
         verticalSyncEnabled: Bool = true,
         adaptiveSyncEnabled: Bool = false,
+        wideGamutDisplay: Bool = false,
         clearColor: SIMD4<Double> = SIMD4(0, 0, 0, 1)
     ) {
         self.contentMode = contentMode
         self.verticalSyncEnabled = verticalSyncEnabled
         self.adaptiveSyncEnabled = adaptiveSyncEnabled
+        self.wideGamutDisplay = wideGamutDisplay
         self.clearColor = clearColor
     }
 
@@ -55,6 +61,8 @@ private struct MetalFragmentUniforms {
     var matrix: simd_float3x3
     /// xyz is the YCbCr offset; w is 0 for SDR, 1 for PQ, and 2 for HLG.
     var offsetAndTransfer: SIMD4<Float>
+    /// x is 1 when SDR output is converted from Rec. 709 to Display P3 primaries.
+    var output: SIMD4<Float>
 }
 
 private final class MetalRenderRunLoopExecutor: @unchecked Sendable {
@@ -254,6 +262,33 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     private var displayLink: CAMetalDisplayLink?
     /// Per-second presentation diagnostics; touched only on the render executor.
     private var presentationDiagnostics = PresentationDiagnostics()
+    /// Where the video sits inside the drawable, normalized with a top-left origin. The layer
+    /// covers the whole screen so it can be scanned out directly; the video may sit in a smaller
+    /// safe area below a camera housing, with the rest cleared to black.
+    private var videoContentRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    /// Live presentation experiment for Umbra Sync, read once a second from the
+    /// `UmbraPresentMode` default (`vrr`, `immediate`, or `scanline`); render executor only.
+    private var presentMode = UmbraPresentMode.vrr
+    private var scanlineLead: CFTimeInterval = 0.0012
+    private var minimumOnGlassDuration: CFTimeInterval = 1.0 / 120
+    private var layerExperimentState = ""
+    private var gpuPriority: UInt32 = 0
+    private var attimeTarget: CFTimeInterval?
+    private var genlockReportHandler: @Sendable (GenlockReport) -> Void = { _ in }
+    /// Genlock controller state; render executor only.
+    private var genlockFlipSamples: [CFTimeInterval] = []
+    private var genlockFlipEstimate: CFTimeInterval = 0.0028
+    private var genlockSlackSamples: [CFTimeInterval] = []
+    private var genlockLastReport: CFTimeInterval = 0
+    private var genlockTargetOffset: CFTimeInterval = 0.00005
+    private var genlockDesiredSlack: CFTimeInterval = 0.003
+    private var genlockWasActive = false
+    private var lastSyncedDeadline: CFTimeInterval = 0
+    /// UmbraSyncedLeadMs override for the commit lead; nil aims commits at WindowServer's update.
+    private var syncedCommitLeadOverride: CFTimeInterval?
+    /// Time left for the draw before a hardware-scheduled flip.
+    private static let attimeRenderMargin: CFTimeInterval = 0.0015
+    private let vblankClock = VBlankClock()
     /// Per-minute rollup of the one-second windows; touched only on the render executor.
     private var presentationSummary = PresentationSummary()
     private var presentationSummaryHandler: @Sendable (String) -> Void = { _ in }
@@ -325,9 +360,16 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         super.init()
         layer.device = device
         layer.framebufferOnly = true
-        // Frames present immediately and the newest always wins, so a third drawable adds no
-        // queueing; with two, nextDrawable blocks up to a refresh while the compositor holds both.
-        layer.maximumDrawableCount = 3
+        layer.maximumDrawableCount = Self.drawableCount(for: configuration)
+        // Live experiment: private presentation-path switches, applied before the first drawable
+        // so the render server builds the layer's swap path with them.
+        let launchDefaults = UserDefaults.standard
+        for (key, defaultsKey) in [("serverSyncEnabled", "UmbraLayerServerSync"), ("lowLatency", "UmbraLayerLowLatency"), ("fenceEnabled", "UmbraLayerFence")] {
+            if let requested = launchDefaults.object(forKey: defaultsKey) as? Bool,
+               layer.responds(to: NSSelectorFromString(key)) {
+                layer.setValue(requested, forKey: key)
+            }
+        }
         layer.allowsNextDrawableTimeout = true
         layer.presentsWithTransaction = false
         layer.displaySyncEnabled = presentationActive && configuration.displaySyncEnabled
@@ -500,6 +542,12 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         displayLinkGeneration = expectedGeneration
     }
 
+    /// A third drawable keeps nextDrawable from blocking while one frame is on glass and the
+    /// next is in flight; the renderer always draws the newest arrival.
+    static func drawableCount(for configuration: MetalDisplayConfiguration) -> Int {
+        3
+    }
+
     private func applyPresentationClockOnExecutor(expectedGeneration: UInt64) {
         lock.lock()
         let isCurrent = state.presentationGeneration == expectedGeneration
@@ -507,9 +555,14 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         let displaySyncEnabled = isCurrent
             && state.isPresentationActive
             && state.configuration.displaySyncEnabled
+        let drawableCount = Self.drawableCount(for: state.configuration)
+        let forcesUnsynced = presentModeForcesUnsynced(state.configuration)
         lock.unlock()
         guard isCurrent else { return }
-        layer.displaySyncEnabled = displaySyncEnabled
+        layer.displaySyncEnabled = displaySyncEnabled && !forcesUnsynced
+        if layer.maximumDrawableCount != drawableCount {
+            layer.maximumDrawableCount = drawableCount
+        }
         if shouldUseDisplayLink {
             installDisplayLinkOnExecutor(expectedGeneration: expectedGeneration)
         } else if let displayLink {
@@ -519,10 +572,15 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         }
     }
 
-    public func updateLayerGeometry(size: CGSize, contentsScale: CGFloat) {
+    public func updateLayerGeometry(
+        size: CGSize,
+        contentsScale: CGFloat,
+        videoContentRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    ) {
         renderExecutor.perform { [self] in
             layer.contentsScale = contentsScale
             layer.drawableSize = size
+            self.videoContentRect = videoContentRect
         }
     }
 
@@ -591,6 +649,10 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     /// Receives one presentation summary line per minute of streaming, for the persistent log.
     public func installPresentationSummaryHandler(_ handler: @escaping @Sendable (String) -> Void) {
         lock.withLock { presentationSummaryHandler = handler }
+    }
+
+    public func installGenlockReportHandler(_ handler: @escaping @Sendable (GenlockReport) -> Void) {
+        lock.withLock { genlockReportHandler = handler }
     }
 
     public func installFrameDropHandler(
@@ -773,12 +835,17 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             width: CVPixelBufferGetWidth(frame.imageBuffer),
             height: CVPixelBufferGetHeight(frame.imageBuffer)
         )
+        let content = videoContentRect
         let quad = VideoGeometry.quad(
             source: sourceSize,
-            destination: layer.drawableSize,
+            destination: CGSize(
+                width: layer.drawableSize.width * content.width,
+                height: layer.drawableSize.height * content.height
+            ),
             mode: configuration.contentMode
         )
-        let vertices = Self.vertices(for: quad)
+        let vertices = Self.vertices(for: quad, in: content)
+        let umbraSync = configuration.adaptiveSyncEnabled && !configuration.verticalSyncEnabled
         let renderPass = MTLRenderPassDescriptor()
         renderPass.colorAttachments[0].texture = drawable.texture
         renderPass.colorAttachments[0].loadAction = .clear
@@ -820,7 +887,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentTexture(lumaTexture, index: 0)
             encoder.setFragmentTexture(chromaTexture, index: 1)
-            var uniforms = Self.uniforms(for: frame.color)
+            var uniforms = Self.uniforms(for: frame.color, wideGamutDisplay: configuration.wideGamutDisplay)
             encoder.setFragmentBytes(
                 &uniforms,
                 length: MemoryLayout<MetalFragmentUniforms>.stride,
@@ -844,6 +911,12 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             let pipeline = try pipeline(pixelFormat: drawable.texture.pixelFormat, yuv: false)
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentTexture(texture, index: 0)
+            var uniforms = Self.uniforms(for: frame.color, wideGamutDisplay: configuration.wideGamutDisplay)
+            encoder.setFragmentBytes(
+                &uniforms,
+                length: MemoryLayout<MetalFragmentUniforms>.stride,
+                index: 0
+            )
             lease = MetalFrameLease(
                 frame: frame,
                 textures: [textureReference],
@@ -872,6 +945,14 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             }
         case .drop:
             presentationProxy = nil
+        }
+        let gpuCommitTime = CACurrentMediaTime()
+        commandBuffer.addCompletedHandler { [weak self] completedBuffer in
+            let gpuEnd = completedBuffer.gpuEndTime
+            guard gpuEnd > 0 else { return }
+            self?.renderExecutor.perform { [weak self] in
+                self?.recordGPUCompletion(commitToGPUEnd: gpuEnd - gpuCommitTime, gpuTime: gpuEnd - completedBuffer.gpuStartTime)
+            }
         }
         commandBuffer.addCompletedHandler { [self, lease] completedBuffer in
             guard let committedAt = lease.commandCommitTime else { return }
@@ -905,14 +986,66 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         #if DEBUG
         hooks.beforeCommit(frame.frameNumber)
         #endif
+        // Presentation timing runs before the state lock: holds and scanline waits must never
+        // block enqueue, and the genlock report reads the handler under that lock.
+        if umbraSync, suppliedDrawable == nil {
+            let wantsDisplaySync = presentMode == .vrr || presentMode == .vrrmin || presentMode == .vrrpaced
+            if layer.displaySyncEnabled != wantsDisplaySync {
+                layer.displaySyncEnabled = wantsDisplaySync
+            }
+            if presentMode == .genlock {
+                genlockHold(frameNumber: frame.frameNumber)
+            }
+            if presentMode == .vrrpaced {
+                syncedGenlock(frameNumber: frame.frameNumber, latency: frame.latencyMetadata)
+            }
+            if presentMode == .scanline,
+               let scanout = vblankClock.nextScanoutStart(atOrAfter: CACurrentMediaTime() + scanlineLead) {
+                // Commit just early enough for the draw to finish and the immediate flip to land
+                // in the blanking interval before scanout, never mid-scan.
+                Self.wait(until: scanout - scanlineLead)
+            }
+        }
         lock.lock()
         guard acceptsLocked(queuedFrame) else {
             lock.unlock()
             return
         }
+        if case .presentImmediately = pacingDecision {
+            let commitTime = CACurrentMediaTime()
+            let arrivalTime = frame.latencyMetadata.rendererEnqueueTime?.seconds
+            // presentedTime is the real on-glass time; the handler itself runs a few refreshes
+            // later, so it measures latency but must never gate presentation.
+            attimeTarget = umbraSync ? attimeTargetForHandler() : nil
+            drawable.addPresentedHandler { [weak self, flipTarget = attimeTarget] presented in
+                let shownAt = presented.presentedTime
+                if let flipTarget, shownAt > 0 {
+                    self?.renderExecutor.perform { [weak self] in
+                        guard let self, self.presentationDiagnostics.flipErrorSamples.count < 512 else { return }
+                        self.presentationDiagnostics.flipErrorSamples.append(shownAt - flipTarget)
+                    }
+                }
+                self?.renderExecutor.perform { [weak self] in
+                    self?.drawableReachedGlass(shownAt: shownAt, committedAt: commitTime)
+                    if let self, let arrivalTime, shownAt > arrivalTime,
+                       self.presentationDiagnostics.arrivalToGlassSamples.count < 512 {
+                        self.presentationDiagnostics.arrivalToGlassSamples.append(shownAt - arrivalTime)
+                    }
+                }
+            }
+        }
         switch pacingDecision {
         case let .schedule(time): commandBuffer.present(drawable, atTime: time)
-        case .presentImmediately: commandBuffer.present(drawable)
+        case .presentImmediately:
+            if umbraSync, suppliedDrawable == nil, presentMode == .attime, let attimeTarget {
+                commandBuffer.present(drawable, atTime: attimeTarget)
+            } else if umbraSync, suppliedDrawable == nil, presentMode == .vrrmin {
+                // Adaptive-Sync scheduling: show this frame as soon as the previous one has been
+                // on glass for the panel's minimum refresh interval, instead of at a latched vblank.
+                commandBuffer.present(drawable, afterMinimumDuration: minimumOnGlassDuration)
+            } else {
+                commandBuffer.present(drawable)
+            }
         case .drop: break
         }
         let committedAt = lease.stampCommandCommit()
@@ -1037,16 +1170,274 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         }
     }
 
+    /// Runs on the render executor when Core Animation shows (or discards) a drawable.
+    private func drawableReachedGlass(shownAt: CFTimeInterval, committedAt: CFTimeInterval) {
+        if shownAt > 0 {
+            let latency = max(0, shownAt - committedAt)
+            presentationDiagnostics.glassLatencySum += latency
+            if presentationDiagnostics.glassLatencySamples.count < 512 {
+                presentationDiagnostics.glassLatencySamples.append(latency)
+            }
+            if presentMode == .genlock {
+                genlockFlipSamples.append(latency)
+                if genlockFlipSamples.count >= 32 {
+                    // Immediate flips land 1.5 to 5 ms after commit; anything outside that is a
+                    // mis-measured or synced flip and must not move the target.
+                    genlockFlipEstimate = min(0.005, max(0.0015, genlockFlipSamples.sorted()[genlockFlipSamples.count / 2]))
+                    genlockFlipSamples.removeAll(keepingCapacity: true)
+                }
+            }
+            if let phase = vblankClock.scanPhase(at: shownAt) {
+                presentationDiagnostics.flipPhaseBins[min(15, max(0, Int(phase * 16)))] += 1
+            }
+            presentationDiagnostics.glassLatencyCount += 1
+            presentationDiagnostics.maximumGlassLatency = max(presentationDiagnostics.maximumGlassLatency, latency)
+        } else {
+            presentationDiagnostics.unshownPresents += 1
+        }
+    }
+
+    /// Holds an early frame until the commit moment that lands its immediate flip at the target
+    /// scan position, and reports how early frames arrive so the host can shift its release.
+    private func genlockHold(frameNumber: Int) {
+        let now = CACurrentMediaTime()
+        guard let period = vblankClock.refreshPeriod,
+              let scanout = vblankClock.nextScanoutStart(atOrAfter: now + genlockFlipEstimate - genlockTargetOffset) else { return }
+        let commitTarget = scanout + genlockTargetOffset - genlockFlipEstimate
+        // Time until the next commit moment, always in (0, period]: every frame waits for it, so
+        // no flip ever lands mid-scan. The loop steers that wait toward the desired cushion.
+        let wait = commitTarget - now
+        var error = wait - genlockDesiredSlack
+        error -= (error / period).rounded() * period
+        genlockSlackSamples.append(error)
+        presentationDiagnostics.genlockSlackSamples.append(wait)
+        if wait > 0 {
+            Self.wait(until: commitTarget)
+            presentationDiagnostics.genlockHolds += 1
+        }
+        if error < -0.001 {
+            presentationDiagnostics.genlockLate += 1
+        }
+        if now - genlockLastReport >= 0.05, !genlockSlackSamples.isEmpty {
+            // Positive error: frames arrive earlier than the cushion needs, so release later.
+            let correction = genlockSlackSamples.sorted()[genlockSlackSamples.count / 2]
+            genlockSlackSamples.removeAll(keepingCapacity: true)
+            genlockLastReport = now
+            presentationDiagnostics.genlockReports += 1
+            presentationDiagnostics.genlockLastCorrection = correction
+            let handler = lock.withLock { genlockReportHandler }
+            handler(GenlockReport(
+                refreshPeriodNanoseconds: UInt64(period * 1_000_000_000),
+                phaseCorrectionNanoseconds: Int64(max(-0.049, min(0.049, correction)) * 1_000_000_000),
+                frameNumber: frameNumber,
+                active: true
+            ))
+            genlockWasActive = true
+        }
+    }
+
+    /// Synced genlock: frames stay vsync-synced (no tearing) and the host is steered so each one
+    /// arrives `genlockDesiredSlack` before WindowServer's next display update, the latest moment
+    /// a frame still reaches the following refresh. Frames are never held; `holds` counts frames
+    /// that shared a refresh window.
+    private func syncedGenlock(frameNumber: Int, latency: VideoFrameLatencyMetadata) {
+        let now = CACurrentMediaTime()
+        recordStagePhases(latency: latency, commit: now)
+        guard let period = vblankClock.refreshPeriod else { return }
+        // WindowServer runs its display update about 0.5 ms after each vsync, and the frames it
+        // picks up then reach the display controller in time for the next refresh. The deadline
+        // is just after a vsync: one period minus 0.3 ms ahead of the following scanout.
+        let commitLead = syncedCommitLeadOverride ?? (period - 0.0003)
+        guard let scanout = vblankClock.nextScanoutStart(atOrAfter: now + commitLead) else { return }
+        let deadline = scanout - commitLead
+        // Steer from the arrival margin before any hold: a held frame's extra refresh says
+        // nothing about the host's phase and would bias every correction late.
+        let lead = deadline - now
+        if deadline <= lastSyncedDeadline + period * 0.5 {
+            // Two frames in one refresh window. Holding this one would push every later frame
+            // a refresh back too, so it commits now and only the count is kept.
+            presentationDiagnostics.genlockHolds += 1
+        }
+        lastSyncedDeadline = deadline
+        var error = lead - genlockDesiredSlack
+        error -= (error / period).rounded() * period
+        genlockSlackSamples.append(error)
+        presentationDiagnostics.genlockSlackSamples.append(lead)
+        if error < -0.001 {
+            presentationDiagnostics.genlockLate += 1
+        }
+        guard now - genlockLastReport >= 0.05, !genlockSlackSamples.isEmpty else { return }
+        // Positive error: frames arrive earlier than the slack needs, so the host releases later.
+        let correction = genlockSlackSamples.sorted()[genlockSlackSamples.count / 2]
+        genlockSlackSamples.removeAll(keepingCapacity: true)
+        genlockLastReport = now
+        presentationDiagnostics.genlockReports += 1
+        presentationDiagnostics.genlockLastCorrection = correction
+        let handler = lock.withLock { genlockReportHandler }
+        handler(GenlockReport(
+            refreshPeriodNanoseconds: UInt64(period * 1_000_000_000),
+            phaseCorrectionNanoseconds: Int64(max(-0.049, min(0.049, correction)) * 1_000_000_000),
+            frameNumber: frameNumber,
+            active: true
+        ))
+        genlockWasActive = true
+    }
+
+    /// Where each pipeline stage of this frame fell within the refresh, in sixteenths after
+    /// scanout start, and how long decode took: shows whether arrival jitter comes from the
+    /// network or from the Mac.
+    private func recordStagePhases(latency: VideoFrameLatencyMetadata, commit: CFTimeInterval) {
+        func bin(_ time: CFTimeInterval?) -> Int? {
+            guard let time, let phase = vblankClock.scanPhase(at: time) else { return nil }
+            return min(15, max(0, Int(phase * 16)))
+        }
+        if let b = bin(latency.receiveTime?.seconds) { presentationDiagnostics.receivePhaseBins[b] += 1 }
+        if let b = bin(latency.videoToolboxDecodeCompletionTime?.seconds) { presentationDiagnostics.decodedPhaseBins[b] += 1 }
+        if let b = bin(commit) { presentationDiagnostics.commitPhaseBins[b] += 1 }
+        if let submit = latency.videoToolboxSubmitTime, let done = latency.videoToolboxDecodeCompletionTime,
+           let decode = submit.duration(to: done), presentationDiagnostics.decodeSamples.count < 512 {
+            presentationDiagnostics.decodeSamples.append(decode)
+        }
+        if let receive = latency.receiveTime?.seconds, presentationDiagnostics.receiveToCommitSamples.count < 512,
+           commit >= receive {
+            presentationDiagnostics.receiveToCommitSamples.append(commit - receive)
+        }
+    }
+
+    /// The scheduled flip time for the drawable being presented; computed before the presented
+    /// handler is registered, so it reflects this frame.
+    private func attimeTargetForHandler() -> CFTimeInterval? {
+        guard presentMode == .attime,
+              let scanout = vblankClock.nextScanoutStart(atOrAfter: CACurrentMediaTime() + Self.attimeRenderMargin + scanlineLead) else { return nil }
+        return scanout - scanlineLead
+    }
+
+    private func recordGPUCompletion(commitToGPUEnd: CFTimeInterval, gpuTime: CFTimeInterval) {
+        guard presentationDiagnostics.gpuDoneSamples.count < 512 else { return }
+        presentationDiagnostics.gpuDoneSamples.append(commitToGPUEnd)
+        presentationDiagnostics.gpuTimeSamples.append(gpuTime)
+    }
+
+    private static func percentiles(_ samples: [CFTimeInterval], label: String = "glass") -> String {
+        guard !samples.isEmpty else { return "\(label)P50=- \(label)P90=- \(label)P99=-" }
+        let sorted = samples.sorted()
+        func at(_ q: Double) -> String { String(format: "%.2f", sorted[min(sorted.count - 1, Int(Double(sorted.count) * q))] * 1000) }
+        return "\(label)P50=\(at(0.5)) \(label)P90=\(at(0.9)) \(label)P99=\(at(0.99))"
+    }
+
+    private static func wait(until time: CFTimeInterval) {
+        let remaining = time - CACurrentMediaTime()
+        guard remaining > 0, remaining < 0.02 else { return }
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        let ticks = UInt64(remaining * 1_000_000_000 * Double(timebase.denom) / Double(timebase.numer))
+        mach_wait_until(mach_absolute_time() + ticks)
+    }
+
+    /// Private CAMetalLayer switches under live test; applied only when the layer responds.
+    private func applyLayerExperiment(_ key: String, defaultsKey: String, defaults: UserDefaults) -> String {
+        let selector = NSSelectorFromString(key)
+        guard layer.responds(to: selector) else { return "n/a" }
+        if let requested = defaults.object(forKey: defaultsKey) as? Bool {
+            let current = (layer.value(forKey: key) as? Bool) ?? !requested
+            if current != requested { layer.setValue(requested, forKey: key) }
+        }
+        return String(describing: layer.value(forKey: key) ?? "nil")
+    }
+
+    /// Apple GPU queue priority through IOGPUMetalCommandQueue; the driver asserts on any
+    /// foreground value other than 1, 2, or 4, so only those are ever passed.
+    private func applyGPUPriority(_ requested: Int) {
+        let queue = commandQueue as AnyObject
+        let getSelector = NSSelectorFromString("getGPUPriority")
+        let setSelector = NSSelectorFromString("setGPUPriority:")
+        guard queue.responds(to: getSelector), queue.responds(to: setSelector),
+              let queueClass = object_getClass(queue) else { return }
+        typealias Get = @convention(c) (AnyObject, Selector) -> UInt32
+        typealias Set = @convention(c) (AnyObject, Selector, UInt32) -> Void
+        let get = unsafeBitCast(class_getMethodImplementation(queueClass, getSelector), to: Get.self)
+        if [1, 2, 4].contains(requested), get(queue, getSelector) != UInt32(requested) {
+            let set = unsafeBitCast(class_getMethodImplementation(queueClass, setSelector), to: Set.self)
+            set(queue, setSelector, UInt32(requested))
+        }
+        gpuPriority = get(queue, getSelector)
+    }
+
+    /// Umbra Sync's unsynced present modes flip immediately; no layer reconfiguration may turn
+    /// display sync back on underneath them, or those frames take the two-refresh synced path.
+    private func presentModeForcesUnsynced(_ configuration: MetalDisplayConfiguration) -> Bool {
+        configuration.adaptiveSyncEnabled && !configuration.verticalSyncEnabled
+            && presentMode != .vrr && presentMode != .vrrmin && presentMode != .vrrpaced
+    }
+
+    private func refreshPresentMode() {
+        let defaults = UserDefaults.standard
+        applyGPUPriority(defaults.integer(forKey: "UmbraGPUPriority"))
+        layerExperimentState = [
+            "lowLatency=" + applyLayerExperiment("lowLatency", defaultsKey: "UmbraLayerLowLatency", defaults: defaults),
+            "serverSync=" + applyLayerExperiment("serverSyncEnabled", defaultsKey: "UmbraLayerServerSync", defaults: defaults),
+            "fence=" + applyLayerExperiment("fenceEnabled", defaultsKey: "UmbraLayerFence", defaults: defaults),
+            "compositing=" + String(describing: layer.responds(to: NSSelectorFromString("displayCompositingInternalStatus"))
+                ? (layer.value(forKey: "displayCompositingInternalStatus") ?? "nil") : "n/a"),
+        ].joined(separator: " ")
+        let mode = defaults.string(forKey: "UmbraPresentMode").flatMap(UmbraPresentMode.init(rawValue:)) ?? .vrr
+        let leadMilliseconds = defaults.double(forKey: "UmbraScanlineLeadMs")
+        scanlineLead = leadMilliseconds > 0 ? leadMilliseconds / 1000 : 0.0012
+        let targetMilliseconds = defaults.object(forKey: "UmbraGenlockTargetMs") as? Double
+        genlockTargetOffset = (targetMilliseconds ?? 0.05) / 1000
+        let slackMilliseconds = defaults.object(forKey: "UmbraGenlockSlackMs") as? Double
+        // Half a refresh at most: beyond that the wrapped error can no longer tell early from late.
+        genlockDesiredSlack = min(0.004, max(0.0003, (slackMilliseconds ?? 1.5) / 1000))
+        if presentMode != .genlock, presentMode != .vrrpaced, genlockWasActive, let period = vblankClock.refreshPeriod ?? Optional(1.0 / 120) {
+            genlockWasActive = false
+            let handler = lock.withLock { genlockReportHandler }
+            handler(GenlockReport(
+                refreshPeriodNanoseconds: UInt64(period * 1_000_000_000),
+                phaseCorrectionNanoseconds: 0,
+                frameNumber: 0,
+                active: false
+            ))
+        }
+        syncedCommitLeadOverride = (defaults.object(forKey: "UmbraSyncedLeadMs") as? Double)
+            .map { min(0.05, max(0.0005, $0 / 1000)) }
+        let minimumMilliseconds = defaults.double(forKey: "UmbraMinDurationMs")
+        minimumOnGlassDuration = minimumMilliseconds > 0 ? minimumMilliseconds / 1000 : 1.0 / 120
+        guard mode != presentMode else { return }
+        presentMode = mode
+        if mode != .vrr {
+            vblankClock.start(displayID: CGMainDisplayID())
+        } else {
+            vblankClock.stop()
+        }
+        renderDiagnosticsLog.notice("present mode=\(mode.rawValue, privacy: .public) leadMs=\(leadMilliseconds)")
+    }
+
     private func flushPresentationDiagnostics(now: CFTimeInterval) {
         guard now - presentationDiagnostics.windowStart >= 1 else { return }
+        refreshPresentMode()
         lock.lock()
         let arrived = state.diagnosticEnqueuedFrames
         state.diagnosticEnqueuedFrames = 0
         let generation = state.presentationGeneration
         lock.unlock()
         let d = presentationDiagnostics
+        let mode = presentMode.rawValue + " " + layerExperimentState + " gpuPriority=\(gpuPriority) "
+            + Self.percentiles(d.glassLatencySamples) + " "
+            + Self.percentiles(d.gpuDoneSamples, label: "gpuDone") + " "
+            + Self.percentiles(d.gpuTimeSamples, label: "gpuTime") + " "
+            + Self.percentiles(d.flipErrorSamples, label: "flipErr")
+            + " flipPhase16=" + d.flipPhaseBins.map(String.init).joined(separator: ",")
+            + " recvPhase16=" + d.receivePhaseBins.map(String.init).joined(separator: ",")
+            + " decodedPhase16=" + d.decodedPhaseBins.map(String.init).joined(separator: ",")
+            + " commitPhase16=" + d.commitPhaseBins.map(String.init).joined(separator: ",")
+            + " " + Self.percentiles(d.decodeSamples, label: "decode")
+            + " " + Self.percentiles(d.receiveToCommitSamples, label: "recvToCommit")
+            + " " + Self.percentiles(d.arrivalToGlassSamples, label: "arrival")
+            + " " + Self.percentiles(d.genlockSlackSamples, label: "slack")
+            + " holds=\(d.genlockHolds) late=\(d.genlockLate) reports=\(d.genlockReports)"
+            + String(format: " correctionMs=%.2f flipEstMs=%.2f", d.genlockLastCorrection * 1000, genlockFlipEstimate * 1000)
         renderDiagnosticsLog.notice(
-            "present window=\(Int((now - d.windowStart) * 1000))ms arrived=\(arrived) callbacks=\(d.callbacks) presented=\(d.presentedFrames) empty=\(d.emptyCallbacks) stale=\(d.staleFrames) drawableWaitMaxMs=\(Int(d.maximumDrawableWait * 1000)) slowDrawableWaits=\(d.slowDrawableWaits) missingDrawables=\(d.missingDrawables) layerReconfig=\(d.layerReconfigurations) maxGapMs=\(Int(d.maximumGap * 1000)) maxEncodeMs=\(Int(d.maximumEncode * 1000)) generation=\(generation)"
+            "present window=\(Int((now - d.windowStart) * 1000))ms arrived=\(arrived) callbacks=\(d.callbacks) presented=\(d.presentedFrames) empty=\(d.emptyCallbacks) stale=\(d.staleFrames) drawableWaitMaxMs=\(Int(d.maximumDrawableWait * 1000)) slowDrawableWaits=\(d.slowDrawableWaits) missingDrawables=\(d.missingDrawables) layerReconfig=\(d.layerReconfigurations) maxGapMs=\(Int(d.maximumGap * 1000)) maxEncodeMs=\(Int(d.maximumEncode * 1000)) glassAvgMs=\(String(format: "%.1f", d.glassLatencyCount > 0 ? d.glassLatencySum / Double(d.glassLatencyCount) * 1000 : 0), privacy: .public) glassMaxMs=\(String(format: "%.1f", d.maximumGlassLatency * 1000), privacy: .public) unshown=\(d.unshownPresents) mode=\(mode, privacy: .public) generation=\(generation)"
         )
         presentationDiagnostics = PresentationDiagnostics(windowStart: now, lastCallback: now)
         presentationSummary.add(arrived: arrived, window: d)
@@ -1160,6 +1551,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         let color = layerConfiguration.color
         let useEDR = color.isHDR
         layer.displaySyncEnabled = layerConfiguration.displaySyncEnabled
+            && !presentModeForcesUnsynced(lock.withLock { state.configuration })
         layer.wantsExtendedDynamicRangeContent = useEDR
         if useEDR {
             layer.pixelFormat = .rgba16Float
@@ -1196,7 +1588,10 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
             }
         } else {
             layer.pixelFormat = .bgra8Unorm
-            layer.colorspace = sRGBColorSpace
+            // No color matching: the shader already wrote display-native values. A tagged color
+            // space makes WindowServer convert, and so composite, every frame, which costs about
+            // two refreshes of latency and rules out direct scanout and variable refresh.
+            layer.colorspace = nil
             layer.edrMetadata = nil
         }
         appliedLayerConfiguration = layerConfiguration
@@ -1255,22 +1650,25 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         }
     }
 
-    private static func vertices(for quad: VideoQuad) -> [MetalVideoVertex] {
-        let sx = Float(quad.clipScale.x)
-        let sy = Float(quad.clipScale.y)
+    /// Places the quad inside `content`, a normalized top-left-origin rect of the drawable.
+    private static func vertices(for quad: VideoQuad, in content: CGRect) -> [MetalVideoVertex] {
+        let cx = Float(content.midX * 2 - 1)
+        let cy = Float(1 - content.midY * 2)
+        let sx = Float(quad.clipScale.x * content.width)
+        let sy = Float(quad.clipScale.y * content.height)
         let minX = Float(quad.textureRect.minX)
         let maxX = Float(quad.textureRect.maxX)
         let minY = Float(quad.textureRect.minY)
         let maxY = Float(quad.textureRect.maxY)
         return [
-            MetalVideoVertex(position: SIMD2(-sx, -sy), textureCoordinate: SIMD2(minX, maxY)),
-            MetalVideoVertex(position: SIMD2(sx, -sy), textureCoordinate: SIMD2(maxX, maxY)),
-            MetalVideoVertex(position: SIMD2(-sx, sy), textureCoordinate: SIMD2(minX, minY)),
-            MetalVideoVertex(position: SIMD2(sx, sy), textureCoordinate: SIMD2(maxX, minY)),
+            MetalVideoVertex(position: SIMD2(cx - sx, cy - sy), textureCoordinate: SIMD2(minX, maxY)),
+            MetalVideoVertex(position: SIMD2(cx + sx, cy - sy), textureCoordinate: SIMD2(maxX, maxY)),
+            MetalVideoVertex(position: SIMD2(cx - sx, cy + sy), textureCoordinate: SIMD2(minX, minY)),
+            MetalVideoVertex(position: SIMD2(cx + sx, cy + sy), textureCoordinate: SIMD2(maxX, minY)),
         ]
     }
 
-    private static func uniforms(for metadata: VideoColorMetadata) -> MetalFragmentUniforms {
+    private static func uniforms(for metadata: VideoColorMetadata, wideGamutDisplay: Bool) -> MetalFragmentUniforms {
         let conversion = YUVConversion(metadata: metadata)
         let matrix = simd_float3x3(rows: [
             SIMD3(conversion.matrix[0], conversion.matrix[1], conversion.matrix[2]),
@@ -1289,7 +1687,8 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
                 conversion.offset[1],
                 conversion.offset[2],
                 transfer
-            )
+            ),
+            output: SIMD4(transfer == 0 && wideGamutDisplay ? 1 : 0, 0, 0, 0)
         )
     }
 
@@ -1336,7 +1735,26 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
     struct FragmentUniforms {
         float3x3 matrix;
         float4 offsetAndTransfer;
+        float4 output;
     };
+
+    // Rec. 709 to Display P3 for gamma-encoded SDR: decode the sRGB curve, convert the
+    // linear primaries, and re-encode with the same curve Display P3 uses.
+    float3 srgbToLinear(float3 value) {
+        return select(pow((value + 0.055) / 1.055, 2.4), value / 12.92, value <= 0.04045);
+    }
+
+    float3 linearToSrgb(float3 value) {
+        return select(1.055 * pow(value, 1.0 / 2.4) - 0.055, value * 12.92, value <= 0.0031308);
+    }
+
+    float3 rec709ToDisplayP3(float3 value) {
+        const float3x3 primaries = float3x3(
+            float3(0.8225, 0.0332, 0.0171),
+            float3(0.1774, 0.9669, 0.0724),
+            float3(0.0000, 0.0000, 0.9108));
+        return linearToSrgb(saturate(primaries * srgbToLinear(saturate(value))));
+    }
 
     vertex VertexOut videoVertex(
         uint vertexID [[vertex_id]],
@@ -1378,14 +1796,18 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         float3 rgb = max(uniforms.matrix * (float3(y, cbcr) + uniforms.offsetAndTransfer.xyz), 0.0);
         if (uniforms.offsetAndTransfer.w == 1.0) rgb = pqToLinear(rgb);
         if (uniforms.offsetAndTransfer.w == 2.0) rgb = hlgToLinear(rgb);
+        if (uniforms.output.x == 1.0) rgb = rec709ToDisplayP3(rgb);
         return float4(rgb, 1.0);
     }
 
     fragment float4 rgbFragment(
         VertexOut in [[stage_in]],
-        texture2d<float> colorTexture [[texture(0)]]) {
+        texture2d<float> colorTexture [[texture(0)]],
+        constant FragmentUniforms &uniforms [[buffer(0)]]) {
         constexpr sampler sampleFilter(coord::normalized, address::clamp_to_edge, filter::linear);
-        return colorTexture.sample(sampleFilter, in.textureCoordinate);
+        float4 color = colorTexture.sample(sampleFilter, in.textureCoordinate);
+        if (uniforms.output.x == 1.0) color.rgb = rec709ToDisplayP3(color.rgb);
+        return color;
     }
     """
 }
@@ -1413,6 +1835,16 @@ private struct PresentationSummary {
 }
 
 /// Rolling one-second presentation counters used to diagnose stream stutter.
+enum UmbraPresentMode: String {
+    case vrr
+    case immediate
+    case scanline
+    case vrrmin
+    case attime
+    case genlock
+    case vrrpaced
+}
+
 private struct PresentationDiagnostics {
     var windowStart: CFTimeInterval = CACurrentMediaTime()
     var lastCallback: CFTimeInterval?
@@ -1426,6 +1858,28 @@ private struct PresentationDiagnostics {
     var maximumDrawableWait: CFTimeInterval = 0
     var slowDrawableWaits = 0
     var missingDrawables = 0
+    /// Commit-to-glass time of shown drawables, from each drawable's presentedTime.
+    var glassLatencySamples: [CFTimeInterval] = []
+    var gpuDoneSamples: [CFTimeInterval] = []
+    var gpuTimeSamples: [CFTimeInterval] = []
+    var flipErrorSamples: [CFTimeInterval] = []
+    /// Where shown flips landed in the scan, as sixteenths of the refresh period after scanout start.
+    var flipPhaseBins = [Int](repeating: 0, count: 16)
+    var receivePhaseBins = [Int](repeating: 0, count: 16)
+    var decodedPhaseBins = [Int](repeating: 0, count: 16)
+    var commitPhaseBins = [Int](repeating: 0, count: 16)
+    var decodeSamples: [CFTimeInterval] = []
+    var receiveToCommitSamples: [CFTimeInterval] = []
+    var genlockSlackSamples: [CFTimeInterval] = []
+    var arrivalToGlassSamples: [CFTimeInterval] = []
+    var genlockHolds = 0
+    var genlockLate = 0
+    var genlockReports = 0
+    var genlockLastCorrection: CFTimeInterval = 0
+    var glassLatencySum: CFTimeInterval = 0
+    var glassLatencyCount = 0
+    var maximumGlassLatency: CFTimeInterval = 0
+    var unshownPresents = 0
 
     mutating func recordCallback(at now: CFTimeInterval) {
         callbacks += 1

@@ -161,6 +161,19 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         renderer.installCommandCommitHandler { [weak self] frameNumber in
             self?.reportCommit(frameNumber: frameNumber, videoGeneration: generation)
         }
+        renderer.installGenlockReportHandler { [weak self] report in
+            guard let self else { return }
+            feedbackQueue.async { [self] in
+                guard lock.withLock({ state.active }) else { return }
+                // A rejected correction only costs one measurement; the next report re-measures.
+                try? transport.reportGenlock(
+                    refreshPeriodNanoseconds: report.refreshPeriodNanoseconds,
+                    phaseCorrectionNanoseconds: report.phaseCorrectionNanoseconds,
+                    frameID: UInt64(max(0, report.frameNumber)),
+                    active: report.active
+                )
+            }
+        }
         renderer.installFrameDropHandler { [weak self] frameNumber, reason in
             self?.rendererDropped(
                 frameNumber: frameNumber,
@@ -175,6 +188,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
             lock.withLock { state.active = false }
             renderer.installCommandCommitHandler { _ in }
             renderer.installFrameDropHandler { _, _ in }
+            renderer.installGenlockReportHandler { _ in }
             renderer.setMailboxDropNewest(false)
             throw error
         }
@@ -190,6 +204,7 @@ public final class LSPVideoPipeline: @unchecked Sendable {
         decoder?.cleanUpPreservingRenderer()
         renderer.installCommandCommitHandler { _ in }
         renderer.installFrameDropHandler { _, _ in }
+        renderer.installGenlockReportHandler { _ in }
         renderer.flush()
         renderer.setMailboxDropNewest(false)
     }

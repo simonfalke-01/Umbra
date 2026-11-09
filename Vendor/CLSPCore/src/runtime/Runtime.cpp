@@ -2469,6 +2469,35 @@ namespace umbra::lsp {
 #endif
     }
 
+    /** @brief Record the newest genlock measurement for the next LSPT packet. */
+    [[nodiscard]] clsp_status_t report_genlock(
+      const std::uint64_t refresh_period_ns,
+      const std::int64_t phase_correction_ns,
+      const std::uint64_t frame_id,
+      const bool active
+    ) noexcept {
+#if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!video_configured_.load(std::memory_order_acquire)) {
+        return CLSP_STATUS_INVALID_STATE;
+      }
+      pthread_mutex_lock(&mutex_);
+      genlock_period_ns_ = refresh_period_ns;
+      genlock_correction_ns_ = phase_correction_ns;
+      genlock_frame_id_ = frame_id;
+      genlock_active_ = active;
+      genlock_dirty_ = true;
+      pthread_mutex_unlock(&mutex_);
+      wake_worker();
+      return CLSP_STATUS_OK;
+#else
+      (void) refresh_period_ns;
+      (void) phase_correction_ns;
+      (void) frame_id;
+      (void) active;
+      return CLSP_STATUS_UNSUPPORTED;
+#endif
+    }
+
     /** @brief Advance the latest committed-frame watermark and coalesce protected
      * LSPV. */
     [[nodiscard]] clsp_status_t
@@ -3253,6 +3282,7 @@ namespace umbra::lsp {
         compound,  ///< Regular RR plus SDES CNAME.
         congestion_feedback,  ///< Reduced-size RFC 8888 CCFB.
         lspv,  ///< Protected decoder/render status.
+        lspt,  ///< Protected genlock presentation-phase correction.
         microphone_report,  ///< Reverse microphone sender report.
       } kind {Kind::none};  ///< Retained packet semantic.
       std::array<std::uint8_t, maximum_udp_payload> bytes {};  ///< Exact protected bytes.
@@ -4218,6 +4248,27 @@ namespace umbra::lsp {
 #endif
     }
 
+    /** @brief Per-turn phase durations of the authenticated worker loop. */
+    struct WorkerTurnTiming {
+      std::uint64_t started = 0;
+      std::uint64_t drain = 0;
+      std::uint64_t deferred = 0;  ///< Deferred video, including decrypt.
+      std::uint64_t decrypt = 0;  ///< SRTP authentication and decryption inside `deferred`.
+      std::uint64_t deliver = 0;
+    };
+
+    /** @brief Ten-second high-water marks that expose a worker stall on the next stream. */
+    struct WorkerTurnStatistics {
+      std::uint64_t window_started = 0;
+      std::uint64_t turns = 0;
+      std::uint64_t slow_turns = 0;
+      std::uint64_t backlogged_turns = 0;
+      WorkerTurnTiming slowest {};
+      std::uint64_t slowest_total = 0;
+      std::uint64_t longest_backlog_wait = 0;
+      int lowest_slow_priority = std::numeric_limits<int>::max();
+    };
+
 #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
     /** @brief Select a resolved UDP route by sending its real ClientHello, then register readiness. */
     [[nodiscard]] clsp_status_t open_socket(const clsp_endpoint_t &endpoint) noexcept {
@@ -4646,32 +4697,16 @@ namespace umbra::lsp {
           fail_worker(status);
           return;
         }
+        status = transmit_lspt();
+        if (status != CLSP_STATUS_OK) {
+          fail_worker(status);
+          return;
+        }
         flush_telemetry(transport_now);
         record_worker_turn();
       }
       flush_telemetry(monotonic_microseconds(), true);
     }
-
-    /** @brief Per-turn phase durations of the authenticated worker loop. */
-    struct WorkerTurnTiming {
-      std::uint64_t started = 0;
-      std::uint64_t drain = 0;
-      std::uint64_t deferred = 0;  ///< Deferred video, including decrypt.
-      std::uint64_t decrypt = 0;  ///< SRTP authentication and decryption inside `deferred`.
-      std::uint64_t deliver = 0;
-    };
-
-    /** @brief Ten-second high-water marks that expose a worker stall on the next stream. */
-    struct WorkerTurnStatistics {
-      std::uint64_t window_started = 0;
-      std::uint64_t turns = 0;
-      std::uint64_t slow_turns = 0;
-      std::uint64_t backlogged_turns = 0;
-      WorkerTurnTiming slowest {};
-      std::uint64_t slowest_total = 0;
-      std::uint64_t longest_backlog_wait = 0;
-      int lowest_slow_priority = std::numeric_limits<int>::max();
-    };
 
     [[nodiscard]] clsp_status_t timed_drain_socket() noexcept {
       const auto started = monotonic_microseconds();
@@ -9082,6 +9117,67 @@ namespace umbra::lsp {
       pending_video_delivery_count_ = 0;
     }
 
+    /** @brief Serialize and submit one 44-byte protected RTCP APP LSPT genlock correction:
+     * version, flags (bit 0 active), reserved, sequence, refresh period ns, signed phase
+     * correction ns (positive releases host frames later), reference frame id, reserved. */
+    [[nodiscard]] clsp_status_t transmit_lspt() noexcept {
+  #if defined(__APPLE__) && CLSP_CORE_HAS_RUNTIME
+      if (!video_delivery_active_.load(std::memory_order_acquire) || !compound_rtcp_sent_ ||
+          !video_configured_.load(std::memory_order_acquire) || !input_configured_ || pending_rtcp_) {
+        return CLSP_STATUS_OK;
+      }
+      constexpr std::uint64_t minimum_interval_microseconds = 40'000;
+      const auto now = monotonic_microseconds();
+      pthread_mutex_lock(&mutex_);
+      if (!genlock_dirty_ || now - last_lspt_microseconds_ < minimum_interval_microseconds) {
+        pthread_mutex_unlock(&mutex_);
+        return CLSP_STATUS_OK;
+      }
+      const auto period = genlock_period_ns_;
+      const auto correction = genlock_correction_ns_;
+      const auto frame_id = genlock_frame_id_;
+      const auto active = genlock_active_;
+      genlock_dirty_ = false;
+      last_lspt_microseconds_ = now;
+      const auto sequence = ++genlock_sequence_;
+      pthread_mutex_unlock(&mutex_);
+      auto &packet = pending_rtcp_.bytes;
+      std::fill(packet.begin(), packet.end(), 0);
+      packet[0] = 0x80;
+      packet[1] = lumen::lsp::transport::rtcp_app_type;
+      lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t>{packet}.subspan(2, 2), 10U);
+      lumen::lsp::wire::write_be<std::uint32_t>(
+        std::span<std::uint8_t>{packet}.subspan(4, 4),
+        input_configuration_.input_ssrc
+      );
+      constexpr std::array<std::uint8_t, 4> lspt_app_name {'L', 'S', 'P', 'T'};
+      std::copy(lspt_app_name.begin(), lspt_app_name.end(), packet.begin() + 8);
+      packet[12] = 1U;
+      packet[13] = active ? 1U : 0U;
+      lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t>{packet}.subspan(16, 4), sequence);
+      lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t>{packet}.subspan(20, 8), period);
+      lumen::lsp::wire::write_be<std::uint64_t>(
+        std::span<std::uint8_t>{packet}.subspan(28, 8),
+        static_cast<std::uint64_t>(correction)
+      );
+      lumen::lsp::wire::write_be<std::uint32_t>(
+        std::span<std::uint8_t>{packet}.subspan(36, 4),
+        static_cast<std::uint32_t>(frame_id)
+      );
+      auto length = std::size_t{44};
+      const auto protected_status = srtp_.protect(packet, length, true);
+      if (protected_status != CLSP_STATUS_OK) {
+        return protected_status;
+      }
+      pending_rtcp_.kind = PendingProtectedRtcp::Kind::lspt;
+      pending_rtcp_.length = length;
+      pending_rtcp_.created_microseconds = now;
+      return transmit_pending_rtcp(now);
+  #else
+      return CLSP_STATUS_UNSUPPORTED;
+  #endif
+    }
+
     /** @brief Serialize and submit the frozen 56-byte protected RTCP APP LSPV
      * status. */
     [[nodiscard]] clsp_status_t transmit_lspv() noexcept {
@@ -10528,7 +10624,14 @@ namespace umbra::lsp {
     std::size_t reserved_ssrc_count_ {};  ///< Populated SSRC reservations.
     std::size_t reserved_payload_type_count_ {};  ///< Populated dynamic PT reservations.
     std::size_t pending_path_probe_event_count_ {};  ///< Populated retained path callbacks.
-    PendingProtectedRtcp pending_rtcp_ {};  ///< Exact protected regular/reduced RTCP retry.
+    PendingProtectedRtcp pending_rtcp_ {};
+    std::uint64_t genlock_period_ns_ {};  ///< Latest client refresh period for LSPT.
+    std::int64_t genlock_correction_ns_ {};  ///< Latest signed release-phase correction.
+    std::uint64_t genlock_frame_id_ {};  ///< Frame the latest correction was measured on.
+    bool genlock_active_ {};  ///< Whether the client asks the host to genlock.
+    bool genlock_dirty_ {};  ///< A measurement is waiting to be sent.
+    std::uint32_t genlock_sequence_ {};  ///< LSPT sequence number.
+    std::uint64_t last_lspt_microseconds_ {};  ///< When the last LSPT was built.  ///< Exact protected regular/reduced RTCP retry.
     PendingInboundSecurityInstall pending_inbound_security_install_ {};  ///< Socket-thread provider mutation.
     PendingProtectedNack pending_video_nack_ {};  ///< Urgent protected Generic NACK retry.
     PendingControllerAck pending_controller_ack_ {};  ///< Exact protected controller ACK retry.
@@ -10864,6 +10967,15 @@ namespace umbra::lsp {
     const std::uint8_t render_mailbox_occupancy
   ) noexcept {
     return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->report_video_decode(video_generation, frame_id, recovery_epoch, decoder_status, decoder_credit, render_mailbox_occupancy);
+  }
+
+  clsp_status_t Runtime::report_genlock(
+    const std::uint64_t refresh_period_ns,
+    const std::int64_t phase_correction_ns,
+    const std::uint64_t frame_id,
+    const bool active
+  ) noexcept {
+    return impl_ == nullptr ? CLSP_STATUS_RESOURCE_EXHAUSTED : impl_->report_genlock(refresh_period_ns, phase_correction_ns, frame_id, active);
   }
 
   clsp_status_t Runtime::report_video_commit(

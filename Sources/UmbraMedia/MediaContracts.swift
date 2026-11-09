@@ -790,6 +790,23 @@ public struct DecodedVideoFrame: @unchecked Sendable {
     }
 }
 
+/// One genlock measurement: how far the client's flips land from their target scan position,
+/// as the correction the host should apply to its frame release clock.
+public struct GenlockReport: Sendable, Equatable {
+    public var refreshPeriodNanoseconds: UInt64
+    /// Positive asks the host to release frames later.
+    public var phaseCorrectionNanoseconds: Int64
+    public var frameNumber: Int
+    public var active: Bool
+
+    public init(refreshPeriodNanoseconds: UInt64, phaseCorrectionNanoseconds: Int64, frameNumber: Int, active: Bool) {
+        self.refreshPeriodNanoseconds = refreshPeriodNanoseconds
+        self.phaseCorrectionNanoseconds = phaseCorrectionNanoseconds
+        self.frameNumber = frameNumber
+        self.active = active
+    }
+}
+
 public protocol MetalVideoRendering: AnyObject, Sendable {
     func enqueue(_ frame: DecodedVideoFrame)
     func flush()
@@ -798,6 +815,7 @@ public protocol MetalVideoRendering: AnyObject, Sendable {
     func installFirstPresentationProxyHandler(_ handler: @escaping @Sendable (Int) -> Void)
     func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void)
     func installFrameDropHandler(_ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void)
+    func installGenlockReportHandler(_ handler: @escaping @Sendable (GenlockReport) -> Void)
     func setMailboxDropNewest(_ enabled: Bool)
     func installTelemetryProfile(_ profile: StreamingTelemetryProfile)
     func installTelemetryClient(_ client: StreamingTelemetryClient)
@@ -810,6 +828,7 @@ public extension MetalVideoRendering {
 
     func installCommandCommitHandler(_ handler: @escaping @Sendable (Int) -> Void) { _ = handler }
     func installFrameDropHandler(_ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void) { _ = handler }
+    func installGenlockReportHandler(_ handler: @escaping @Sendable (GenlockReport) -> Void) { _ = handler }
     func setMailboxDropNewest(_ enabled: Bool) { _ = enabled }
 
     func installTelemetryProfile(_ profile: StreamingTelemetryProfile) {

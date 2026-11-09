@@ -366,7 +366,8 @@ struct StreamRendererConfiguration: Equatable {
         displayRefreshRate: Double,
         usesMetalRenderer: Bool = true,
         umbraSyncPreferred: Bool = false,
-        screenSupportsVariableRefresh: Bool = false
+        screenSupportsVariableRefresh: Bool = false,
+        screenIsWideGamut: Bool = false
     ) -> Self {
         let usesDisplayLink = usesMetalRenderer
             && policy.presentationIntent == .displayLinkedTearFree
@@ -378,7 +379,8 @@ struct StreamRendererConfiguration: Equatable {
                 adaptiveSyncEnabled: usesMetalRenderer
                     && !usesDisplayLink
                     && umbraSyncPreferred
-                    && screenSupportsVariableRefresh
+                    && screenSupportsVariableRefresh,
+                wideGamutDisplay: screenIsWideGamut
             ),
             pacing: FramePacingConfiguration(
                 nominalFramesPerSecond: framesPerSecond,
@@ -502,6 +504,9 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             )
         )
         let metalLayer = CAMetalLayer()
+        // Every pixel is drawn (letterbox included), so the layer is opaque. A non-opaque layer
+        // must be blended by WindowServer, which rules out direct scanout and variable refresh.
+        metalLayer.isOpaque = true
         metalLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         metalLayer.drawableSize = frame.size.scaled(by: metalLayer.contentsScale)
         contentView.wantsLayer = true
@@ -569,12 +574,18 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             guard let self else { return }
             let drawableSize = size.scaled(by: scale)
             if let renderer = self.renderer {
-                renderer.updateLayerGeometry(size: drawableSize, contentsScale: scale)
+                renderer.updateLayerGeometry(
+                    size: drawableSize,
+                    contentsScale: scale,
+                    videoContentRect: self.contentView.normalizedContentRect
+                )
             } else {
                 self.contentView.metalLayer.contentsScale = scale
                 self.contentView.metalLayer.drawableSize = drawableSize
             }
-            self.pointer.geometry.contentSize = size
+            let contentRect = self.contentView.contentRect
+            self.pointer.geometry.contentSize = contentRect.size
+            self.pointer.geometry.contentOrigin = contentRect.origin
             self.updatePointerCaptureRegion()
             self.rebuildMacCursor()
         }
@@ -1691,7 +1702,11 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         let scale = screen?.backingScaleFactor ?? 2
         let drawableSize = contentView.bounds.size.scaled(by: scale)
         if let renderer {
-            renderer.updateLayerGeometry(size: drawableSize, contentsScale: scale)
+            renderer.updateLayerGeometry(
+                size: drawableSize,
+                contentsScale: scale,
+                videoContentRect: contentView.normalizedContentRect
+            )
         } else {
             contentView.metalLayer.contentsScale = scale
             contentView.metalLayer.drawableSize = drawableSize
@@ -1702,13 +1717,14 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             displayRefreshRate: displayRefreshRate(for: screen),
             usesMetalRenderer: preferences.rendererPreference != .avSampleBufferDisplayLayer,
             umbraSyncPreferred: preferences.umbraSync,
-            screenSupportsVariableRefresh: screen.map(Self.supportsVariableRefresh) ?? false
+            screenSupportsVariableRefresh: screen.map(Self.supportsVariableRefresh) ?? false,
+            screenIsWideGamut: screen?.canRepresent(.p3) ?? false
         )
         let adaptiveSyncEnabled = rendererConfiguration.display.adaptiveSyncEnabled
         if adaptiveSyncEnabled != umbraSyncActive {
             umbraSyncActive = adaptiveSyncEnabled
             diagnosticHandler(
-                "umbra sync active=\(adaptiveSyncEnabled) minInterval=\(screen?.minimumRefreshInterval ?? 0) maxInterval=\(screen?.maximumRefreshInterval ?? 0)"
+                "umbra sync active=\(adaptiveSyncEnabled) minInterval=\(screen?.minimumRefreshInterval ?? 0) maxInterval=\(screen?.maximumRefreshInterval ?? 0) videoArea=\(contentView.normalizedContentRect)"
             )
         }
         renderer?.updateDisplayConfiguration(rendererConfiguration.display)
@@ -1733,7 +1749,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
 
     /// ProMotion and Adaptive-Sync panels report a refresh interval range instead of one fixed value.
     private static func supportsVariableRefresh(_ screen: NSScreen) -> Bool {
-        screen.maximumRefreshInterval - screen.minimumRefreshInterval > 0.000_1
+        screen.maximumRefreshInterval - screen.minimumRefreshInterval > 0.0001
     }
 
     private func displayRefreshRate(for screen: NSScreen?) -> Double {
@@ -1775,10 +1791,20 @@ final class StreamContainerView: NSView {
 
     override func layout() {
         super.layout()
-        streamView.frame = StreamViewportPolicy.frame(
+        // The stream layer always covers the whole window so fullscreen can scan it out
+        // directly; a layer inset below the camera housing forces WindowServer to composite the
+        // band around it, about two refreshes of latency. The safe area becomes content insets.
+        streamView.frame = bounds
+        let content = StreamViewportPolicy.frame(
             bounds: bounds,
             safeAreaRect: safeAreaRect,
             usesSafeArea: usesSafeArea
+        )
+        streamView.contentInsets = NSEdgeInsets(
+            top: max(0, bounds.maxY - content.maxY),
+            left: max(0, content.minX - bounds.minX),
+            bottom: max(0, content.minY - bounds.minY),
+            right: max(0, bounds.maxX - content.maxX)
         )
     }
 }
@@ -1857,6 +1883,33 @@ final class StreamMetalView: NSView {
     private var statisticsPresentation: StreamStatisticsPresentation?
     private var lastLayoutSize: CGSize?
     private var lastLayoutScale: CGFloat?
+    private var lastLayoutInsets: NSEdgeInsets?
+    /// Area of the view the video may occupy; the rest of the full-screen layer stays black.
+    var contentInsets = NSEdgeInsets() {
+        didSet { needsLayout = true }
+    }
+
+    /// The video area in this view's flipped coordinates.
+    var contentRect: CGRect {
+        CGRect(
+            x: contentInsets.left,
+            y: contentInsets.top,
+            width: max(0, bounds.width - contentInsets.left - contentInsets.right),
+            height: max(0, bounds.height - contentInsets.top - contentInsets.bottom)
+        )
+    }
+
+    /// `contentRect` as a fraction of the view, top-left origin, for the renderer.
+    var normalizedContentRect: CGRect {
+        guard bounds.width > 0, bounds.height > 0 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        let rect = contentRect
+        return CGRect(
+            x: rect.minX / bounds.width,
+            y: rect.minY / bounds.height,
+            width: rect.width / bounds.width,
+            height: rect.height / bounds.height
+        )
+    }
     weak var sampleBufferLayer: AVSampleBufferDisplayLayer?
     var videoSize: CGSize = .init(width: 1_280, height: 720) {
         didSet {
@@ -1909,12 +1962,14 @@ final class StreamMetalView: NSView {
         controllerModeLabel.frame.size.height += 12
         controllerModeLabel.frame.origin = CGPoint(
             x: max(12, (bounds.width - controllerModeLabel.frame.width) / 2),
-            y: 20
+            y: contentInsets.top + 20
         )
         let scale = window?.backingScaleFactor ?? 2
-        guard lastLayoutSize != bounds.size || lastLayoutScale != scale else { return }
+        let insetsChanged = lastLayoutInsets.map { !NSEdgeInsetsEqual($0, contentInsets) } ?? true
+        guard lastLayoutSize != bounds.size || lastLayoutScale != scale || insetsChanged else { return }
         lastLayoutSize = bounds.size
         lastLayoutScale = scale
+        lastLayoutInsets = contentInsets
         sampleBufferLayer?.frame = bounds
         onLayout?(bounds.size, scale)
     }
@@ -1929,7 +1984,10 @@ final class StreamMetalView: NSView {
             ),
             height: overlayFittingSize.height
         )
-        statisticsOverlay.frame.origin = CGPoint(x: UmbraLayout.space3, y: UmbraLayout.space3)
+        statisticsOverlay.frame.origin = CGPoint(
+            x: contentInsets.left + UmbraLayout.space3,
+            y: contentInsets.top + UmbraLayout.space3
+        )
     }
 
     override func keyDown(with event: NSEvent) { keyboard?.consumeInStreamView(event) }
@@ -2449,6 +2507,10 @@ final class NativeVideoRendererRouter: UmbraMedia.MetalVideoRendering, @unchecke
         _ handler: @escaping @Sendable (Int, MetalFrameDropReason) -> Void
     ) {
         metal?.installFrameDropHandler(handler)
+    }
+
+    func installGenlockReportHandler(_ handler: @escaping @Sendable (GenlockReport) -> Void) {
+        metal?.installGenlockReportHandler(handler)
     }
 
     func setMailboxDropNewest(_ enabled: Bool) {
