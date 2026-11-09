@@ -438,6 +438,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         }
     )
     private var isSessionActive = false
+    private var appliedScreenEnvironment: ScreenEnvironment?
     private var isStopRequested = false
     private var quitHostApplication = false
     private var hiddenApplicationWindows: [NSWindow] = []
@@ -572,7 +573,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         contentView.onRequestTextInput = { [weak self] in self?.requestTextInput() }
         contentView.onLayout = { [weak self] size, scale in
             guard let self else { return }
-            let drawableSize = size.scaled(by: scale)
+            let drawableSize = size.scaled(by: scale * Self.panelPixelRatio(for: self.window.screen))
             if let renderer = self.renderer {
                 renderer.updateLayerGeometry(
                     size: drawableSize,
@@ -713,6 +714,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         windowModeCoordinator.setWindowActivationSuppressed(true)
         fullscreenTeardown = StreamWindowTeardownStateMachine()
         isSessionActive = true
+        appliedScreenEnvironment = nil
         isStopRequested = false
         quitHostApplication = false
         presentationRevealed = false
@@ -799,6 +801,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         windowModeCoordinator.setWindowActivationSuppressed(true)
         fullscreenTeardown = StreamWindowTeardownStateMachine()
         isSessionActive = true
+        appliedScreenEnvironment = nil
         isStopRequested = false
         quitHostApplication = false
         presentationRevealed = false
@@ -941,6 +944,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         guard isSessionActive else { return }
         controllers.releaseAllInputs()
         isSessionActive = false
+        appliedScreenEnvironment = nil
         isStopRequested = false
         controllers.gamepadMouseEnabled = false
         activeSystemShortcutCaptureMode = .off
@@ -1666,6 +1670,49 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
         ))
     }
 
+    /// Panel pixels per backing pixel. In a scaled display mode the backing store is larger than
+    /// the panel (4112x2580 over a 3456x2168 panel), and a drawable at backing size is
+    /// downscaled by the display pipeline every frame; at panel size it scans out 1:1.
+    private static func panelPixelRatio(for screen: NSScreen?) -> CGFloat {
+        guard let screen,
+              let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return 1 }
+        let displayID = number.uint32Value
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        guard let modes = CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode] else { return 1 }
+        // kDisplayModeNativeFlag marks the panel's own resolution.
+        guard let native = modes.first(where: { $0.ioFlags & 0x0200_0000 != 0 }) else { return 1 }
+        let backingWidth = screen.frame.width * screen.backingScaleFactor
+        guard backingWidth > 0 else { return 1 }
+        return min(1, CGFloat(native.pixelWidth) / backingWidth)
+    }
+
+    /// What a screen environment change can alter; menu bar reveals and focus changes post
+    /// screen notifications every frame of their animation without changing any of it.
+    private struct ScreenEnvironment: Equatable {
+        let displayID: CGDirectDisplayID?
+        let windowDisplayID: CGDirectDisplayID?
+        let frame: CGRect?
+        let backingScaleFactor: CGFloat?
+        let maximumFramesPerSecond: Int?
+        let minimumRefreshInterval: TimeInterval?
+        let maximumRefreshInterval: TimeInterval?
+        let presentation: WindowPresentation
+
+        init(target: NSScreen?, window: NSScreen?, presentation: WindowPresentation) {
+            func id(_ screen: NSScreen?) -> CGDirectDisplayID? {
+                (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            }
+            displayID = id(target)
+            windowDisplayID = id(window)
+            frame = target?.frame
+            backingScaleFactor = target?.backingScaleFactor
+            maximumFramesPerSecond = target?.maximumFramesPerSecond
+            minimumRefreshInterval = target?.minimumRefreshInterval
+            maximumRefreshInterval = target?.maximumRefreshInterval
+            self.presentation = presentation
+        }
+    }
+
     private func handleScreenEnvironmentChange() {
         guard isSessionActive,
               let preferences = activePreferences,
@@ -1675,6 +1722,13 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
             currentScreen: window.screen,
             uiScreen: nil
         )
+        let environment = ScreenEnvironment(
+            target: targetScreen,
+            window: window.screen,
+            presentation: windowModeCoordinator.machine.presentation
+        )
+        guard environment != appliedScreenEnvironment else { return }
+        appliedScreenEnvironment = environment
         updateDisplayConfiguration(for: targetScreen, preferences: preferences, policy: policy)
         applyInputPresentation(windowModeCoordinator.machine.presentation)
         if windowModeCoordinator.machine.presentation == .borderlessFullscreen {
@@ -1700,7 +1754,7 @@ final class StreamWindowController: NSObject, PlatformInputSinkInstalling, NSWin
     ) {
         let screen = screen ?? window.screen ?? NSScreen.main
         let scale = screen?.backingScaleFactor ?? 2
-        let drawableSize = contentView.bounds.size.scaled(by: scale)
+        let drawableSize = contentView.bounds.size.scaled(by: scale * Self.panelPixelRatio(for: screen))
         if let renderer {
             renderer.updateLayerGeometry(
                 size: drawableSize,
