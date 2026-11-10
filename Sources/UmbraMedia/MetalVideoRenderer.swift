@@ -1236,6 +1236,24 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         }
     }
 
+    /// How long the flipshift service (Scripts/FlipShift) holds WindowServer's display update after
+    /// each vsync. Commits aim just before that delayed update, so they can land this much later.
+    private static func flipShiftUpdateDelay() -> CFTimeInterval {
+        let now = CACurrentMediaTime()
+        if now - flipShiftDelayCheckedAt < 2 { return flipShiftDelay }
+        flipShiftDelayCheckedAt = now
+        var delay: CFTimeInterval = 0
+        if let conf = try? String(contentsOfFile: "/Library/Application Support/Umbra/flipshift.conf", encoding: .utf8),
+           let line = conf.split(separator: "\n").first(where: { $0.hasPrefix("UPDATE_DELAY_US=") }),
+           let microseconds = Double(line.dropFirst("UPDATE_DELAY_US=".count)) {
+            delay = min(0.006, max(0, microseconds / 1_000_000))
+        }
+        flipShiftDelay = delay
+        return delay
+    }
+    private nonisolated(unsafe) static var flipShiftDelay: CFTimeInterval = 0
+    private nonisolated(unsafe) static var flipShiftDelayCheckedAt: CFTimeInterval = -10
+
     /// Synced genlock: frames stay vsync-synced (no tearing) and the host is steered so each one
     /// arrives `genlockDesiredSlack` before WindowServer's next display update, the latest moment
     /// a frame still reaches the following refresh. Frames are never held; `holds` counts frames
@@ -1247,7 +1265,7 @@ public final class MetalVideoRenderer: NSObject, MetalVideoRendering, CAMetalDis
         // WindowServer runs its display update about 0.5 ms after each vsync, and the frames it
         // picks up then reach the display controller in time for the next refresh. The deadline
         // is just after a vsync: one period minus 0.3 ms ahead of the following scanout.
-        let commitLead = syncedCommitLeadOverride ?? (period - 0.0003)
+        let commitLead = syncedCommitLeadOverride ?? (period - 0.0003 - Self.flipShiftUpdateDelay())
         guard let scanout = vblankClock.nextScanoutStart(atOrAfter: now + commitLead) else { return }
         let deadline = scanout - commitLead
         // Steer from the arrival margin before any hold: a held frame's extra refresh says
